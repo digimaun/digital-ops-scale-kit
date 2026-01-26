@@ -1,0 +1,117 @@
+# Validates manifests and runs unit tests on pull requests
+
+name: Validate PR
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "siteops/**"
+      - "workspaces/**"
+      - "templates/**"
+      - "tests/**"
+      - "pyproject.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      checks: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Site Ops
+        uses: ./.github/actions/setup-siteops
+        with:
+          install-dev: "true"
+
+      - name: Run unit tests
+        run: pytest tests/ -v --cov=siteops --cov-report=term-missing --junitxml=test-results.xml
+
+      - name: Test Summary
+        if: always()
+        uses: test-summary/action@v2
+        with:
+          paths: test-results.xml
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 7
+
+  validate:
+    name: Validate Manifests
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Site Ops
+        uses: ./.github/actions/setup-siteops
+        with:
+          install-dev: "true"
+
+      - name: Find manifests
+        id: find
+        shell: bash
+        env:
+          WORKSPACE_DIR: workspaces/iot-operations
+        run: |
+          MANIFESTS=$(find "$WORKSPACE_DIR/manifests" -name "*.yaml" -o -name "*.yml" 2>/dev/null | tr '\n' ' ' || echo "")
+          echo "manifests=$MANIFESTS" >> $GITHUB_OUTPUT
+
+          if [[ -z "$MANIFESTS" ]]; then
+            echo "::warning::No manifests found in $WORKSPACE_DIR/manifests"
+          else
+            echo "Found manifests: $MANIFESTS"
+          fi
+
+      - name: Validate manifests and show plans
+        if: steps.find.outputs.manifests != ''
+        shell: bash
+        env:
+          MANIFESTS: ${{ steps.find.outputs.manifests }}
+          WORKSPACE_DIR: workspaces/iot-operations
+        run: |
+          echo "## Deployment Plans" >> $GITHUB_STEP_SUMMARY
+          EXIT_CODE=0
+
+          for manifest in $MANIFESTS; do
+            manifest_rel="${manifest#$WORKSPACE_DIR/}"
+            echo "::group::Validating $manifest"
+            echo "### $(basename $manifest)" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+
+            # validate -v validates and shows deployment plan
+            if siteops -w "$WORKSPACE_DIR" validate "$manifest_rel" -v 2>&1 | tee -a $GITHUB_STEP_SUMMARY; then
+              echo "✓ Valid"
+            else
+              EXIT_CODE=1
+            fi
+
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "::endgroup::"
+          done
+
+          exit $EXIT_CODE

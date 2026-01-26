@@ -1,0 +1,31 @@
+# Munich Production Site
+
+apiVersion: siteops/v1
+kind: Site
+name: munich-prod
+inherits: base-site.yaml
+
+subscription: "00000000-0000-0000-0000-000000000000"
+resourceGroup: rg-iot-munich-prod
+location: germanywestcentral
+
+labels:
+  environment: prod
+  country: DE
+  city: Munich
+
+properties:
+  deployOptions:
+    includeSolution: true
+    includeOpcPlcSimulator: false
+
+parameters:
+  clusterName: munich-prod-arc
+  brokerConfig:
+    frontendReplicas: 4
+    frontendWorkers: 2
+    backendRedundancyFactor: 2
+    backendWorkers: 4
+    backendPartitions: 2
+    memoryProfile: Medium
+  defaultDataflowInstanceCount: 1

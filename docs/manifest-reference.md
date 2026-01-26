@@ -1,0 +1,122 @@
+# Manifest Reference
+
+Manifests define **what** to deploy and in **what order**.
+
+## Basic structure
+
+```yaml
+apiVersion: siteops/v1
+kind: Manifest
+name: iot-ops-base
+description: Deploy Azure IoT Operations
+
+# Site selection (choose one)
+sites:
+  - munich-dev
+  - seattle-dev
+# OR
+siteSelector: "environment=dev"
+
+# Parallel execution
+parallel: 3  # Deploy up to 3 sites concurrently
+
+# Manifest-level parameters (applied to all steps)
+parameters:
+  - parameters/common.yaml
+
+steps:
+  - name: step-name
+    template: templates/resource.bicep
+    scope: resourceGroup
+    parameters:
+      - parameters/step-specific.yaml
+    when: "{{ site.labels.condition == 'true' }}"
+```
+
+## Site selection
+
+| Method | Behavior |
+|--------|----------|
+| `sites:` list | Deploy to named sites only |
+| `siteSelector:` | Deploy to all sites matching label |
+| CLI `-l` flag | **Overrides** manifest selection |
+
+```bash
+# Overrides manifest's sites: list, deploys to all prod sites
+siteops deploy manifest.yaml -l "environment=prod"
+```
+
+## Step types
+
+### Bicep/ARM steps (default)
+
+```yaml
+- name: deploy-resources
+  template: templates/my-template.bicep
+  scope: resourceGroup  # or 'subscription'
+  parameters:
+    - parameters/my-params.yaml
+```
+
+### Kubectl steps
+
+```yaml
+- name: apply-config
+  type: kubectl
+  operation: apply
+  arc:
+    name: "{{ site.parameters.clusterName }}"
+    resourceGroup: "{{ site.resourceGroup }}"
+  files:
+    - https://example.com/manifest.yaml
+    - configs/local-manifest.yaml
+```
+
+## Conditional steps
+
+Control step execution based on site labels or properties:
+
+```yaml
+# Truthy check on properties (recommended for booleans)
+- name: deploy-solution
+  template: templates/solution.bicep
+  scope: resourceGroup
+  when: "{{ site.properties.deployOptions.includeSolution }}"
+
+# String comparison on labels
+- name: prod-only-feature
+  template: templates/feature.bicep
+  scope: resourceGroup
+  when: "{{ site.labels.environment == 'prod' }}"
+```
+
+### Supported syntax
+
+| Syntax | Example | Use Case |
+|--------|---------|----------|
+| Truthy check | `{{ site.properties.path }}` | Boolean properties |
+| Equals | `{{ site.labels.env == 'prod' }}` | String comparison |
+| Not equals | `{{ site.labels.env != 'dev' }}` | Exclusion |
+| Boolean comparison | `{{ site.properties.flag == true }}` | Explicit boolean check |
+
+Truthy evaluation:
+
+- `true` → runs step
+- `false`, `""`, `"false"`, `"0"`, `0`, `[]`, `{}` → skips step
+
+## Parallel execution
+
+| Value | Behavior |
+|-------|----------|
+| `parallel: 1` | Sequential (default) |
+| `parallel: true` | Unlimited concurrency |
+| `parallel: 5` | Up to 5 sites concurrently |
+
+CLI override: `siteops deploy manifest.yaml -p 5`
+
+## Deployment scopes
+
+| Scope | Use case | Azure CLI |
+|-------|----------|-----------|
+| `resourceGroup` | Deploy resources into RG | `az deployment group create` |
+| `subscription` | Create RGs, policies | `az deployment sub create` |

@@ -1,0 +1,529 @@
+"""Tests for site inheritance and SiteTemplate handling.
+
+Covers:
+- Basic site inheritance
+- Chained inheritance
+- Circular inheritance detection
+- SiteTemplate exclusion from site discovery
+- Local overlay interaction with inheritance
+"""
+
+import pytest
+import yaml
+
+from siteops.orchestrator import Orchestrator
+
+
+class TestSiteInheritance:
+    """Tests for site inheritance via the `inherits` field."""
+
+    def test_basic_inheritance(self, tmp_workspace):
+        """Site should inherit values from parent template."""
+        shared_dir = tmp_workspace / "shared"
+        shared_dir.mkdir()
+        base_template = {
+            "apiVersion": "siteops/v1",
+            "kind": "SiteTemplate",
+            "subscription": "inherited-sub",
+            "labels": {"team": "platform", "managedBy": "siteops"},
+            "properties": {"mqtt": {"qos": 1}},
+        }
+        (shared_dir / "base-site.yaml").write_text(yaml.dump(base_template))
+
+        site = {
+            "apiVersion": "siteops/v1",
+            "kind": "Site",
+            "inherits": "../shared/base-site.yaml",
+            "name": "dev-eastus",
+            "location": "eastus",
+            "resourceGroup": "dev-eastus-rg",
+            "labels": {"environment": "dev"},
+        }
+        (tmp_workspace / "sites" / "dev-eastus.yaml").write_text(yaml.dump(site))
+
+        orchestrator = Orchestrator(tmp_workspace)
+        loaded = orchestrator.load_site("dev-eastus")
+
+        # Inherited values
+        assert loaded.subscription == "inherited-sub"
+        assert loaded.properties["mqtt"]["qos"] == 1
+        # Merged labels
+        assert loaded.labels["team"] == "platform"
+        assert loaded.labels["managedBy"] == "siteops"
+        assert loaded.labels["environment"] == "dev"
+        # Site-specific values
+        assert loaded.name == "dev-eastus"
+        assert loaded.location == "eastus"
+        assert loaded.resource_group == "dev-eastus-rg"
+
+    def test_inheritance_with_override(self, tmp_workspace):
+        """Site values should override inherited values."""
+        shared_dir = tmp_workspace / "shared"
+        shared_dir.mkdir()
+        base_template = {
+            "subscription": "base-sub",
+            "location": "westus",
+            "labels": {"environment": "base"},
+        }
+        (shared_dir / "base.yaml").write_text(yaml.dump(base_template))
+
+        site = {
+            "inherits": "../shared/base.yaml",
+            "name": "override-test",
+            "location": "eastus",  # Override inherited location
+            "labels": {"environment": "dev"},  # Override inherited label
+        }
+        (tmp_workspace / "sites" / "override-test.yaml").write_text(yaml.dump(site))
+
+        orchestrator = Orchestrator(tmp_workspace)
+        loaded = orchestrator.load_site("override-test")
+
+        assert loaded.subscription == "base-sub"  # Inherited
+        assert loaded.location == "eastus"  # Overridden
+        assert loaded.labels["environment"] == "dev"  # Overridden
+
+    def test_chained_inheritance(self, tmp_workspace):
+        """Sites should support chained inheritance (A inherits B inherits C)."""
+        shared_dir = tmp_workspace / "shared"
+        shared_dir.mkdir()
+
+        # Grandparent template
+        grandparent = {
+            "kind": "SiteTemplate",
+            "subscription": "org-sub",
+            "labels": {"org": "contoso"},
+        }
+        (shared_dir / "org-base.yaml").write_text(yaml.dump(grandparent))
+
+        # Parent template that inherits from grandparent
+        parent = {
+            "kind": "SiteTemplate",
+            "inherits": "org-base.yaml",
+            "labels": {"team": "platform"},
+            "properties": {"tier": "standard"},
+        }
+        (shared_dir / "team-base.yaml").write_text(yaml.dump(parent))
+
+        # Site that inherits from parent
+        site = {
+            "inherits": "../shared/team-base.yaml",
+            "name": "chained-test",
+            "location": "eastus",
+            "labels": {"environment": "dev"},
+        }
+        (tmp_workspace / "sites" / "chained-test.yaml").write_text(yaml.dump(site))
+
+        orchestrator = Orchestrator(tmp_workspace)
+        loaded = orchestrator.load_site("chained-test")
+
+        # From grandparent
+        assert loaded.subscription == "org-sub"
+        assert loaded.labels["org"] == "contoso"
+        # From parent
+        assert loaded.labels["team"] == "platform"
+        assert loaded.properties["tier"] == "standard"
+        # From site
+        assert loaded.labels["environment"] == "dev"
+        assert loaded.location == "eastus"
+
+    def test_inheritance_with_local_overlay(self, tmp_workspace):
+        """Local overlay should apply after inheritance."""
+        shared_dir = tmp_workspace / "shared"
+        shared_dir.mkdir()
+        base_template = {
+            "subscription": "template-sub",
+            "labels": {"team": "platform"},
+        }
+        (shared_dir / "base.yaml").write_text(yaml.dump(base_template))
+
+        # Base site with inheritance
+        site = {
+            "inherits": "../shared/base.yaml",
+            "name": "overlay-inherit-test",
+            "location": "eastus",
+        }
+        (tmp_workspace / "sites" / "overlay-inherit-test.yaml").write_text(yaml.dump(site))
+
+        # Local overlay (should override inherited values)
+        (tmp_workspace / "sites.local").mkdir()
+        local = {"subscription": "local-sub"}
+        (tmp_workspace / "sites.local" / "overlay-inherit-test.yaml").write_text(yaml.dump(local))
+
+        orchestrator = Orchestrator(tmp_workspace)
+        loaded = orchestrator.load_site("overlay-inherit-test")
+
+        # Local overlay wins over inheritance
+        assert loaded.subscription == "local-sub"
+        # Inherited labels preserved
+        assert loaded.labels["team"] == "platform"
+
+    def test_circular_inheritance_detection(self, tmp_workspace):
+        """Circular inheritance should raise ValueError."""
+        shared_dir = tmp_workspace / "shared"
+        shared_dir.mkdir()
+
+        # A inherits B
+        a = {"inherits": "b.yaml", "location": "eastus"}
+        (shared_dir / "a.yaml").write_text(yaml.dump(a))
+
+        # B inherits A (circular!)
+        b = {"inherits": "a.yaml", "subscription": "sub"}
+        (shared_dir / "b.yaml").write_text(yaml.dump(b))
+
+        # Site inherits A
+        site = {
+            "inherits": "../shared/a.yaml",
+            "name": "circular-test",
+            "subscription": "sub",
+            "location": "eastus",
+        }
+        (tmp_workspace / "sites" / "circular-test.yaml").write_text(yaml.dump(site))
+
+        orchestrator = Orchestrator(tmp_workspace)
+        with pytest.raises(ValueError, match="Circular inheritance detected"):
+            orchestrator.load_site("circular-test")
+
+    def test_self_inheritance_detection(self, tmp_workspace):
+        """Self-referencing inheritance should raise ValueError."""
+        site = {
+            "inherits": "self-ref.yaml",  # References itself
+            "name": "self-ref",
+            "subscription": "sub",
+            "location": "eastus",
+        }
+        (tmp_workspace / "sites" / "self-ref.yaml").write_text(yaml.dump(site))
+
+        orchestrator = Orchestrator(tmp_workspace)
+        with pytest.raises(ValueError, match="Circular inheritance detected"):
+            orchestrator.load_site("self-ref")
+
+    def test_missing_inherited_file(self, tmp_workspace):
+        """Missing inherited file should raise FileNotFoundError."""
+        site = {
+            "inherits": "../shared/nonexistent.yaml",
+            "name": "missing-parent",
+            "subscription": "sub",
+            "location": "eastus",
+        }
+        (tmp_workspace / "sites" / "missing-parent.yaml").write_text(yaml.dump(site))
+
+        orchestrator = Orchestrator(tmp_workspace)
+        with pytest.raises(FileNotFoundError, match="Inherited file not found"):
+            orchestrator.load_site("missing-parent")
+
+    def test_invalid_kind_inheritance(self, tmp_workspace):
+        """Inheriting from invalid kind should raise ValueError."""
+        shared_dir = tmp_workspace / "shared"
+        shared_dir.mkdir()
+
+        # Create a Manifest (invalid for inheritance)
+        manifest = {
+            "apiVersion": "siteops/v1",
+            "kind": "Manifest",
+            "name": "not-a-template",
+        }
+        (shared_dir / "manifest.yaml").write_text(yaml.dump(manifest))
+
+        site = {
+            "inherits": "../shared/manifest.yaml",
+            "name": "invalid-inherit",
+            "subscription": "sub",
+            "location": "eastus",
+        }
+        (tmp_workspace / "sites" / "invalid-inherit.yaml").write_text(yaml.dump(site))
+
+        orchestrator = Orchestrator(tmp_workspace)
+        with pytest.raises(ValueError):
+            orchestrator.load_site("invalid-inherit")
+
+    def test_no_inheritance(self, tmp_workspace):
+        """Sites without inherits should work normally."""
+        site = {
+            "name": "no-inherit",
+            "subscription": "direct-sub",
+            "location": "eastus",
+        }
+        (tmp_workspace / "sites" / "no-inherit.yaml").write_text(yaml.dump(site))
+
+        orchestrator = Orchestrator(tmp_workspace)
+        loaded = orchestrator.load_site("no-inherit")
+
+        assert loaded.subscription == "direct-sub"
+        assert loaded.location == "eastus"
+
+    def test_inherit_from_site_kind(self, tmp_workspace):
+        """Should be able to inherit from kind: Site (not just SiteTemplate)."""
+        shared_dir = tmp_workspace / "shared"
+        shared_dir.mkdir()
+
+        # Base site (not template)
+        base_site = {
+            "kind": "Site",
+            "subscription": "shared-sub",
+            "location": "westus",
+            "labels": {"shared": "true"},
+        }
+        (shared_dir / "base-site.yaml").write_text(yaml.dump(base_site))
+
+        site = {
+            "inherits": "../shared/base-site.yaml",
+            "name": "inherit-from-site",
+            "location": "eastus",  # Override location
+        }
+        (tmp_workspace / "sites" / "inherit-from-site.yaml").write_text(yaml.dump(site))
+
+        orchestrator = Orchestrator(tmp_workspace)
+        loaded = orchestrator.load_site("inherit-from-site")
+
+        assert loaded.subscription == "shared-sub"
+        assert loaded.location == "eastus"  # Overridden
+        assert loaded.labels["shared"] == "true"
+
+    def test_local_overlay_cannot_add_inheritance(self, tmp_workspace):
+        """Local overlay should not be able to add inheritance to a site that doesn't have it."""
+        # Base site without inheritance
+        site = {
+            "name": "no-inherit-site",
+            "subscription": "base-sub",
+            "location": "eastus",
+        }
+        (tmp_workspace / "sites" / "no-inherit-site.yaml").write_text(yaml.dump(site))
+
+        # Create a template to try to inherit from
+        shared_dir = tmp_workspace / "shared"
+        shared_dir.mkdir()
+        template = {
+            "kind": "SiteTemplate",
+            "subscription": "template-sub",
+            "labels": {"from": "template"},
+        }
+        (shared_dir / "base.yaml").write_text(yaml.dump(template))
+
+        # Local overlay trying to add inheritance (should be ignored or error)
+        (tmp_workspace / "sites.local").mkdir()
+        local = {
+            "inherits": "../shared/base.yaml",
+            "location": "westus",
+        }
+        (tmp_workspace / "sites.local" / "no-inherit-site.yaml").write_text(yaml.dump(local))
+
+        orchestrator = Orchestrator(tmp_workspace)
+        loaded = orchestrator.load_site("no-inherit-site")
+
+        # The local overlay's location override should apply
+        assert loaded.location == "westus"
+        # But inheritance should NOT be applied from local overlay
+        # (subscription should remain from base site, not template)
+        assert loaded.subscription == "base-sub"
+        assert loaded.labels.get("from") != "template"
+
+    def test_deep_merge_properties_with_inheritance(self, tmp_workspace):
+        """Properties should be deep merged through inheritance chain."""
+        shared_dir = tmp_workspace / "shared"
+        shared_dir.mkdir()
+
+        # Base template with nested properties
+        base_template = {
+            "kind": "SiteTemplate",
+            "subscription": "inherited-sub",
+            "properties": {
+                "mqtt": {"broker": "mqtt://base:1883", "qos": 1},
+                "baseOnly": "from-base",
+            },
+        }
+        (shared_dir / "base.yaml").write_text(yaml.dump(base_template))
+
+        # Site that inherits and adds/overrides properties
+        site = {
+            "inherits": "../shared/base.yaml",
+            "name": "props-inherit-test",
+            "location": "eastus",
+            "properties": {
+                "mqtt": {"broker": "mqtt://site:1883", "clientId": "site-client"},
+                "siteOnly": "from-site",
+            },
+        }
+        (tmp_workspace / "sites" / "props-inherit-test.yaml").write_text(yaml.dump(site))
+
+        orchestrator = Orchestrator(tmp_workspace)
+        loaded = orchestrator.load_site("props-inherit-test")
+
+        # Verify deep merge behavior
+        assert loaded.properties["mqtt"]["broker"] == "mqtt://site:1883"  # Overridden
+        assert loaded.properties["mqtt"]["qos"] == 1  # Preserved from base
+        assert loaded.properties["mqtt"]["clientId"] == "site-client"  # Added by site
+        assert loaded.properties["baseOnly"] == "from-base"  # Preserved from base
+        assert loaded.properties["siteOnly"] == "from-site"  # Added by site
+
+
+class TestSiteTemplateExclusion:
+    """Tests for SiteTemplate handling in site discovery and loading."""
+
+    def test_get_all_site_names_excludes_site_templates(self, tmp_workspace):
+        """SiteTemplate files should be excluded from site discovery."""
+        # Create a regular site
+        (tmp_workspace / "sites" / "prod-site.yaml").write_text(
+            """
+apiVersion: siteops/v1
+kind: Site
+name: prod-site
+subscription: "00000000-0000-0000-0000-000000000000"
+resourceGroup: rg-prod
+location: eastus
+"""
+        )
+
+        # Create a site template (should be excluded)
+        (tmp_workspace / "sites" / "base-site.yaml").write_text(
+            """
+apiVersion: siteops/v1
+kind: SiteTemplate
+name: base-site
+parameters:
+  brokerConfig:
+    memoryProfile: Medium
+"""
+        )
+
+        orchestrator = Orchestrator(tmp_workspace)
+        site_names = orchestrator._get_all_site_names()
+
+        assert "prod-site" in site_names
+        assert "base-site" not in site_names
+
+    def test_load_site_rejects_site_template(self, tmp_workspace):
+        """Attempting to load a SiteTemplate as a Site should raise ValueError."""
+        (tmp_workspace / "sites" / "base-site.yaml").write_text(
+            """
+apiVersion: siteops/v1
+kind: SiteTemplate
+name: base-site
+"""
+        )
+
+        orchestrator = Orchestrator(tmp_workspace)
+
+        with pytest.raises(ValueError, match="SiteTemplate.*cannot be deployed"):
+            orchestrator.load_site("base-site")
+
+    def test_load_all_sites_excludes_templates(self, tmp_workspace):
+        """load_all_sites should not include SiteTemplate files."""
+        (tmp_workspace / "sites" / "dev-site.yaml").write_text(
+            """
+apiVersion: siteops/v1
+kind: Site
+name: dev-site
+subscription: "00000000-0000-0000-0000-000000000000"
+resourceGroup: rg-dev
+location: eastus
+"""
+        )
+
+        (tmp_workspace / "sites" / "prod-site.yaml").write_text(
+            """
+apiVersion: siteops/v1
+kind: Site
+name: prod-site
+subscription: "00000000-0000-0000-0000-000000000000"
+resourceGroup: rg-prod
+location: westus
+"""
+        )
+
+        (tmp_workspace / "sites" / "base-site.yaml").write_text(
+            """
+apiVersion: siteops/v1
+kind: SiteTemplate
+name: base-site
+"""
+        )
+
+        orchestrator = Orchestrator(tmp_workspace)
+        sites = orchestrator.load_all_sites()
+
+        site_names = {s.name for s in sites}
+        assert site_names == {"dev-site", "prod-site"}
+        assert "base-site" not in site_names
+
+    def test_is_site_template_returns_false_on_parse_error(self, tmp_workspace):
+        """_is_site_template should return False for unparseable files."""
+        (tmp_workspace / "sites" / "bad-file.yaml").write_text("this is: not: valid: yaml: {{{")
+
+        orchestrator = Orchestrator(tmp_workspace)
+        result = orchestrator._is_site_template(tmp_workspace / "sites" / "bad-file.yaml")
+
+        assert result is False
+
+    def test_site_inherits_from_site_template(self, tmp_workspace):
+        """Sites should successfully inherit from SiteTemplates."""
+        # Create template
+        (tmp_workspace / "sites" / "base-site.yaml").write_text(
+            """
+apiVersion: siteops/v1
+kind: SiteTemplate
+name: base-site
+parameters:
+  brokerConfig:
+    memoryProfile: Medium
+    replicas: 2
+"""
+        )
+
+        # Create site that inherits
+        (tmp_workspace / "sites" / "prod-site.yaml").write_text(
+            """
+apiVersion: siteops/v1
+kind: Site
+name: prod-site
+inherits: base-site.yaml
+subscription: "00000000-0000-0000-0000-000000000000"
+resourceGroup: rg-prod
+location: westus
+parameters:
+  brokerConfig:
+    replicas: 4
+"""
+        )
+
+        orchestrator = Orchestrator(tmp_workspace)
+        site = orchestrator.load_site("prod-site")
+
+        assert site.name == "prod-site"
+        assert site.parameters["brokerConfig"]["memoryProfile"] == "Medium"  # inherited
+        assert site.parameters["brokerConfig"]["replicas"] == 4  # overridden
+
+    def test_site_template_with_labels_inherited(self, tmp_workspace):
+        """SiteTemplate labels should be inherited by child sites."""
+        (tmp_workspace / "sites" / "base-site.yaml").write_text(
+            """
+apiVersion: siteops/v1
+kind: SiteTemplate
+name: base-site
+labels:
+  managedBy: siteops
+  platform: azure-iot-operations
+"""
+        )
+
+        (tmp_workspace / "sites" / "dev-site.yaml").write_text(
+            """
+apiVersion: siteops/v1
+kind: Site
+name: dev-site
+inherits: base-site.yaml
+subscription: "00000000-0000-0000-0000-000000000000"
+resourceGroup: rg-dev
+location: eastus
+labels:
+  environment: dev
+"""
+        )
+
+        orchestrator = Orchestrator(tmp_workspace)
+        site = orchestrator.load_site("dev-site")
+
+        # Inherited labels
+        assert site.labels["managedBy"] == "siteops"
+        assert site.labels["platform"] == "azure-iot-operations"
+        # Site-specific labels
+        assert site.labels["environment"] == "dev"

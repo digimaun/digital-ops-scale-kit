@@ -1,0 +1,22 @@
+# Base site template for IoT Operations deployments
+# All sites inherit from this to get consistent defaults
+
+apiVersion: siteops/v1
+kind: SiteTemplate
+name: base-site
+
+labels:
+  managedBy: siteops
+
+properties:
+  # Deployment options - control which components are deployed
+  deployOptions:
+    includeSolution: false
+    includeOpcPlcSimulator: false
+
+parameters:
+  # AIO broker configuration defaults
+  brokerConfig:
+    memoryProfile: Medium
+  # Default dataflow instance count
+  defaultDataflowInstanceCount: 1

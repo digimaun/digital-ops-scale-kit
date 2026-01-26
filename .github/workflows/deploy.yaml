@@ -1,0 +1,162 @@
+# Main deployment workflow - triggered via UI or API
+#
+# UI: Actions tab → "Deploy Infrastructure" → Run workflow
+# API: POST /repos/{owner}/{repo}/actions/workflows/deploy.yaml/dispatches
+#      Body: {"ref": "main", "inputs": {"workspace": "iot-operations", "manifest": "aio-install", "environment": "dev"}}
+
+name: Deploy Infrastructure
+
+run-name: "Deploy ${{ inputs.workspace }}/${{ inputs.manifest }} → ${{ inputs.environment }}${{ inputs.ref != '' && format(' @ {0}', inputs.ref) || '' }}${{ inputs.dry-run == true && ' (dry-run)' || '' }}"
+
+on:
+    workflow_dispatch:
+        inputs:
+            ref:
+                description: "Git ref to deploy (tag, branch, or commit SHA). Leave empty for current branch."
+                required: false
+                type: string
+                default: ""
+            workspace:
+                description: "Workspace to deploy"
+                required: true
+                type: choice
+                options:
+                    - iot-operations
+                default: "iot-operations"
+            manifest:
+                description: "Manifest to deploy"
+                required: true
+                type: choice
+                options:
+                    - aio-install
+                    - opc-ua-solution
+                default: "aio-install"
+            environment:
+                description: "Target environment"
+                required: true
+                type: choice
+                options:
+                    - dev
+                    - staging
+                    - prod
+            selector:
+                description: "Additional site selector (e.g., country=US,name=seattle-dev)"
+                required: false
+                type: string
+                default: ""
+            dry-run:
+                description: "Dry run (preview only, no deployment)"
+                required: false
+                type: boolean
+                default: false
+
+env:
+    PYTHONUNBUFFERED: "1"
+
+# Prevent concurrent deployments to the same environment
+concurrency:
+    group: deploy-${{ inputs.environment }}
+    cancel-in-progress: false
+
+permissions:
+    id-token: write
+    contents: read
+
+jobs:
+    prepare:
+        runs-on: ubuntu-latest
+        outputs:
+            github-environment: ${{ steps.map.outputs.environment }}
+            selector: ${{ steps.map.outputs.selector }}
+            ref: ${{ steps.resolve-ref.outputs.ref }}
+            workspace: ${{ steps.map.outputs.workspace }}
+            manifest: ${{ steps.map.outputs.manifest }}
+        env:
+            INPUT_ENVIRONMENT: ${{ inputs.environment }}
+            INPUT_SELECTOR: ${{ inputs.selector }}
+            INPUT_WORKSPACE: "workspaces/${{ inputs.workspace }}"
+            INPUT_MANIFEST: "manifests/${{ inputs.manifest }}.yaml"
+            INPUT_REF: ${{ inputs.ref }}
+        steps:
+            - name: Resolve git ref
+              id: resolve-ref
+              shell: bash
+              run: |
+                  # Use provided ref, or fall back to the branch/tag that triggered the workflow
+                  if [[ -n "$INPUT_REF" ]]; then
+                    echo "ref=$INPUT_REF" >> $GITHUB_OUTPUT
+                    echo "✓ Using specified ref: $INPUT_REF"
+                  else
+                    echo "ref=${{ github.ref }}" >> $GITHUB_OUTPUT
+                    echo "✓ Using current ref: ${{ github.ref }}"
+                  fi
+
+            - name: Checkout repository
+              uses: actions/checkout@v4
+              with:
+                  ref: ${{ steps.resolve-ref.outputs.ref }}
+                  persist-credentials: false
+
+            - name: Setup Site Ops
+              uses: ./.github/actions/setup-siteops
+              with:
+                  install-dev: "true"
+
+            - name: Validate manifest exists
+              shell: bash
+              run: |
+                  if [[ ! -f "$INPUT_WORKSPACE/$INPUT_MANIFEST" ]]; then
+                    echo "::error::Manifest not found: $INPUT_WORKSPACE/$INPUT_MANIFEST"
+                    echo ""
+                    echo "Available manifests:"
+                    find "$INPUT_WORKSPACE/manifests" -name "*.yaml" -o -name "*.yml" 2>/dev/null || echo "  (none found)"
+                    exit 1
+                  fi
+                  echo "✓ Manifest found: $INPUT_MANIFEST"
+
+            - name: Map environment and build selector
+              id: map
+              env:
+                  RESOLVED_REF: ${{ steps.resolve-ref.outputs.ref }}
+              shell: bash
+              run: |
+                  ENV="$INPUT_ENVIRONMENT"
+                  SELECTOR="$INPUT_SELECTOR"
+
+                  # Add environment label to selector
+                  if [ -n "$SELECTOR" ]; then
+                    SELECTOR="environment=$ENV,$SELECTOR"
+                  else
+                    SELECTOR="environment=$ENV"
+                  fi
+
+                  echo "environment=$ENV" >> $GITHUB_OUTPUT
+                  echo "selector=$SELECTOR" >> $GITHUB_OUTPUT
+                  echo "workspace=$INPUT_WORKSPACE" >> $GITHUB_OUTPUT
+                  echo "manifest=$INPUT_MANIFEST" >> $GITHUB_OUTPUT
+
+                  echo "### Deployment Configuration" >> $GITHUB_STEP_SUMMARY
+                  echo "| Setting | Value |" >> $GITHUB_STEP_SUMMARY
+                  echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
+                  echo "| Git Ref | \`$RESOLVED_REF\` |" >> $GITHUB_STEP_SUMMARY
+                  echo "| Workspace | \`$INPUT_WORKSPACE\` |" >> $GITHUB_STEP_SUMMARY
+                  echo "| Manifest | \`$INPUT_MANIFEST\` |" >> $GITHUB_STEP_SUMMARY
+                  echo "| Environment | \`$ENV\` |" >> $GITHUB_STEP_SUMMARY
+                  echo "| Selector | \`$SELECTOR\` |" >> $GITHUB_STEP_SUMMARY
+                  echo "| Dry Run | \`${{ inputs.dry-run }}\` |" >> $GITHUB_STEP_SUMMARY
+
+    deploy:
+        needs: prepare
+        uses: ./.github/workflows/_siteops-deploy.yaml
+        with:
+            manifest: ${{ needs.prepare.outputs.manifest }}
+            workspace: ${{ needs.prepare.outputs.workspace }}
+            selector: ${{ needs.prepare.outputs.selector }}
+            dry-run: ${{ inputs.dry-run }}
+            environment: ${{ needs.prepare.outputs.github-environment }}
+            ref: ${{ needs.prepare.outputs.ref }}
+        secrets:
+            AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+            AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+            AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+            SITE_OVERRIDES: ${{ secrets.SITE_OVERRIDES }}

@@ -1,0 +1,31 @@
+# Seattle Development Site
+
+apiVersion: siteops/v1
+kind: Site
+name: seattle-dev
+inherits: base-site.yaml
+
+subscription: "00000000-0000-0000-0000-000000000000"
+resourceGroup: rg-iot-seattle-dev
+location: westus
+
+labels:
+  environment: dev
+  country: US
+  city: Seattle
+
+properties:
+  deployOptions:
+    includeSolution: true
+    includeOpcPlcSimulator: true
+
+parameters:
+  clusterName: seattle-dev-arc
+  brokerConfig:
+    frontendReplicas: 1
+    frontendWorkers: 1
+    backendRedundancyFactor: 2
+    backendWorkers: 1
+    backendPartitions: 1
+    memoryProfile: Low
+  defaultDataflowInstanceCount: 1

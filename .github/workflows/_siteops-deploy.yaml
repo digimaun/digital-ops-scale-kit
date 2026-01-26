@@ -1,0 +1,266 @@
+# Reusable workflow for Site Ops deployments
+# Called by deploy.yaml with specific parameters
+
+name: _Site Ops Deploy
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git ref to checkout"
+        required: false
+        type: string
+        default: ""
+      workspace:
+        description: "Workspace directory"
+        required: false
+        type: string
+        default: "workspaces/iot-operations"
+      manifest:
+        description: "Path to manifest file (relative to workspace)"
+        required: true
+        type: string
+      environment:
+        description: "GitHub environment for protection rules"
+        required: false
+        type: string
+        default: ""
+      selector:
+        description: "Site selector (e.g., environment=prod)"
+        required: false
+        type: string
+        default: ""
+      dry-run:
+        description: "Dry run mode (no actual deployment)"
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      AZURE_CLIENT_ID:
+        description: "Azure AD application client ID"
+        required: true
+      AZURE_TENANT_ID:
+        description: "Azure AD tenant ID"
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        description: "Azure subscription ID (for OIDC)"
+        required: true
+      SITE_OVERRIDES:
+        description: "JSON object with site overrides"
+        required: false
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || null }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      INPUT_WORKSPACE: ${{ inputs.workspace }}
+      INPUT_MANIFEST: ${{ inputs.manifest }}
+      INPUT_SELECTOR: ${{ inputs.selector }}
+      INPUT_DRY_RUN: ${{ inputs.dry-run }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: Setup Site Ops
+        uses: ./.github/actions/setup-siteops
+        with:
+          install-dev: "true"
+
+      - name: Setup site overrides
+        env:
+          SITE_OVERRIDES: ${{ secrets.SITE_OVERRIDES }}
+        shell: bash
+        run: |
+          # Generate sites.local/ override files from SITE_OVERRIDES JSON secret.
+          # Supports nested paths using dot notation for parameters:
+          # {
+          #   "munich-dev": {
+          #     "subscription": "...",
+          #     "resourceGroup": "...",
+          #     "parameters.clusterName": "actual-cluster-name",
+          #     "parameters.customLocationName": "actual-custom-location"
+          #   }
+          # }
+
+          if [[ -z "$SITE_OVERRIDES" ]]; then
+            echo "No site overrides configured, using committed sites"
+            exit 0
+          fi
+
+          if ! echo "$SITE_OVERRIDES" | jq empty 2>/dev/null; then
+            echo "::error::SITE_OVERRIDES secret is not valid JSON"
+            exit 1
+          fi
+
+          mkdir -p "$INPUT_WORKSPACE/sites.local"
+
+          for site_name in $(echo "$SITE_OVERRIDES" | jq -r 'keys[]'); do
+            # Sanitize site name - only allow alphanumeric, dash, underscore
+            if [[ ! "$site_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+              echo "::error::Invalid site name in SITE_OVERRIDES: $site_name"
+              exit 1
+            fi
+
+            output_file="$INPUT_WORKSPACE/sites.local/${site_name}.yaml"
+            
+            # Build the YAML file with proper nesting
+            # First, collect all entries and group by parent
+            {
+              # Write top-level keys first
+              echo "$SITE_OVERRIDES" | jq -r --arg site "$site_name" \
+                '.[$site] | to_entries[] | select(.key | contains(".") | not) | "\(.key): \"\(.value)\""'
+              
+              # Then write nested keys grouped by parent
+              for parent in $(echo "$SITE_OVERRIDES" | jq -r --arg site "$site_name" \
+                '.[$site] | keys[] | select(contains(".")) | split(".")[0]' | sort -u); do
+                echo "${parent}:"
+                echo "$SITE_OVERRIDES" | jq -r --arg site "$site_name" --arg parent "$parent" \
+                  '.[$site] | to_entries[] | select(.key | startswith($parent + ".")) | "  \(.key | split(".")[1]): \"\(.value)\""'
+              done
+            } > "$output_file"
+
+            echo "✓ Generated override for: $site_name"
+          done
+
+          echo ""
+          echo "Site overrides created:"
+          for f in "$INPUT_WORKSPACE/sites.local/"*.yaml; do
+            [[ -f "$f" ]] || continue
+            echo "--- $f ---"
+            cat "$f"
+          done
+
+      - name: Show target sites
+        shell: bash
+        run: |
+          echo "### Target Sites" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          if [[ -n "$INPUT_SELECTOR" ]]; then
+            siteops -w "$INPUT_WORKSPACE" sites -l "$INPUT_SELECTOR" 2>&1 | tee -a $GITHUB_STEP_SUMMARY || echo "No matching sites found" >> $GITHUB_STEP_SUMMARY
+          else
+            siteops -w "$INPUT_WORKSPACE" sites 2>&1 | tee -a $GITHUB_STEP_SUMMARY || echo "No matching sites found" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Start OIDC token refresh service
+        shell: bash
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+        run: |
+          # Background service that refreshes OIDC token every 4 minutes.
+          # GitHub OIDC tokens expire after ~5 minutes, so this keeps az cli
+          # authenticated for long-running AIO deployments (which can take 20+ min).
+          (
+            while true; do
+              sleep 240
+              token=$(curl -sH "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+                "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange" | jq -r .value)
+              az login --service-principal -u "$AZURE_CLIENT_ID" -t "$AZURE_TENANT_ID" \
+                --federated-token "$token" --output none 2>/dev/null || true
+            done
+          ) &
+          echo "OIDC token refresh service started (PID: $!)"
+
+      - name: Validate inputs
+        shell: bash
+        run: |
+          # Prevent path traversal attacks
+          if [[ "$INPUT_WORKSPACE" == *".."* ]] || [[ "$INPUT_MANIFEST" == *".."* ]]; then
+            echo "::error::Path traversal not allowed"
+            exit 1
+          fi
+
+          if [[ -n "$INPUT_SELECTOR" && ! "$INPUT_SELECTOR" =~ ^[a-zA-Z0-9_=,./:-]+$ ]]; then
+            echo "::error::Invalid selector format"
+            exit 1
+          fi
+
+          if [[ ! -d "$INPUT_WORKSPACE" ]]; then
+            echo "::error::Workspace directory not found: $INPUT_WORKSPACE"
+            exit 1
+          fi
+
+          echo "✓ Inputs validated"
+
+      - name: Validate manifest and show plan
+        shell: bash
+        run: |
+          CMD_ARGS=(-w "$INPUT_WORKSPACE" validate "$INPUT_MANIFEST")
+          [[ -n "$INPUT_SELECTOR" ]] && CMD_ARGS+=(-l "$INPUT_SELECTOR")
+          CMD_ARGS+=(-v)
+
+          siteops "${CMD_ARGS[@]}"
+
+      - name: Deploy
+        id: deploy
+        shell: bash
+        run: |
+          set -o pipefail
+          START_TIME=$(date +%s)
+
+          CMD_ARGS=(-w "$INPUT_WORKSPACE" deploy "$INPUT_MANIFEST")
+
+          if [[ "$INPUT_DRY_RUN" == "true" ]]; then
+            CMD_ARGS+=(--dry-run)
+            echo "::notice::Running in DRY-RUN mode - no actual deployment"
+          fi
+
+          [[ -n "$INPUT_SELECTOR" ]] && CMD_ARGS+=(-l "$INPUT_SELECTOR")
+
+          echo "Executing: siteops ${CMD_ARGS[*]}"
+          siteops "${CMD_ARGS[@]}" 2>&1 | tee deploy-output.txt
+
+          DEPLOY_EXIT_CODE=${PIPESTATUS[0]}
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Deployment Result" >> $GITHUB_STEP_SUMMARY
+          if [[ $DEPLOY_EXIT_CODE -eq 0 ]]; then
+            echo "✅ **Success** in ${DURATION}s" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Failed** after ${DURATION}s" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          {
+            echo "log<<EOF"
+            cat deploy-output.txt
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          exit $DEPLOY_EXIT_CODE
+
+      - name: Upload deployment log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-log-${{ github.run_id }}-${{ github.run_attempt }}
+          path: deploy-output.txt
+          retention-days: 30
+
+      - name: Azure Logout
+        if: always()
+        shell: bash
+        run: az logout || true

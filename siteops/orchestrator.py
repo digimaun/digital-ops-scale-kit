@@ -1,0 +1,1614 @@
+"""Main orchestration engine.
+
+This module provides the Orchestrator class which handles:
+- Loading sites and manifests from the workspace
+- Resolving parameters with template variable substitution
+- Executing deployment steps (Bicep/ARM and kubectl) across sites
+- Parallel and sequential deployment modes with configurable concurrency
+"""
+
+import copy
+import hashlib
+import json
+import logging
+import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+
+import yaml
+
+from siteops.executor import (
+    AzCliExecutor,
+    DeploymentResult,
+    KubectlResult,
+    filter_parameters,
+)
+from siteops.models import (
+    CONDITION_PATTERN,
+    DeploymentStep,
+    KubectlStep,
+    Manifest,
+    ManifestStep,
+    ParallelConfig,
+    Site,
+    _validate_resource,
+    parse_selector,
+)
+
+logger = logging.getLogger(__name__)
+
+# Pattern for {{ steps.<step_name>.outputs.<output_path> }}
+# Supports nested paths like: steps.X.outputs.Y.Z.A
+STEP_OUTPUT_PATTERN = re.compile(r"\{\{\s*steps\.([a-zA-Z0-9_-]+)\.outputs\.([a-zA-Z0-9_.-]+)\s*\}\}")
+
+# Pattern for {{ site.properties.<path> }}
+# Supports nested paths and array indices like: site.properties.endpoints[0].host
+SITE_PROPERTIES_PATTERN = re.compile(r"\{\{\s*site\.properties\.([a-zA-Z0-9_.\[\]]+)\s*\}\}")
+
+# Pattern for {{ site.parameters.<path> }}
+# Supports nested paths like: site.parameters.brokerConfig.memoryProfile
+SITE_PARAMETERS_PATTERN = re.compile(r"\{\{\s*site\.parameters\.([a-zA-Z0-9_.\[\]]+)\s*\}\}")
+
+# Result type that can be either a deployment or kubectl result
+StepResult = Union[DeploymentResult, KubectlResult]
+
+
+def _resolve_output_path(obj: Any, path: str) -> Any:
+    """Resolve a dot-separated path into an object.
+
+    Handles Azure ARM output format which wraps values in {"value": X, "type": "..."}
+
+    Args:
+        obj: The object to traverse (dict or value)
+        path: Dot-separated path like "adrNamespace.id"
+
+    Returns:
+        The value at the path, or None if not found
+    """
+    parts = path.split(".")
+    current = obj
+
+    for part in parts:
+        if current is None:
+            return None
+        # Unwrap Azure output format at each level
+        if isinstance(current, dict) and "value" in current and "type" in current:
+            current = current["value"]
+        if isinstance(current, dict) and part in current:
+            current = current[part]
+        else:
+            return None
+
+    # Final unwrap if needed
+    if isinstance(current, dict) and "value" in current and "type" in current:
+        current = current["value"]
+
+    return current
+
+
+# Lock for thread-safe console output
+_print_lock = threading.Lock()
+
+
+def _thread_safe_print(*args, **kwargs):
+    """Print with lock to avoid interleaved output from multiple threads."""
+    with _print_lock:
+        print(*args, **kwargs)
+
+
+class Orchestrator:
+    """Orchestrates deployments across sites.
+
+    The orchestrator is responsible for:
+    - Loading and caching sites from the workspace
+    - Resolving manifest steps with parameter files and template variables
+    - Executing deployment steps (Bicep/ARM deployments and kubectl operations)
+    - Managing parallel deployment to multiple sites with configurable concurrency
+
+    Attributes:
+        workspace: Path to the Site Ops workspace directory
+        dry_run: If True, commands are logged but not executed
+        executor: The AzCliExecutor instance for running commands
+    """
+
+    def __init__(self, workspace: Path, dry_run: bool = False):
+        self.workspace = Path(workspace).resolve()
+        self.dry_run = dry_run
+        self.executor = AzCliExecutor(workspace=self.workspace, dry_run=dry_run)
+        self._params_cache: Dict[Path, Dict[str, Any]] = {}
+        self._params_cache_lock = threading.Lock()
+        self._site_cache: Dict[str, Site] = {}
+        self._cache_lock = threading.Lock()
+
+    def _deep_merge(self, base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+        """Deep merge two dictionaries, with override taking precedence.
+
+        Behavior:
+        - Nested dicts are merged recursively
+        - Lists are REPLACED entirely (not concatenated)
+        - Scalar values from override replace base values
+
+        Args:
+            base: Base dictionary
+            override: Override dictionary (values take precedence)
+
+        Returns:
+            New merged dictionary (neither input is modified)
+
+        Example:
+            >>> base = {"a": {"x": 1, "y": 2}, "b": [1, 2]}
+            >>> override = {"a": {"x": 10}, "b": [3]}
+            >>> _deep_merge(base, override)
+            {"a": {"x": 10, "y": 2}, "b": [3]}  # Note: list replaced, not merged
+        """
+        result = copy.deepcopy(base)
+        for key, value in override.items():
+            if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+                result[key] = self._deep_merge(result[key], value)
+            else:
+                result[key] = copy.deepcopy(value)
+        return result
+
+    def _load_inherited_data(self, path: Path, seen: Optional[List[Path]] = None) -> Dict[str, Any]:
+        """Load inherited site template with support for chained inheritance.
+
+        Resolves the `inherits` field recursively, merging parent data first.
+
+        Args:
+            path: Absolute path to the inherited file
+            seen: List of visited paths for cycle detection (preserves order)
+
+        Returns:
+            Merged data from inheritance chain (with metadata fields stripped)
+
+        Raises:
+            FileNotFoundError: If inherited file doesn't exist
+            ValueError: If circular inheritance is detected or kind is invalid
+        """
+        if seen is None:
+            seen = []
+
+        # Normalize path for consistent cycle detection
+        normalized = path.resolve()
+        if normalized in seen:
+            cycle_path = " -> ".join(str(p) for p in seen) + f" -> {normalized}"
+            raise ValueError(f"Circular inheritance detected: {cycle_path}")
+        seen.append(normalized)
+
+        if not path.exists():
+            raise FileNotFoundError(f"Inherited file not found: {path}")
+
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+
+        # Validate kind if present (allow Site or SiteTemplate)
+        kind = data.get("kind")
+        if kind is not None and kind not in ("Site", "SiteTemplate"):
+            raise ValueError(f"Cannot inherit from kind '{kind}' in {path}. " f"Expected 'Site' or 'SiteTemplate'")
+
+        # Handle chained inheritance
+        if "inherits" in data:
+            parent_path = (path.parent / data["inherits"]).resolve()
+            parent_data = self._load_inherited_data(parent_path, seen)
+            # Remove metadata fields before merging
+            child_data = {k: v for k, v in data.items() if k not in ("inherits", "kind", "apiVersion")}
+            data = self._deep_merge(parent_data, child_data)
+        else:
+            # Remove metadata fields from leaf template
+            data = {k: v for k, v in data.items() if k not in ("kind", "apiVersion")}
+
+        logger.debug(f"Loaded inherited data from: {path}")
+        return data
+
+    def _load_site_data(self, name: str) -> Dict[str, Any]:
+        """Load and merge site data with inheritance and overlay support.
+
+        Merge order (later overrides earlier):
+        1. inherits target  - Parent template (if specified, resolved recursively)
+        2. sites/           - Base site definitions (committed)
+        3. sites.local/     - Local/CI overrides (gitignored)
+
+        Note: Only the base file (sites/) can specify `inherits`. The sites.local/
+        overlay cannot change inheritance for security reasons.
+
+        Args:
+            name: Site name (filename without extension)
+
+        Returns:
+            Merged site data dictionary
+
+        Raises:
+            FileNotFoundError: If site file doesn't exist in any directory
+            ValueError: If inheritance creates a cycle or references invalid kind
+        """
+        site_dirs = [
+            self.workspace / "sites",  # Base (committed)
+            self.workspace / "sites.local",  # Local/CI overrides
+        ]
+
+        merged_data: Dict[str, Any] = {}
+        found = False
+        is_base_file = True  # Track if we're processing the base file
+
+        for sites_dir in site_dirs:
+            for ext in (".yaml", ".yml"):
+                path = sites_dir / f"{name}{ext}"
+                if path.exists():
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = yaml.safe_load(f) or {}
+
+                    # Process inheritance only on base file (not local overlay)
+                    if is_base_file and "inherits" in data:
+                        inherits_path = (path.parent / data["inherits"]).resolve()
+                        # Initialize seen list with current file to detect self-reference
+                        inherited_data = self._load_inherited_data(inherits_path, seen=[path.resolve()])
+                        merged_data = self._deep_merge(merged_data, inherited_data)
+                        # Remove inherits from data before merging
+                        data = {k: v for k, v in data.items() if k != "inherits"}
+                    elif not is_base_file and "inherits" in data:
+                        # Strip inherits from local overlay (security: can't inject inheritance)
+                        data = {k: v for k, v in data.items() if k != "inherits"}
+
+                    merged_data = self._deep_merge(merged_data, data)
+                    found = True
+                    is_base_file = False  # Subsequent files are overlays
+                    logger.debug(f"Loaded site data from: {path}")
+                    break  # Only load one file per directory (prefer .yaml)
+
+        if not found:
+            raise FileNotFoundError(f"Site '{name}' not found in sites/ or sites.local/")
+
+        return merged_data
+
+    def load_site(self, name: str) -> Site:
+        """Load a site by name, applying inheritance and local overlays.
+
+        Resolution order (later sources override earlier):
+        1. Inherited site/template (if 'inherits' specified)
+        2. Base site file from sites/{name}.yaml
+        3. Local overlay from sites.local/{name}.yaml (if exists)
+
+        Args:
+            name: Site name (corresponds to sites/{name}.yaml)
+
+        Returns:
+            Fully resolved Site instance
+
+        Raises:
+            ValueError: If site file is invalid, missing required fields,
+                       or references non-existent inherited files
+            FileNotFoundError: If sites/{name}.yaml doesn't exist
+        """
+        # Check cache first
+        with self._cache_lock:
+            if name in self._site_cache:
+                return self._site_cache[name]
+
+        # Check if site file exists
+        site_path = self.workspace / "sites" / f"{name}.yaml"
+        if not site_path.exists():
+            # Also check .yml extension
+            site_path = self.workspace / "sites" / f"{name}.yml"
+            if not site_path.exists():
+                raise FileNotFoundError(f"Site file not found: sites/{name}.yaml")
+
+        # Check if this is a SiteTemplate (cannot be loaded directly)
+        if self._is_site_template(site_path):
+            raise ValueError(
+                f"Cannot load '{name}' as a site: it is a SiteTemplate (inheritance-only). "
+                f"SiteTemplates cannot be deployed directly."
+            )
+
+        # Load and merge site data (handles inheritance + local overlay)
+        merged_data = self._load_site_data(name)
+
+        # Validate merged data
+        _validate_resource(merged_data, "Site", site_path)
+
+        # Parse merged data (similar to Site.from_file but from dict)
+        if "spec" in merged_data:
+            spec = merged_data["spec"]
+            metadata = merged_data.get("metadata", {})
+            site_name = metadata.get("name", name)
+            labels = metadata.get("labels", {})
+        else:
+            spec = merged_data
+            site_name = merged_data.get("name", name)
+            labels = merged_data.get("labels", {})
+
+        required = ["subscription", "location"]
+        for req in required:
+            if req not in spec:
+                raise ValueError(f"Missing required field '{req}' in site: {name}")
+
+        site = Site(
+            name=site_name,
+            subscription=spec["subscription"],
+            resource_group=spec.get("resourceGroup", ""),
+            location=spec["location"],
+            labels=labels,
+            properties=spec.get("properties", {}),
+            parameters=spec.get("parameters", {}),
+        )
+
+        # Cache the resolved site
+        with self._cache_lock:
+            self._site_cache[name] = site
+
+        return site
+
+    def _get_all_site_names(self) -> List[str]:
+        """Get all deployable site names from the sites directory.
+
+        Scans the workspace's sites/ directory for YAML files and returns
+        the names of files that represent deployable sites (kind: Site).
+        Files with kind: SiteTemplate are excluded as they are only used
+        for inheritance.
+
+        Returns:
+            List of site names (filename stems without .yaml extension)
+
+        Note:
+            - Files that cannot be parsed are included and will error during load_site()
+            - This allows proper error reporting with full context
+        """
+        sites_dir = self.workspace / "sites"
+        if not sites_dir.exists():
+            return []
+
+        site_names = set()  # Use set to avoid duplicates if both .yaml and .yml exist
+        for ext in ("*.yaml", "*.yml"):
+            for path in sites_dir.glob(ext):
+                if self._is_site_template(path):
+                    continue
+                site_names.add(path.stem)
+
+        return sorted(site_names)  # Sort for deterministic order
+
+    def _is_site_template(self, path: Path) -> bool:
+        """Check if a YAML file is a SiteTemplate (inheritance-only).
+
+        Args:
+            path: Path to the YAML file
+
+        Returns:
+            True if the file has kind: SiteTemplate, False otherwise
+
+        Note:
+            Returns False if the file cannot be parsed, allowing load_site()
+            to handle the error with proper context.
+        """
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+            return bool(data and data.get("kind") == "SiteTemplate")
+        except Exception:
+            # Let load_site() handle parsing errors with full context
+            return False
+
+    def load_all_sites(self) -> List[Site]:
+        """Load all sites from sites/ and sites.local/ directories.
+
+        Sites are merged across directories with the following precedence:
+        sites.local/ > sites/
+
+        Returns:
+            List of all Site instances found (with merged configuration)
+        """
+        sites = []
+
+        for name in self._get_all_site_names():
+            try:
+                site = self.load_site(name)
+                sites.append(site)
+            except Exception as e:
+                logger.warning(f"Failed to load site '{name}': {e}")
+
+        return sites
+
+    def load_parameters(self, path: Path) -> Dict[str, Any]:
+        """Load parameters from a YAML/JSON file with caching.
+
+        Thread-safe caching prevents re-reading files during parallel deployments.
+        Returns a deep copy to prevent mutation of cached data.
+
+        Args:
+            path: Path to the parameter file
+
+        Returns:
+            Dict of parameters (deep copy from cache)
+        """
+        path = path.resolve()
+
+        with self._params_cache_lock:
+            if path in self._params_cache:
+                return copy.deepcopy(self._params_cache[path])
+
+        if not path.exists():
+            logger.warning(f"Parameter file not found: {path}")
+            return {}
+
+        with open(path, "r", encoding="utf-8") as f:
+            if path.suffix == ".json":
+                result = json.load(f)
+            else:
+                result = yaml.safe_load(f) or {}
+
+        with self._params_cache_lock:
+            self._params_cache[path] = result
+
+        return copy.deepcopy(result)
+
+    def _resolve_template_strings(
+        self, value: Any, site: Site, step_outputs: Optional[Dict[str, Dict[str, Any]]] = None
+    ) -> Any:
+        """Recursively resolve {{ site.X }} templates in values.
+
+        Supports:
+        - {{ site.name }}
+        - {{ site.location }}
+        - {{ site.resourceGroup }}
+        - {{ site.subscription }}
+        - {{ site.labels.<key> }}
+        - {{ site.properties.<path> }} (nested paths supported)
+        - {{ site.parameters.<path> }} (nested paths supported)
+
+        Args:
+            value: Value to resolve (string, dict, list, or other)
+            site: Site to resolve variables from
+            step_outputs: Optional step outputs for chaining
+
+        Returns:
+            Value with all site templates resolved
+        """
+        if isinstance(value, str):
+            # Simple replacements
+            result = value
+            result = result.replace("{{ site.name }}", site.name)
+            result = result.replace("{{ site.location }}", site.location)
+            result = result.replace("{{ site.resourceGroup }}", site.resource_group)
+            result = result.replace("{{ site.subscription }}", site.subscription)
+
+            # Labels
+            for key, val in site.labels.items():
+                result = result.replace(f"{{{{ site.labels.{key} }}}}", str(val))
+
+            # Properties (complex paths) - may return non-string for entire object/array templates
+            result = self._resolve_properties_templates(result, site.properties)
+
+            # Parameters (complex paths) - only if result is still a string
+            # (properties resolution may have returned a list/dict for templates like {{ site.properties.endpoints }})
+            if isinstance(result, str):
+                result = self._resolve_parameters_templates(result, site.parameters)
+
+            return result
+
+        elif isinstance(value, dict):
+            return {k: self._resolve_template_strings(v, site, step_outputs) for k, v in value.items()}
+        elif isinstance(value, list):
+            return [self._resolve_template_strings(v, site, step_outputs) for v in value]
+        return value
+
+    def _resolve_parameters_templates(self, value: str, parameters: Dict[str, Any]) -> Any:
+        """Resolve {{ site.parameters.<path> }} templates in a string.
+
+        Supports nested paths like:
+        - {{ site.parameters.clusterName }}
+        - {{ site.parameters.brokerConfig.memoryProfile }}
+
+        Args:
+            value: String potentially containing parameter templates
+            parameters: Site parameters dict
+
+        Returns:
+            Resolved value (may be non-string if entire value is a single template)
+        """
+        # Check if entire string is a single template (for complex types)
+        stripped = value.strip()
+        full_match = SITE_PARAMETERS_PATTERN.fullmatch(stripped)
+        if full_match:
+            path = full_match.group(1)
+            resolved = self._resolve_property_path(parameters, path)
+            if resolved is not None:
+                return resolved
+            # Return original if path not found
+            return value
+
+        # For strings with embedded templates, do string substitution
+        def replacer(match: re.Match) -> str:
+            path = match.group(1)
+            resolved = self._resolve_property_path(parameters, path)
+            if resolved is not None:
+                return str(resolved)
+            return match.group(0)  # Return original if not found
+
+        return SITE_PARAMETERS_PATTERN.sub(replacer, value)
+
+    def _resolve_properties_templates(self, value: str, properties: Dict[str, Any]) -> Any:
+        """Resolve {{ site.properties.<path> }} templates in a string.
+
+        Supports nested paths like:
+        - {{ site.properties.mqtt.broker }}
+        - {{ site.properties.deviceEndpoints[0].host }}
+        - {{ site.properties.deviceEndpoints }} (returns entire list/object)
+
+        Args:
+            value: String potentially containing property templates
+            properties: Site properties dict
+
+        Returns:
+            Resolved value (may be non-string if entire value is a single template)
+        """
+        # Check if entire string is a single template (for complex types)
+        stripped = value.strip()
+        full_match = SITE_PROPERTIES_PATTERN.fullmatch(stripped)
+        if full_match:
+            path = full_match.group(1)
+            resolved = self._resolve_property_path(properties, path)
+            if resolved is not None:
+                return resolved
+            return value
+
+        # For strings with embedded templates, do string substitution
+        def replacer(match: re.Match) -> str:
+            path = match.group(1)
+            resolved = self._resolve_property_path(properties, path)
+            if resolved is not None:
+                # Convert to string for embedded templates
+                if isinstance(resolved, (dict, list)):
+                    return json.dumps(resolved)
+                return str(resolved)
+            return match.group(0)  # Return original if not found
+
+        return SITE_PROPERTIES_PATTERN.sub(replacer, value)
+
+    def _resolve_property_path(self, obj: Any, path: str) -> Any:
+        """Resolve a dotted path with optional array indices.
+
+        Examples:
+            - "mqtt.broker" -> obj["mqtt"]["broker"]
+            - "endpoints[0].host" -> obj["endpoints"][0]["host"]
+            - "devices[0]" -> obj["devices"][0]
+
+        Args:
+            obj: Object to traverse
+            path: Dotted path with optional [N] indices
+
+        Returns:
+            Resolved value or None if path doesn't exist
+        """
+
+        # Split path into segments, handling array notation
+        # e.g., "endpoints[0].host" -> ["endpoints", "[0]", "host"]
+        segments = re.split(r"\.(?![^\[]*\])", path)
+
+        current = obj
+        for segment in segments:
+            if current is None:
+                return None
+
+            # Check for array index notation: "name[0]" or just "[0]"
+            array_match = re.match(r"^([a-zA-Z0-9_]*)\[(\d+)\]$", segment)
+            if array_match:
+                key = array_match.group(1)
+                index = int(array_match.group(2))
+
+                if key:
+                    if not isinstance(current, dict) or key not in current:
+                        return None
+                    current = current[key]
+
+                if not isinstance(current, list) or index >= len(current):
+                    return None
+                current = current[index]
+            else:
+                if not isinstance(current, dict) or segment not in current:
+                    return None
+                current = current[segment]
+
+        return current
+
+    def _resolve_step_outputs(self, value: Any, step_outputs: Dict[str, Dict[str, Any]]) -> Any:
+        """Recursively resolve {{ steps.<name>.outputs.<path> }} templates.
+
+        Supports output chaining between steps, e.g.:
+        - {{ steps.aio-enablement.outputs.clusterExtensionIds }}
+        - {{ steps.adr-namespace.outputs.adrNamespace.id }}
+
+        Args:
+            value: Value to resolve (string, dict, list, or other)
+            step_outputs: Dict mapping step names to their outputs
+
+        Returns:
+            Value with all step output references resolved
+        """
+        if isinstance(value, str):
+            # Check if entire string is a single template (for complex types like arrays)
+            stripped = value.strip()
+            full_match = STEP_OUTPUT_PATTERN.fullmatch(stripped)
+            if full_match:
+                step_name = full_match.group(1)
+                output_path = full_match.group(2)
+                if step_name in step_outputs:
+                    output_value = _resolve_output_path(step_outputs[step_name], output_path)
+                    if output_value is not None:
+                        return output_value
+                return value
+
+            # For strings with embedded templates, do string substitution
+            def replacer(match: re.Match) -> str:
+                step_name = match.group(1)
+                output_path = match.group(2)
+
+                if step_name not in step_outputs:
+                    return match.group(0)
+
+                output_value = _resolve_output_path(step_outputs[step_name], output_path)
+                if output_value is None:
+                    return match.group(0)
+
+                if isinstance(output_value, (list, dict)):
+                    logger.warning(f"Cannot embed complex output '{output_path}' in string: {value}")
+                    return match.group(0)
+
+                return str(output_value)
+
+            return STEP_OUTPUT_PATTERN.sub(replacer, value)
+
+        elif isinstance(value, dict):
+            return {k: self._resolve_step_outputs(v, step_outputs) for k, v in value.items()}
+        elif isinstance(value, list):
+            return [self._resolve_step_outputs(item, step_outputs) for item in value]
+        return value
+
+    def resolve_parameters(
+        self,
+        step: DeploymentStep,
+        site: Site,
+        manifest: Manifest,
+        step_outputs: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Merge and resolve parameters for a deployment step.
+
+        Parameter merge order (later overrides earlier):
+        1. Site-level parameters (from site definition)
+        2. Manifest-level parameter files (from manifest.parameters)
+        3. Step-level parameter files (from step.parameters)
+
+        After merging, parameters are:
+        - Resolved with template variable substitution ({{ site.X }}, {{ steps.X.outputs.Y }})
+        - Filtered to only include parameters accepted by the template
+
+        Args:
+            step: The deployment step
+            site: Target site
+            manifest: The manifest being deployed
+            step_outputs: Outputs from previous steps (for chaining)
+
+        Returns:
+            Fully resolved and filtered parameters dict
+        """
+        # 1. Start with site-level parameters
+        params = site.get_all_parameters()
+
+        # 2. Merge manifest-level parameter files
+        for param_path in manifest.parameters:
+            resolved_path = manifest.resolve_parameter_path(param_path, site)
+            full_path = (self.workspace / resolved_path).resolve()
+            if full_path.exists():
+                file_params = self.load_parameters(full_path)
+                params = self._deep_merge(params, file_params)
+            else:
+                logger.warning(f"Manifest parameter file not found: {full_path}")
+
+        # 3. Merge step-level parameter files (override manifest-level)
+        for param_path in step.parameters:
+            resolved_path = manifest.resolve_parameter_path(param_path, site)
+            full_path = (self.workspace / resolved_path).resolve()
+            if full_path.exists():
+                file_params = self.load_parameters(full_path)
+                params = self._deep_merge(params, file_params)
+            else:
+                logger.warning(f"Step parameter file not found: {full_path}")
+
+        # 4. Resolve template variables ({{ site.X }})
+        params = self._resolve_template_strings(params, site)
+
+        # 5. Resolve step output references ({{ steps.X.outputs.Y }})
+        if step_outputs:
+            params = self._resolve_step_outputs(params, step_outputs)
+
+        # 6. Warn about any unresolved templates
+        self._check_unresolved_templates(params, site.name)
+
+        # 7. Filter to only parameters accepted by the template
+        template_path = (self.workspace / step.template).resolve()
+        if template_path.exists():
+            try:
+                params = filter_parameters(params, str(template_path), step.name)
+            except (ValueError, FileNotFoundError) as e:
+                logger.warning(f"Could not filter parameters for step '{step.name}': {e}")
+                # Continue with unfiltered params - let ARM validate
+
+        return params
+
+    def _check_unresolved_templates(self, params: Dict[str, Any], site_name: str) -> None:
+        """Warn if any {{ ... }} templates weren't resolved."""
+
+        def check_value(v, path=""):
+            if isinstance(v, str) and "{{" in v and "}}" in v:
+                logger.warning(f"Unresolved template in {path}: {v} (site: {site_name})")
+            elif isinstance(v, dict):
+                for k, val in v.items():
+                    check_value(val, f"{path}.{k}" if path else k)
+            elif isinstance(v, list):
+                for i, item in enumerate(v):
+                    check_value(item, f"{path}[{i}]")
+
+        check_value(params)
+
+    def _evaluate_condition(self, condition: Optional[str], site: Site) -> bool:
+        """Evaluate a step condition against a site.
+
+        Supports:
+        - {{ site.labels.key == 'value' }}
+        - {{ site.labels.key != 'value' }}
+        - {{ site.properties.path == 'value' }}
+        - {{ site.properties.path != 'value' }}
+        - {{ site.properties.nested.path == 'value' }}
+        - {{ site.properties.array[0].field == 'value' }}
+        - {{ site.properties.path == true }}
+        - {{ site.properties.path == false }}
+        - {{ site.properties.path }} (truthy check)
+
+        Truthy check returns True if:
+        - Boolean: value is True
+        - String: value is not empty and not in ('false', '0') (case-insensitive)
+        - Number: value is not 0
+        - List/Dict: value is not empty
+
+        Args:
+            condition: The condition expression (or None)
+            site: The site to evaluate against
+
+        Returns:
+            True if condition passes (or is None/empty), False otherwise
+        """
+        if not condition:
+            return True
+
+        condition = condition.strip()
+        match = CONDITION_PATTERN.fullmatch(condition)
+        if not match:
+            logger.warning(f"Invalid condition syntax: {condition}")
+            return True
+
+        field_path = match.group(1)  # e.g., "labels.environment" or "properties.deployOptions.includeSolution"
+        operator = match.group(2)  # "==" or "!=" or None (for truthy check)
+        # Group 3 is quoted string value, group 4 is unquoted boolean
+        expected_value = match.group(3) if match.group(3) is not None else match.group(4)
+
+        # Resolve the actual value based on field path
+        if field_path.startswith("labels."):
+            label_key = field_path[7:]  # Remove "labels." prefix
+            actual_value = site.labels.get(label_key, "")
+            raw_value = actual_value  # For truthy check
+        elif field_path.startswith("properties."):
+            prop_path = field_path[11:]  # Remove "properties." prefix
+            raw_value = self._resolve_property_path(site.properties, prop_path)
+            # Convert to string for comparison (booleans become "true"/"false")
+            if raw_value is None:
+                actual_value = ""
+            elif isinstance(raw_value, bool):
+                actual_value = "true" if raw_value else "false"
+            else:
+                actual_value = str(raw_value)
+        else:
+            logger.warning(f"Unknown condition field type: {field_path}")
+            return True
+
+        # Handle truthy check (no operator)
+        if operator is None:
+            # Truthy: True for bool True, non-empty strings, non-zero numbers
+            if raw_value is None:
+                return False
+            if isinstance(raw_value, bool):
+                return raw_value
+            if isinstance(raw_value, str):
+                return raw_value.lower() not in ("", "false", "0")
+            if isinstance(raw_value, (int, float)):
+                return raw_value != 0
+            # For lists/dicts, truthy if non-empty
+            return bool(raw_value)
+
+        # Handle comparison operators
+        if operator == "==":
+            return actual_value == expected_value
+        elif operator == "!=":
+            return actual_value != expected_value
+
+        return True
+
+    def _get_step_type_label(self, step: ManifestStep) -> str:
+        """Get a display label for the step type.
+
+        Args:
+            step: The manifest step
+
+        Returns:
+            Display string like 'resourceGroup', 'subscription', or 'kubectl:apply'
+        """
+        if isinstance(step, KubectlStep):
+            return f"kubectl:{step.operation}"
+        return step.scope
+
+    def _deploy_bicep_step(
+        self,
+        site: Site,
+        step: DeploymentStep,
+        manifest: Manifest,
+        timestamp: str,
+        step_outputs: Dict[str, Dict[str, Any]],
+    ) -> DeploymentResult:
+        """Execute a Bicep/ARM deployment step.
+
+        Args:
+            site: Target site
+            step: The deployment step
+            manifest: The manifest being deployed
+            timestamp: Shared timestamp for deployment naming
+            step_outputs: Outputs from previous steps
+
+        Returns:
+            DeploymentResult with success status and outputs
+        """
+        params = self.resolve_parameters(step, site, manifest, step_outputs)
+        template_path = (self.workspace / step.template).resolve()
+
+        # Azure deployment names have a 64 char limit
+        # Format: {base_name}-{timestamp} where timestamp is 14 chars (YYYYMMDDHHmmss)
+        base_name = f"{manifest.name}-{site.name}-{step.name}"
+        MAX_LEN = 64
+        TIMESTAMP_LEN = 14
+        max_base = MAX_LEN - TIMESTAMP_LEN - 1  # -1 for the separator
+
+        if len(base_name) > max_base:
+            # Use hash suffix to ensure uniqueness when truncating
+            name_hash = hashlib.md5(base_name.encode()).hexdigest()[:6]
+            base_name = f"{base_name[:max_base - 7]}-{name_hash}"
+
+        deployment_name = f"{base_name}-{timestamp}"
+
+        if step.scope == "subscription":
+            return self.executor.deploy_subscription(
+                subscription=site.subscription,
+                location=site.location,
+                template_path=template_path,
+                parameters=params,
+                deployment_name=deployment_name,
+                step_name=step.name,
+                site_name=site.name,
+            )
+        else:
+            return self.executor.deploy_resource_group(
+                subscription=site.subscription,
+                resource_group=site.resource_group,
+                template_path=template_path,
+                parameters=params,
+                deployment_name=deployment_name,
+                step_name=step.name,
+                site_name=site.name,
+            )
+
+    def _execute_kubectl_step(
+        self,
+        site: Site,
+        step: KubectlStep,
+        step_outputs: Dict[str, Dict[str, Any]],
+    ) -> KubectlResult:
+        """Execute a kubectl step against an Arc-connected cluster.
+
+        Args:
+            site: Target site
+            step: The kubectl step
+            step_outputs: Outputs from previous steps
+
+        Returns:
+            KubectlResult with success status
+        """
+        # Resolve template variables in Arc config
+        cluster_name = self._resolve_template_strings(step.arc.name, site)
+        resource_group = self._resolve_template_strings(step.arc.resource_group, site)
+
+        if step_outputs:
+            cluster_name = self._resolve_step_outputs(cluster_name, step_outputs)
+            resource_group = self._resolve_step_outputs(resource_group, step_outputs)
+
+        # Resolve template variables in files list
+        resolved_files = []
+        for f in step.files:
+            resolved = self._resolve_template_strings(f, site)
+            if step_outputs:
+                resolved = self._resolve_step_outputs(resolved, step_outputs)
+            resolved_files.append(resolved)
+
+        if step.operation == "apply":
+            return self.executor.kubectl_apply(
+                cluster_name=cluster_name,
+                resource_group=resource_group,
+                subscription=site.subscription,
+                files=resolved_files,
+                step_name=step.name,
+                site_name=site.name,
+            )
+        else:
+            # Should not happen due to model validation
+            return KubectlResult(
+                success=False,
+                step_name=step.name,
+                site_name=site.name,
+                error=f"Unsupported kubectl operation: {step.operation}",
+            )
+
+    def _execute_step(
+        self,
+        site: Site,
+        step: ManifestStep,
+        manifest: Manifest,
+        timestamp: str,
+        step_outputs: Dict[str, Dict[str, Any]],
+    ) -> StepResult:
+        """Execute a single step (deployment or kubectl).
+
+        Args:
+            site: Target site
+            step: The step to execute
+            manifest: The manifest being deployed
+            timestamp: Shared timestamp for deployment naming
+            step_outputs: Outputs from previous steps
+
+        Returns:
+            StepResult (DeploymentResult or KubectlResult)
+        """
+        if isinstance(step, KubectlStep):
+            return self._execute_kubectl_step(site, step, step_outputs)
+        else:
+            return self._deploy_bicep_step(site, step, manifest, timestamp, step_outputs)
+
+    def _deploy_site(
+        self,
+        manifest: Manifest,
+        site: Site,
+        timestamp: str,
+        parallel_mode: bool = False,
+    ) -> Dict[str, Any]:
+        """Deploy all steps to a single site.
+
+        Steps are executed sequentially. If a step fails, remaining steps
+        are skipped for that site.
+
+        Args:
+            manifest: The manifest being deployed
+            site: Target site
+            timestamp: Shared timestamp for deployment naming
+            parallel_mode: If True, use thread-safe printing
+
+        Returns:
+            Dict with site deployment result including status, steps, and timing
+        """
+        site_start = time.time()
+        step_outputs: Dict[str, Dict[str, Any]] = {}
+        log = _thread_safe_print if parallel_mode else print
+
+        steps_completed = 0
+        steps_skipped = 0
+        status = "success"
+        error_message: Optional[str] = None
+        step_results: List[Dict[str, Any]] = []
+
+        for step in manifest.steps:
+            # Evaluate condition
+            if not self._evaluate_condition(step.when, site):
+                log(f"[{site.name}] ○ {step.name} (skipped: condition not met)")
+                steps_skipped += 1
+                step_results.append(
+                    {
+                        "name": step.name,
+                        "status": "skipped",
+                        "reason": f"Condition not met: {step.when}",
+                    }
+                )
+                continue
+
+            step_type = self._get_step_type_label(step)
+            log(f"[{site.name}] ▸ {step.name} ({step_type})...")
+
+            result = self._execute_step(site, step, manifest, timestamp, step_outputs)
+
+            if result.success:
+                # Only DeploymentResult has outputs for chaining
+                if isinstance(result, DeploymentResult):
+                    step_outputs[step.name] = result.outputs or {}
+                log(f"[{site.name}] ✓ {step.name}")
+                steps_completed += 1
+                step_results.append(
+                    {
+                        "name": step.name,
+                        "status": "success",
+                    }
+                )
+            else:
+                log(f"[{site.name}] ✗ {step.name}: {result.error}")
+                status = "failed"
+                error_message = result.error
+                step_results.append(
+                    {
+                        "name": step.name,
+                        "status": "failed",
+                        "error": result.error,
+                    }
+                )
+                break
+
+        elapsed = time.time() - site_start
+        total_steps = len(manifest.steps)
+
+        skip_info = f", {steps_skipped} skipped" if steps_skipped > 0 else ""
+        status_symbol = "✓" if status == "success" else "✗"
+        log(
+            f"[{site.name}] {status_symbol} completed in {elapsed:.1f}s "
+            f"({steps_completed}/{total_steps - steps_skipped} steps{skip_info})"
+        )
+
+        return {
+            "site": site.name,
+            "status": status,
+            "error": error_message,
+            "steps_completed": steps_completed,
+            "steps_skipped": steps_skipped,
+            "steps_total": total_steps,
+            "elapsed": elapsed,
+            "steps": step_results,
+        }
+
+    def _deploy_sequential(
+        self,
+        manifest: Manifest,
+        sites: List[Site],
+        timestamp: str,
+    ) -> List[Dict[str, Any]]:
+        """Deploy to sites sequentially (one at a time).
+
+        Args:
+            manifest: The manifest being deployed
+            sites: List of target sites
+            timestamp: Shared timestamp for deployment naming
+
+        Returns:
+            List of deployment results per site
+        """
+        results: List[Dict[str, Any]] = []
+        for site in sites:
+            result = self._deploy_site(manifest, site, timestamp, parallel_mode=False)
+            results.append(result)
+        return results
+
+    def _deploy_parallel(
+        self,
+        manifest: Manifest,
+        sites: List[Site],
+        timestamp: str,
+        parallel_config: ParallelConfig,
+    ) -> List[Dict[str, Any]]:
+        """Deploy to sites in parallel with controlled concurrency.
+
+        Args:
+            manifest: The manifest being deployed
+            sites: List of target sites
+            timestamp: Shared timestamp for deployment naming
+            parallel_config: Parallelism configuration
+
+        Returns:
+            List of deployment results per site
+        """
+        max_workers = parallel_config.max_workers
+        # If unlimited (None), cap at number of sites
+        num_workers = len(sites) if max_workers is None else min(len(sites), max_workers)
+
+        print(f"\n  ⚡ Parallel mode: deploying to {len(sites)} sites ({num_workers} concurrent)")
+
+        results: List[Dict[str, Any]] = []
+        results_lock = threading.Lock()
+
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            future_to_site = {
+                executor.submit(self._deploy_site, manifest, site, timestamp, True): site for site in sites
+            }
+
+            for future in as_completed(future_to_site):
+                site = future_to_site[future]
+                try:
+                    result = future.result()
+                    with results_lock:
+                        results.append(result)
+                except Exception as e:
+                    logger.error(f"Unexpected error deploying to {site.name}: {e}")
+                    with results_lock:
+                        results.append(
+                            {
+                                "site": site.name,
+                                "status": "failed",
+                                "error": f"Unexpected error: {e}",
+                                "steps_completed": 0,
+                                "steps_skipped": 0,
+                                "steps_total": len(manifest.steps),
+                                "elapsed": 0.0,
+                                "steps": [],
+                            }
+                        )
+
+        return results
+
+    def _print_deployment_summary(
+        self,
+        results: List[Dict[str, Any]],
+        total_elapsed: float,
+    ) -> None:
+        """Print deployment summary.
+
+        Args:
+            results: List of deployment results per site
+            total_elapsed: Total elapsed time in seconds
+        """
+        succeeded = sum(1 for r in results if r["status"] == "success")
+        failed = sum(1 for r in results if r["status"] == "failed")
+        total = len(results)
+
+        print()
+        print("=" * 60)
+        print("  Deployment Summary")
+        print("=" * 60)
+        print()
+
+        # Results table header
+        print(f"  {'SITE':<25} {'STATUS':<10} {'STEPS':<15} {'DURATION':<10}")
+        print(f"  {'-'*25} {'-'*10} {'-'*15} {'-'*10}")
+
+        # Sort by site name for consistent output
+        for result in sorted(results, key=lambda r: r["site"]):
+            site = result["site"]
+            status = "✓ Success" if result["status"] == "success" else "✗ Failed"
+            steps = f"{result['steps_completed']}/{result['steps_total']}"
+            if result.get("steps_skipped"):
+                steps += f" ({result['steps_skipped']} skip)"
+            duration = f"{result['elapsed']:.1f}s"
+
+            print(f"  {site:<25} {status:<10} {steps:<15} {duration:<10}")
+
+        print()
+        print(f"  Total: {succeeded} succeeded, {failed} failed ({total} sites)")
+        print(f"  Duration: {total_elapsed:.1f}s")
+        print()
+
+        # Show errors for failed sites
+        failed_results = [r for r in results if r["status"] == "failed"]
+        if failed_results:
+            print("  Failed Sites:")
+            for result in failed_results:
+                error = result.get("error", "Unknown error")
+                print(f"    [{result['site']}] {error}")
+            print()
+
+    def resolve_sites(self, manifest: Manifest, cli_selector: Optional[str] = None) -> List[Site]:
+        """Resolve sites from manifest, applying selectors.
+
+        Priority:
+        1. CLI --selector overrides everything
+        2. Explicit sites list in manifest
+        3. Manifest siteSelector
+
+        Args:
+            manifest: The manifest
+            cli_selector: Optional selector from CLI
+
+        Returns:
+            List of matching sites
+        """
+        # CLI selector requires loading all sites for filtering
+        if cli_selector:
+            all_sites = self.load_all_sites()
+            selector = parse_selector(cli_selector)
+            return [s for s in all_sites if s.matches_selector(selector)]
+
+        # Explicit sites list - load only the named sites (most common case)
+        if manifest.sites:
+            return [self.load_site(name) for name in manifest.sites]
+
+        # Site selector requires loading all sites for filtering
+        if manifest.site_selector:
+            all_sites = self.load_all_sites()
+            selector = parse_selector(manifest.site_selector)
+            return [s for s in all_sites if s.matches_selector(selector)]
+
+        return []
+
+    def validate(self, manifest_path: Path, selector: Optional[str] = None) -> List[str]:
+        """Validate manifest and return list of errors.
+
+        Checks:
+        - Manifest parses correctly
+        - Sites exist and match criteria
+        - Template files exist
+        - Parameter files exist and are valid YAML (manifest and step level)
+        - Kubectl files exist (for local files) and use HTTPS
+        - Conditions have valid syntax
+        - Required site fields are present
+        - Step output references point to valid prior steps (accounting for auto-filtering)
+
+        Args:
+            manifest_path: Path to manifest file
+            selector: Optional site selector
+
+        Returns:
+            List of error messages (empty if valid)
+        """
+        errors: List[str] = []
+
+        try:
+            manifest = Manifest.from_file(manifest_path)
+        except Exception as e:
+            return [f"Failed to parse manifest: {e}"]
+
+        sites = self.resolve_sites(manifest, selector)
+        if not sites:
+            if manifest.sites or manifest.site_selector or selector:
+                errors.append("No sites matched the specified criteria")
+
+        # Validate manifest-level parameter files
+        for param_path in manifest.parameters:
+            full_path = (self.workspace / param_path).resolve()
+            if not full_path.exists():
+                errors.append(f"Manifest parameter file not found: {param_path}")
+            else:
+                try:
+                    self.load_parameters(full_path)
+                except Exception as e:
+                    errors.append(f"Invalid manifest parameter file {param_path}: {e}")
+
+        # Build step name lookup for output reference validation
+        all_step_names = {step.name for step in manifest.steps}
+
+        for step_index, step in enumerate(manifest.steps):
+            # Steps that execute before this one (valid sources for output references)
+            prior_step_names = {s.name for s in manifest.steps[:step_index]}
+
+            if isinstance(step, KubectlStep):
+                # Validate kubectl files (skip URLs and templates)
+                for file_path in step.files:
+                    if file_path.startswith("https://") or "{{" in file_path:
+                        continue
+                    if file_path.lower().startswith("http://"):
+                        errors.append(f"HTTP URLs not allowed (use HTTPS): {file_path} (step: {step.name})")
+                        continue
+                    full_path = (self.workspace / file_path).resolve()
+                    if not full_path.exists():
+                        errors.append(f"Kubectl file not found: {file_path} (step: {step.name})")
+            else:
+                template_path = (self.workspace / step.template).resolve()
+
+                if not template_path.exists():
+                    errors.append(f"Template not found: {step.template}")
+                    continue
+
+                for param_path in step.parameters:
+                    full_path = (self.workspace / param_path).resolve()
+                    if not full_path.exists():
+                        errors.append(f"Parameter file not found: {param_path} (step: {step.name})")
+                    else:
+                        try:
+                            params = self.load_parameters(full_path)
+
+                            # Check if params contain self-references before expensive template parsing
+                            has_self_ref = self._contains_self_reference(params, step.name)
+
+                            template_params: Optional[frozenset] = None
+                            if has_self_ref:
+                                # Only extract template params when needed for self-reference validation
+                                try:
+                                    from siteops.executor import get_template_parameters
+
+                                    template_params = frozenset(get_template_parameters(str(template_path)))
+                                except Exception as e:
+                                    logger.debug(f"Could not extract template params for '{step.name}': {e}")
+                                    # Continue without template params - validation will be conservative
+
+                            # Validate step output references with auto-filter awareness
+                            errors.extend(
+                                self._validate_output_references(
+                                    params,
+                                    step.name,
+                                    prior_step_names,
+                                    all_step_names,
+                                    param_path,
+                                    template_params,
+                                )
+                            )
+                        except Exception as e:
+                            errors.append(f"Invalid parameter file {param_path}: {e}")
+
+        if not manifest.steps:
+            errors.append("Manifest has no steps defined")
+
+        for step in manifest.steps:
+            if step.when:
+                if not CONDITION_PATTERN.fullmatch(step.when.strip()):
+                    errors.append(f"Invalid 'when' condition in step '{step.name}': {step.when}")
+
+        for step in manifest.steps:
+            if isinstance(step, DeploymentStep) and step.scope == "resourceGroup":
+                for site in sites:
+                    if not site.resource_group:
+                        errors.append(f"Site '{site.name}' missing 'resourceGroup' required by step '{step.name}'")
+
+        return errors
+
+    def _contains_self_reference(self, value: Any, step_name: str) -> bool:
+        """Check if a value contains a self-reference to the given step.
+
+        This is a quick check to avoid expensive template parameter extraction
+        when there are no self-references to validate.
+
+        Args:
+            value: Parameter value to check (recursively handles dict/list/str)
+            step_name: Name of the current step
+
+        Returns:
+            True if value contains {{ steps.<step_name>.outputs... }}
+        """
+        if isinstance(value, dict):
+            return any(self._contains_self_reference(v, step_name) for v in value.values())
+        elif isinstance(value, list):
+            return any(self._contains_self_reference(item, step_name) for item in value)
+        elif isinstance(value, str):
+            # Quick string check before regex
+            pattern = f"steps.{step_name}."
+            if pattern not in value:
+                return False
+            for match in STEP_OUTPUT_PATTERN.finditer(value):
+                if match.group(1) == step_name:
+                    return True
+        return False
+
+    def _validate_output_references(
+        self,
+        value: Any,
+        current_step: str,
+        prior_steps: set,
+        all_steps: set,
+        source_file: Path,
+        template_params: Optional[frozenset] = None,
+        _current_key: Optional[str] = None,
+    ) -> List[str]:
+        """Validate step output references in parameter values.
+
+        Finds all {{ steps.<name>.outputs.<path> }} patterns and validates that:
+        1. The referenced step exists in the manifest
+        2. The referenced step executes before the current step
+        3. Self-references are only flagged if the template accepts that parameter
+           (otherwise auto-filtering will remove it)
+
+        Args:
+            value: Parameter value to check (recursively handles dict/list/str)
+            current_step: Name of the step using these parameters
+            prior_steps: Set of step names that execute before current_step
+            all_steps: Set of all step names in the manifest
+            source_file: Parameter file path for error messages
+            template_params: Set of parameter names the template accepts.
+                            If None, self-references are always flagged (conservative).
+            _current_key: Internal - tracks the top-level parameter key during recursion
+
+        Returns:
+            List of validation error messages
+        """
+        errors: List[str] = []
+
+        if isinstance(value, dict):
+            for key, val in value.items():
+                # Track top-level key for self-reference validation
+                top_level_key = _current_key if _current_key is not None else key
+                errors.extend(
+                    self._validate_output_references(
+                        val,
+                        current_step,
+                        prior_steps,
+                        all_steps,
+                        source_file,
+                        template_params,
+                        top_level_key,
+                    )
+                )
+        elif isinstance(value, list):
+            for item in value:
+                errors.extend(
+                    self._validate_output_references(
+                        item,
+                        current_step,
+                        prior_steps,
+                        all_steps,
+                        source_file,
+                        template_params,
+                        _current_key,
+                    )
+                )
+        elif isinstance(value, str):
+            for match in STEP_OUTPUT_PATTERN.finditer(value):
+                ref_step = match.group(1)
+
+                if ref_step not in all_steps:
+                    errors.append(f"Step '{current_step}' references unknown step '{ref_step}' in {source_file}")
+                elif ref_step == current_step:
+                    # Self-reference: only error if template actually accepts this parameter
+                    if template_params is None:
+                        # No template info available - be conservative and flag it
+                        errors.append(f"Step '{current_step}' cannot reference its own outputs in {source_file}")
+                    elif _current_key is not None and _current_key in template_params:
+                        # Template accepts this parameter - genuine circular dependency
+                        errors.append(
+                            f"Step '{current_step}' cannot reference its own outputs "
+                            f"for parameter '{_current_key}' in {source_file}"
+                        )
+                    # else: auto-filtering will remove this parameter, so no error
+                elif ref_step not in prior_steps:
+                    errors.append(
+                        f"Step '{current_step}' references step '{ref_step}' which runs later in {source_file}"
+                    )
+
+        return errors
+
+    def show_plan(
+        self,
+        manifest_path: Path,
+        selector: Optional[str] = None,
+    ) -> None:
+        """Display deployment plan without executing.
+
+        Shows which sites will be deployed to and what steps will run.
+        Called by 'validate -v' to show the plan after validation passes.
+
+        Args:
+            manifest_path: Path to manifest file
+            selector: Optional site selector
+        """
+        manifest = Manifest.from_file(manifest_path)
+        sites = self.resolve_sites(manifest, selector)
+
+        if not sites:
+            print(f"⚠ No sites matched for manifest '{manifest.name}'")
+            if selector:
+                print(f"  Selector: {selector}")
+            elif manifest.site_selector:
+                print(f"  Manifest siteSelector: {manifest.site_selector}")
+            print()
+            return
+
+        print(f"{'═'*60}")
+        print(f"  DEPLOYMENT PLAN: {manifest.name}")
+        if selector:
+            print(f"  (filtered by: {selector})")
+        print(f"{'═'*60}")
+
+        if manifest.description:
+            print(f"\n  {manifest.description}")
+
+        print(f"\n  Sites ({len(sites)}):")
+        for site in sites:
+            print(f"    • {site.name} ({site.location})")
+
+        print(f"\n  Parallel: {manifest.parallel}")
+
+        print(f"\n  Steps ({len(manifest.steps)}):")
+        for i, step in enumerate(manifest.steps, 1):
+            condition_info = f" [when: {step.when}]" if step.when else ""
+
+            if isinstance(step, KubectlStep):
+                print(f"    {i}. {step.name} (kubectl:{step.operation}){condition_info}")
+                print(f"       ├─ cluster: {step.arc.name}")
+                for j, f in enumerate(step.files):
+                    prefix = "└─" if j == len(step.files) - 1 else "├─"
+                    print(f"       {prefix} {f}")
+            else:
+                print(f"    {i}. {step.name} ({step.scope}){condition_info}")
+                print(f"       └─ {step.template}")
+
+        print(f"\n{'═'*60}")
+        total = sum(1 for site in sites for step in manifest.steps if self._evaluate_condition(step.when, site))
+        print(f"  Total: {total} operation(s)")
+
+        if len(sites) > 1:
+            if manifest.parallel.is_sequential:
+                print("  Execution: Sequential (one site at a time)")
+            elif manifest.parallel.is_unlimited:
+                print("  Execution: Parallel (all sites concurrently)")
+            else:
+                print(f"  Execution: Parallel (max {manifest.parallel.sites} concurrent)")
+        print(f"{'═'*60}\n")
+
+    def deploy(
+        self,
+        manifest_path: Path,
+        selector: Optional[str] = None,
+        parallel_override: Optional[int] = None,
+        manifest: Optional[Manifest] = None,
+        sites: Optional[List[Site]] = None,
+    ) -> Dict[str, Any]:
+        """Execute deployment from manifest.
+
+        Args:
+            manifest_path: Path to manifest file
+            selector: Optional site selector
+            parallel_override: Override manifest's parallel.sites setting.
+                              None = use manifest setting.
+            manifest: Pre-loaded manifest (avoids re-parsing)
+            sites: Pre-resolved sites (avoids re-resolving)
+
+        Returns:
+            Dict with deployment results keyed by site name and summary
+        """
+        if manifest is None:
+            manifest = Manifest.from_file(manifest_path)
+        if sites is None:
+            sites = self.resolve_sites(manifest, selector)
+
+        if not sites:
+            logger.warning("No sites to deploy to")
+            return {
+                "sites": {},
+                "summary": {
+                    "total": 0,
+                    "succeeded": 0,
+                    "failed": 0,
+                    "elapsed": 0.0,
+                },
+            }
+
+        # Determine effective parallelism
+        if parallel_override is not None:
+            effective_parallel = ParallelConfig(sites=parallel_override)
+        else:
+            effective_parallel = manifest.parallel
+
+        logger.info(f"Deploying '{manifest.name}' to {len(sites)} site(s) " f"(parallel: {effective_parallel})")
+
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        start_time = time.time()
+
+        # Choose execution mode based on parallelism config
+        if effective_parallel.is_sequential or len(sites) == 1:
+            results = self._deploy_sequential(manifest, sites, timestamp)
+        else:
+            results = self._deploy_parallel(manifest, sites, timestamp, effective_parallel)
+
+        total_elapsed = time.time() - start_time
+
+        # Build summary
+        succeeded = sum(1 for r in results if r["status"] == "success")
+        failed = sum(1 for r in results if r["status"] == "failed")
+
+        summary = {
+            "total": len(results),
+            "succeeded": succeeded,
+            "failed": failed,
+            "elapsed": total_elapsed,
+        }
+
+        # Print summary
+        self._print_deployment_summary(results, total_elapsed)
+
+        return {
+            "sites": {r["site"]: r for r in results},
+            "summary": summary,
+        }

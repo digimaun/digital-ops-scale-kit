@@ -1,0 +1,84 @@
+apiVersion: siteops/v1
+kind: Manifest
+name: aio-install
+description: |
+  Deploy Azure IoT Operations platform to Arc-enabled Kubernetes clusters.
+
+  Deployment modes (controlled by site properties):
+    - Base platform only: deployOptions.includeSolution = false
+    - Base + solution: deployOptions.includeSolution = true
+    - With simulator: deployOptions.includeOpcPlcSimulator = true
+
+# Parallelization:
+#   0 = unlimited (all sites concurrently)
+#   1 = sequential (one at a time)
+#   N = max N concurrent sites
+parallel: 3
+
+# Site selection (choose ONE method):
+#
+# Option 1: Explicit site list
+# sites:
+#   - munich-dev
+#   - seattle-dev
+#
+# Option 2: Label selector (matches all sites with matching labels)
+siteSelector: "environment=dev"
+
+# Shared parameters applied to all steps (auto-filtered per template)
+parameters:
+  - parameters/common.yaml
+
+steps:
+  # ─────────────────────────────────────────────────────────────
+  # Base Platform Installation
+  # ─────────────────────────────────────────────────────────────
+
+  - name: edge-site
+    template: templates/edge-site.bicep
+    scope: resourceGroup
+
+  - name: schema-registry
+    template: templates/iot-ops/deps/schema-registry.bicep
+    scope: resourceGroup
+
+  - name: adr-ns
+    template: templates/iot-ops/deps/adr-ns.bicep
+    scope: resourceGroup
+
+  - name: aio-enablement
+    template: templates/iot-ops/install/azure-iot-operations-enablement.bicep
+    scope: resourceGroup
+
+  - name: aio-instance
+    template: templates/iot-ops/install/azure-iot-operations-instance.bicep
+    scope: resourceGroup
+    parameters:
+      - parameters/chaining.yaml
+
+  - name: schema-registry-role
+    template: templates/iot-ops/deps/schema-registry-role.bicep
+    scope: resourceGroup
+    parameters:
+      - parameters/post-instance.yaml
+
+  # ─────────────────────────────────────────────────────────────
+  # Solution Layer (conditional)
+  # ─────────────────────────────────────────────────────────────
+
+  - name: opc-ua-solution
+    template: templates/iot-ops/solutions/opc-ua-solution.bicep
+    scope: resourceGroup
+    parameters:
+      - parameters/post-instance.yaml
+    when: "{{ site.properties.deployOptions.includeSolution }}"
+
+  - name: opc-plc-simulator
+    type: kubectl
+    operation: apply
+    arc:
+      name: "{{ site.parameters.clusterName }}"
+      resourceGroup: "{{ site.resourceGroup }}"
+    files:
+      - https://raw.githubusercontent.com/Azure-Samples/explore-iot-operations/main/samples/quickstarts/opc-plc-deployment.yaml
+    when: "{{ site.properties.deployOptions.includeOpcPlcSimulator }}"

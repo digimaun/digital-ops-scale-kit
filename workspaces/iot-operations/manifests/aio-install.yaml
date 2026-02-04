@@ -34,26 +34,13 @@ steps:
   # Base Platform Installation
   # ─────────────────────────────────────────────────────────────
 
-  # Edge Site - currently deployed per resource group.
-  #
-  # Future: When orchestrator supports scope: subscription, add a subscription-
-  # scoped step to deploy a shared Edge Site once per subscription:
-  #
-  #   - name: edge-site
-  #     template: templates/edge-site.bicep
-  #     scope: subscription  # Runs once per unique subscription
-  #
-  # The same edge-site.bicep template works for both scopes - the deployment
-  # scope is determined by the step's scope field, not the template.
-  #
-  # To use subscription-scoped Edge Sites:
-  #   1. Create a Site (not SiteTemplate) from shared/germany.yaml with no resourceGroup
-  #   2. Change this step's scope to: subscription
-  #   3. RG-level sites will resolve edge-site outputs from their subscription parent
+  # Edge Site - deployed once per subscription via contoso-global site.
+  # RG-level sites (munich-dev, seattle-dev) resolve edge-site outputs
+  # from their subscription's deployment via cross-scope output chaining.
 
   - name: edge-site
     template: templates/edge-site.bicep
-    scope: resourceGroup
+    scope: subscription
 
   - name: schema-registry
     template: templates/iot-ops/deps/schema-registry.bicep

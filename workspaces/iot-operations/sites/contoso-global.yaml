@@ -1,0 +1,24 @@
+# Contoso Global Subscription Site
+#
+# Subscription-level site for deploying shared resources once per subscription.
+# RG-level sites in the same subscription will resolve outputs from this site
+# via cross-scope output chaining.
+#
+# This site has no resourceGroup, so it only runs `scope: subscription` steps.
+# The edge-site step deploys here, then munich-dev, seattle-dev, etc. can
+# reference its outputs.
+
+apiVersion: siteops/v1
+kind: Site
+name: contoso-global
+inherits: base-site.yaml
+
+subscription: "00000000-0000-0000-0000-000000000000"
+location: eastus
+# No resourceGroup → subscription-level site
+
+labels:
+  environment: dev
+
+parameters:
+  edgeSiteName: contoso-edge-site

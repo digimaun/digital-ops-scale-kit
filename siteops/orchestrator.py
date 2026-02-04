@@ -1625,6 +1625,9 @@ class Orchestrator:
         for step in manifest.steps:
             if isinstance(step, DeploymentStep) and step.scope == "resourceGroup":
                 for site in sites:
+                    # Subscription-level sites are exempt - they intentionally skip RG-scoped steps
+                    if site.is_subscription_level:
+                        continue
                     if not site.resource_group:
                         errors.append(f"Site '{site.name}' missing 'resourceGroup' required by step '{step.name}'")
 

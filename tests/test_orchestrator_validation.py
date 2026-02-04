@@ -1144,6 +1144,8 @@ steps:
         # Should not have subscription-level site errors
         assert not any("subscription-level site" in e for e in errors)
         assert not any("multiple subscription-level sites" in e.lower() for e in errors)
+        # Subscription-level sites should NOT trigger "missing resourceGroup" for RG-scoped steps
+        assert not any("missing 'resourceGroup'" in e for e in errors)
 
     def test_no_subscription_step_validation_skipped(self, tmp_workspace, sample_bicep_template):
         """No validation errors when manifest has no subscription-scoped steps."""

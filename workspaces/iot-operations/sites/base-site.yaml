@@ -11,6 +11,8 @@ labels:
 properties:
   # Deployment options - control which components are deployed
   deployOptions:
+    includeGlobalSite: false      # Subscription-scoped edge site (for subscription-level sites)
+    includeEdgeSite: true         # RG-scoped edge site (default for RG-level sites)
     includeSolution: false
     includeOpcPlcSimulator: false
 

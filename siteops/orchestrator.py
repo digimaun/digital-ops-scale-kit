@@ -1347,7 +1347,7 @@ class Orchestrator:
         # If unlimited (None), cap at number of sites
         num_workers = len(sites) if max_workers is None else min(len(sites), max_workers)
 
-        print(f"\n  ⚡ Parallel mode: deploying to {len(sites)} sites ({num_workers} concurrent)")
+        print(f"\n  [Parallel] Deploying to {len(sites)} sites ({num_workers} concurrent)")
 
         results: List[Dict[str, Any]] = []
         results_lock = threading.Lock()
@@ -1453,7 +1453,7 @@ class Orchestrator:
         if not sub_level_sites:
             return subscription_outputs, results
 
-        print(f"\n  📋 Subscription-scoped steps: {len(subscription_sites)} subscription(s)")
+        print(f"\n  [Phase 1] Subscription-scoped steps: {len(subscription_sites)} subscription(s)")
 
         # Deploy to subscription-level sites (they'll skip RG-scoped steps)
         if parallel_config.is_sequential or len(sub_level_sites) == 1:
@@ -2076,7 +2076,7 @@ class Orchestrator:
 
             # Phase 2: Execute RG-scoped steps for all RG-level sites
             if rg_sites:
-                print(f"\n  📦 Resource group-scoped steps: {len(rg_sites)} site(s)")
+                print(f"\n  [Phase 2] Resource group-scoped steps: {len(rg_sites)} site(s)")
                 if effective_parallel.is_sequential or len(rg_sites) == 1:
                     rg_results = self._deploy_sequential(
                         manifest, rg_sites, timestamp, subscription_outputs

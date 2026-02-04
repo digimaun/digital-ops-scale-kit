@@ -20,5 +20,10 @@ location: eastus
 labels:
   environment: dev
 
+properties:
+  deployOptions:
+    includeGlobalSite: true       # Deploy subscription-scoped edge site
+    includeEdgeSite: false        # No RG-level edge site (no resourceGroup)
+
 parameters:
   edgeSiteName: contoso-edge-site

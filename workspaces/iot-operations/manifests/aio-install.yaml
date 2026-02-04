@@ -34,13 +34,18 @@ steps:
   # Base Platform Installation
   # ─────────────────────────────────────────────────────────────
 
-  # Edge Site - deployed once per subscription via contoso-global site.
-  # RG-level sites (munich-dev, seattle-dev) resolve edge-site outputs
-  # from their subscription's deployment via cross-scope output chaining.
-
-  - name: edge-site
+  # Edge Site (Global) - deployed once per subscription via subscription-level site.
+  # RG-level sites resolve outputs via cross-scope output chaining.
+  - name: global-edge-site
     template: templates/edge-site.bicep
     scope: subscription
+    when: "{{ site.properties.deployOptions.includeGlobalSite }}"
+
+  # Edge Site (Per-RG) - deployed per resource group (original behavior)
+  - name: edge-site
+    template: templates/edge-site.bicep
+    scope: resourceGroup
+    when: "{{ site.properties.deployOptions.includeEdgeSite }}"
 
   - name: schema-registry
     template: templates/iot-ops/deps/schema-registry.bicep

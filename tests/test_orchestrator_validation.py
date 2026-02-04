@@ -977,3 +977,204 @@ location: eastus
         #   - aioInstanceName refs aio-instance (valid - prior step)
         #   - schemaRegistryId refs schema-registry (valid - prior step)
         assert not errors, f"Expected no errors, got: {errors}"
+
+class TestSubscriptionScopedValidation:
+    """Tests for subscription-scoped step validation."""
+
+    def test_subscription_step_without_subscription_site(self, tmp_workspace, sample_bicep_template):
+        """Error when subscription-scoped step has no subscription-level site."""
+        # Create RG-level site only
+        (tmp_workspace / "sites" / "rg-site.yaml").write_text(
+            """
+apiVersion: siteops/v1
+kind: Site
+name: rg-site
+subscription: "00000000-0000-0000-0000-000000000001"
+resourceGroup: rg-test
+location: eastus
+"""
+        )
+
+        # Create manifest with subscription-scoped step
+        manifest_path = tmp_workspace / "manifests" / "sub-scoped.yaml"
+        manifest_path.write_text(
+            """
+name: sub-scoped
+sites:
+  - rg-site
+steps:
+  - name: shared-resource
+    template: templates/test.bicep
+    scope: subscription
+"""
+        )
+
+        orchestrator = Orchestrator(tmp_workspace)
+        errors = orchestrator.validate(manifest_path)
+
+        assert any("subscription-level site" in e for e in errors)
+        assert any("subscription-scoped steps" in e for e in errors)
+
+    def test_subscription_step_with_subscription_site(self, tmp_workspace, sample_bicep_template):
+        """No error when subscription-scoped step has subscription-level site."""
+        # Create subscription-level site (no resourceGroup)
+        (tmp_workspace / "sites" / "sub-site.yaml").write_text(
+            """
+apiVersion: siteops/v1
+kind: Site
+name: sub-site
+subscription: "00000000-0000-0000-0000-000000000001"
+location: eastus
+"""
+        )
+
+        # Create manifest with subscription-scoped step
+        manifest_path = tmp_workspace / "manifests" / "sub-scoped.yaml"
+        manifest_path.write_text(
+            """
+name: sub-scoped
+sites:
+  - sub-site
+steps:
+  - name: shared-resource
+    template: templates/test.bicep
+    scope: subscription
+"""
+        )
+
+        orchestrator = Orchestrator(tmp_workspace)
+        errors = orchestrator.validate(manifest_path)
+
+        # Should not have subscription-level site errors
+        assert not any("subscription-level site" in e for e in errors)
+
+    def test_multiple_subscription_sites_same_subscription(self, tmp_workspace, sample_bicep_template):
+        """Error when multiple subscription-level sites exist for same subscription."""
+        sub_id = "00000000-0000-0000-0000-000000000001"
+
+        # Create two subscription-level sites with same subscription
+        (tmp_workspace / "sites" / "sub-site-1.yaml").write_text(
+            f"""
+apiVersion: siteops/v1
+kind: Site
+name: sub-site-1
+subscription: "{sub_id}"
+location: eastus
+"""
+        )
+
+        (tmp_workspace / "sites" / "sub-site-2.yaml").write_text(
+            f"""
+apiVersion: siteops/v1
+kind: Site
+name: sub-site-2
+subscription: "{sub_id}"
+location: westus
+"""
+        )
+
+        # Create manifest with subscription-scoped step
+        manifest_path = tmp_workspace / "manifests" / "sub-scoped.yaml"
+        manifest_path.write_text(
+            """
+name: sub-scoped
+sites:
+  - sub-site-1
+  - sub-site-2
+steps:
+  - name: shared-resource
+    template: templates/test.bicep
+    scope: subscription
+"""
+        )
+
+        orchestrator = Orchestrator(tmp_workspace)
+        errors = orchestrator.validate(manifest_path)
+
+        assert any("multiple subscription-level sites" in e.lower() for e in errors)
+
+    def test_mixed_sites_valid_hierarchy(self, tmp_workspace, sample_bicep_template):
+        """Valid when subscription-level and RG-level sites exist for same subscription."""
+        sub_id = "00000000-0000-0000-0000-000000000001"
+
+        # Create subscription-level site
+        (tmp_workspace / "sites" / "sub-site.yaml").write_text(
+            f"""
+apiVersion: siteops/v1
+kind: Site
+name: sub-site
+subscription: "{sub_id}"
+location: eastus
+"""
+        )
+
+        # Create RG-level site with same subscription
+        (tmp_workspace / "sites" / "rg-site.yaml").write_text(
+            f"""
+apiVersion: siteops/v1
+kind: Site
+name: rg-site
+subscription: "{sub_id}"
+resourceGroup: rg-test
+location: eastus
+"""
+        )
+
+        # Create manifest with both subscription and RG-scoped steps
+        manifest_path = tmp_workspace / "manifests" / "mixed.yaml"
+        manifest_path.write_text(
+            """
+name: mixed
+sites:
+  - sub-site
+  - rg-site
+steps:
+  - name: sub-step
+    template: templates/test.bicep
+    scope: subscription
+  - name: rg-step
+    template: templates/test.bicep
+    scope: resourceGroup
+"""
+        )
+
+        orchestrator = Orchestrator(tmp_workspace)
+        errors = orchestrator.validate(manifest_path)
+
+        # Should not have subscription-level site errors
+        assert not any("subscription-level site" in e for e in errors)
+        assert not any("multiple subscription-level sites" in e.lower() for e in errors)
+
+    def test_no_subscription_step_validation_skipped(self, tmp_workspace, sample_bicep_template):
+        """No validation errors when manifest has no subscription-scoped steps."""
+        # Create RG-level site only
+        (tmp_workspace / "sites" / "rg-site.yaml").write_text(
+            """
+apiVersion: siteops/v1
+kind: Site
+name: rg-site
+subscription: "00000000-0000-0000-0000-000000000001"
+resourceGroup: rg-test
+location: eastus
+"""
+        )
+
+        # Create manifest with only RG-scoped steps
+        manifest_path = tmp_workspace / "manifests" / "rg-only.yaml"
+        manifest_path.write_text(
+            """
+name: rg-only
+sites:
+  - rg-site
+steps:
+  - name: rg-step
+    template: templates/test.bicep
+    scope: resourceGroup
+"""
+        )
+
+        orchestrator = Orchestrator(tmp_workspace)
+        errors = orchestrator.validate(manifest_path)
+
+        # Should have no subscription-related errors
+        assert not any("subscription" in e.lower() for e in errors)

@@ -3,15 +3,13 @@
 apiVersion: siteops/v1
 kind: Site
 name: chicago-staging
-inherits: base-site.yaml
+inherits: shared/usa-east.yaml
 
-subscription: "00000000-0000-0000-0000-000000000000"
+# subscription, location, country inherited from shared/usa-east.yaml
 resourceGroup: rg-iot-chicago-staging
-location: eastus
 
 labels:
   environment: staging
-  country: US
   city: Chicago
 
 properties:

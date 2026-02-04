@@ -3,15 +3,13 @@
 apiVersion: siteops/v1
 kind: Site
 name: seattle-prod
-inherits: base-site.yaml
+inherits: shared/usa-west.yaml
 
-subscription: "00000000-0000-0000-0000-000000000000"
+# subscription, location, country inherited from shared/usa-west.yaml
 resourceGroup: rg-iot-seattle-prod
-location: westus
 
 labels:
   environment: prod
-  country: US
   city: Seattle
 
 properties:

@@ -1,0 +1,22 @@
+# USA East Regional Template (Subscription-Level)
+#
+# Inheritance: base-site.yaml → usa-east.yaml → <factory>-<env>.yaml
+#
+# This template represents the USA East subscription - shared by East Coast factories.
+# Sites inheriting from this get subscription + location + country pre-configured.
+#
+# Hierarchy:
+#   usa-east.yaml (subscription-level)
+#     └── chicago-staging.yaml (RG-level)
+
+apiVersion: siteops/v1
+kind: SiteTemplate
+name: usa-east
+inherits: ../base-site.yaml
+
+subscription: "00000000-0000-0000-0000-000000000000"
+location: eastus
+
+labels:
+  country: US
+  region: americas

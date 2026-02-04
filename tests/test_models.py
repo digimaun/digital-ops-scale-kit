@@ -446,6 +446,36 @@ class TestSite:
         assert "test-site" in repr_str
         assert "eastus" in repr_str
 
+    def test_is_subscription_level_with_resource_group(self):
+        """Site with resource_group is NOT subscription-level."""
+        site = Site(
+            name="test",
+            subscription="sub-123",
+            resource_group="rg-test",
+            location="eastus",
+        )
+        assert site.is_subscription_level is False
+
+    def test_is_subscription_level_without_resource_group(self):
+        """Site without resource_group IS subscription-level."""
+        site = Site(
+            name="test",
+            subscription="sub-123",
+            resource_group="",  # Empty string
+            location="eastus",
+        )
+        assert site.is_subscription_level is True
+
+    def test_is_subscription_level_none_resource_group(self):
+        """Site with None resource_group IS subscription-level."""
+        site = Site(
+            name="test",
+            subscription="sub-123",
+            resource_group=None,  # None
+            location="eastus",
+        )
+        assert site.is_subscription_level is True
+
 
 class TestDeploymentStep:
     """Tests for the DeploymentStep dataclass."""

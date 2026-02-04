@@ -324,6 +324,20 @@ class Site:
             parameters=spec.get("parameters", {}),
         )
 
+    @property
+    def is_subscription_level(self) -> bool:
+        """Check if this is a subscription-level site (no resource group).
+
+        Subscription-level sites are used for deploying shared resources
+        once per subscription (e.g., Azure Edge Sites). They have only
+        subscription + location, no resourceGroup.
+
+        Returns:
+            True if site has no resource_group (subscription-level)
+            False if site has a resource_group (RG-level)
+        """
+        return not self.resource_group
+
     def get_all_parameters(self) -> Dict[str, Any]:
         """Get a copy of site-level parameters.
 

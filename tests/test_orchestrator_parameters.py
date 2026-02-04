@@ -1489,3 +1489,297 @@ steps:
         assert result["clusterName"] == "real-cluster-from-overlay"
         # Non-overridden value preserved from base
         assert result["customLocationName"] == "placeholder-cl"
+
+class TestSubscriptionOutputExtraction:
+    """Tests for extracting outputs from subscription-scoped step results."""
+
+    def test_extract_subscription_outputs_basic(self, complete_workspace):
+        """Test that outputs are correctly extracted from step results."""
+        orchestrator = Orchestrator(complete_workspace)
+
+        result = {
+            "site": "sub-site",
+            "status": "success",
+            "steps": [
+                {
+                    "step": "shared-resource",
+                    "status": "success",
+                    "outputs": {"resourceId": "/subscriptions/123/resource"},
+                },
+                {
+                    "step": "another-step",
+                    "status": "success",
+                    "outputs": {"value": "test"},
+                },
+            ],
+        }
+
+        subscription_outputs = {}
+        orchestrator._extract_subscription_outputs(result, "sub-123", subscription_outputs)
+
+        assert "sub-123" in subscription_outputs
+        assert subscription_outputs["sub-123"]["shared-resource"] == {"resourceId": "/subscriptions/123/resource"}
+        assert subscription_outputs["sub-123"]["another-step"] == {"value": "test"}
+
+    def test_extract_subscription_outputs_skips_failed_steps(self, complete_workspace):
+        """Test that failed steps don't have outputs extracted."""
+        orchestrator = Orchestrator(complete_workspace)
+
+        result = {
+            "site": "sub-site",
+            "status": "failed",
+            "steps": [
+                {
+                    "step": "success-step",
+                    "status": "success",
+                    "outputs": {"value": "ok"},
+                },
+                {
+                    "step": "failed-step",
+                    "status": "failed",
+                    "error": "Something went wrong",
+                },
+            ],
+        }
+
+        subscription_outputs = {}
+        orchestrator._extract_subscription_outputs(result, "sub-123", subscription_outputs)
+
+        assert "success-step" in subscription_outputs["sub-123"]
+        assert "failed-step" not in subscription_outputs["sub-123"]
+
+    def test_extract_subscription_outputs_skips_empty_outputs(self, complete_workspace):
+        """Test that steps with no outputs are skipped."""
+        orchestrator = Orchestrator(complete_workspace)
+
+        result = {
+            "site": "sub-site",
+            "status": "success",
+            "steps": [
+                {
+                    "step": "no-output-step",
+                    "status": "success",
+                    "outputs": {},
+                },
+                {
+                    "step": "with-output",
+                    "status": "success",
+                    "outputs": {"id": "123"},
+                },
+            ],
+        }
+
+        subscription_outputs = {}
+        orchestrator._extract_subscription_outputs(result, "sub-123", subscription_outputs)
+
+        assert "no-output-step" not in subscription_outputs["sub-123"]
+        assert "with-output" in subscription_outputs["sub-123"]
+
+    def test_extract_subscription_outputs_multiple_subscriptions(self, complete_workspace):
+        """Test outputs are keyed by subscription ID correctly."""
+        orchestrator = Orchestrator(complete_workspace)
+
+        subscription_outputs = {}
+
+        result1 = {
+            "site": "sub-site-1",
+            "status": "success",
+            "steps": [{"step": "step1", "status": "success", "outputs": {"id": "a"}}],
+        }
+        orchestrator._extract_subscription_outputs(result1, "sub-111", subscription_outputs)
+
+        result2 = {
+            "site": "sub-site-2",
+            "status": "success",
+            "steps": [{"step": "step1", "status": "success", "outputs": {"id": "b"}}],
+        }
+        orchestrator._extract_subscription_outputs(result2, "sub-222", subscription_outputs)
+
+        assert subscription_outputs["sub-111"]["step1"]["id"] == "a"
+        assert subscription_outputs["sub-222"]["step1"]["id"] == "b"
+
+
+class TestCrossScopeOutputResolution:
+    """Tests for resolving outputs across subscription/RG scope boundaries."""
+
+    def test_resolve_output_from_subscription_outputs(self, complete_workspace):
+        """Test that subscription outputs can be resolved for RG-level sites."""
+        orchestrator = Orchestrator(complete_workspace)
+
+        step_outputs = {}  # Per-site outputs (empty for this test)
+        subscription_outputs = {
+            "sub-123": {
+                "shared-resource": {"resourceId": "/subscriptions/123/shared"}
+            }
+        }
+
+        value = "{{ steps.shared-resource.outputs.resourceId }}"
+        result = orchestrator._resolve_step_outputs(
+            value, step_outputs, subscription_outputs, "sub-123"
+        )
+
+        assert result == "/subscriptions/123/shared"
+
+    def test_per_site_outputs_take_precedence(self, complete_workspace):
+        """Test that per-site outputs override subscription outputs."""
+        orchestrator = Orchestrator(complete_workspace)
+
+        step_outputs = {
+            "shared-resource": {"resourceId": "/per-site-value"}
+        }
+        subscription_outputs = {
+            "sub-123": {
+                "shared-resource": {"resourceId": "/subscription-value"}
+            }
+        }
+
+        value = "{{ steps.shared-resource.outputs.resourceId }}"
+        result = orchestrator._resolve_step_outputs(
+            value, step_outputs, subscription_outputs, "sub-123"
+        )
+
+        # Per-site should win
+        assert result == "/per-site-value"
+
+    def test_subscription_output_fallback(self, complete_workspace):
+        """Test fallback to subscription outputs when per-site not found."""
+        orchestrator = Orchestrator(complete_workspace)
+
+        step_outputs = {
+            "rg-step": {"value": "rg-only"}
+        }
+        subscription_outputs = {
+            "sub-123": {
+                "sub-step": {"value": "sub-only"}
+            }
+        }
+
+        # RG step output
+        result1 = orchestrator._resolve_step_outputs(
+            "{{ steps.rg-step.outputs.value }}",
+            step_outputs, subscription_outputs, "sub-123"
+        )
+        assert result1 == "rg-only"
+
+        # Subscription step output
+        result2 = orchestrator._resolve_step_outputs(
+            "{{ steps.sub-step.outputs.value }}",
+            step_outputs, subscription_outputs, "sub-123"
+        )
+        assert result2 == "sub-only"
+
+    def test_cross_scope_nested_output(self, complete_workspace):
+        """Test nested output paths work with cross-scope resolution."""
+        orchestrator = Orchestrator(complete_workspace)
+
+        subscription_outputs = {
+            "sub-123": {
+                "registry": {
+                    "schema": {"id": "schema-123", "name": "my-schema"}
+                }
+            }
+        }
+
+        value = "{{ steps.registry.outputs.schema.id }}"
+        result = orchestrator._resolve_step_outputs(
+            value, {}, subscription_outputs, "sub-123"
+        )
+
+        assert result == "schema-123"
+
+    def test_cross_scope_complex_type_output(self, complete_workspace):
+        """Test that complex types (arrays, objects) are returned correctly."""
+        orchestrator = Orchestrator(complete_workspace)
+
+        subscription_outputs = {
+            "sub-123": {
+                "enablement": {
+                    "extensionIds": ["ext-1", "ext-2", "ext-3"]
+                }
+            }
+        }
+
+        value = "{{ steps.enablement.outputs.extensionIds }}"
+        result = orchestrator._resolve_step_outputs(
+            value, {}, subscription_outputs, "sub-123"
+        )
+
+        assert result == ["ext-1", "ext-2", "ext-3"]
+
+    def test_wrong_subscription_not_resolved(self, complete_workspace):
+        """Test outputs from different subscription aren't accidentally resolved."""
+        orchestrator = Orchestrator(complete_workspace)
+
+        subscription_outputs = {
+            "sub-AAA": {
+                "step1": {"value": "from-AAA"}
+            }
+        }
+
+        # Request with different subscription ID
+        value = "{{ steps.step1.outputs.value }}"
+        result = orchestrator._resolve_step_outputs(
+            value, {}, subscription_outputs, "sub-BBB"
+        )
+
+        # Should remain unresolved
+        assert result == value
+
+
+class TestGroupSitesBySubscription:
+    """Tests for the _group_sites_by_subscription static method."""
+
+    def test_group_mixed_sites(self, complete_workspace):
+        """Test grouping sites into subscription-level and RG-level."""
+        from siteops.models import Site
+
+        sites = [
+            Site(name="sub-site", subscription="sub-123", resource_group="", location="eastus"),
+            Site(name="rg-site-1", subscription="sub-123", resource_group="rg-1", location="eastus"),
+            Site(name="rg-site-2", subscription="sub-123", resource_group="rg-2", location="eastus"),
+        ]
+
+        groups = Orchestrator._group_sites_by_subscription(sites)
+
+        sub_sites, rg_sites = groups["sub-123"]
+        assert len(sub_sites) == 1
+        assert sub_sites[0].name == "sub-site"
+        assert len(rg_sites) == 2
+        assert {s.name for s in rg_sites} == {"rg-site-1", "rg-site-2"}
+
+    def test_group_multiple_subscriptions(self, complete_workspace):
+        """Test grouping with multiple subscriptions."""
+        from siteops.models import Site
+
+        sites = [
+            Site(name="sub-A", subscription="AAA", resource_group="", location="eastus"),
+            Site(name="rg-A", subscription="AAA", resource_group="rg", location="eastus"),
+            Site(name="sub-B", subscription="BBB", resource_group="", location="westus"),
+            Site(name="rg-B", subscription="BBB", resource_group="rg", location="westus"),
+        ]
+
+        groups = Orchestrator._group_sites_by_subscription(sites)
+
+        assert len(groups) == 2
+        sub_A, rg_A = groups["AAA"]
+        sub_B, rg_B = groups["BBB"]
+
+        assert sub_A[0].name == "sub-A"
+        assert rg_A[0].name == "rg-A"
+        assert sub_B[0].name == "sub-B"
+        assert rg_B[0].name == "rg-B"
+
+    def test_group_only_rg_sites(self, complete_workspace):
+        """Test grouping when no subscription-level sites exist."""
+        from siteops.models import Site
+
+        sites = [
+            Site(name="rg-1", subscription="sub-123", resource_group="rg-1", location="eastus"),
+            Site(name="rg-2", subscription="sub-123", resource_group="rg-2", location="eastus"),
+        ]
+
+        groups = Orchestrator._group_sites_by_subscription(sites)
+
+        sub_sites, rg_sites = groups["sub-123"]
+        assert len(sub_sites) == 0
+        assert len(rg_sites) == 2

@@ -1,0 +1,23 @@
+# Germany Regional Template (Subscription-Level)
+#
+# Inheritance: base-site.yaml → germany.yaml → <factory>-<env>.yaml
+#
+# This template represents the Germany subscription - shared by all German factories.
+# Sites inheriting from this get subscription + location + country pre-configured.
+#
+# Hierarchy:
+#   germany.yaml (subscription-level)
+#     ├── munich-dev.yaml (RG-level)
+#     └── munich-prod.yaml (RG-level)
+
+apiVersion: siteops/v1
+kind: SiteTemplate
+name: germany
+inherits: ../base-site.yaml
+
+subscription: "00000000-0000-0000-0000-000000000000"
+location: germanywestcentral
+
+labels:
+  country: DE
+  region: europe

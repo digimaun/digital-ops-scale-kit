@@ -3,15 +3,13 @@
 apiVersion: siteops/v1
 kind: Site
 name: munich-dev
-inherits: base-site.yaml
+inherits: shared/germany.yaml
 
-subscription: "00000000-0000-0000-0000-000000000000"
+# subscription, location, country inherited from shared/germany.yaml
 resourceGroup: rg-iot-munich-dev
-location: germanywestcentral
 
 labels:
   environment: dev
-  country: DE
   city: Munich
 
 properties:

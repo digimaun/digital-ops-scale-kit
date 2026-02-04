@@ -12,7 +12,7 @@ This guide covers GitHub Actions configuration for automated deployments.
 
 ## Azure OIDC Configuration
 
-Site Ops uses OIDC federation—no stored Azure credentials.
+Site Ops uses OIDC federation—no stored Azure credentials. Examples use bash syntax.
 
 ### 1. Create Azure AD application
 
@@ -33,9 +33,11 @@ az ad app federated-credential create \
   }'
 ```
 
-Create credentials for each environment (`dev`, `staging`, `prod`).
+Create credentials for each environment (`dev`, `staging`, `prod`). Alternatively, configure the subject to match a branch (`ref:refs/heads/main`), pull request (`pull_request`), or tag (`ref:refs/tags/v*`) instead of an environment.
 
 ### 3. Assign Azure roles
+
+For basic deployments, Contributor is sufficient:
 
 ```bash
 az role assignment create \
@@ -43,6 +45,25 @@ az role assignment create \
   --role "Contributor" \
   --scope /subscriptions/<subscription-id>
 ```
+
+**For AIO deployments:** The full installation includes RBAC operations (e.g., granting the AIO extension access to the schema registry). Contributor cannot create role assignments. Use Owner with a condition that prevents privilege escalation:
+
+```bash
+az role assignment create \
+  --assignee <app-id> \
+  --role "Owner" \
+  --scope /subscriptions/<subscription-id> \
+  --condition $'((!(ActionMatches{\'Microsoft.Authorization/roleAssignments/write\'})) OR (@Request[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAllValues:GuidNotEquals {8e3af657-a8ff-443c-a75c-2fe8c4bcb635, 18d7d88d-d35e-4fb5-a5c3-7773c20a72d9, f58310d9-a9f6-439a-9e8d-f62e7b41a168})) AND ((!(ActionMatches{\'Microsoft.Authorization/roleAssignments/delete\'})) OR (@Resource[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAllValues:GuidNotEquals {8e3af657-a8ff-443c-a75c-2fe8c4bcb635, 18d7d88d-d35e-4fb5-a5c3-7773c20a72d9, f58310d9-a9f6-439a-9e8d-f62e7b41a168}))' \
+  --condition-version "2.0"
+```
+
+This condition allows creating and deleting role assignments but blocks these privileged roles:
+
+| GUID | Role |
+| ---- | ---- |
+| `8e3af657-a8ff-443c-a75c-2fe8c4bcb635` | Owner |
+| `18d7d88d-d35e-4fb5-a5c3-7773c20a72d9` | User Access Administrator |
+| `f58310d9-a9f6-439a-9e8d-f62e7b41a168` | Role Based Access Control Administrator |
 
 ### Required secrets
 
@@ -99,10 +120,16 @@ Supports nested paths using dot notation (e.g., `parameters.clusterName`).
 
 ```bash
 gh workflow run deploy.yaml \
-  -f workspace="iot-operations" \
-  -f manifest="iot-ops-base" \
-  -f environment="dev"
+  -f workspace=iot-operations \
+  -f manifest=aio-install \
+  -f environment=dev
 ```
+
+Add `-f selector="<value>"` to filter sites further:
+
+- `selector="country=US"` — sites with country label
+- `selector="name=seattle-dev"` — specific site by name
+- `selector="country=US,name=seattle-dev"` — multiple filters
 
 ## Environments
 

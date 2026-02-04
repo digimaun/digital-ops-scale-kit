@@ -21,7 +21,7 @@ dev = [
 siteops = "siteops.cli:main"
 
 [project.urls]
-Repository = "https://github.com/Azure/digital-operations-scalekit"
+Repository = "https://github.com/Azure/digital-ops-scale-kit"
 
 [tool.setuptools.packages.find]
 include = ["siteops*"]

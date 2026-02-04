@@ -37,6 +37,25 @@ clExtensionIds: "{{ steps.aio-enablement.outputs.clExtensionIds }}"
 
 > **Note**: Output chaining only works during real deployments. In `--dry-run` mode, output templates remain unresolved.
 
+### Cross-scope output chaining
+
+RG-level sites can reference outputs from subscription-scoped steps. Subscription outputs are keyed by subscription ID and resolved automatically:
+
+```yaml
+# parameters/chaining.yaml
+edgeSiteId: "{{ steps.edge-site.outputs.site.id }}"
+```
+
+For `munich-line-1` (subscription: sub-123):
+→ Resolves from subscription outputs for sub-123
+
+For `munich-line-2` (subscription: sub-123):
+→ Resolves from the same subscription outputs
+
+**Resolution priority:**
+1. Per-site step outputs (from RG-scoped steps)
+2. Subscription outputs (from subscription-scoped steps, matched by site's subscription)
+
 ## Auto-filtering
 
 Parameters are automatically filtered to only include values accepted by each template. This enables shared parameter files:

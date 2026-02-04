@@ -119,4 +119,34 @@ CLI override: `siteops deploy manifest.yaml -p 5`
 | Scope | Use case | Azure CLI |
 |-------|----------|-----------|
 | `resourceGroup` | Deploy resources into RG | `az deployment group create` |
-| `subscription` | Create RGs, policies | `az deployment sub create` |
+| `subscription` | Shared resources (Edge Sites, policies) | `az deployment sub create` |
+
+### Two-phase deployment
+
+When a manifest contains `scope: subscription` steps, Site Ops uses two-phase deployment:
+
+**Phase 1** — Subscription-scoped steps:
+- Groups selected sites by subscription
+- Finds the subscription-level site for each subscription
+- Executes subscription-scoped steps once per subscription
+- Caches outputs keyed by subscription ID
+
+**Phase 2** — RG-scoped steps:
+- Executes for all RG-level sites (parallelizable)
+- Subscription-level sites are skipped (no resource group)
+- Can reference Phase 1 outputs via cross-scope chaining
+
+```yaml
+steps:
+  - name: edge-site
+    template: templates/edge-site.bicep
+    scope: subscription  # Phase 1: once per subscription
+
+  - name: schema-registry
+    template: templates/schema-registry.bicep
+    scope: resourceGroup  # Phase 2: per RG-level site
+    parameters:
+      - parameters/chaining.yaml  # Can reference edge-site outputs
+```
+
+See [parameter-resolution.md](parameter-resolution.md) for cross-scope output chaining details.

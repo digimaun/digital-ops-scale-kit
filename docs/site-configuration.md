@@ -2,7 +2,22 @@
 
 Sites define **where** to deploy—the Azure subscription, resource group, location, and site-specific configuration.
 
+## Site levels
+
+Sites operate at two levels based on whether they have a `resourceGroup`:
+
+| Site has | Site level | Deploys |
+|----------|-----------|--------|
+| `subscription` + `resourceGroup` | RG-level | Both subscription and RG-scoped steps |
+| `subscription` only | Subscription-level | `scope: subscription` steps only |
+
+**RG-level sites** are the most common—they deploy resources into a specific resource group.
+
+**Subscription-level sites** deploy shared resources once per subscription (like Azure Edge Sites), then RG-level sites in that subscription can reference those outputs via cross-scope output chaining.
+
 ## Site structure
+
+**RG-level site** (most common):
 
 ```yaml
 apiVersion: siteops/v1
@@ -17,18 +32,33 @@ labels:
   environment: dev
   country: DE
   city: Munich
-  deploySolution: "true"
 
 parameters:
   clusterName: munich-dev-arc
-  customLocationName: munich-dev-cl
-  aioInstanceName: munich-dev-aio
   brokerConfig:
     memoryProfile: Low
 
 properties:
-  tags:
-    costCenter: engineering
+  deployOptions:
+    includeSolution: true
+```
+
+**Subscription-level site** (for shared resources):
+
+```yaml
+apiVersion: siteops/v1
+kind: Site
+name: germany-subscription
+
+subscription: "00000000-0000-0000-0000-000000000000"
+location: germanywestcentral
+# No resourceGroup → subscription-level site
+
+labels:
+  environment: dev
+
+parameters:
+  edgeSiteName: germany-edge-site
 ```
 
 ## Labels vs Parameters vs Properties

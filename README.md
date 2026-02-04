@@ -48,7 +48,8 @@ Site Ops runs anywhere Python runs—no agents, no servers, no state to manage.
 - **One-command fleet deployment** — Deploy to all matching sites with a single command
 - **Declarative site inventory** — Define your fleet as code—sites with labels, parameters, and inheritance
 - **Label-based site selection** — Target any slice of your fleet: `-l environment=prod`, `-l country=US,city=Seattle`, or `-l name=munich-dev`
-- **Output chaining** — Reference outputs from previous steps (`{{ steps.schema-registry.outputs.schemaRegistry.id }}`)
+- **Subscription-scoped deployment** — Deploy shared resources once per subscription, then deploy per-site resources with automatic output resolution
+- **Output chaining** — Reference outputs from previous steps, including cross-scope resolution from subscription to resource group deployments
 - **Parallel execution** — Deploy to multiple sites simultaneously with configurable concurrency
 - **Failure isolation** — One site's failure doesn't block deployments to other sites
 - **Dry-run validation** — Preview the full deployment plan without making Azure calls
@@ -152,6 +153,11 @@ digital-operations-scalekit/
 │       ├── parameters/           # Parameter files
 │       └── templates/            # Bicep templates
 ├── docs/                         # Extended documentation
+│   ├── ci-cd-setup.md            # GitHub Actions, OIDC, secrets
+│   ├── manifest-reference.md     # Manifest syntax, step types
+│   ├── parameter-resolution.md   # Variables, output chaining
+│   ├── site-configuration.md     # Sites, inheritance, overlays
+│   └── troubleshooting.md        # Common issues and solutions
 └── .github/                      # CI/CD workflows
 ```
 
@@ -173,7 +179,14 @@ Each workspace follows a consistent structure:
 
 ### Sites
 
-Sites define deployment targets—subscription, resource group, location, and custom labels:
+Sites define deployment targets. Sites operate at two levels:
+
+| Site has | Site level | Deploys |
+|----------|-----------|--------|
+| `subscription` + `resourceGroup` | RG-level | Both subscription and RG-scoped steps |
+| `subscription` only | Subscription-level | `scope: subscription` steps only |
+
+**RG-level site** (most common):
 
 ```yaml
 apiVersion: siteops/v1
@@ -188,14 +201,29 @@ labels:
   environment: dev
   country: DE
   city: Munich
-  deploySolution: "true"
-  enableOpcPlcSimulator: "true"
 
 parameters:
   clusterName: munich-dev-arc
   brokerConfig:
     memoryProfile: Low
 ```
+
+**Subscription-level site** (for shared resources):
+
+```yaml
+apiVersion: siteops/v1
+kind: Site
+name: germany-subscription
+
+subscription: "00000000-0000-0000-0000-000000000000"
+location: germanywestcentral
+# No resourceGroup → subscription-level site
+
+parameters:
+  edgeSiteName: germany-edge-site
+```
+
+See [docs/site-configuration.md](docs/site-configuration.md) for inheritance, overlays, and SiteTemplate patterns.
 
 ### Manifests
 
@@ -214,9 +242,13 @@ parameters:
   - parameters/common.yaml  # Applied to all steps
 
 steps:
+  - name: edge-site
+    template: templates/edge-site.bicep
+    scope: subscription  # Deploys once per subscription
+
   - name: schema-registry
     template: templates/iot-ops/deps/schema-registry.bicep
-    scope: resourceGroup
+    scope: resourceGroup  # Deploys per-site
 
   - name: aio-instance
     template: templates/iot-ops/install/azure-iot-operations-instance.bicep
@@ -250,7 +282,12 @@ tags:
 # parameters/chaining.yaml (step-level, for output chaining)
 schemaRegistryId: "{{ steps.schema-registry.outputs.schemaRegistry.id }}"
 adrNamespaceId: "{{ steps.adr-ns.outputs.adrNamespace.id }}"
+
+# Cross-scope output chaining (subscription → resource group)
+edgeSiteId: "{{ steps.edge-site.outputs.site.id }}"
 ```
+
+See [docs/parameter-resolution.md](docs/parameter-resolution.md) for auto-filtering, merge order, and cross-scope resolution.
 
 ---
 

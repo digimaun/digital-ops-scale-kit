@@ -488,3 +488,218 @@ steps:
         captured = capsys.readouterr()
         # Check for unlimited indicator
         assert "Parallel" in captured.out or "unlimited" in captured.out.lower()
+
+
+class TestStepSiteCompatibility:
+    """Tests for _check_step_site_compatibility method."""
+
+    def test_kubectl_step_always_compatible(self, tmp_workspace):
+        """Kubectl steps should run on any site type."""
+        from siteops.models import ArcCluster, KubectlStep, Site
+
+        orchestrator = Orchestrator(tmp_workspace)
+
+        kubectl_step = KubectlStep(
+            name="apply-config",
+            operation="apply",
+            arc=ArcCluster(name="cluster", resource_group="rg"),
+            files=["config.yaml"],
+        )
+
+        # Test with RG-level site
+        rg_site = Site(
+            name="rg-site",
+            subscription="sub",
+            resource_group="rg",
+            location="eastus",
+        )
+        assert orchestrator._check_step_site_compatibility(kubectl_step, rg_site) is None
+
+        # Test with subscription-level site
+        sub_site = Site(
+            name="sub-site",
+            subscription="sub",
+            resource_group="",
+            location="eastus",
+        )
+        assert orchestrator._check_step_site_compatibility(kubectl_step, sub_site) is None
+
+    def test_subscription_step_with_rg_site_skipped(self, tmp_workspace):
+        """Subscription-scoped step should be skipped for RG-level site."""
+        from siteops.models import DeploymentStep, Site
+
+        orchestrator = Orchestrator(tmp_workspace)
+
+        sub_step = DeploymentStep(
+            name="sub-step",
+            template="test.bicep",
+            scope="subscription",
+        )
+        rg_site = Site(
+            name="rg-site",
+            subscription="sub",
+            resource_group="rg",
+            location="eastus",
+        )
+
+        reason = orchestrator._check_step_site_compatibility(sub_step, rg_site)
+        assert reason is not None
+        assert "subscription-scoped" in reason
+
+    def test_rg_step_with_subscription_site_skipped(self, tmp_workspace):
+        """ResourceGroup-scoped step should be skipped for subscription-level site."""
+        from siteops.models import DeploymentStep, Site
+
+        orchestrator = Orchestrator(tmp_workspace)
+
+        rg_step = DeploymentStep(
+            name="rg-step",
+            template="test.bicep",
+            scope="resourceGroup",
+        )
+        sub_site = Site(
+            name="sub-site",
+            subscription="sub",
+            resource_group="",
+            location="eastus",
+        )
+
+        reason = orchestrator._check_step_site_compatibility(rg_step, sub_site)
+        assert reason is not None
+        assert "resourceGroup-scoped" in reason
+
+    def test_matching_scope_returns_none(self, tmp_workspace):
+        """Matching scope/site level should return None (compatible)."""
+        from siteops.models import DeploymentStep, Site
+
+        orchestrator = Orchestrator(tmp_workspace)
+
+        # RG step with RG site
+        rg_step = DeploymentStep(name="rg-step", template="test.bicep", scope="resourceGroup")
+        rg_site = Site(name="rg-site", subscription="sub", resource_group="rg", location="eastus")
+        assert orchestrator._check_step_site_compatibility(rg_step, rg_site) is None
+
+        # Subscription step with subscription site
+        sub_step = DeploymentStep(name="sub-step", template="test.bicep", scope="subscription")
+        sub_site = Site(name="sub-site", subscription="sub", resource_group="", location="eastus")
+        assert orchestrator._check_step_site_compatibility(sub_step, sub_site) is None
+
+
+class TestPrintSummary:
+    """Tests for _print_deployment_summary method."""
+
+    def test_summary_with_success_only(self, tmp_workspace, capsys):
+        """Test summary output with only successful deployments."""
+        orchestrator = Orchestrator(tmp_workspace)
+        results = [
+            {
+                "site": "site-a",
+                "status": "success",
+                "steps_completed": 3,
+                "steps_total": 3,
+                "steps_skipped": 0,
+                "elapsed": 10.5,
+            },
+            {
+                "site": "site-b",
+                "status": "success",
+                "steps_completed": 3,
+                "steps_total": 3,
+                "steps_skipped": 0,
+                "elapsed": 12.3,
+            },
+        ]
+
+        orchestrator._print_deployment_summary(results, 15.0)
+
+        captured = capsys.readouterr()
+        assert "✓ Success" in captured.out
+        assert "2 succeeded" in captured.out
+        assert "0 failed" in captured.out
+        assert "site-a" in captured.out
+        assert "site-b" in captured.out
+
+    def test_summary_with_failed_sites(self, tmp_workspace, capsys):
+        """Test summary output shows failed sites section."""
+        orchestrator = Orchestrator(tmp_workspace)
+        results = [
+            {
+                "site": "good-site",
+                "status": "success",
+                "steps_completed": 3,
+                "steps_total": 3,
+                "steps_skipped": 0,
+                "elapsed": 10.0,
+            },
+            {
+                "site": "bad-site",
+                "status": "failed",
+                "error": "Deployment failed: resource conflict",
+                "steps_completed": 1,
+                "steps_total": 3,
+                "steps_skipped": 0,
+                "elapsed": 5.0,
+            },
+        ]
+
+        orchestrator._print_deployment_summary(results, 15.0)
+
+        captured = capsys.readouterr()
+        assert "✗ Failed" in captured.out
+        assert "1 succeeded" in captured.out
+        assert "1 failed" in captured.out
+        assert "Failed Sites:" in captured.out
+        assert "[bad-site]" in captured.out
+        assert "resource conflict" in captured.out
+
+    def test_summary_with_blocked_sites(self, tmp_workspace, capsys):
+        """Test summary output shows blocked sites section."""
+        orchestrator = Orchestrator(tmp_workspace)
+        results = [
+            {
+                "site": "sub-site",
+                "status": "failed",
+                "error": "Subscription deployment failed",
+                "steps_completed": 0,
+                "steps_total": 5,
+                "steps_skipped": 0,
+                "elapsed": 2.0,
+            },
+            {
+                "site": "blocked-site",
+                "status": "blocked",
+                "error": "Subscription deployment failed and site depends on its outputs",
+                "steps_completed": 0,
+                "steps_total": 5,
+                "steps_skipped": 5,
+                "elapsed": 0.0,
+            },
+        ]
+
+        orchestrator._print_deployment_summary(results, 5.0)
+
+        captured = capsys.readouterr()
+        assert "○ Blocked" in captured.out
+        assert "1 blocked" in captured.out
+        assert "Blocked Sites:" in captured.out
+        assert "[blocked-site]" in captured.out
+
+    def test_summary_with_skipped_steps(self, tmp_workspace, capsys):
+        """Test summary output shows skipped step count."""
+        orchestrator = Orchestrator(tmp_workspace)
+        results = [
+            {
+                "site": "partial-site",
+                "status": "success",
+                "steps_completed": 5,
+                "steps_total": 8,
+                "steps_skipped": 3,
+                "elapsed": 20.0,
+            },
+        ]
+
+        orchestrator._print_deployment_summary(results, 20.0)
+
+        captured = capsys.readouterr()
+        assert "5/8" in captured.out
+        assert "(3 skip)" in captured.out

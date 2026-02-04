@@ -814,6 +814,72 @@ class TestManifest:
         with pytest.raises(ValueError, match="missing 'files'"):
             Manifest.from_file(manifest_path)
 
+    def test_from_file_kubectl_missing_operation(self, tmp_path):
+        """Kubectl step without operation field should raise ValueError."""
+        manifest_data = {
+            "name": "bad-manifest",
+            "sites": ["site-a"],
+            "steps": [
+                {
+                    "name": "bad-kubectl",
+                    "type": "kubectl",
+                    # Missing operation
+                    "arc": {"name": "cluster", "resourceGroup": "rg"},
+                    "files": ["config.yaml"],
+                }
+            ],
+        }
+        manifest_path = tmp_path / "manifest.yaml"
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            yaml.dump(manifest_data, f)
+
+        with pytest.raises(ValueError, match="missing 'operation'"):
+            Manifest.from_file(manifest_path)
+
+    def test_from_file_kubectl_arc_missing_name(self, tmp_path):
+        """Kubectl step with arc config missing name should raise ValueError."""
+        manifest_data = {
+            "name": "bad-manifest",
+            "sites": ["site-a"],
+            "steps": [
+                {
+                    "name": "bad-kubectl",
+                    "type": "kubectl",
+                    "operation": "apply",
+                    "arc": {"resourceGroup": "rg"},  # Missing name
+                    "files": ["config.yaml"],
+                }
+            ],
+        }
+        manifest_path = tmp_path / "manifest.yaml"
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            yaml.dump(manifest_data, f)
+
+        with pytest.raises(ValueError, match="must have 'name' and 'resourceGroup'"):
+            Manifest.from_file(manifest_path)
+
+    def test_from_file_kubectl_arc_missing_resource_group(self, tmp_path):
+        """Kubectl step with arc config missing resourceGroup should raise ValueError."""
+        manifest_data = {
+            "name": "bad-manifest",
+            "sites": ["site-a"],
+            "steps": [
+                {
+                    "name": "bad-kubectl",
+                    "type": "kubectl",
+                    "operation": "apply",
+                    "arc": {"name": "cluster"},  # Missing resourceGroup
+                    "files": ["config.yaml"],
+                }
+            ],
+        }
+        manifest_path = tmp_path / "manifest.yaml"
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            yaml.dump(manifest_data, f)
+
+        with pytest.raises(ValueError, match="must have 'name' and 'resourceGroup'"):
+            Manifest.from_file(manifest_path)
+
     def test_from_file_empty_file(self, tmp_path):
         manifest_path = tmp_path / "empty.yaml"
         manifest_path.write_text("")

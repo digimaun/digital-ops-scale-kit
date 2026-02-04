@@ -932,6 +932,43 @@ class TestPrintValue:
         captured = capsys.readouterr()
         assert "    key: value" in captured.out
 
+    def test_print_bare_list_with_dicts(self, capsys):
+        """Test printing a bare list of dicts (not wrapped in a dict key)."""
+        from siteops.cli import _print_value
+
+        _print_value(
+            [{"name": "item1", "value": 10}, {"name": "item2", "value": 20}],
+            indent=0,
+        )
+
+        captured = capsys.readouterr()
+        # Bare list with dicts should show indexed items
+        assert "[0]:" in captured.out
+        assert "[1]:" in captured.out
+        assert "name: item1" in captured.out
+        assert "name: item2" in captured.out
+
+    def test_print_bare_list_simple(self, capsys):
+        """Test printing a bare list of simple values."""
+        from siteops.cli import _print_value
+
+        _print_value(["alpha", "beta", "gamma"], indent=0)
+
+        captured = capsys.readouterr()
+        # Bare list with simple values should show dash-prefixed items
+        assert "- alpha" in captured.out
+        assert "- beta" in captured.out
+        assert "- gamma" in captured.out
+
+    def test_print_scalar_value(self, capsys):
+        """Test printing a scalar value directly."""
+        from siteops.cli import _print_value
+
+        _print_value("just a string", indent=2)
+
+        captured = capsys.readouterr()
+        assert "  just a string" in captured.out
+
 
 class TestCmdSitesParameterDisplay:
     """Tests for parameter display in cmd_sites."""

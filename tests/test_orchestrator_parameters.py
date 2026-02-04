@@ -2006,3 +2006,65 @@ steps:
         assert orchestrator._site_depends_on_subscription_outputs(
             manifest, site, sub_step_names
         ) is True
+
+
+class TestComplexOutputHandling:
+    """Tests for handling complex outputs (list/dict) in string contexts."""
+
+    def test_complex_output_in_string_context_warns(self, tmp_workspace, sample_bicep_template, caplog):
+        """Test that embedding a complex output in a string logs a warning."""
+        import logging
+
+        # Create site
+        (tmp_workspace / "sites" / "test-site.yaml").write_text(
+            """
+apiVersion: siteops/v1
+kind: Site
+name: test-site
+subscription: sub-123
+resourceGroup: rg-test
+location: eastus
+"""
+        )
+
+        orchestrator = Orchestrator(tmp_workspace)
+
+        # Simulate step outputs with a complex value (list)
+        step_outputs = {"setup": {"items": ["a", "b", "c"]}}
+
+        # Try to embed the list in a string context (should warn and leave unresolved)
+        value = "Items are: {{ steps.setup.outputs.items }} - done"
+
+        with caplog.at_level(logging.WARNING):
+            result = orchestrator._resolve_step_outputs(value, step_outputs)
+
+        # The complex output should not be embedded - original template preserved
+        assert "{{ steps.setup.outputs.items }}" in result
+        assert "Cannot embed complex output" in caplog.text
+
+    def test_complex_output_standalone_resolves(self, tmp_workspace, sample_bicep_template):
+        """Test that a complex output as the sole value resolves correctly."""
+        # Create site
+        (tmp_workspace / "sites" / "test-site.yaml").write_text(
+            """
+apiVersion: siteops/v1
+kind: Site
+name: test-site
+subscription: sub-123
+resourceGroup: rg-test
+location: eastus
+"""
+        )
+
+        orchestrator = Orchestrator(tmp_workspace)
+
+        # Simulate step outputs with a complex value
+        step_outputs = {"setup": {"config": {"key": "value", "nested": True}}}
+
+        # Complex output as standalone value (entire string is the template)
+        value = "{{ steps.setup.outputs.config }}"
+
+        result = orchestrator._resolve_step_outputs(value, step_outputs)
+
+        # Standalone complex outputs should resolve to the dict
+        assert result == {"key": "value", "nested": True}

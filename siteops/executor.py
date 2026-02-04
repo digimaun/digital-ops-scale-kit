@@ -91,7 +91,7 @@ _allocated_arc_port_slots: set[int] = set()
 HTTPS_URL_PATTERN = re.compile(r"^https://", re.IGNORECASE)
 
 # Time to wait for Arc proxy to establish connection (seconds)
-ARC_PROXY_STARTUP_WAIT = int(os.environ.get("SITEOPS_ARC_PROXY_WAIT", "30"))
+ARC_PROXY_STARTUP_WAIT = int(os.environ.get("SITEOPS_ARC_PROXY_WAIT", "60"))
 
 # Default timeout for Azure CLI deployments (60 minutes)
 # Azure deployments can take significant time for complex resources

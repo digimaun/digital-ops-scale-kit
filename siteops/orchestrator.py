@@ -17,7 +17,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import yaml
 
@@ -936,6 +936,102 @@ class Orchestrator:
             return f"kubectl:{step.operation}"
         return step.scope
 
+    @staticmethod
+    def _get_subscription_step_names(manifest: Manifest) -> Set[str]:
+        """Get names of all subscription-scoped steps in a manifest.
+
+        Args:
+            manifest: The manifest to inspect
+
+        Returns:
+            Set of step names that have scope: subscription
+        """
+        return {
+            step.name
+            for step in manifest.steps
+            if isinstance(step, DeploymentStep) and step.scope == "subscription"
+        }
+
+    @staticmethod
+    def _references_any_step(value: Any, step_names: Set[str]) -> bool:
+        """Check if a value contains output references to any of the given steps.
+
+        Recursively searches dict/list/str for {{ steps.<name>.outputs.* }} patterns.
+
+        Args:
+            value: Parameter value to check
+            step_names: Set of step names to look for
+
+        Returns:
+            True if value references any step in step_names
+        """
+        if isinstance(value, dict):
+            return any(
+                Orchestrator._references_any_step(v, step_names) for v in value.values()
+            )
+        elif isinstance(value, list):
+            return any(
+                Orchestrator._references_any_step(item, step_names) for item in value
+            )
+        elif isinstance(value, str):
+            # Quick check before regex
+            if "steps." not in value:
+                return False
+            for match in STEP_OUTPUT_PATTERN.finditer(value):
+                if match.group(1) in step_names:
+                    return True
+        return False
+
+    def _site_depends_on_subscription_outputs(
+        self,
+        manifest: Manifest,
+        site: Site,
+        subscription_step_names: Set[str],
+    ) -> bool:
+        """Check if a site's RG-scoped steps reference subscription-scoped outputs.
+
+        Scans manifest-level and step-level parameter files for references to
+        subscription-scoped step outputs.
+
+        Args:
+            manifest: The manifest being deployed
+            site: The site to check
+            subscription_step_names: Names of subscription-scoped steps
+
+        Returns:
+            True if site has steps that depend on subscription-scoped outputs
+        """
+        if not subscription_step_names:
+            return False
+
+        # Check manifest-level parameters (apply to all steps)
+        for param_path in manifest.parameters:
+            resolved_path = manifest.resolve_parameter_path(param_path, site)
+            full_path = (self.workspace / resolved_path).resolve()
+            if full_path.exists():
+                try:
+                    params = self.load_parameters(full_path)
+                    if self._references_any_step(params, subscription_step_names):
+                        return True
+                except Exception:
+                    pass  # Skip unreadable files, validation catches these
+
+        # Check step-level parameters for RG-scoped steps
+        for step in manifest.steps:
+            if isinstance(step, DeploymentStep) and step.scope == "resourceGroup":
+                for param_path in step.parameters:
+                    resolved_path = manifest.resolve_parameter_path(param_path, site)
+                    full_path = (self.workspace / resolved_path).resolve()
+                    if full_path.exists():
+                        try:
+                            params = self.load_parameters(full_path)
+                            if self._references_any_step(params, subscription_step_names):
+                                return True
+                        except Exception:
+                            pass
+
+        return False
+
     def _deploy_bicep_step(
         self,
         site: Site,
@@ -1440,6 +1536,7 @@ class Orchestrator:
         """
         succeeded = sum(1 for r in results if r["status"] == "success")
         failed = sum(1 for r in results if r["status"] == "failed")
+        blocked = sum(1 for r in results if r["status"] == "blocked")
         total = len(results)
 
         print()
@@ -1455,7 +1552,13 @@ class Orchestrator:
         # Sort by site name for consistent output
         for result in sorted(results, key=lambda r: r["site"]):
             site = result["site"]
-            status = "✓ Success" if result["status"] == "success" else "✗ Failed"
+            result_status = result["status"]
+            if result_status == "success":
+                status = "✓ Success"
+            elif result_status == "blocked":
+                status = "○ Blocked"
+            else:
+                status = "✗ Failed"
             steps = f"{result['steps_completed']}/{result['steps_total']}"
             if result.get("steps_skipped"):
                 steps += f" ({result['steps_skipped']} skip)"
@@ -1464,7 +1567,10 @@ class Orchestrator:
             print(f"  {site:<25} {status:<10} {steps:<15} {duration:<10}")
 
         print()
-        print(f"  Total: {succeeded} succeeded, {failed} failed ({total} sites)")
+        summary_parts = [f"{succeeded} succeeded", f"{failed} failed"]
+        if blocked:
+            summary_parts.append(f"{blocked} blocked")
+        print(f"  Total: {', '.join(summary_parts)} ({total} sites)")
         print(f"  Duration: {total_elapsed:.1f}s")
         print()
 
@@ -1474,6 +1580,15 @@ class Orchestrator:
             print("  Failed Sites:")
             for result in failed_results:
                 error = result.get("error", "Unknown error")
+                print(f"    [{result['site']}] {error}")
+            print()
+
+        # Show blocked sites
+        blocked_results = [r for r in results if r["status"] == "blocked"]
+        if blocked_results:
+            print("  Blocked Sites:")
+            for result in blocked_results:
+                error = result.get("error", "Blocked due to subscription failure")
                 print(f"    [{result['site']}] {error}")
             print()
 
@@ -1916,6 +2031,48 @@ class Orchestrator:
                 manifest, subscription_sites, timestamp, effective_parallel
             )
             results.extend(sub_results)
+
+            # Identify failed subscriptions and filter blocked sites
+            failed_subscriptions = {
+                sub_id
+                for sub_id, site in subscription_sites.items()
+                if any(
+                    r["site"] == site.name and r["status"] == "failed"
+                    for r in sub_results
+                )
+            }
+
+            # Filter RG-level sites: block those with dependencies on failed subscriptions
+            if failed_subscriptions and rg_sites:
+                sub_step_names = self._get_subscription_step_names(manifest)
+                proceeding_sites = []
+                for site in rg_sites:
+                    if site.subscription in failed_subscriptions:
+                        if self._site_depends_on_subscription_outputs(
+                            manifest, site, sub_step_names
+                        ):
+                            # Site depends on failed subscription outputs - block it
+                            _thread_safe_print(
+                                f"[{site.name}] ○ blocked "
+                                "(subscription deployment failed, site depends on its outputs)"
+                            )
+                            results.append({
+                                "site": site.name,
+                                "status": "blocked",
+                                "error": "Subscription deployment failed and site depends on its outputs",
+                                "steps_completed": 0,
+                                "steps_skipped": len(manifest.steps),
+                                "steps_total": len(manifest.steps),
+                                "elapsed": 0.0,
+                                "steps": [],
+                            })
+                        else:
+                            # Site doesn't depend on subscription outputs - let it proceed
+                            proceeding_sites.append(site)
+                    else:
+                        # Site is in a different subscription - unaffected
+                        proceeding_sites.append(site)
+                rg_sites = proceeding_sites
 
             # Phase 2: Execute RG-scoped steps for all RG-level sites
             if rg_sites:

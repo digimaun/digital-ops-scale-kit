@@ -51,7 +51,7 @@ Site Ops runs anywhere Python runs—no agents, no servers, no state to manage.
 - **Subscription-scoped deployment** — Deploy shared resources once per subscription, then deploy per-site resources with automatic output resolution
 - **Output chaining** — Reference outputs from previous steps, including cross-scope resolution from subscription to resource group deployments
 - **Parallel execution** — Deploy to multiple sites simultaneously with configurable concurrency
-- **Failure isolation** — One site's failure doesn't block deployments to other sites
+- **Failure isolation** — One site's failure doesn't block others; subscription failures block only dependent sites
 - **Dry-run validation** — Preview the full deployment plan without making Azure calls
 - **Flexible step orchestration** — Conditional execution, parameter auto-filtering, and mixed step types (Bicep and kubectl via Arc proxy) in a single manifest
 

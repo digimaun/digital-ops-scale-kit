@@ -188,6 +188,56 @@ class TestSiteOverlayMerging:
         assert site.properties["baseOnly"] == "preserved"  # Base only preserved
         assert site.properties["localOnly"] == "added"  # Local only added
 
+    def test_subscription_level_site_overlay(self, tmp_workspace):
+        """Overlay on subscription-level site preserves subscription-level status."""
+        base_site = {
+            "name": "sub-level-test",
+            "subscription": "base-sub",
+            # No resourceGroup - subscription-level site
+            "location": "eastus",
+            "labels": {"team": "infra"},
+        }
+        (tmp_workspace / "sites" / "sub-level-test.yaml").write_text(yaml.dump(base_site))
+
+        (tmp_workspace / "sites.local").mkdir()
+        local_override = {
+            "subscription": "local-sub",
+            "labels": {"environment": "dev"},
+        }
+        (tmp_workspace / "sites.local" / "sub-level-test.yaml").write_text(yaml.dump(local_override))
+
+        orchestrator = Orchestrator(tmp_workspace)
+        site = orchestrator.load_site("sub-level-test")
+
+        # Site should remain subscription-level
+        assert site.is_subscription_level is True
+        assert site.resource_group == ""
+        # Overlay values should be applied
+        assert site.subscription == "local-sub"
+        assert site.labels["environment"] == "dev"
+        assert site.labels["team"] == "infra"  # Preserved from base
+
+    def test_overlay_adds_resource_group(self, tmp_workspace):
+        """Overlay can convert subscription-level to RG-level by adding resourceGroup."""
+        base_site = {
+            "name": "upgrade-test",
+            "subscription": "sub",
+            # No resourceGroup - subscription-level site
+            "location": "eastus",
+        }
+        (tmp_workspace / "sites" / "upgrade-test.yaml").write_text(yaml.dump(base_site))
+
+        (tmp_workspace / "sites.local").mkdir()
+        local_override = {"resourceGroup": "rg-from-overlay"}
+        (tmp_workspace / "sites.local" / "upgrade-test.yaml").write_text(yaml.dump(local_override))
+
+        orchestrator = Orchestrator(tmp_workspace)
+        site = orchestrator.load_site("upgrade-test")
+
+        # Site should now be RG-level
+        assert site.is_subscription_level is False
+        assert site.resource_group == "rg-from-overlay"
+
 
 class TestResolveSites:
     """Tests for site resolution from manifests."""

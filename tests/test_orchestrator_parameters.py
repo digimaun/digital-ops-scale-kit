@@ -1783,3 +1783,226 @@ class TestGroupSitesBySubscription:
         sub_sites, rg_sites = groups["sub-123"]
         assert len(sub_sites) == 0
         assert len(rg_sites) == 2
+
+
+class TestSubscriptionFailureIsolation:
+    """Tests for subscription-level failure isolation in two-phase deployment."""
+
+    def test_get_subscription_step_names(self, tmp_workspace, sample_bicep_template):
+        """Test extracting subscription-scoped step names from manifest."""
+        manifest_path = tmp_workspace / "manifests" / "mixed.yaml"
+        manifest_path.write_text(
+            """
+name: mixed
+sites:
+  - test-site
+steps:
+  - name: sub-step-1
+    template: templates/test.bicep
+    scope: subscription
+  - name: rg-step
+    template: templates/test.bicep
+    scope: resourceGroup
+  - name: sub-step-2
+    template: templates/test.bicep
+    scope: subscription
+"""
+        )
+
+        from siteops.models import Manifest
+
+        manifest = Manifest.from_file(manifest_path)
+        step_names = Orchestrator._get_subscription_step_names(manifest)
+
+        assert step_names == {"sub-step-1", "sub-step-2"}
+        assert "rg-step" not in step_names
+
+    def test_references_any_step_finds_reference(self):
+        """Test detecting step output references in parameters."""
+        value = {"id": "{{ steps.shared.outputs.resourceId }}"}
+        assert Orchestrator._references_any_step(value, {"shared"}) is True
+        assert Orchestrator._references_any_step(value, {"other"}) is False
+
+    def test_references_any_step_nested_dict(self):
+        """Test detecting step references in nested structures."""
+        value = {
+            "config": {
+                "nested": {
+                    "ref": "{{ steps.deep-step.outputs.value }}"
+                }
+            }
+        }
+        assert Orchestrator._references_any_step(value, {"deep-step"}) is True
+        assert Orchestrator._references_any_step(value, {"shallow-step"}) is False
+
+    def test_references_any_step_in_list(self):
+        """Test detecting step references in list values."""
+        value = ["static", "{{ steps.list-step.outputs.item }}"]
+        assert Orchestrator._references_any_step(value, {"list-step"}) is True
+
+    def test_references_any_step_no_references(self):
+        """Test no false positives on values without step references."""
+        assert Orchestrator._references_any_step("plain string", {"any"}) is False
+        assert Orchestrator._references_any_step({"key": "value"}, {"any"}) is False
+        assert Orchestrator._references_any_step(123, {"any"}) is False
+
+    def test_site_depends_on_subscription_outputs_with_dependency(
+        self, tmp_workspace, sample_bicep_template
+    ):
+        """Test site dependency detection when parameter file references subscription step."""
+        # Create site
+        (tmp_workspace / "sites" / "rg-site.yaml").write_text(
+            """
+apiVersion: siteops/v1
+kind: Site
+name: rg-site
+subscription: "sub-123"
+resourceGroup: rg-test
+location: eastus
+"""
+        )
+
+        # Create parameter file that references subscription step
+        (tmp_workspace / "parameters" / "chaining.yaml").write_text(
+            """
+sharedId: "{{ steps.sub-step.outputs.resourceId }}"
+"""
+        )
+
+        # Create manifest with subscription and RG steps
+        manifest_path = tmp_workspace / "manifests" / "test.yaml"
+        manifest_path.write_text(
+            """
+name: test
+sites:
+  - rg-site
+steps:
+  - name: sub-step
+    template: templates/test.bicep
+    scope: subscription
+  - name: rg-step
+    template: templates/test.bicep
+    scope: resourceGroup
+    parameters:
+      - parameters/chaining.yaml
+"""
+        )
+
+        orchestrator = Orchestrator(tmp_workspace)
+        from siteops.models import Manifest
+
+        manifest = Manifest.from_file(manifest_path)
+        site = orchestrator.load_site("rg-site")
+        sub_step_names = {"sub-step"}
+
+        assert orchestrator._site_depends_on_subscription_outputs(
+            manifest, site, sub_step_names
+        ) is True
+
+    def test_site_depends_on_subscription_outputs_no_dependency(
+        self, tmp_workspace, sample_bicep_template
+    ):
+        """Test site dependency detection when no subscription outputs are referenced."""
+        # Create site
+        (tmp_workspace / "sites" / "rg-site.yaml").write_text(
+            """
+apiVersion: siteops/v1
+kind: Site
+name: rg-site
+subscription: "sub-123"
+resourceGroup: rg-test
+location: eastus
+"""
+        )
+
+        # Create parameter file that only references RG-scoped steps
+        (tmp_workspace / "parameters" / "chaining.yaml").write_text(
+            """
+localId: "{{ steps.rg-step-1.outputs.id }}"
+"""
+        )
+
+        # Create manifest with subscription and RG steps
+        manifest_path = tmp_workspace / "manifests" / "test.yaml"
+        manifest_path.write_text(
+            """
+name: test
+sites:
+  - rg-site
+steps:
+  - name: sub-step
+    template: templates/test.bicep
+    scope: subscription
+  - name: rg-step-1
+    template: templates/test.bicep
+    scope: resourceGroup
+  - name: rg-step-2
+    template: templates/test.bicep
+    scope: resourceGroup
+    parameters:
+      - parameters/chaining.yaml
+"""
+        )
+
+        orchestrator = Orchestrator(tmp_workspace)
+        from siteops.models import Manifest
+
+        manifest = Manifest.from_file(manifest_path)
+        site = orchestrator.load_site("rg-site")
+        sub_step_names = {"sub-step"}
+
+        assert orchestrator._site_depends_on_subscription_outputs(
+            manifest, site, sub_step_names
+        ) is False
+
+    def test_site_depends_checks_manifest_level_params(
+        self, tmp_workspace, sample_bicep_template
+    ):
+        """Test that manifest-level parameters are also checked for dependencies."""
+        # Create site
+        (tmp_workspace / "sites" / "rg-site.yaml").write_text(
+            """
+apiVersion: siteops/v1
+kind: Site
+name: rg-site
+subscription: "sub-123"
+resourceGroup: rg-test
+location: eastus
+"""
+        )
+
+        # Create manifest-level parameter file with subscription reference
+        (tmp_workspace / "parameters" / "common.yaml").write_text(
+            """
+sharedId: "{{ steps.sub-step.outputs.resourceId }}"
+"""
+        )
+
+        manifest_path = tmp_workspace / "manifests" / "test.yaml"
+        manifest_path.write_text(
+            """
+name: test
+sites:
+  - rg-site
+parameters:
+  - parameters/common.yaml
+steps:
+  - name: sub-step
+    template: templates/test.bicep
+    scope: subscription
+  - name: rg-step
+    template: templates/test.bicep
+    scope: resourceGroup
+"""
+        )
+
+        orchestrator = Orchestrator(tmp_workspace)
+        from siteops.models import Manifest
+
+        manifest = Manifest.from_file(manifest_path)
+        site = orchestrator.load_site("rg-site")
+        sub_step_names = {"sub-step"}
+
+        assert orchestrator._site_depends_on_subscription_outputs(
+            manifest, site, sub_step_names
+        ) is True

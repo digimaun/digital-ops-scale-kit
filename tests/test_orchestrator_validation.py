@@ -1180,3 +1180,194 @@ steps:
 
         # Should have no subscription-related errors
         assert not any("subscription" in e.lower() for e in errors)
+
+    def test_subscription_step_skipped_when_condition_false(
+        self, tmp_workspace, sample_bicep_template
+    ):
+        """No error when subscription-scoped step has `when` condition that evaluates to false."""
+        # Create RG-level site with property that would skip the subscription step
+        (tmp_workspace / "sites" / "rg-site.yaml").write_text(
+            """
+apiVersion: siteops/v1
+kind: Site
+name: rg-site
+subscription: "00000000-0000-0000-0000-000000000001"
+resourceGroup: rg-test
+location: eastus
+properties:
+  deployOptions:
+    includeGlobalSite: false
+"""
+        )
+
+        # Create manifest with conditional subscription-scoped step
+        manifest_path = tmp_workspace / "manifests" / "conditional-sub.yaml"
+        manifest_path.write_text(
+            """
+name: conditional-sub
+sites:
+  - rg-site
+steps:
+  - name: global-edge-site
+    template: templates/test.bicep
+    scope: subscription
+    when: "{{ site.properties.deployOptions.includeGlobalSite }}"
+  - name: rg-step
+    template: templates/test.bicep
+    scope: resourceGroup
+"""
+        )
+
+        orchestrator = Orchestrator(tmp_workspace)
+        errors = orchestrator.validate(manifest_path)
+
+        # Should NOT error because the subscription step would be skipped anyway
+        assert not any("subscription-level site" in e for e in errors)
+
+    def test_subscription_step_required_when_condition_true(
+        self, tmp_workspace, sample_bicep_template
+    ):
+        """Error when subscription-scoped step has `when` condition that evaluates to true."""
+        # Create RG-level site with property that would execute the subscription step
+        (tmp_workspace / "sites" / "rg-site.yaml").write_text(
+            """
+apiVersion: siteops/v1
+kind: Site
+name: rg-site
+subscription: "00000000-0000-0000-0000-000000000001"
+resourceGroup: rg-test
+location: eastus
+properties:
+  deployOptions:
+    includeGlobalSite: true
+"""
+        )
+
+        # Create manifest with conditional subscription-scoped step
+        manifest_path = tmp_workspace / "manifests" / "conditional-sub.yaml"
+        manifest_path.write_text(
+            """
+name: conditional-sub
+sites:
+  - rg-site
+steps:
+  - name: global-edge-site
+    template: templates/test.bicep
+    scope: subscription
+    when: "{{ site.properties.deployOptions.includeGlobalSite }}"
+  - name: rg-step
+    template: templates/test.bicep
+    scope: resourceGroup
+"""
+        )
+
+        orchestrator = Orchestrator(tmp_workspace)
+        errors = orchestrator.validate(manifest_path)
+
+        # SHOULD error because the subscription step would execute
+        assert any("subscription-level site" in e for e in errors)
+
+    def test_subscription_step_required_when_any_site_condition_true(
+        self, tmp_workspace, sample_bicep_template
+    ):
+        """Error when any RG-level site's condition evaluates to true."""
+        # Create two RG-level sites - one would skip, one would execute
+        (tmp_workspace / "sites" / "skip-site.yaml").write_text(
+            """
+apiVersion: siteops/v1
+kind: Site
+name: skip-site
+subscription: "00000000-0000-0000-0000-000000000001"
+resourceGroup: rg-skip
+location: eastus
+properties:
+  deployOptions:
+    includeGlobalSite: false
+"""
+        )
+        (tmp_workspace / "sites" / "run-site.yaml").write_text(
+            """
+apiVersion: siteops/v1
+kind: Site
+name: run-site
+subscription: "00000000-0000-0000-0000-000000000001"
+resourceGroup: rg-run
+location: eastus
+properties:
+  deployOptions:
+    includeGlobalSite: true
+"""
+        )
+
+        # Create manifest with conditional subscription-scoped step
+        manifest_path = tmp_workspace / "manifests" / "mixed-conditions.yaml"
+        manifest_path.write_text(
+            """
+name: mixed-conditions
+sites:
+  - skip-site
+  - run-site
+steps:
+  - name: global-edge-site
+    template: templates/test.bicep
+    scope: subscription
+    when: "{{ site.properties.deployOptions.includeGlobalSite }}"
+  - name: rg-step
+    template: templates/test.bicep
+    scope: resourceGroup
+"""
+        )
+
+        orchestrator = Orchestrator(tmp_workspace)
+        errors = orchestrator.validate(manifest_path)
+
+        # SHOULD error because at least one site would execute the subscription step
+        assert any("subscription-level site" in e for e in errors)
+
+    def test_subscription_step_multiple_steps_all_skipped(
+        self, tmp_workspace, sample_bicep_template
+    ):
+        """No error when multiple subscription-scoped steps all have false conditions."""
+        # Create RG-level site with all conditions false
+        (tmp_workspace / "sites" / "rg-site.yaml").write_text(
+            """
+apiVersion: siteops/v1
+kind: Site
+name: rg-site
+subscription: "00000000-0000-0000-0000-000000000001"
+resourceGroup: rg-test
+location: eastus
+properties:
+  deployOptions:
+    includeGlobalSite: false
+    includeEdgeSite: false
+"""
+        )
+
+        # Create manifest with multiple conditional subscription-scoped steps
+        manifest_path = tmp_workspace / "manifests" / "multi-sub-steps.yaml"
+        manifest_path.write_text(
+            """
+name: multi-sub-steps
+sites:
+  - rg-site
+steps:
+  - name: global-edge-site
+    template: templates/test.bicep
+    scope: subscription
+    when: "{{ site.properties.deployOptions.includeGlobalSite }}"
+  - name: another-sub-step
+    template: templates/test.bicep
+    scope: subscription
+    when: "{{ site.properties.deployOptions.includeEdgeSite }}"
+  - name: rg-step
+    template: templates/test.bicep
+    scope: resourceGroup
+"""
+        )
+
+        orchestrator = Orchestrator(tmp_workspace)
+        errors = orchestrator.validate(manifest_path)
+
+        # Should NOT error because all subscription steps would be skipped
+        assert not any("subscription-level site" in e for e in errors)

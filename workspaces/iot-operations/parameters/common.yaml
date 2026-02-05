@@ -17,10 +17,11 @@ schemaRegistryName: "{{ site.name }}-sr"
 adrNamespaceName: "{{ site.name }}-ns"
 
 # ─────────────────────────────────────────────────────────────
-# Edge Site Parameters (for edge-site.bicep)
+# Edge Site Parameters (for edge-site templates)
 # ─────────────────────────────────────────────────────────────
-country: "{{ site.labels.country }}"
-city: "{{ site.labels.city }}"
+siteAddress:
+  country: "{{ site.labels.country }}"
+  city: "{{ site.labels.city }}"
 labels:
   managedBy: siteops
 

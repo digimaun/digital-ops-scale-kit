@@ -19,11 +19,13 @@ location: eastus
 
 labels:
   environment: dev
+  country: US
+  city: Redmond
 
 properties:
   deployOptions:
-    includeGlobalSite: true       # Deploy subscription-scoped edge site
-    includeEdgeSite: false        # No RG-level edge site (no resourceGroup)
+    includeGlobalSite: false      # Deploy subscription-scoped edge site
+    includeEdgeSite: true         # Deploy rg-scoped edge site
 
 parameters:
-  edgeSiteName: contoso-edge-site
+  siteName: contoso-edge-site

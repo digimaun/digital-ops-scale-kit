@@ -613,7 +613,7 @@ class TestPrintSummary:
         orchestrator._print_deployment_summary(results, 15.0)
 
         captured = capsys.readouterr()
-        assert "✓ Success" in captured.out
+        assert "+ Success" in captured.out
         assert "2 succeeded" in captured.out
         assert "0 failed" in captured.out
         assert "site-a" in captured.out
@@ -645,7 +645,7 @@ class TestPrintSummary:
         orchestrator._print_deployment_summary(results, 15.0)
 
         captured = capsys.readouterr()
-        assert "✗ Failed" in captured.out
+        assert "x Failed" in captured.out
         assert "1 succeeded" in captured.out
         assert "1 failed" in captured.out
         assert "Failed Sites:" in captured.out
@@ -679,7 +679,7 @@ class TestPrintSummary:
         orchestrator._print_deployment_summary(results, 5.0)
 
         captured = capsys.readouterr()
-        assert "○ Blocked" in captured.out
+        assert "- Blocked" in captured.out
         assert "1 blocked" in captured.out
         assert "Blocked Sites:" in captured.out
         assert "[blocked-site]" in captured.out

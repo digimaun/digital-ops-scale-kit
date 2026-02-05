@@ -37,13 +37,13 @@ steps:
   # Edge Site (Global) - deployed once per subscription via subscription-level site.
   # RG-level sites resolve outputs via cross-scope output chaining.
   - name: global-edge-site
-    template: templates/edge-site.bicep
+    template: templates/edge-site/subscription.bicep
     scope: subscription
     when: "{{ site.properties.deployOptions.includeGlobalSite }}"
 
   # Edge Site (Per-RG) - deployed per resource group (original behavior)
   - name: edge-site
-    template: templates/edge-site.bicep
+    template: templates/edge-site/main.bicep
     scope: resourceGroup
     when: "{{ site.properties.deployOptions.includeEdgeSite }}"
 

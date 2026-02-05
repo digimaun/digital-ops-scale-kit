@@ -733,9 +733,9 @@ class Orchestrator:
         """Merge and resolve parameters for a deployment step.
 
         Parameter merge order (later overrides earlier):
-        1. Site-level parameters (from site definition)
-        2. Manifest-level parameter files (from manifest.parameters)
-        3. Step-level parameter files (from step.parameters)
+        1. Manifest-level parameter files (from manifest.parameters) - shared defaults
+        2. Site-level parameters (from site definition) - site-specific overrides
+        3. Step-level parameter files (from step.parameters) - step-specific overrides
 
         After merging, parameters are:
         - Resolved with template variable substitution ({{ site.X }}, {{ steps.X.outputs.Y }})
@@ -751,10 +751,8 @@ class Orchestrator:
         Returns:
             Fully resolved and filtered parameters dict
         """
-        # 1. Start with site-level parameters
-        params = site.get_all_parameters()
-
-        # 2. Merge manifest-level parameter files
+        # 1. Start with manifest-level parameter files (shared defaults)
+        params: Dict[str, Any] = {}
         for param_path in manifest.parameters:
             resolved_path = manifest.resolve_parameter_path(param_path, site)
             full_path = (self.workspace / resolved_path).resolve()
@@ -764,7 +762,10 @@ class Orchestrator:
             else:
                 logger.warning(f"Manifest parameter file not found: {full_path}")
 
-        # 3. Merge step-level parameter files (override manifest-level)
+        # 2. Merge site-level parameters (site-specific overrides)
+        params = self._deep_merge(params, site.get_all_parameters())
+
+        # 3. Merge step-level parameter files (step-specific overrides)
         for param_path in step.parameters:
             resolved_path = manifest.resolve_parameter_path(param_path, site)
             full_path = (self.workspace / resolved_path).resolve()
@@ -951,6 +952,36 @@ class Orchestrator:
             for step in manifest.steps
             if isinstance(step, DeploymentStep) and step.scope == "subscription"
         }
+
+    def _any_subscription_step_would_execute(
+        self,
+        subscription_steps: List[DeploymentStep],
+        rg_level_sites: List[Site],
+    ) -> bool:
+        """Check if any subscription-scoped step would execute for any RG-level site.
+
+        Used during validation to determine if a subscription-level site is actually
+        needed. If all subscription-scoped steps have `when` conditions that evaluate
+        to False for all RG-level sites, no subscription-level site is required.
+
+        Args:
+            subscription_steps: List of subscription-scoped steps to check
+            rg_level_sites: RG-level sites in the subscription
+
+        Returns:
+            True if at least one step would execute (needs subscription-level site)
+        """
+        for step in subscription_steps:
+            # No condition = always runs
+            if not step.when:
+                return True
+
+            # Check if condition passes for any RG-level site
+            for site in rg_level_sites:
+                if self._evaluate_condition(step.when, site):
+                    return True
+
+        return False
 
     @staticmethod
     def _references_any_step(value: Any, step_names: Set[str]) -> bool:
@@ -1218,7 +1249,7 @@ class Orchestrator:
             # Check step/site scope compatibility
             skip_reason = self._check_step_site_compatibility(step, site)
             if skip_reason:
-                log(f"[{site.name}] ○ {step.name} (skipped: {skip_reason})")
+                log(f"[{site.name}] - {step.name} (skipped: {skip_reason})")
                 steps_skipped += 1
                 step_results.append(
                     {
@@ -1231,7 +1262,7 @@ class Orchestrator:
 
             # Evaluate condition
             if not self._evaluate_condition(step.when, site):
-                log(f"[{site.name}] ○ {step.name} (skipped: condition not met)")
+                log(f"[{site.name}] - {step.name} (skipped: condition not met)")
                 steps_skipped += 1
                 step_results.append(
                     {
@@ -1243,7 +1274,7 @@ class Orchestrator:
                 continue
 
             step_type = self._get_step_type_label(step)
-            log(f"[{site.name}] ▸ {step.name} ({step_type})...")
+            log(f"[{site.name}] > {step.name} ({step_type})...")
 
             result = self._execute_step(site, step, manifest, timestamp, step_outputs, subscription_outputs)
 
@@ -1252,7 +1283,7 @@ class Orchestrator:
                 outputs = result.outputs or {} if isinstance(result, DeploymentResult) else {}
                 if outputs:
                     step_outputs[step.name] = outputs
-                log(f"[{site.name}] ✓ {step.name}")
+                log(f"[{site.name}] + {step.name}")
                 steps_completed += 1
                 step_results.append(
                     {
@@ -1262,7 +1293,7 @@ class Orchestrator:
                     }
                 )
             else:
-                log(f"[{site.name}] ✗ {step.name}: {result.error}")
+                log(f"[{site.name}] x {step.name}: {result.error}")
                 status = "failed"
                 error_message = result.error
                 step_results.append(
@@ -1278,7 +1309,7 @@ class Orchestrator:
         total_steps = len(manifest.steps)
 
         skip_info = f", {steps_skipped} skipped" if steps_skipped > 0 else ""
-        status_symbol = "✓" if status == "success" else "✗"
+        status_symbol = "+" if status == "success" else "x"
         log(
             f"[{site.name}] {status_symbol} completed in {elapsed:.1f}s "
             f"({steps_completed}/{total_steps - steps_skipped} steps{skip_info})"
@@ -1554,11 +1585,11 @@ class Orchestrator:
             site = result["site"]
             result_status = result["status"]
             if result_status == "success":
-                status = "✓ Success"
+                status = "+ Success"
             elif result_status == "blocked":
-                status = "○ Blocked"
+                status = "- Blocked"
             else:
-                status = "✗ Failed"
+                status = "x Failed"
             steps = f"{result['steps_completed']}/{result['steps_total']}"
             if result.get("steps_skipped"):
                 steps += f" ({result['steps_skipped']} skip)"
@@ -1747,26 +1778,34 @@ class Orchestrator:
                         errors.append(f"Site '{site.name}' missing 'resourceGroup' required by step '{step.name}'")
 
         # Validate subscription-scoped steps
-        has_subscription_steps = any(
-            isinstance(step, DeploymentStep) and step.scope == "subscription"
+        subscription_steps = [
+            step
             for step in manifest.steps
-        )
+            if isinstance(step, DeploymentStep) and step.scope == "subscription"
+        ]
 
-        if has_subscription_steps and sites:
+        if subscription_steps and sites:
             # Group sites by subscription to check for subscription-level sites
             site_groups = self._group_sites_by_subscription(sites)
 
             # Check that each subscription has exactly one subscription-level site
             for sub_id, (sub_level_sites, rg_level_sites) in site_groups.items():
                 if not sub_level_sites and rg_level_sites:
-                    # RG-level sites exist but no subscription-level site
-                    site_names = ", ".join(s.name for s in rg_level_sites[:3])
-                    if len(rg_level_sites) > 3:
-                        site_names += f"... and {len(rg_level_sites) - 3} more"
-                    errors.append(
-                        f"Subscription '{sub_id[:8]}...' has RG-level sites ({site_names}) "
-                        f"but no subscription-level site for subscription-scoped steps"
+                    # RG-level sites exist but no subscription-level site.
+                    # Check if any subscription-scoped step would actually execute
+                    # based on its `when` condition evaluated against RG-level sites.
+                    needs_subscription_site = self._any_subscription_step_would_execute(
+                        subscription_steps, rg_level_sites
                     )
+
+                    if needs_subscription_site:
+                        site_names = ", ".join(s.name for s in rg_level_sites[:3])
+                        if len(rg_level_sites) > 3:
+                            site_names += f"... and {len(rg_level_sites) - 3} more"
+                        errors.append(
+                            f"Subscription '{sub_id[:8]}...' has RG-level sites ({site_names}) "
+                            f"but no subscription-level site for subscription-scoped steps"
+                        )
                 elif len(sub_level_sites) > 1:
                     # Multiple subscription-level sites for same subscription
                     site_names = ", ".join(s.name for s in sub_level_sites)
@@ -2053,7 +2092,7 @@ class Orchestrator:
                         ):
                             # Site depends on failed subscription outputs - block it
                             _thread_safe_print(
-                                f"[{site.name}] ○ blocked "
+                                f"[{site.name}] - blocked "
                                 "(subscription deployment failed, site depends on its outputs)"
                             )
                             results.append({

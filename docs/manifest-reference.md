@@ -138,15 +138,21 @@ When a manifest contains `scope: subscription` steps, Site Ops uses two-phase de
 
 ```yaml
 steps:
-  - name: edge-site
-    template: templates/edge-site.bicep
+  - name: global-edge-site
+    template: templates/edge-site/subscription.bicep
     scope: subscription  # Phase 1: once per subscription
+    when: "{{ site.properties.deployOptions.includeGlobalSite }}"
+
+  - name: edge-site
+    template: templates/edge-site/main.bicep
+    scope: resourceGroup  # Phase 2: per RG-level site
+    when: "{{ site.properties.deployOptions.includeEdgeSite }}"
 
   - name: schema-registry
     template: templates/schema-registry.bicep
     scope: resourceGroup  # Phase 2: per RG-level site
     parameters:
-      - parameters/chaining.yaml  # Can reference edge-site outputs
+      - parameters/chaining.yaml  # Can reference global-edge-site outputs
 ```
 
 See [parameter-resolution.md](parameter-resolution.md) for cross-scope output chaining details.

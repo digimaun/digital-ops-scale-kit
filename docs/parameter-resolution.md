@@ -6,11 +6,11 @@ Parameters flow from multiple sources and are automatically filtered per templat
 
 | Priority | Source | Description |
 |----------|--------|-------------|
-| 1 (lowest) | Site parameters | `site.parameters` section |
-| 2 | Manifest parameters | `manifest.parameters` list |
-| 3 (highest) | Step parameters | `step.parameters` list |
+| 1 (lowest) | Manifest parameters | `manifest.parameters` list - shared defaults |
+| 2 | Site parameters | `site.parameters` section - site-specific overrides |
+| 3 (highest) | Step parameters | `step.parameters` list - step-specific overrides |
 
-Later values override earlier values. Nested objects merge recursively.
+Later values override earlier values. Nested objects merge recursively. This order follows the principle of specificity: manifest provides shared defaults, sites override with specific values.
 
 ## Template variables
 

@@ -965,8 +965,83 @@ steps:
         assert "extraManifestParam" not in result
         assert "extraStepParam" not in result
 
-    def test_site_parameters_included_in_merge(self, tmp_path):
-        """Test that site.parameters are included in the merge."""
+    def test_full_merge_order_manifest_site_step(self, tmp_path):
+        """Test the complete merge order: manifest → site → step.
+
+        Verifies that:
+        - Manifest provides base defaults
+        - Site overrides manifest values
+        - Step overrides both manifest and site values
+        """
+        workspace = self._setup_workspace(tmp_path)
+
+        self._create_site(
+            workspace,
+            """
+apiVersion: siteops/v1
+kind: Site
+name: test-site
+subscription: "00000000-0000-0000-0000-000000000000"
+resourceGroup: rg-test
+location: eastus
+parameters:
+  fromManifest: site-override
+  fromSite: site-value
+  fromAll: site-wins
+""",
+        )
+
+        (workspace / "parameters" / "common.yaml").write_text(
+            "fromManifest: manifest-value\nfromAll: manifest-value\n"
+        )
+        (workspace / "parameters" / "step.yaml").write_text("fromAll: step-wins\nfromStep: step-value\n")
+
+        self._create_template(
+            workspace,
+            {
+                "fromManifest": {"type": "string"},
+                "fromSite": {"type": "string"},
+                "fromStep": {"type": "string"},
+                "fromAll": {"type": "string"},
+            },
+        )
+
+        (workspace / "manifests" / "test.yaml").write_text(
+            """
+apiVersion: siteops/v1
+kind: Manifest
+name: test
+sites: [test-site]
+parameters: [parameters/common.yaml]
+steps:
+  - name: test-step
+    template: templates/test.json
+    parameters: [parameters/step.yaml]
+"""
+        )
+
+        from siteops.executor import get_template_parameters
+
+        get_template_parameters.cache_clear()
+
+        orchestrator = Orchestrator(workspace)
+        manifest = Manifest.from_file(workspace / "manifests" / "test.yaml")
+        site = orchestrator.load_site("test-site")
+        step = manifest.steps[0]
+
+        result = orchestrator.resolve_parameters(step, site, manifest, {})
+
+        # Manifest value, overridden by site
+        assert result["fromManifest"] == "site-override"
+        # Site-only value
+        assert result["fromSite"] == "site-value"
+        # Step-only value
+        assert result["fromStep"] == "step-value"
+        # All three levels define this - step wins
+        assert result["fromAll"] == "step-wins"
+
+    def test_site_parameters_override_manifest_parameters(self, tmp_path):
+        """Test that site.parameters override manifest parameters."""
         workspace = self._setup_workspace(tmp_path)
 
         self._create_site(
@@ -1019,8 +1094,8 @@ steps:
         result = orchestrator.resolve_parameters(step, site, manifest, {})
 
         assert result["siteParam"] == "from-site"
-        # Manifest params override site params
-        assert result["sharedParam"] == "manifest-value"
+        # Site params override manifest params (more specific wins)
+        assert result["sharedParam"] == "site-value"
 
     def test_missing_manifest_parameter_file_logs_warning(self, tmp_path, caplog):
         """Test that missing manifest parameter file logs a warning."""

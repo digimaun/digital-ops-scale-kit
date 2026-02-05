@@ -242,13 +242,19 @@ parameters:
   - parameters/common.yaml  # Applied to all steps
 
 steps:
-  - name: edge-site
-    template: templates/edge-site.bicep
+  - name: global-edge-site
+    template: templates/edge-site/subscription.bicep
     scope: subscription  # Deploys once per subscription
+    when: "{{ site.properties.deployOptions.includeGlobalSite }}"
+
+  - name: edge-site
+    template: templates/edge-site/main.bicep
+    scope: resourceGroup  # Deploys per-site
+    when: "{{ site.properties.deployOptions.includeEdgeSite }}"
 
   - name: schema-registry
     template: templates/iot-ops/deps/schema-registry.bicep
-    scope: resourceGroup  # Deploys per-site
+    scope: resourceGroup
 
   - name: aio-instance
     template: templates/iot-ops/install/azure-iot-operations-instance.bicep

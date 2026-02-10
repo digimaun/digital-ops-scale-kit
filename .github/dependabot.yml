@@ -1,0 +1,11 @@
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    # limit to security updates only
+    open-pull-requests-limit: 0
+    commit-message:
+      prefix: "chore(pip-deps)"
+      prefix-development: "chore(pip-dev-deps)"

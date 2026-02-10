@@ -9,3 +9,10 @@ updates:
     commit-message:
       prefix: "chore(pip-deps)"
       prefix-development: "chore(pip-dev-deps)"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore(actions)"

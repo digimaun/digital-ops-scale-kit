@@ -703,3 +703,108 @@ class TestPrintSummary:
         captured = capsys.readouterr()
         assert "5/8" in captured.out
         assert "(3 skip)" in captured.out
+
+
+class TestLoadParameters:
+    """Tests for parameter file loading."""
+
+    def test_load_parameters_missing_file(self, tmp_workspace):
+        """Test that missing parameter file returns empty dict with warning."""
+        orchestrator = Orchestrator(tmp_workspace)
+        missing_path = tmp_workspace / "parameters" / "nonexistent.yaml"
+
+        result = orchestrator.load_parameters(missing_path)
+
+        assert result == {}
+
+    def test_load_parameters_json_file(self, tmp_workspace):
+        """Test loading parameters from a JSON file."""
+        import json
+
+        params_data = {"location": "eastus", "sku": "Standard_LRS"}
+        json_path = tmp_workspace / "parameters" / "params.json"
+        json_path.write_text(json.dumps(params_data))
+
+        orchestrator = Orchestrator(tmp_workspace)
+        result = orchestrator.load_parameters(json_path)
+
+        assert result == {"location": "eastus", "sku": "Standard_LRS"}
+
+
+class TestLoadAllSites:
+    """Tests for loading all sites with error handling."""
+
+    def test_load_all_sites_skips_bad_site(self, tmp_workspace):
+        """Test that a malformed site file is skipped without crashing."""
+        # Create one good site
+        (tmp_workspace / "sites" / "good-site.yaml").write_text(
+            """
+apiVersion: siteops/v1
+kind: Site
+name: good-site
+subscription: "00000000-0000-0000-0000-000000000000"
+resourceGroup: rg-test
+location: eastus
+"""
+        )
+
+        # Create one bad site (missing required fields)
+        (tmp_workspace / "sites" / "bad-site.yaml").write_text(
+            """
+apiVersion: siteops/v1
+kind: Site
+name: bad-site
+"""
+        )
+
+        orchestrator = Orchestrator(tmp_workspace)
+        sites = orchestrator.load_all_sites()
+
+        # Only the good site should be loaded
+        assert len(sites) == 1
+        assert sites[0].name == "good-site"
+
+
+class TestGetAllSiteNames:
+    """Tests for site name discovery."""
+
+    def test_get_all_site_names_no_sites_dir(self, tmp_path):
+        """Test that missing sites directory returns empty list."""
+        workspace = tmp_path / "empty-workspace"
+        workspace.mkdir()
+
+        orchestrator = Orchestrator(workspace)
+        names = orchestrator._get_all_site_names()
+
+        assert names == []
+
+
+class TestGetStepTypeLabel:
+    """Tests for step type display labels."""
+
+    def test_kubectl_step_label(self, tmp_workspace):
+        """Test that kubectl steps produce 'kubectl:<operation>' label."""
+        from siteops.models import ArcCluster, KubectlStep
+
+        orchestrator = Orchestrator(tmp_workspace)
+        step = KubectlStep(
+            name="apply-config",
+            operation="apply",
+            arc=ArcCluster(name="cluster", resource_group="rg"),
+            files=["config.yaml"],
+        )
+
+        label = orchestrator._get_step_type_label(step)
+        assert label == "kubectl:apply"
+
+    def test_deployment_step_label(self, tmp_workspace):
+        """Test that deployment steps return their scope as label."""
+        orchestrator = Orchestrator(tmp_workspace)
+        step = DeploymentStep(
+            name="deploy",
+            template="test.bicep",
+            scope="subscription",
+        )
+
+        label = orchestrator._get_step_type_label(step)
+        assert label == "subscription"

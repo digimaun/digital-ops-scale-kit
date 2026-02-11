@@ -77,8 +77,6 @@ jobs:
 
       - name: Setup Site Ops
         uses: ./.github/actions/setup-siteops
-        with:
-          install-dev: "true"
 
       - name: Setup site overrides
         env:

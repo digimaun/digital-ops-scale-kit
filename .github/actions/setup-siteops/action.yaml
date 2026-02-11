@@ -1,5 +1,5 @@
 name: "Setup Site Ops"
-description: "Install Python and Site Ops (local or from repository)"
+description: "Install Python and Site Ops"
 
 inputs:
   python-version:
@@ -7,20 +7,9 @@ inputs:
     required: false
     default: "3.11"
   install-dev:
-    description: "Install from local directory with dev dependencies (for siteops repo only)"
+    description: "Include dev dependencies (pytest, pytest-cov)"
     required: false
     default: "false"
-  siteops-pat:
-    description: "Fine-grained PAT for Site Ops repo (Contents: read). Required if install-dev is false."
-    required: false
-  siteops-repo:
-    description: "Site Ops repository (owner/repo)"
-    required: false
-    default: "digimaun/siteops"
-  siteops-ref:
-    description: "Site Ops git ref (branch, tag, or commit)"
-    required: false
-    default: "main"
 
 runs:
   using: "composite"
@@ -34,32 +23,20 @@ runs:
       uses: actions/cache@v4
       with:
         path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-siteops-${{ inputs.install-dev == 'true' && 'local' || inputs.siteops-ref }}
+        key: ${{ runner.os }}-pip-siteops-${{ inputs.install-dev == 'true' && 'dev-' || '' }}${{ hashFiles('pyproject.toml') }}
         restore-keys: |
           ${{ runner.os }}-pip-siteops-
           ${{ runner.os }}-pip-
 
-    - name: Install Site Ops (local with dev dependencies)
-      if: inputs.install-dev == 'true'
+    - name: Install Site Ops
       shell: bash
       run: |
         pip install --upgrade pip
-        pip install -e ".[dev]"
-
-    - name: Install Site Ops (from remote repo)
-      if: inputs.install-dev != 'true'
-      shell: bash
-      env:
-        SITEOPS_PAT: ${{ inputs.siteops-pat }}
-        SITEOPS_REPO: ${{ inputs.siteops-repo }}
-        SITEOPS_REF: ${{ inputs.siteops-ref }}
-      run: |
-        if [[ -z "$SITEOPS_PAT" ]]; then
-          echo "::error::siteops-pat is required when install-dev is false"
-          exit 1
+        if [[ "${{ inputs.install-dev }}" == "true" ]]; then
+          pip install -e ".[dev]"
+        else
+          pip install -e .
         fi
-        pip install --upgrade pip
-        pip install "git+https://${SITEOPS_PAT}@github.com/${SITEOPS_REPO}.git@${SITEOPS_REF}"
 
     - name: Verify Site Ops installation
       shell: bash

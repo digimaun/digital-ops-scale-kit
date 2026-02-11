@@ -106,7 +106,7 @@ Site Ops deploys infrastructure through Azure Resource Manager—the native cont
 
 ```bash
 # Clone the repository
-git clone https://github.com/Azure/digital-operations-scalekit.git
+git clone https://github.com/Azure/digital-ops-scale-kit.git
 cd digital-operations-scalekit
 
 # Install Site Ops

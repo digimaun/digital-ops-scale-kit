@@ -389,7 +389,7 @@ class Orchestrator:
             with open(path, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f)
             return bool(data and data.get("kind") == "SiteTemplate")
-        except Exception:
+        except (yaml.YAMLError, OSError):
             # Let load_site() handle parsing errors with full context
             return False
 
@@ -408,7 +408,7 @@ class Orchestrator:
             try:
                 site = self.load_site(name)
                 sites.append(site)
-            except Exception as e:
+            except (ValueError, yaml.YAMLError, OSError) as e:
                 logger.warning(f"Failed to load site '{name}': {e}")
 
         return sites
@@ -1044,8 +1044,8 @@ class Orchestrator:
                     params = self.load_parameters(full_path)
                     if self._references_any_step(params, subscription_step_names):
                         return True
-                except Exception:
-                    pass  # Skip unreadable files, validation catches these
+                except (ValueError, yaml.YAMLError, OSError) as e:
+                    logger.debug(f"Could not read parameter file {full_path}: {e}")
 
         # Check step-level parameters for RG-scoped steps
         for step in manifest.steps:
@@ -1058,8 +1058,8 @@ class Orchestrator:
                             params = self.load_parameters(full_path)
                             if self._references_any_step(params, subscription_step_names):
                                 return True
-                        except Exception:
-                            pass
+                        except (ValueError, yaml.YAMLError, OSError) as e:
+                            logger.debug(f"Could not read parameter file {full_path}: {e}")
 
         return False
 

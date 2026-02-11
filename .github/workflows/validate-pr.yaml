@@ -69,8 +69,6 @@ jobs:
 
       - name: Setup Site Ops
         uses: ./.github/actions/setup-siteops
-        with:
-          install-dev: "true"
 
       - name: Find manifests
         id: find

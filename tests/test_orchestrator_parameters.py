@@ -2143,3 +2143,180 @@ location: eastus
 
         # Standalone complex outputs should resolve to the dict
         assert result == {"key": "value", "nested": True}
+
+
+class TestPropertyPathEdgeCases:
+    """Tests for _resolve_property_path edge cases."""
+
+    def test_null_in_path_traversal(self, tmp_workspace):
+        """Test that None value mid-path returns None."""
+        orchestrator = Orchestrator(tmp_workspace)
+
+        obj = {"level1": {"level2": None}}
+        result = orchestrator._resolve_property_path(obj, "level1.level2.level3")
+
+        assert result is None
+
+    def test_array_index_out_of_bounds(self, tmp_workspace):
+        """Test that out-of-bounds array index returns None."""
+        orchestrator = Orchestrator(tmp_workspace)
+
+        obj = {"items": ["a", "b"]}
+        result = orchestrator._resolve_property_path(obj, "items[5]")
+
+        assert result is None
+
+    def test_array_index_on_non_list(self, tmp_workspace):
+        """Test that array index on non-list value returns None."""
+        orchestrator = Orchestrator(tmp_workspace)
+
+        obj = {"items": "not-a-list"}
+        result = orchestrator._resolve_property_path(obj, "items[0]")
+
+        assert result is None
+
+    def test_array_key_not_in_dict(self, tmp_workspace):
+        """Test that array notation with key not in dict returns None."""
+        orchestrator = Orchestrator(tmp_workspace)
+
+        obj = {"other": [1, 2, 3]}
+        result = orchestrator._resolve_property_path(obj, "missing[0]")
+
+        assert result is None
+
+    def test_missing_dict_key(self, tmp_workspace):
+        """Test that missing dict key returns None."""
+        orchestrator = Orchestrator(tmp_workspace)
+
+        obj = {"exists": "yes"}
+        result = orchestrator._resolve_property_path(obj, "missing")
+
+        assert result is None
+
+
+class TestResolveStepOutputsRecursion:
+    """Tests for dict/list recursion in _resolve_step_outputs."""
+
+    def test_resolve_outputs_in_nested_dict(self, tmp_workspace):
+        """Test that step output references in nested dicts are resolved."""
+        orchestrator = Orchestrator(tmp_workspace)
+
+        step_outputs = {"step1": {"id": "resource-123"}}
+        value = {
+            "config": {
+                "resourceId": "{{ steps.step1.outputs.id }}",
+                "static": "unchanged",
+            }
+        }
+
+        result = orchestrator._resolve_step_outputs(value, step_outputs)
+
+        assert result["config"]["resourceId"] == "resource-123"
+        assert result["config"]["static"] == "unchanged"
+
+    def test_resolve_outputs_in_list(self, tmp_workspace):
+        """Test that step output references in lists are resolved."""
+        orchestrator = Orchestrator(tmp_workspace)
+
+        step_outputs = {"step1": {"id": "resource-123"}}
+        value = ["{{ steps.step1.outputs.id }}", "static", 42]
+
+        result = orchestrator._resolve_step_outputs(value, step_outputs)
+
+        assert result == ["resource-123", "static", 42]
+
+    def test_resolve_outputs_non_string_passthrough(self, tmp_workspace):
+        """Test that non-string/dict/list values pass through unchanged."""
+        orchestrator = Orchestrator(tmp_workspace)
+
+        assert orchestrator._resolve_step_outputs(42, {}) == 42
+        assert orchestrator._resolve_step_outputs(True, {}) is True
+        assert orchestrator._resolve_step_outputs(None, {}) is None
+
+    def test_resolve_unresolved_output_in_embedded_string(self, tmp_workspace):
+        """Test that unresolved output in embedded string preserves the template."""
+        orchestrator = Orchestrator(tmp_workspace)
+
+        step_outputs = {"step1": {"id": "resource-123"}}
+        value = "prefix-{{ steps.missing.outputs.val }}-suffix"
+
+        result = orchestrator._resolve_step_outputs(value, step_outputs)
+
+        assert result == "prefix-{{ steps.missing.outputs.val }}-suffix"
+
+
+class TestParameterTemplateFallbacks:
+    """Tests for unresolvable template fallback behavior."""
+
+    def test_unresolvable_parameter_in_embedded_string(self, tmp_workspace):
+        """Test that unresolvable {{ site.parameters.X }} in embedded context is preserved."""
+        orchestrator = Orchestrator(tmp_workspace)
+
+        result = orchestrator._resolve_parameters_templates(
+            "prefix-{{ site.parameters.missing }}-suffix",
+            {},
+        )
+
+        assert result == "prefix-{{ site.parameters.missing }}-suffix"
+
+    def test_unresolvable_property_in_embedded_string(self, tmp_workspace):
+        """Test that unresolvable {{ site.properties.X }} in embedded context is preserved."""
+        orchestrator = Orchestrator(tmp_workspace)
+
+        result = orchestrator._resolve_properties_templates(
+            "prefix-{{ site.properties.missing }}-suffix",
+            {},
+        )
+
+        assert result == "prefix-{{ site.properties.missing }}-suffix"
+
+    def test_complex_property_serialized_in_embedded_string(self, tmp_workspace):
+        """Test that complex types (dict/list) are JSON-serialized when embedded in a string."""
+        orchestrator = Orchestrator(tmp_workspace)
+
+        result = orchestrator._resolve_properties_templates(
+            "data={{ site.properties.config }}",
+            {"config": {"key": "value"}},
+        )
+
+        assert 'data={"key": "value"}' == result
+
+
+class TestConditionEdgeCases:
+    """Tests for condition evaluation edge cases and operators."""
+
+    def test_invalid_condition_syntax_returns_true(self, tmp_workspace):
+        """Test that invalid condition syntax returns True (permissive) at runtime."""
+        orchestrator = Orchestrator(tmp_workspace)
+        site = Site(name="test", subscription="sub", resource_group="rg", location="eastus")
+
+        # This doesn't match CONDITION_PATTERN
+        result = orchestrator._evaluate_condition("not a valid condition", site)
+        assert result is True
+
+    def test_unknown_field_type_returns_true(self, tmp_workspace):
+        """Test that unknown field prefix returns True (permissive)."""
+        orchestrator = Orchestrator(tmp_workspace)
+        site = Site(name="test", subscription="sub", resource_group="rg", location="eastus")
+
+        # "custom.field" doesn't start with "labels." or "properties."
+        # This should not match CONDITION_PATTERN at all, so returns True
+        result = orchestrator._evaluate_condition("{{ site.custom.field == 'x' }}", site)
+        assert result is True
+
+    def test_not_equals_operator_on_properties(self, tmp_workspace):
+        """Test != operator on site.properties for string comparison."""
+        orchestrator = Orchestrator(tmp_workspace)
+        site = Site(
+            name="test",
+            subscription="sub",
+            resource_group="rg",
+            location="eastus",
+            properties={"env": "staging"},
+        )
+
+        result = orchestrator._evaluate_condition("{{ site.properties.env != 'prod' }}", site)
+        assert result is True
+
+        result = orchestrator._evaluate_condition("{{ site.properties.env != 'staging' }}", site)
+        assert result is False

@@ -9,6 +9,10 @@ description = "Azure Site Ops - Multi-site orchestration for Azure IaC"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"
+authors = [
+    {name = "Microsoft Corporation"},
+    {name = "digimaun"},
+]
 dependencies = ["pyyaml>=6.0"]
 
 [project.optional-dependencies]

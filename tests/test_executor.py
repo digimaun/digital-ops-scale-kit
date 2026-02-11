@@ -149,6 +149,19 @@ class TestAzCliExecutor:
 
         assert tmp_dir1 is tmp_dir2
 
+    def test_kubectl_path_cached(self, tmp_workspace):
+        """Test that kubectl_path property lazy-caches shutil.which result."""
+        executor = AzCliExecutor(workspace=tmp_workspace)
+
+        with patch("shutil.which", return_value="/usr/local/bin/kubectl") as mock_which:
+            path1 = executor.kubectl_path
+            path2 = executor.kubectl_path
+
+        assert path1 == "/usr/local/bin/kubectl"
+        assert path2 == "/usr/local/bin/kubectl"
+        # Should only call shutil.which once (cached)
+        mock_which.assert_called_once_with("kubectl")
+
 
 class TestAzCliExecutorRunAz:
     """Tests for Azure CLI command execution."""
@@ -209,6 +222,17 @@ class TestAzCliExecutorRunAz:
         assert success is False
         assert "timed out" in stderr
 
+    def test_run_az_generic_exception(self, tmp_workspace):
+        """Test that unexpected exceptions are caught and returned as failure."""
+        executor = AzCliExecutor(workspace=tmp_workspace)
+        executor._az_path = "/usr/bin/az"
+
+        with patch("subprocess.run", side_effect=OSError("Permission denied")):
+            success, stdout, stderr = executor._run_az(["version"])
+
+        assert success is False
+        assert "Permission denied" in stderr
+
     def test_run_az_dry_run(self, tmp_workspace, monkeypatch):
         executor = AzCliExecutor(workspace=tmp_workspace, dry_run=True)
         monkeypatch.setattr(executor, "_az_path", "/usr/bin/az")
@@ -260,6 +284,28 @@ class TestAzCliExecutorRunKubectl:
 
             assert success is True
             mock_run.assert_not_called()
+
+    def test_run_kubectl_timeout(self, tmp_workspace):
+        """Test that kubectl timeout is caught and returned as failure."""
+        executor = AzCliExecutor(workspace=tmp_workspace)
+        executor._kubectl_path = "/usr/bin/kubectl"
+
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="kubectl", timeout=10)):
+            success, stdout, stderr = executor._run_kubectl(["apply", "-f", "config.yaml"], timeout=10)
+
+        assert success is False
+        assert "timed out" in stderr
+
+    def test_run_kubectl_generic_exception(self, tmp_workspace):
+        """Test that unexpected exceptions are caught and returned as failure."""
+        executor = AzCliExecutor(workspace=tmp_workspace)
+        executor._kubectl_path = "/usr/bin/kubectl"
+
+        with patch("subprocess.run", side_effect=OSError("Permission denied")):
+            success, stdout, stderr = executor._run_kubectl(["version"])
+
+        assert success is False
+        assert "Permission denied" in stderr
 
 
 class TestWriteParamsFile:
@@ -414,6 +460,32 @@ class TestDeployResourceGroup:
 
         assert result.success is False
         assert "not found" in result.error
+
+    def test_deploy_resource_group_malformed_json_output(self, tmp_workspace, sample_bicep_template, monkeypatch):
+        """Test that malformed JSON in az deployment output is handled gracefully."""
+        executor = AzCliExecutor(workspace=tmp_workspace)
+        monkeypatch.setattr(executor, "_az_path", "/usr/bin/az")
+
+        mock_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="Deployment succeeded but output is not JSON",
+            stderr="",
+        )
+
+        with patch("subprocess.run", return_value=mock_result):
+            result = executor.deploy_resource_group(
+                subscription="sub-123",
+                resource_group="rg-test",
+                template_path=sample_bicep_template,
+                parameters={},
+                deployment_name="test-deploy",
+                step_name="step-1",
+                site_name="site-1",
+            )
+
+        assert result.success is True
+        assert result.outputs == {}
 
     def test_deploy_resource_group_dry_run(self, tmp_workspace, sample_bicep_template):
         executor = AzCliExecutor(workspace=tmp_workspace, dry_run=True)
@@ -741,6 +813,26 @@ class TestGetTemplateParameters:
             get_template_parameters.cache_clear()
 
             with pytest.raises(ValueError, match="Azure CLI.*not found"):
+                get_template_parameters(str(bicep_file))
+
+    def test_bicep_invalid_json_output_raises_error(self, tmp_path):
+        """Test that invalid JSON from az bicep build raises ValueError."""
+        bicep_file = tmp_path / "test.bicep"
+        bicep_file.write_text("param location string")
+
+        with (
+            patch("siteops.executor.subprocess.run") as mock_run,
+            patch("siteops.executor.shutil.which", return_value="/usr/bin/az"),
+        ):
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="not valid json at all",
+                stderr="",
+            )
+
+            get_template_parameters.cache_clear()
+
+            with pytest.raises(ValueError, match="Failed to parse compiled Bicep"):
                 get_template_parameters(str(bicep_file))
 
 

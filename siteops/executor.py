@@ -20,7 +20,7 @@ import subprocess
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -45,8 +45,7 @@ def _configure_user_agent() -> None:
     Sets the AZURE_HTTP_USER_AGENT environment variable, which Azure CLI
     appends to all ARM requests. This enables usage tracking in:
     - Azure Activity Logs
-    - Azure Resource Graph queries
-    - Microsoft internal telemetry (Kusto/Jarvis)
+    - Azure Telemetry
 
     The User-Agent follows Azure SDK conventions: "siteops/{version}"
 
@@ -242,12 +241,8 @@ class DeploymentResult:
     step_name: str
     site_name: str
     deployment_name: str
-    outputs: Dict[str, Any] = None
+    outputs: Dict[str, Any] = field(default_factory=dict)
     error: Optional[str] = None
-
-    def __post_init__(self):
-        if self.outputs is None:
-            self.outputs = {}
 
 
 @dataclass

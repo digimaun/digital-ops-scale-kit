@@ -6,8 +6,8 @@ This project welcomes contributions and suggestions.
 
 ```bash
 # Clone the repository
-git clone https://github.com/Azure/digital-operations-scalekit.git
-cd digital-operations-scalekit
+git clone https://github.com/Azure/digital-ops-scale-kit.git
+cd digital-ops-scale-kit
 
 # Install with dev dependencies
 pip install -e ".[dev]"

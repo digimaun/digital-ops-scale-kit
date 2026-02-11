@@ -361,12 +361,12 @@ jobs:
 
 ### Setup Site Ops Action
 
-The `setup-siteops` composite action supports:
+The `setup-siteops` composite action installs Python and Site Ops:
 
 | Input | Default | Description |
 |-------|---------|-------------|
 | `python-version` | `3.11` | Python version to install |
-| `install-dev` | `false` | Install dev dependencies (pytest, pytest-cov) |
+| `install-dev` | `false` | Include dev dependencies (pytest, pytest-cov) |
 
 Example with dev dependencies (for running tests):
 

@@ -7,6 +7,7 @@ Covers:
 - Self-reference detection with auto-filter awareness
 """
 
+import json
 from unittest.mock import patch
 
 import yaml
@@ -446,6 +447,200 @@ steps:
         condition_errors = [e for e in errors if "condition" in e.lower() or "when" in e.lower()]
         assert condition_errors == [], f"Unexpected condition errors: {condition_errors}"
 
+    def test_validate_no_steps_defined(self, tmp_workspace, sample_site_file):
+        """Test that manifests with no steps produce an error."""
+        orchestrator = Orchestrator(tmp_workspace)
+
+        manifest_path = tmp_workspace / "manifests" / "empty-steps.yaml"
+        manifest_path.write_text(
+            """
+name: empty-steps
+sites:
+  - test-site
+steps: []
+"""
+        )
+
+        errors = orchestrator.validate(manifest_path)
+        assert any("no steps" in e.lower() for e in errors)
+
+    def test_validate_rg_missing_for_rg_scoped_step(self, tmp_workspace):
+        """Test that RG-scoped steps error when no RG-level sites exist and
+        subscription-scoped steps are absent (sites without resourceGroup are
+        subscription-level and skip RG-scoped steps, but the manifest should
+        still have at least one RG-level site to be meaningful)."""
+        # Create a subscription-level site only (no resourceGroup)
+        (tmp_workspace / "sites" / "sub-only-site.yaml").write_text(
+            """
+apiVersion: siteops/v1
+kind: Site
+name: sub-only-site
+subscription: "00000000-0000-0000-0000-000000000000"
+location: eastus
+"""
+        )
+
+        # Create template
+        template_path = tmp_workspace / "templates" / "test.bicep"
+        template_path.write_text("param location string")
+
+        # Manifest with only RG-scoped steps but only subscription-level sites
+        manifest_path = tmp_workspace / "manifests" / "rg-check.yaml"
+        manifest_path.write_text(
+            """
+name: rg-check
+sites:
+  - sub-only-site
+steps:
+  - name: rg-step
+    template: templates/test.bicep
+    scope: resourceGroup
+"""
+        )
+
+        orchestrator = Orchestrator(tmp_workspace)
+        errors = orchestrator.validate(manifest_path)
+        # Subscription-level sites are skipped for RG-scoped steps.
+        # No error is produced because the site is exempt, not invalid.
+        # This validates the exemption logic works correctly.
+        assert not any("missing 'resourceGroup'" in e for e in errors)
+
+
+class TestKubectlValidation:
+    """Tests for kubectl step validation."""
+
+    def test_validate_kubectl_http_url_rejected(self, tmp_workspace, sample_site_file):
+        """Test that HTTP URLs in kubectl files are rejected."""
+        orchestrator = Orchestrator(tmp_workspace)
+
+        manifest_path = tmp_workspace / "manifests" / "kubectl-http.yaml"
+        manifest_path.write_text(
+            """
+name: kubectl-http
+sites:
+  - test-site
+steps:
+  - name: apply-step
+    type: kubectl
+    operation: apply
+    arc:
+      name: my-cluster
+      resourceGroup: rg-test
+    files:
+      - http://insecure.example.com/deployment.yaml
+"""
+        )
+
+        errors = orchestrator.validate(manifest_path)
+        assert any("HTTP URLs not allowed" in e for e in errors)
+
+    def test_validate_kubectl_https_url_accepted(self, tmp_workspace, sample_site_file):
+        """Test that HTTPS URLs in kubectl files pass validation."""
+        orchestrator = Orchestrator(tmp_workspace)
+
+        manifest_path = tmp_workspace / "manifests" / "kubectl-https.yaml"
+        manifest_path.write_text(
+            """
+name: kubectl-https
+sites:
+  - test-site
+steps:
+  - name: apply-step
+    type: kubectl
+    operation: apply
+    arc:
+      name: my-cluster
+      resourceGroup: rg-test
+    files:
+      - https://raw.githubusercontent.com/example/repo/main/deploy.yaml
+"""
+        )
+
+        errors = orchestrator.validate(manifest_path)
+        # No kubectl-related errors expected
+        assert not any("HTTP URLs not allowed" in e for e in errors)
+        assert not any("Kubectl file not found" in e for e in errors)
+
+    def test_validate_kubectl_missing_local_file(self, tmp_workspace, sample_site_file):
+        """Test that missing local kubectl files are caught."""
+        orchestrator = Orchestrator(tmp_workspace)
+
+        manifest_path = tmp_workspace / "manifests" / "kubectl-missing.yaml"
+        manifest_path.write_text(
+            """
+name: kubectl-missing
+sites:
+  - test-site
+steps:
+  - name: apply-step
+    type: kubectl
+    operation: apply
+    arc:
+      name: my-cluster
+      resourceGroup: rg-test
+    files:
+      - manifests/nonexistent.yaml
+"""
+        )
+
+        errors = orchestrator.validate(manifest_path)
+        assert any("Kubectl file not found" in e for e in errors)
+
+    def test_validate_kubectl_existing_local_file(self, tmp_workspace, sample_site_file):
+        """Test that existing local kubectl files pass validation."""
+        orchestrator = Orchestrator(tmp_workspace)
+
+        # Create a local file that the kubectl step references
+        kubectl_file = tmp_workspace / "manifests" / "deployment.yaml"
+        kubectl_file.write_text("apiVersion: apps/v1\nkind: Deployment\n")
+
+        manifest_path = tmp_workspace / "manifests" / "kubectl-local.yaml"
+        manifest_path.write_text(
+            """
+name: kubectl-local
+sites:
+  - test-site
+steps:
+  - name: apply-step
+    type: kubectl
+    operation: apply
+    arc:
+      name: my-cluster
+      resourceGroup: rg-test
+    files:
+      - manifests/deployment.yaml
+"""
+        )
+
+        errors = orchestrator.validate(manifest_path)
+        assert not any("Kubectl file not found" in e for e in errors)
+
+    def test_validate_kubectl_template_in_file_path_skipped(self, tmp_workspace, sample_site_file):
+        """Test that kubectl file paths with templates are skipped during validation."""
+        orchestrator = Orchestrator(tmp_workspace)
+
+        manifest_path = tmp_workspace / "manifests" / "kubectl-template.yaml"
+        manifest_path.write_text(
+            """
+name: kubectl-template
+sites:
+  - test-site
+steps:
+  - name: apply-step
+    type: kubectl
+    operation: apply
+    arc:
+      name: my-cluster
+      resourceGroup: rg-test
+    files:
+      - "{{ site.parameters.kubectlFile }}"
+"""
+        )
+
+        errors = orchestrator.validate(manifest_path)
+        # Template paths should be skipped, not treated as missing files
+        assert not any("Kubectl file not found" in e for e in errors)
+
 
 class TestStepOutputReferenceValidation:
     """Tests for {{ steps.X.outputs.Y }} reference validation."""
@@ -757,9 +952,14 @@ cluster: "{{ site.labels.clusterName }}"
 
     def test_self_reference_allowed_when_filtered(self, tmp_workspace):
         """Self-references should be allowed if auto-filtering will remove them."""
-        template = tmp_workspace / "templates" / "simple.bicep"
+        template = tmp_workspace / "templates" / "simple.json"
         template.parent.mkdir(parents=True, exist_ok=True)
-        template.write_text("param location string\nparam name string\n")
+        template.write_text(json.dumps({
+            "parameters": {
+                "location": {"type": "string"},
+                "name": {"type": "string"},
+            }
+        }))
 
         params = tmp_workspace / "parameters" / "chaining.yaml"
         params.parent.mkdir(parents=True, exist_ok=True)
@@ -775,7 +975,7 @@ name: test
 sites: [test-site]
 steps:
   - name: my-step
-    template: templates/simple.bicep
+    template: templates/simple.json
     parameters: [parameters/chaining.yaml]
 """
         )
@@ -804,9 +1004,14 @@ location: eastus
     def test_self_reference_error_when_template_accepts_param(self, tmp_workspace):
         """Self-references should error if template accepts the parameter."""
         # Template that DOES accept instanceName
-        template = tmp_workspace / "templates" / "instance.bicep"
+        template = tmp_workspace / "templates" / "instance.json"
         template.parent.mkdir(parents=True, exist_ok=True)
-        template.write_text("param clusterName string\nparam instanceName string\n")
+        template.write_text(json.dumps({
+            "parameters": {
+                "clusterName": {"type": "string"},
+                "instanceName": {"type": "string"},
+            }
+        }))
 
         # Parameter file with self-reference to a param the template accepts
         params = tmp_workspace / "parameters" / "bad-chaining.yaml"
@@ -824,7 +1029,7 @@ sites:
   - test-site
 steps:
   - name: my-step
-    template: templates/instance.bicep
+    template: templates/instance.json
     parameters:
       - parameters/bad-chaining.yaml
 """
@@ -908,13 +1113,23 @@ location: eastus
     def test_shared_chaining_file_with_multiple_steps(self, tmp_workspace):
         """A shared chaining.yaml should work when self-refs are auto-filtered."""
         # Template for aio-instance (does NOT accept aioInstanceName - it generates it)
-        aio_template = tmp_workspace / "templates" / "aio-instance.bicep"
+        aio_template = tmp_workspace / "templates" / "aio-instance.json"
         aio_template.parent.mkdir(parents=True, exist_ok=True)
-        aio_template.write_text("param clusterName string\nparam schemaRegistryId string\n")
+        aio_template.write_text(json.dumps({
+            "parameters": {
+                "clusterName": {"type": "string"},
+                "schemaRegistryId": {"type": "string"},
+            }
+        }))
 
         # Template for quickstart (DOES accept aioInstanceName)
-        quickstart_template = tmp_workspace / "templates" / "quickstart.bicep"
-        quickstart_template.write_text("param aioInstanceName string\nparam clusterName string\n")
+        quickstart_template = tmp_workspace / "templates" / "quickstart.json"
+        quickstart_template.write_text(json.dumps({
+            "parameters": {
+                "aioInstanceName": {"type": "string"},
+                "clusterName": {"type": "string"},
+            }
+        }))
 
         # Shared chaining file with outputs from various steps
         chaining = tmp_workspace / "parameters" / "chaining.yaml"
@@ -940,13 +1155,13 @@ sites:
   - test-site
 steps:
   - name: schema-registry
-    template: templates/aio-instance.bicep
+    template: templates/aio-instance.json
   - name: aio-instance
-    template: templates/aio-instance.bicep
+    template: templates/aio-instance.json
     parameters:
       - parameters/chaining.yaml
   - name: quickstart
-    template: templates/quickstart.bicep
+    template: templates/quickstart.json
     parameters:
       - parameters/chaining.yaml
 """

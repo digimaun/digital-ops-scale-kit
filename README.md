@@ -376,7 +376,7 @@ This repository includes GitHub Actions workflows for automated deployment:
 | Workflow | Description |
 |----------|-------------|
 | `deploy.yaml` | Manual deployment via GitHub UI |
-| `validate-pr.yaml` | PR validation (tests + manifest check) |
+| `ci.yaml` | CI validation (tests + manifest check) |
 | `_siteops-deploy.yaml` | Reusable deployment workflow |
 
 ### Required secrets

@@ -12,7 +12,7 @@ This guide explains how to configure GitHub Actions for siteops deployments.
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
-| `validate-pr.yaml` | Pull request, manual | Run unit tests and validate manifests |
+| `ci.yaml` | Push, pull request, manual | Run unit tests and validate manifests |
 | `deploy.yaml` | Manual (workflow_dispatch) | Deploy infrastructure to Azure |
 | `_siteops-deploy.yaml` | Called by deploy.yaml | Reusable deployment logic |
 
@@ -135,9 +135,9 @@ Go to **Settings → Environments** and create:
 
 ## Usage
 
-### Validate PR (Unit Tests + Manifest Validation)
+### CI (Unit Tests + Manifest Validation)
 
-Runs automatically on PRs that modify:
+Runs automatically on pushes to main and PRs that modify:
 
 - `workspaces/**`
 - `templates/**`
@@ -145,7 +145,7 @@ Runs automatically on PRs that modify:
 - `tests/**`
 - `pyproject.toml`
 
-Can also be triggered manually from **Actions → Validate PR → Run workflow**.
+Can also be triggered manually from **Actions → CI → Run workflow**.
 
 ### Deploy via GitHub UI
 
@@ -236,8 +236,8 @@ gh workflow run deploy.yaml -f workspace="iot-operations" -f manifest="opc-ua-so
        │             │             │               │
        ▼             ▼             ▼               ▼
 ┌─────────────────────────┐   ┌─────────────────────────────┐
-│     deploy.yaml         │   │      validate-pr.yaml       │
-│  (workflow_dispatch)    │   │  (pull_request + manual)    │
+│     deploy.yaml         │   │          ci.yaml            │
+│  (workflow_dispatch)    │   │  (push + pull_request)      │
 └───────────┬─────────────┘   ├─────────────────────────────┤
             │                 │  • Unit Tests               │
             │                 │  • Manifest Validation      │

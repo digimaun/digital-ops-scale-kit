@@ -1,8 +1,16 @@
-# Validates manifests and runs unit tests on pull requests
+# Validates manifests and runs unit tests on push and pull requests
 
-name: Validate PR
+name: CI
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - "siteops/**"
+      - "workspaces/**"
+      - "templates/**"
+      - "tests/**"
+      - "pyproject.toml"
   pull_request:
     branches: [main]
     paths:

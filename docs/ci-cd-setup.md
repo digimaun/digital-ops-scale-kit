@@ -7,7 +7,7 @@ This guide covers GitHub Actions configuration for automated deployments.
 | Workflow | Purpose | Trigger |
 |----------|---------|---------|
 | `deploy.yaml` | Manual deployment | `workflow_dispatch` |
-| `validate-pr.yaml` | PR validation | Pull request |
+| `ci.yaml` | CI validation | Push, pull request |
 | `_siteops-deploy.yaml` | Reusable deployment | Called by other workflows |
 
 ## Azure OIDC Configuration

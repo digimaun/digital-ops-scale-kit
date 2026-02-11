@@ -69,7 +69,7 @@ Error: Step 'aio-instance' references unknown step 'schema-reg'
 1. Verify cluster is connected: `az connectedk8s show -n <cluster> -g <rg>`
 2. Enable Cluster Connect: `az connectedk8s enable-features -n <cluster> -g <rg> --features cluster-connect`
 
-### "Connection refused on port 47011"
+### "Connection refused on port 47021"
 
 **Cause**: Port conflict with another proxy instance.
 

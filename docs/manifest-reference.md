@@ -7,7 +7,7 @@ Manifests define **what** to deploy and in **what order**.
 ```yaml
 apiVersion: siteops/v1
 kind: Manifest
-name: iot-ops-base
+name: aio-install
 description: Deploy Azure IoT Operations
 
 # Site selection (choose one)

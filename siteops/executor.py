@@ -19,12 +19,13 @@ import signal
 import subprocess
 import threading
 import time
+from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, Generator, List, Optional, Tuple
+from typing import Any
 
 from siteops import __version__
 
@@ -110,7 +111,7 @@ ARC_PROXY_MAX_SLOTS = 10  # Maximum concurrent proxies
 
 
 @lru_cache(maxsize=128)
-def get_template_parameters(template_path: str) -> FrozenSet[str]:
+def get_template_parameters(template_path: str) -> frozenset[str]:
     """Extract parameter names from a Bicep or ARM template.
 
     For Bicep files, uses 'az bicep build --stdout' to convert to ARM JSON.
@@ -166,10 +167,10 @@ def get_template_parameters(template_path: str) -> FrozenSet[str]:
 
 
 def filter_parameters(
-    parameters: Dict[str, Any],
+    parameters: dict[str, Any],
     template_path: str,
     step_name: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Filter parameters to only those accepted by the template.
 
     Args:
@@ -241,8 +242,8 @@ class DeploymentResult:
     step_name: str
     site_name: str
     deployment_name: str
-    outputs: Dict[str, Any] = field(default_factory=dict)
-    error: Optional[str] = None
+    outputs: dict[str, Any] = field(default_factory=dict)
+    error: str | None = None
 
 
 @dataclass
@@ -259,7 +260,7 @@ class KubectlResult:
     success: bool
     step_name: str
     site_name: str
-    error: Optional[str] = None
+    error: str | None = None
 
 
 class AzCliExecutor:
@@ -277,19 +278,19 @@ class AzCliExecutor:
     def __init__(self, workspace: Path, dry_run: bool = False):
         self.workspace = workspace
         self.dry_run = dry_run
-        self._tmp_dir: Optional[Path] = None
-        self._az_path: Optional[str] = None
-        self._kubectl_path: Optional[str] = None
+        self._tmp_dir: Path | None = None
+        self._az_path: str | None = None
+        self._kubectl_path: str | None = None
 
     @property
-    def az_path(self) -> Optional[str]:
+    def az_path(self) -> str | None:
         """Find and cache the az CLI executable path."""
         if self._az_path is None:
             self._az_path = shutil.which("az")
         return self._az_path
 
     @property
-    def kubectl_path(self) -> Optional[str]:
+    def kubectl_path(self) -> str | None:
         """Find and cache the kubectl executable path."""
         if self._kubectl_path is None:
             self._kubectl_path = shutil.which("kubectl")
@@ -308,7 +309,7 @@ class AzCliExecutor:
                     self._tmp_dir.mkdir(parents=True, exist_ok=True)
         return self._tmp_dir
 
-    def _run_az(self, args: List[str], timeout: int = DEFAULT_AZ_TIMEOUT_SECONDS) -> Tuple[bool, str, str]:
+    def _run_az(self, args: list[str], timeout: int = DEFAULT_AZ_TIMEOUT_SECONDS) -> tuple[bool, str, str]:
         """Run an Azure CLI command.
 
         Args:
@@ -338,7 +339,7 @@ class AzCliExecutor:
         except Exception as e:
             return False, "", f"Failed to execute az command: {e}"
 
-    def _run_kubectl(self, args: List[str], timeout: int = DEFAULT_KUBECTL_TIMEOUT_SECONDS) -> Tuple[bool, str, str]:
+    def _run_kubectl(self, args: list[str], timeout: int = DEFAULT_KUBECTL_TIMEOUT_SECONDS) -> tuple[bool, str, str]:
         """Run a kubectl command.
 
         Args:
@@ -409,8 +410,8 @@ class AzCliExecutor:
             yield False
             return
 
-        proxy_process: Optional[subprocess.Popen] = None
-        allocated_port: Optional[int] = None
+        proxy_process: subprocess.Popen | None = None
+        allocated_port: int | None = None
 
         try:
             # Allocate a unique port slot for this proxy instance
@@ -495,7 +496,7 @@ class AzCliExecutor:
             if allocated_port is not None:
                 _release_arc_port_slot(allocated_port)
 
-    def _write_params_file(self, parameters: Dict[str, Any], step_name: str, site_name: str) -> Path:
+    def _write_params_file(self, parameters: dict[str, Any], step_name: str, site_name: str) -> Path:
         """Write parameters to a temp file in ARM parameter format.
 
         Args:
@@ -527,8 +528,8 @@ class AzCliExecutor:
 
     def _deploy(
         self,
-        args: List[str],
-        parameters: Dict[str, Any],
+        args: list[str],
+        parameters: dict[str, Any],
         deployment_name: str,
         step_name: str,
         site_name: str,
@@ -573,7 +574,7 @@ class AzCliExecutor:
         subscription: str,
         resource_group: str,
         template_path: Path,
-        parameters: Dict[str, Any],
+        parameters: dict[str, Any],
         deployment_name: str,
         step_name: str,
         site_name: str,
@@ -614,7 +615,7 @@ class AzCliExecutor:
         subscription: str,
         location: str,
         template_path: Path,
-        parameters: Dict[str, Any],
+        parameters: dict[str, Any],
         deployment_name: str,
         step_name: str,
         site_name: str,
@@ -650,7 +651,7 @@ class AzCliExecutor:
         ]
         return self._deploy(args, parameters, deployment_name, step_name, site_name)
 
-    def _validate_kubectl_file(self, file_path: str) -> Tuple[bool, Optional[str]]:
+    def _validate_kubectl_file(self, file_path: str) -> tuple[bool, str | None]:
         """Validate a kubectl file path or URL for security.
 
         Security checks:
@@ -685,7 +686,7 @@ class AzCliExecutor:
         cluster_name: str,
         resource_group: str,
         subscription: str,
-        files: List[str],
+        files: list[str],
         step_name: str,
         site_name: str,
     ) -> KubectlResult:
@@ -709,7 +710,7 @@ class AzCliExecutor:
             KubectlResult with success status
         """
         # Validate all files first
-        resolved_files: List[str] = []
+        resolved_files: list[str] = []
         for file_path in files:
             is_valid, error = self._validate_kubectl_file(file_path)
             if not is_valid:

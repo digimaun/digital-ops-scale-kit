@@ -20,5 +20,5 @@ The package automatically configures Azure CLI User-Agent tracking
 telemetry in Azure Activity Logs.
 """
 
-__version__ = "0.1.0"
+__version__ = "1.0.0b1"
 __all__ = ["__version__"]

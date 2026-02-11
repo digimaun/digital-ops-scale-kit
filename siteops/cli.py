@@ -301,6 +301,10 @@ Examples:
 
     args.workspace = Path(args.workspace).resolve()
 
+    if not args.workspace.is_dir():
+        print(f"Error: Workspace directory not found: {args.workspace}", file=sys.stderr)
+        sys.exit(1)
+
     orchestrator = Orchestrator(
         workspace=args.workspace,
         dry_run=getattr(args, "dry_run", False),

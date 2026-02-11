@@ -107,7 +107,7 @@ Site Ops deploys infrastructure through Azure Resource Manager—the native cont
 ```bash
 # Clone the repository
 git clone https://github.com/Azure/digital-ops-scale-kit.git
-cd digital-operations-scalekit
+cd digital-ops-scale-kit
 
 # Install Site Ops
 pip install -e .
@@ -130,7 +130,7 @@ siteops -w workspaces/iot-operations deploy manifests/aio-install.yaml -l "envir
 
 ### Prerequisites
 
-- Python 3.9+
+- Python 3.10+
 - [Azure CLI](https://docs.microsoft.com/cli/azure/install-azure-cli) installed and authenticated
 - For kubectl steps: `kubectl` in PATH
 
@@ -139,7 +139,7 @@ siteops -w workspaces/iot-operations deploy manifests/aio-install.yaml -l "envir
 ## Repository structure
 
 ```
-digital-operations-scalekit/
+digital-ops-scale-kit/
 ├── siteops/                      # Site Ops package
 │   ├── cli.py                    # CLI entry point
 │   ├── models.py                 # Site, Manifest, Step dataclasses
@@ -232,7 +232,7 @@ Manifests define deployment steps and target sites:
 ```yaml
 apiVersion: siteops/v1
 kind: Manifest
-name: iot-ops-base
+name: aio-install
 description: Deploy Azure IoT Operations
 parallel: 3  # Deploy up to 3 sites concurrently
 

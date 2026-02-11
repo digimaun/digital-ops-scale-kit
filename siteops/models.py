@@ -13,7 +13,7 @@ Resources support K8s-style apiVersion/kind validation:
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 
 import re
 import yaml
@@ -36,7 +36,7 @@ CONDITION_PATTERN = re.compile(
 KUBECTL_OPERATIONS = {"apply"}
 
 
-def parse_selector(selector: Optional[str]) -> Dict[str, str]:
+def parse_selector(selector: str | None) -> dict[str, str]:
     """Parse a label selector string into key-value pairs.
 
     Args:
@@ -64,7 +64,7 @@ def parse_selector(selector: Optional[str]) -> Dict[str, str]:
     return labels
 
 
-def _validate_resource(data: Dict[str, Any], expected_kind: Union[str, List[str]], path: Path) -> str:
+def _validate_resource(data: dict[str, Any], expected_kind: str | list[str], path: Path) -> str:
     """Validate apiVersion and kind for a resource file.
 
     Args:
@@ -184,7 +184,7 @@ class ParallelConfig:
         return self.sites == 0
 
     @property
-    def max_workers(self) -> Optional[int]:
+    def max_workers(self) -> int | None:
         """Return max workers for ThreadPoolExecutor, or None for unlimited."""
         return None if self.sites == 0 else self.sites
 
@@ -215,11 +215,11 @@ class Site:
     subscription: str
     resource_group: str
     location: str
-    labels: Dict[str, str] = field(default_factory=dict)
-    properties: Dict[str, Any] = field(default_factory=dict)
-    parameters: Dict[str, Any] = field(default_factory=dict)
+    labels: dict[str, str] = field(default_factory=dict)
+    properties: dict[str, Any] = field(default_factory=dict)
+    parameters: dict[str, Any] = field(default_factory=dict)
 
-    def matches_selector(self, selector: Dict[str, str]) -> bool:
+    def matches_selector(self, selector: dict[str, str]) -> bool:
         """Check if site matches all selector criteria.
 
         Supports:
@@ -338,7 +338,7 @@ class Site:
         """
         return not self.resource_group
 
-    def get_all_parameters(self) -> Dict[str, Any]:
+    def get_all_parameters(self) -> dict[str, Any]:
         """Get a copy of site-level parameters.
 
         Returns:
@@ -364,9 +364,9 @@ class DeploymentStep:
 
     name: str
     template: str
-    parameters: List[str] = field(default_factory=list)
+    parameters: list[str] = field(default_factory=list)
     scope: str = "resourceGroup"
-    when: Optional[str] = None
+    when: str | None = None
 
     def __post_init__(self):
         if self.scope not in VALID_SCOPES:
@@ -425,8 +425,8 @@ class KubectlStep:
     name: str
     operation: str
     arc: ArcCluster
-    files: List[str] = field(default_factory=list)
-    when: Optional[str] = None
+    files: list[str] = field(default_factory=list)
+    when: str | None = None
 
     def __post_init__(self):
         if self.operation not in KUBECTL_OPERATIONS:
@@ -446,7 +446,7 @@ class KubectlStep:
 
 
 # Union type for manifest steps - allows type checking to distinguish step types
-ManifestStep = Union[DeploymentStep, KubectlStep]
+ManifestStep = DeploymentStep | KubectlStep
 
 
 @dataclass
@@ -481,11 +481,11 @@ class Manifest:
 
     name: str
     description: str
-    sites: List[str]
-    steps: List[ManifestStep]
-    site_selector: Optional[str] = None
+    sites: list[str]
+    steps: list[ManifestStep]
+    site_selector: str | None = None
     parallel: ParallelConfig = field(default_factory=ParallelConfig)
-    parameters: List[str] = field(default_factory=list)
+    parameters: list[str] = field(default_factory=list)
 
     @classmethod
     def from_file(cls, path: Path) -> "Manifest":
@@ -555,7 +555,7 @@ class Manifest:
         site_selector = spec.get("siteSelector")
         parallel = ParallelConfig.from_value(spec.get("parallel"))
 
-        steps: List[ManifestStep] = []
+        steps: list[ManifestStep] = []
         for i, step_data in enumerate(spec.get("steps", [])):
             if "name" not in step_data:
                 raise ValueError(f"Step {i+1} missing required field 'name' in manifest: {path}")

@@ -17,7 +17,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any
 
 import yaml
 
@@ -54,10 +54,10 @@ SITE_PROPERTIES_PATTERN = re.compile(r"\{\{\s*site\.properties\.([a-zA-Z0-9_.\[\
 SITE_PARAMETERS_PATTERN = re.compile(r"\{\{\s*site\.parameters\.([a-zA-Z0-9_.\[\]]+)\s*\}\}")
 
 # Result type that can be either a deployment or kubectl result
-StepResult = Union[DeploymentResult, KubectlResult]
+StepResult = DeploymentResult | KubectlResult
 
 # Type alias for subscription-scoped outputs: subscription_id -> step_name -> outputs
-SubscriptionOutputs = Dict[str, Dict[str, Dict[str, Any]]]
+SubscriptionOutputs = dict[str, dict[str, dict[str, Any]]]
 
 
 def _resolve_output_path(obj: Any, path: str) -> Any:
@@ -122,12 +122,12 @@ class Orchestrator:
         self.workspace = Path(workspace).resolve()
         self.dry_run = dry_run
         self.executor = AzCliExecutor(workspace=self.workspace, dry_run=dry_run)
-        self._params_cache: Dict[Path, Dict[str, Any]] = {}
+        self._params_cache: dict[Path, dict[str, Any]] = {}
         self._params_cache_lock = threading.Lock()
-        self._site_cache: Dict[str, Site] = {}
+        self._site_cache: dict[str, Site] = {}
         self._cache_lock = threading.Lock()
 
-    def _deep_merge(self, base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    def _deep_merge(self, base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
         """Deep merge two dictionaries, with override taking precedence.
 
         Behavior:
@@ -156,7 +156,7 @@ class Orchestrator:
                 result[key] = copy.deepcopy(value)
         return result
 
-    def _load_inherited_data(self, path: Path, seen: Optional[List[Path]] = None) -> Dict[str, Any]:
+    def _load_inherited_data(self, path: Path, seen: list[Path] | None = None) -> dict[str, Any]:
         """Load inherited site template with support for chained inheritance.
 
         Resolves the `inherits` field recursively, merging parent data first.
@@ -207,7 +207,7 @@ class Orchestrator:
         logger.debug(f"Loaded inherited data from: {path}")
         return data
 
-    def _load_site_data(self, name: str) -> Dict[str, Any]:
+    def _load_site_data(self, name: str) -> dict[str, Any]:
         """Load and merge site data with inheritance and overlay support.
 
         Merge order (later overrides earlier):
@@ -233,7 +233,7 @@ class Orchestrator:
             self.workspace / "sites.local",  # Local/CI overrides
         ]
 
-        merged_data: Dict[str, Any] = {}
+        merged_data: dict[str, Any] = {}
         found = False
         is_base_file = True  # Track if we're processing the base file
 
@@ -344,7 +344,7 @@ class Orchestrator:
 
         return site
 
-    def _get_all_site_names(self) -> List[str]:
+    def _get_all_site_names(self) -> list[str]:
         """Get all deployable site names from the sites directory.
 
         Scans the workspace's sites/ directory for YAML files and returns
@@ -393,7 +393,7 @@ class Orchestrator:
             # Let load_site() handle parsing errors with full context
             return False
 
-    def load_all_sites(self) -> List[Site]:
+    def load_all_sites(self) -> list[Site]:
         """Load all sites from sites/ and sites.local/ directories.
 
         Sites are merged across directories with the following precedence:
@@ -403,6 +403,7 @@ class Orchestrator:
             List of all Site instances found (with merged configuration)
         """
         sites = []
+        skipped = []
 
         for name in self._get_all_site_names():
             try:
@@ -410,10 +411,19 @@ class Orchestrator:
                 sites.append(site)
             except (ValueError, yaml.YAMLError, OSError) as e:
                 logger.warning(f"Failed to load site '{name}': {e}")
+                skipped.append((name, str(e)))
+
+        if skipped:
+            import sys
+
+            print(f"\n\u26a0 Skipped {len(skipped)} site(s) due to errors:", file=sys.stderr)
+            for name, error in skipped:
+                print(f"  \u2022 {name}: {error}", file=sys.stderr)
+            print(file=sys.stderr)
 
         return sites
 
-    def load_parameters(self, path: Path) -> Dict[str, Any]:
+    def load_parameters(self, path: Path) -> dict[str, Any]:
         """Load parameters from a YAML/JSON file with caching.
 
         Thread-safe caching prevents re-reading files during parallel deployments.
@@ -447,7 +457,7 @@ class Orchestrator:
         return copy.deepcopy(result)
 
     def _resolve_template_strings(
-        self, value: Any, site: Site, step_outputs: Optional[Dict[str, Dict[str, Any]]] = None
+        self, value: Any, site: Site, step_outputs: dict[str, dict[str, Any]] | None = None
     ) -> Any:
         """Recursively resolve {{ site.X }} templates in values.
 
@@ -496,7 +506,7 @@ class Orchestrator:
             return [self._resolve_template_strings(v, site, step_outputs) for v in value]
         return value
 
-    def _resolve_parameters_templates(self, value: str, parameters: Dict[str, Any]) -> Any:
+    def _resolve_parameters_templates(self, value: str, parameters: dict[str, Any]) -> Any:
         """Resolve {{ site.parameters.<path> }} templates in a string.
 
         Supports nested paths like:
@@ -531,7 +541,7 @@ class Orchestrator:
 
         return SITE_PARAMETERS_PATTERN.sub(replacer, value)
 
-    def _resolve_properties_templates(self, value: str, properties: Dict[str, Any]) -> Any:
+    def _resolve_properties_templates(self, value: str, properties: dict[str, Any]) -> Any:
         """Resolve {{ site.properties.<path> }} templates in a string.
 
         Supports nested paths like:
@@ -618,9 +628,9 @@ class Orchestrator:
     def _resolve_step_outputs(
         self,
         value: Any,
-        step_outputs: Dict[str, Dict[str, Any]],
-        subscription_outputs: Optional[SubscriptionOutputs] = None,
-        subscription_id: Optional[str] = None,
+        step_outputs: dict[str, dict[str, Any]],
+        subscription_outputs: SubscriptionOutputs | None = None,
+        subscription_id: str | None = None,
     ) -> Any:
         """Recursively resolve {{ steps.<name>.outputs.<path> }} templates.
 
@@ -682,8 +692,7 @@ class Orchestrator:
             }
         elif isinstance(value, list):
             return [
-                self._resolve_step_outputs(item, step_outputs, subscription_outputs, subscription_id)
-                for item in value
+                self._resolve_step_outputs(item, step_outputs, subscription_outputs, subscription_id) for item in value
             ]
         return value
 
@@ -691,9 +700,9 @@ class Orchestrator:
     def _resolve_output_from_sources(
         step_name: str,
         output_path: str,
-        step_outputs: Dict[str, Dict[str, Any]],
-        subscription_outputs: Optional[SubscriptionOutputs],
-        subscription_id: Optional[str],
+        step_outputs: dict[str, dict[str, Any]],
+        subscription_outputs: SubscriptionOutputs | None,
+        subscription_id: str | None,
     ) -> Any:
         """Resolve an output reference from available sources.
 
@@ -727,9 +736,9 @@ class Orchestrator:
         step: DeploymentStep,
         site: Site,
         manifest: Manifest,
-        step_outputs: Optional[Dict[str, Dict[str, Any]]] = None,
-        subscription_outputs: Optional[SubscriptionOutputs] = None,
-    ) -> Dict[str, Any]:
+        step_outputs: dict[str, dict[str, Any]] | None = None,
+        subscription_outputs: SubscriptionOutputs | None = None,
+    ) -> dict[str, Any]:
         """Merge and resolve parameters for a deployment step.
 
         Parameter merge order (later overrides earlier):
@@ -752,7 +761,7 @@ class Orchestrator:
             Fully resolved and filtered parameters dict
         """
         # 1. Start with manifest-level parameter files (shared defaults)
-        params: Dict[str, Any] = {}
+        params: dict[str, Any] = {}
         for param_path in manifest.parameters:
             resolved_path = manifest.resolve_parameter_path(param_path, site)
             full_path = (self.workspace / resolved_path).resolve()
@@ -802,7 +811,7 @@ class Orchestrator:
 
         return params
 
-    def _check_unresolved_templates(self, params: Dict[str, Any], site_name: str) -> None:
+    def _check_unresolved_templates(self, params: dict[str, Any], site_name: str) -> None:
         """Warn if any {{ ... }} templates weren't resolved."""
 
         def check_value(v, path=""):
@@ -817,7 +826,7 @@ class Orchestrator:
 
         check_value(params)
 
-    def _evaluate_condition(self, condition: Optional[str], site: Site) -> bool:
+    def _evaluate_condition(self, condition: str | None, site: Site) -> bool:
         """Evaluate a step condition against a site.
 
         Supports:
@@ -900,7 +909,7 @@ class Orchestrator:
         return True
 
     @staticmethod
-    def _check_step_site_compatibility(step: ManifestStep, site: Site) -> Optional[str]:
+    def _check_step_site_compatibility(step: ManifestStep, site: Site) -> str | None:
         """Check if a step should run for a given site based on scope compatibility.
 
         Args:
@@ -938,7 +947,7 @@ class Orchestrator:
         return step.scope
 
     @staticmethod
-    def _get_subscription_step_names(manifest: Manifest) -> Set[str]:
+    def _get_subscription_step_names(manifest: Manifest) -> set[str]:
         """Get names of all subscription-scoped steps in a manifest.
 
         Args:
@@ -948,15 +957,13 @@ class Orchestrator:
             Set of step names that have scope: subscription
         """
         return {
-            step.name
-            for step in manifest.steps
-            if isinstance(step, DeploymentStep) and step.scope == "subscription"
+            step.name for step in manifest.steps if isinstance(step, DeploymentStep) and step.scope == "subscription"
         }
 
     def _any_subscription_step_would_execute(
         self,
-        subscription_steps: List[DeploymentStep],
-        rg_level_sites: List[Site],
+        subscription_steps: list[DeploymentStep],
+        rg_level_sites: list[Site],
     ) -> bool:
         """Check if any subscription-scoped step would execute for any RG-level site.
 
@@ -984,7 +991,7 @@ class Orchestrator:
         return False
 
     @staticmethod
-    def _references_any_step(value: Any, step_names: Set[str]) -> bool:
+    def _references_any_step(value: Any, step_names: set[str]) -> bool:
         """Check if a value contains output references to any of the given steps.
 
         Recursively searches dict/list/str for {{ steps.<name>.outputs.* }} patterns.
@@ -997,13 +1004,9 @@ class Orchestrator:
             True if value references any step in step_names
         """
         if isinstance(value, dict):
-            return any(
-                Orchestrator._references_any_step(v, step_names) for v in value.values()
-            )
+            return any(Orchestrator._references_any_step(v, step_names) for v in value.values())
         elif isinstance(value, list):
-            return any(
-                Orchestrator._references_any_step(item, step_names) for item in value
-            )
+            return any(Orchestrator._references_any_step(item, step_names) for item in value)
         elif isinstance(value, str):
             # Quick check before regex
             if "steps." not in value:
@@ -1017,7 +1020,7 @@ class Orchestrator:
         self,
         manifest: Manifest,
         site: Site,
-        subscription_step_names: Set[str],
+        subscription_step_names: set[str],
     ) -> bool:
         """Check if a site's RG-scoped steps reference subscription-scoped outputs.
 
@@ -1069,8 +1072,8 @@ class Orchestrator:
         step: DeploymentStep,
         manifest: Manifest,
         timestamp: str,
-        step_outputs: Dict[str, Dict[str, Any]],
-        subscription_outputs: Optional[SubscriptionOutputs] = None,
+        step_outputs: dict[str, dict[str, Any]],
+        subscription_outputs: SubscriptionOutputs | None = None,
     ) -> DeploymentResult:
         """Execute a Bicep/ARM deployment step.
 
@@ -1127,8 +1130,8 @@ class Orchestrator:
         self,
         site: Site,
         step: KubectlStep,
-        step_outputs: Dict[str, Dict[str, Any]],
-        subscription_outputs: Optional[SubscriptionOutputs] = None,
+        step_outputs: dict[str, dict[str, Any]],
+        subscription_outputs: SubscriptionOutputs | None = None,
     ) -> KubectlResult:
         """Execute a kubectl step against an Arc-connected cluster.
 
@@ -1158,9 +1161,7 @@ class Orchestrator:
         for f in step.files:
             resolved = self._resolve_template_strings(f, site)
             if step_outputs or subscription_outputs:
-                resolved = self._resolve_step_outputs(
-                    resolved, step_outputs, subscription_outputs, site.subscription
-                )
+                resolved = self._resolve_step_outputs(resolved, step_outputs, subscription_outputs, site.subscription)
             resolved_files.append(resolved)
 
         if step.operation == "apply":
@@ -1187,8 +1188,8 @@ class Orchestrator:
         step: ManifestStep,
         manifest: Manifest,
         timestamp: str,
-        step_outputs: Dict[str, Dict[str, Any]],
-        subscription_outputs: Optional[SubscriptionOutputs] = None,
+        step_outputs: dict[str, dict[str, Any]],
+        subscription_outputs: SubscriptionOutputs | None = None,
     ) -> StepResult:
         """Execute a single step (deployment or kubectl).
 
@@ -1214,8 +1215,8 @@ class Orchestrator:
         site: Site,
         timestamp: str,
         parallel_mode: bool = False,
-        subscription_outputs: Optional[SubscriptionOutputs] = None,
-    ) -> Dict[str, Any]:
+        subscription_outputs: SubscriptionOutputs | None = None,
+    ) -> dict[str, Any]:
         """Deploy all applicable steps to a single site.
 
         Steps are executed sequentially. If a step fails, remaining steps
@@ -1236,14 +1237,14 @@ class Orchestrator:
             Dict with site deployment result including status, steps, and timing
         """
         site_start = time.time()
-        step_outputs: Dict[str, Dict[str, Any]] = {}
+        step_outputs: dict[str, dict[str, Any]] = {}
         log = _thread_safe_print if parallel_mode else print
 
         steps_completed = 0
         steps_skipped = 0
         status = "success"
-        error_message: Optional[str] = None
-        step_results: List[Dict[str, Any]] = []
+        error_message: str | None = None
+        step_results: list[dict[str, Any]] = []
 
         for step in manifest.steps:
             # Check step/site scope compatibility
@@ -1329,10 +1330,10 @@ class Orchestrator:
     def _deploy_sequential(
         self,
         manifest: Manifest,
-        sites: List[Site],
+        sites: list[Site],
         timestamp: str,
-        subscription_outputs: Optional[SubscriptionOutputs] = None,
-    ) -> List[Dict[str, Any]]:
+        subscription_outputs: SubscriptionOutputs | None = None,
+    ) -> list[dict[str, Any]]:
         """Deploy to sites sequentially (one at a time).
 
         Args:
@@ -1344,10 +1345,12 @@ class Orchestrator:
         Returns:
             List of deployment results per site
         """
-        results: List[Dict[str, Any]] = []
+        results: list[dict[str, Any]] = []
         for site in sites:
             result = self._deploy_site(
-                manifest, site, timestamp,
+                manifest,
+                site,
+                timestamp,
                 parallel_mode=False,
                 subscription_outputs=subscription_outputs,
             )
@@ -1357,11 +1360,11 @@ class Orchestrator:
     def _deploy_parallel(
         self,
         manifest: Manifest,
-        sites: List[Site],
+        sites: list[Site],
         timestamp: str,
         parallel_config: ParallelConfig,
-        subscription_outputs: Optional[SubscriptionOutputs] = None,
-    ) -> List[Dict[str, Any]]:
+        subscription_outputs: SubscriptionOutputs | None = None,
+    ) -> list[dict[str, Any]]:
         """Deploy to sites in parallel with controlled concurrency.
 
         Args:
@@ -1380,14 +1383,12 @@ class Orchestrator:
 
         print(f"\n  [Parallel] Deploying to {len(sites)} sites ({num_workers} concurrent)")
 
-        results: List[Dict[str, Any]] = []
+        results: list[dict[str, Any]] = []
         results_lock = threading.Lock()
 
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
             future_to_site = {
-                executor.submit(
-                    self._deploy_site, manifest, site, timestamp, True, subscription_outputs
-                ): site
+                executor.submit(self._deploy_site, manifest, site, timestamp, True, subscription_outputs): site
                 for site in sites
             }
 
@@ -1417,8 +1418,8 @@ class Orchestrator:
 
     @staticmethod
     def _group_sites_by_subscription(
-        sites: List[Site],
-    ) -> Dict[str, Tuple[List[Site], List[Site]]]:
+        sites: list[Site],
+    ) -> dict[str, tuple[list[Site], list[Site]]]:
         """Group sites by subscription ID, separating subscription-level from RG-level.
 
         Args:
@@ -1427,7 +1428,7 @@ class Orchestrator:
         Returns:
             Dict mapping subscription_id to (subscription_sites, rg_sites) tuple
         """
-        groups: Dict[str, Tuple[List[Site], List[Site]]] = {}
+        groups: dict[str, tuple[list[Site], list[Site]]] = {}
 
         for site in sites:
             sub_id = site.subscription
@@ -1460,10 +1461,10 @@ class Orchestrator:
     def _collect_subscription_outputs(
         self,
         manifest: Manifest,
-        subscription_sites: Dict[str, Site],
+        subscription_sites: dict[str, Site],
         timestamp: str,
         parallel_config: ParallelConfig,
-    ) -> Tuple[SubscriptionOutputs, List[Dict[str, Any]]]:
+    ) -> tuple[SubscriptionOutputs, list[dict[str, Any]]]:
         """Execute subscription-scoped steps and collect outputs.
 
         Args:
@@ -1476,7 +1477,7 @@ class Orchestrator:
             Tuple of (subscription_outputs, results)
         """
         subscription_outputs: SubscriptionOutputs = {}
-        results: List[Dict[str, Any]] = []
+        results: list[dict[str, Any]] = []
 
         # Get subscription-level sites as a list
         sub_level_sites = list(subscription_sites.values())
@@ -1490,15 +1491,15 @@ class Orchestrator:
         if parallel_config.is_sequential or len(sub_level_sites) == 1:
             for site in sub_level_sites:
                 result = self._deploy_site(
-                    manifest, site, timestamp,
+                    manifest,
+                    site,
+                    timestamp,
                     parallel_mode=False,
                     subscription_outputs=subscription_outputs,
                 )
                 results.append(result)
                 # Collect outputs into subscription_outputs keyed by subscription
-                self._extract_subscription_outputs(
-                    result, site.subscription, subscription_outputs
-                )
+                self._extract_subscription_outputs(result, site.subscription, subscription_outputs)
         else:
             # Parallel deployment across subscriptions
             max_workers = parallel_config.max_workers
@@ -1506,9 +1507,7 @@ class Orchestrator:
 
             with ThreadPoolExecutor(max_workers=num_workers) as executor:
                 future_to_site = {
-                    executor.submit(
-                        self._deploy_site, manifest, site, timestamp, True, subscription_outputs
-                    ): site
+                    executor.submit(self._deploy_site, manifest, site, timestamp, True, subscription_outputs): site
                     for site in sub_level_sites
                 }
 
@@ -1517,27 +1516,27 @@ class Orchestrator:
                     try:
                         result = future.result()
                         results.append(result)
-                        self._extract_subscription_outputs(
-                            result, site.subscription, subscription_outputs
-                        )
+                        self._extract_subscription_outputs(result, site.subscription, subscription_outputs)
                     except Exception as e:
                         logger.error(f"Error deploying subscription-level site {site.name}: {e}")
-                        results.append({
-                            "site": site.name,
-                            "status": "failed",
-                            "error": str(e),
-                            "steps_completed": 0,
-                            "steps_skipped": 0,
-                            "steps_total": len(manifest.steps),
-                            "elapsed": 0.0,
-                            "steps": [],
-                        })
+                        results.append(
+                            {
+                                "site": site.name,
+                                "status": "failed",
+                                "error": str(e),
+                                "steps_completed": 0,
+                                "steps_skipped": 0,
+                                "steps_total": len(manifest.steps),
+                                "elapsed": 0.0,
+                                "steps": [],
+                            }
+                        )
 
         return subscription_outputs, results
 
     @staticmethod
     def _extract_subscription_outputs(
-        result: Dict[str, Any],
+        result: dict[str, Any],
         subscription_id: str,
         subscription_outputs: SubscriptionOutputs,
     ) -> None:
@@ -1556,7 +1555,7 @@ class Orchestrator:
 
     def _print_deployment_summary(
         self,
-        results: List[Dict[str, Any]],
+        results: list[dict[str, Any]],
         total_elapsed: float,
     ) -> None:
         """Print deployment summary.
@@ -1623,7 +1622,7 @@ class Orchestrator:
                 print(f"    [{result['site']}] {error}")
             print()
 
-    def resolve_sites(self, manifest: Manifest, cli_selector: Optional[str] = None) -> List[Site]:
+    def resolve_sites(self, manifest: Manifest, cli_selector: str | None = None) -> list[Site]:
         """Resolve sites from manifest, applying selectors.
 
         Priority:
@@ -1646,7 +1645,20 @@ class Orchestrator:
 
         # Explicit sites list - load only the named sites (most common case)
         if manifest.sites:
-            return [self.load_site(name) for name in manifest.sites]
+            missing = []
+            sites = []
+            for name in manifest.sites:
+                try:
+                    sites.append(self.load_site(name))
+                except FileNotFoundError:
+                    missing.append(name)
+            if missing:
+                names = ", ".join(missing)
+                raise FileNotFoundError(
+                    f"Site files not found for manifest '{manifest.name}': {names}. "
+                    f"Check that matching YAML files exist in the sites/ directory."
+                )
+            return sites
 
         # Site selector requires loading all sites for filtering
         if manifest.site_selector:
@@ -1656,7 +1668,7 @@ class Orchestrator:
 
         return []
 
-    def validate(self, manifest_path: Path, selector: Optional[str] = None) -> List[str]:
+    def validate(self, manifest_path: Path, selector: str | None = None) -> list[str]:
         """Validate manifest and return list of errors.
 
         Checks:
@@ -1676,7 +1688,7 @@ class Orchestrator:
         Returns:
             List of error messages (empty if valid)
         """
-        errors: List[str] = []
+        errors: list[str] = []
 
         try:
             manifest = Manifest.from_file(manifest_path)
@@ -1735,7 +1747,7 @@ class Orchestrator:
                             # Check if params contain self-references before expensive template parsing
                             has_self_ref = self._contains_self_reference(params, step.name)
 
-                            template_params: Optional[frozenset] = None
+                            template_params: frozenset | None = None
                             if has_self_ref:
                                 # Only extract template params when needed for self-reference validation
                                 try:
@@ -1779,9 +1791,7 @@ class Orchestrator:
 
         # Validate subscription-scoped steps
         subscription_steps = [
-            step
-            for step in manifest.steps
-            if isinstance(step, DeploymentStep) and step.scope == "subscription"
+            step for step in manifest.steps if isinstance(step, DeploymentStep) and step.scope == "subscription"
         ]
 
         if subscription_steps and sites:
@@ -1850,9 +1860,9 @@ class Orchestrator:
         prior_steps: set,
         all_steps: set,
         source_file: Path,
-        template_params: Optional[frozenset] = None,
-        _current_key: Optional[str] = None,
-    ) -> List[str]:
+        template_params: frozenset | None = None,
+        _current_key: str | None = None,
+    ) -> list[str]:
         """Validate step output references in parameter values.
 
         Finds all {{ steps.<name>.outputs.<path> }} patterns and validates that:
@@ -1874,7 +1884,7 @@ class Orchestrator:
         Returns:
             List of validation error messages
         """
-        errors: List[str] = []
+        errors: list[str] = []
 
         if isinstance(value, dict):
             for key, val in value.items():
@@ -1932,7 +1942,7 @@ class Orchestrator:
     def show_plan(
         self,
         manifest_path: Path,
-        selector: Optional[str] = None,
+        selector: str | None = None,
     ) -> None:
         """Display deployment plan without executing.
 
@@ -2000,11 +2010,11 @@ class Orchestrator:
     def deploy(
         self,
         manifest_path: Path,
-        selector: Optional[str] = None,
-        parallel_override: Optional[int] = None,
-        manifest: Optional[Manifest] = None,
-        sites: Optional[List[Site]] = None,
-    ) -> Dict[str, Any]:
+        selector: str | None = None,
+        parallel_override: int | None = None,
+        manifest: Manifest | None = None,
+        sites: list[Site] | None = None,
+    ) -> dict[str, Any]:
         """Execute deployment from manifest.
 
         Args:
@@ -2052,13 +2062,13 @@ class Orchestrator:
         # Check if we have subscription-scoped steps
         has_sub_steps = self._has_subscription_scoped_steps(manifest)
 
-        results: List[Dict[str, Any]] = []
+        results: list[dict[str, Any]] = []
         subscription_outputs: SubscriptionOutputs = {}
 
         if has_sub_steps:
             # Build map of subscription_id -> subscription-level site
-            subscription_sites: Dict[str, Site] = {}
-            rg_sites: List[Site] = []
+            subscription_sites: dict[str, Site] = {}
+            rg_sites: list[Site] = []
             for sub_id, (sub_level, rg_level) in site_groups.items():
                 if sub_level:
                     # Use first subscription-level site (validation ensures only one)
@@ -2075,10 +2085,7 @@ class Orchestrator:
             failed_subscriptions = {
                 sub_id
                 for sub_id, site in subscription_sites.items()
-                if any(
-                    r["site"] == site.name and r["status"] == "failed"
-                    for r in sub_results
-                )
+                if any(r["site"] == site.name and r["status"] == "failed" for r in sub_results)
             }
 
             # Filter RG-level sites: block those with dependencies on failed subscriptions
@@ -2087,24 +2094,24 @@ class Orchestrator:
                 proceeding_sites = []
                 for site in rg_sites:
                     if site.subscription in failed_subscriptions:
-                        if self._site_depends_on_subscription_outputs(
-                            manifest, site, sub_step_names
-                        ):
+                        if self._site_depends_on_subscription_outputs(manifest, site, sub_step_names):
                             # Site depends on failed subscription outputs - block it
                             _thread_safe_print(
                                 f"[{site.name}] - blocked "
                                 "(subscription deployment failed, site depends on its outputs)"
                             )
-                            results.append({
-                                "site": site.name,
-                                "status": "blocked",
-                                "error": "Subscription deployment failed and site depends on its outputs",
-                                "steps_completed": 0,
-                                "steps_skipped": len(manifest.steps),
-                                "steps_total": len(manifest.steps),
-                                "elapsed": 0.0,
-                                "steps": [],
-                            })
+                            results.append(
+                                {
+                                    "site": site.name,
+                                    "status": "blocked",
+                                    "error": "Subscription deployment failed and site depends on its outputs",
+                                    "steps_completed": 0,
+                                    "steps_skipped": len(manifest.steps),
+                                    "steps_total": len(manifest.steps),
+                                    "elapsed": 0.0,
+                                    "steps": [],
+                                }
+                            )
                         else:
                             # Site doesn't depend on subscription outputs - let it proceed
                             proceeding_sites.append(site)
@@ -2117,9 +2124,7 @@ class Orchestrator:
             if rg_sites:
                 print(f"\n  [Phase 2] Resource group-scoped steps: {len(rg_sites)} site(s)")
                 if effective_parallel.is_sequential or len(rg_sites) == 1:
-                    rg_results = self._deploy_sequential(
-                        manifest, rg_sites, timestamp, subscription_outputs
-                    )
+                    rg_results = self._deploy_sequential(manifest, rg_sites, timestamp, subscription_outputs)
                 else:
                     rg_results = self._deploy_parallel(
                         manifest, rg_sites, timestamp, effective_parallel, subscription_outputs

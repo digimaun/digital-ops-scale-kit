@@ -764,6 +764,40 @@ name: bad-site
         assert len(sites) == 1
         assert sites[0].name == "good-site"
 
+    def test_load_all_sites_skips_bad_site_stderr_warning(self, tmp_workspace, capsys):
+        """Skipped sites produce a visible warning on stderr."""
+        (tmp_workspace / "sites" / "good-site.yaml").write_text(
+            "apiVersion: siteops/v1\nkind: Site\nname: good-site\n"
+            'subscription: "00000000-0000-0000-0000-000000000000"\n'
+            "resourceGroup: rg-test\nlocation: eastus\n"
+        )
+        (tmp_workspace / "sites" / "bad-site.yaml").write_text(
+            "apiVersion: siteops/v1\nkind: Site\nname: bad-site\n"
+        )
+
+        orchestrator = Orchestrator(tmp_workspace)
+        sites = orchestrator.load_all_sites()
+
+        assert len(sites) == 1
+        err = capsys.readouterr().err
+        assert "Skipped 1 site(s) due to errors:" in err
+        assert "bad-site" in err
+
+    def test_load_all_sites_no_warning_when_all_valid(self, tmp_workspace, capsys):
+        """No stderr warning when all sites load successfully."""
+        (tmp_workspace / "sites" / "site-a.yaml").write_text(
+            "apiVersion: siteops/v1\nkind: Site\nname: site-a\n"
+            'subscription: "00000000-0000-0000-0000-000000000000"\n'
+            "resourceGroup: rg-test\nlocation: eastus\n"
+        )
+
+        orchestrator = Orchestrator(tmp_workspace)
+        sites = orchestrator.load_all_sites()
+
+        assert len(sites) == 1
+        err = capsys.readouterr().err
+        assert err == ""
+
 
 class TestGetAllSiteNames:
     """Tests for site name discovery."""

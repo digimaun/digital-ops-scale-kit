@@ -155,7 +155,7 @@ Can also be triggered manually from **Actions → Validate PR → Run workflow**
 4. Fill in options:
    - **Git ref**: Branch, tag, or commit (optional)
    - **Workspace**: Directory containing sites/manifests (default: `workspaces/iot-operations`)
-   - **Manifest**: Path to manifest file (default: `manifests/iot-operations.yaml`)
+   - **Manifest**: Manifest to deploy (default: `aio-install`)
    - **Environment**: `dev`, `staging`, or `prod`
    - **Selector**: Additional site filter (optional, e.g., `region=eastus`)
    - **Dry run**: Preview only, no actual deployment
@@ -171,7 +171,7 @@ curl -X POST \
   -d '{
     "ref": "main",
     "inputs": {
-      "manifest": "manifests/iot-operations.yaml",
+      "manifest": "aio-install",
       "environment": "dev",
       "selector": "",
       "dry-run": "false"
@@ -183,7 +183,7 @@ curl -X POST \
 
 ```bash
 gh workflow run deploy.yaml \
-  -f manifest="manifests/iot-operations.yaml" \
+  -f manifest="aio-install" \
   -f environment="dev" \
   -f dry-run="true"
 ```
@@ -194,9 +194,9 @@ The iot-operations workspace demonstrates key SiteOps capabilities:
 
 | Step | Manifest | Environment | Sites | Demonstrates |
 |------|----------|-------------|-------|--------------|
-| 1 | `iot-ops-base` | `staging` | chicago-staging | Base AIO platform only |
-| 2 | `iot-ops-base` | `dev` | munich-dev, seattle-dev | Parallel deployment + simulator |
-| 3 | `iot-ops-base` | `prod` | munich-prod, seattle-prod | Parallel deployment, no simulator |
+| 1 | `aio-install` | `staging` | chicago-staging | Base AIO platform only |
+| 2 | `aio-install` | `dev` | munich-dev, seattle-dev | Parallel deployment + simulator |
+| 3 | `aio-install` | `prod` | munich-prod, seattle-prod | Parallel deployment, no simulator |
 | 4 | `opc-ua-solution` | `staging` | chicago-staging | Solution layer on existing AIO |
 
 ### Site Configuration
@@ -213,13 +213,13 @@ The iot-operations workspace demonstrates key SiteOps capabilities:
 
 ```bash
 # Step 1: Deploy base AIO to staging (no solution)
-gh workflow run deploy.yaml -f workspace="iot-operations" -f manifest="iot-ops-base" -f environment="staging"
+gh workflow run deploy.yaml -f workspace="iot-operations" -f manifest="aio-install" -f environment="staging"
 
 # Step 2: Deploy full stack to dev (parallel, with simulator)
-gh workflow run deploy.yaml -f workspace="iot-operations" -f manifest="iot-ops-base" -f environment="dev"
+gh workflow run deploy.yaml -f workspace="iot-operations" -f manifest="aio-install" -f environment="dev"
 
 # Step 3: Deploy full stack to prod (parallel, no simulator)
-gh workflow run deploy.yaml -f workspace="iot-operations" -f manifest="iot-ops-base" -f environment="prod"
+gh workflow run deploy.yaml -f workspace="iot-operations" -f manifest="aio-install" -f environment="prod"
 
 # Step 4: Add solution layer to staging
 gh workflow run deploy.yaml -f workspace="iot-operations" -f manifest="opc-ua-solution" -f environment="staging"
@@ -316,7 +316,7 @@ manifest:
     required: true
     type: choice
     options:
-        - iot-ops-base
+        - aio-install
         - opc-ua-solution
         - my-new-manifest  # Add here (without .yaml extension)
 ```

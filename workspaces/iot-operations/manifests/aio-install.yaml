@@ -23,6 +23,8 @@ parallel: 3
 #   - seattle-dev
 #
 # Option 2: Label selector (matches all sites with matching labels)
+# Note: Subscription-scoped sites (e.g. contoso-global) use different labels
+# and are intentionally excluded here. Target them with: siteops deploy -l "scope=subscription"
 siteSelector: "environment=dev"
 
 # Shared parameters applied to all steps (auto-filtered per template)

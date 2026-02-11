@@ -23,11 +23,10 @@ jobs:
 
     permissions:
       contents: read
-      checks: write
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
 
@@ -37,17 +36,57 @@ jobs:
           install-dev: "true"
 
       - name: Run unit tests
-        run: pytest tests/ -v --cov=siteops --cov-report=term-missing --junitxml=test-results.xml
+        run: pytest tests/ -v --cov=siteops --cov-report=term-missing --cov-report=xml:coverage.xml --junitxml=test-results.xml
 
       - name: Test Summary
         if: always()
-        uses: test-summary/action@v2
-        with:
-          paths: test-results.xml
+        shell: python
+        run: |
+          import xml.etree.ElementTree as ET
+          import os
+
+          if not os.path.exists("test-results.xml"):
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                  f.write("## \u274c Test Results\n\nNo test results found.\n")
+              raise SystemExit(0)
+
+          tree = ET.parse("test-results.xml")
+          root = tree.getroot()
+
+          # Handle both <testsuites> (wrapper) and <testsuite> (direct) root elements
+          suites = root.findall("testsuite") if root.tag == "testsuites" else [root]
+
+          tests = sum(int(s.attrib.get("tests", 0)) for s in suites)
+          failures = sum(int(s.attrib.get("failures", 0)) for s in suites)
+          errors = sum(int(s.attrib.get("errors", 0)) for s in suites)
+          skipped = sum(int(s.attrib.get("skipped", 0)) for s in suites)
+          passed = tests - failures - errors - skipped
+          time_taken = sum(float(s.attrib.get("time", 0)) for s in suites)
+
+          icon = "\u2705" if failures == 0 and errors == 0 else "\u274c"
+          summary = f"## {icon} Test Results\n\n"
+          summary += "| Passed | Failed | Errors | Skipped | Total | Time |\n"
+          summary += "|--------|--------|--------|---------|-------|------|\n"
+          summary += f"| {passed} | {failures} | {errors} | {skipped} | {tests} | {time_taken:.1f}s |\n"
+
+          if failures > 0 or errors > 0:
+              summary += "\n### Failed Tests\n\n"
+              for suite in root.iter("testsuite"):
+                  for case in suite.iter("testcase"):
+                      failure = case.find("failure")
+                      error = case.find("error")
+                      if failure is not None or error is not None:
+                          name = case.attrib.get("name", "unknown")
+                          classname = case.attrib.get("classname", "")
+                          msg = (failure or error).attrib.get("message", "")
+                          summary += f"- `{classname}::{name}`: {msg}\n"
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(summary + "\n")
 
       - name: Upload coverage report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: coverage-report
           path: coverage.xml
@@ -59,11 +98,10 @@ jobs:
 
     permissions:
       contents: read
-      pull-requests: write
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
 

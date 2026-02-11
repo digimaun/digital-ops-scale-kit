@@ -70,13 +70,34 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
 
       - name: Setup Site Ops
         uses: ./.github/actions/setup-siteops
+
+      - name: Validate inputs
+        shell: bash
+        run: |
+          # Prevent path traversal attacks
+          if [[ "$INPUT_WORKSPACE" == *".."* ]] || [[ "$INPUT_MANIFEST" == *".."* ]]; then
+            echo "::error::Path traversal not allowed"
+            exit 1
+          fi
+
+          if [[ -n "$INPUT_SELECTOR" && ! "$INPUT_SELECTOR" =~ ^[a-zA-Z0-9_=,./:-]+$ ]]; then
+            echo "::error::Invalid selector format"
+            exit 1
+          fi
+
+          if [[ ! -d "$INPUT_WORKSPACE" ]]; then
+            echo "::error::Workspace directory not found: $INPUT_WORKSPACE"
+            exit 1
+          fi
+
+          echo "✓ Inputs validated"
 
       - name: Setup site overrides
         env:
@@ -155,7 +176,7 @@ jobs:
           echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Azure Login (OIDC)
-        uses: azure/login@v2
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -180,27 +201,6 @@ jobs:
             done
           ) &
           echo "OIDC token refresh service started (PID: $!)"
-
-      - name: Validate inputs
-        shell: bash
-        run: |
-          # Prevent path traversal attacks
-          if [[ "$INPUT_WORKSPACE" == *".."* ]] || [[ "$INPUT_MANIFEST" == *".."* ]]; then
-            echo "::error::Path traversal not allowed"
-            exit 1
-          fi
-
-          if [[ -n "$INPUT_SELECTOR" && ! "$INPUT_SELECTOR" =~ ^[a-zA-Z0-9_=,./:-]+$ ]]; then
-            echo "::error::Invalid selector format"
-            exit 1
-          fi
-
-          if [[ ! -d "$INPUT_WORKSPACE" ]]; then
-            echo "::error::Workspace directory not found: $INPUT_WORKSPACE"
-            exit 1
-          fi
-
-          echo "✓ Inputs validated"
 
       - name: Validate manifest and show plan
         shell: bash
@@ -252,7 +252,7 @@ jobs:
 
       - name: Upload deployment log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: deployment-log-${{ github.run_id }}-${{ github.run_attempt }}
           path: deploy-output.txt

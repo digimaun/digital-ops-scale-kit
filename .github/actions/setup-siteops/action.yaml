@@ -20,7 +20,7 @@ runs:
         python-version: ${{ inputs.python-version }}
 
     - name: Cache pip packages
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: ~/.cache/pip
         key: ${{ runner.os }}-pip-siteops-${{ inputs.install-dev == 'true' && 'dev-' || '' }}${{ hashFiles('pyproject.toml') }}
@@ -30,9 +30,11 @@ runs:
 
     - name: Install Site Ops
       shell: bash
+      env:
+        INSTALL_DEV: ${{ inputs.install-dev }}
       run: |
         pip install --upgrade pip
-        if [[ "${{ inputs.install-dev }}" == "true" ]]; then
+        if [[ "$INSTALL_DEV" == "true" ]]; then
           pip install -e ".[dev]"
         else
           pip install -e .

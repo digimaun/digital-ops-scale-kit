@@ -21,8 +21,8 @@ parallel: 3
 # sites:
 #   - chicago-staging
 #
-# Option 2: Label selector
-# siteSelector: "environment=staging"
+# Option 2: Label selector (override with -l flag)
+siteSelector: "environment=dev"
 
 parameters:
   - parameters/common.yaml

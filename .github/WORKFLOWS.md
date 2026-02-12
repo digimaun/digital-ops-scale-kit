@@ -111,8 +111,8 @@ Supports nested paths using dot notation:
 }
 ```
 
-> **Note:** `SITE_OVERRIDES` is stored as a secret for access control (admin-only modification),
-> not confidentiality. Subscription IDs and resource group names appear in deployment logs.
+> **Note:** `SITE_OVERRIDES` is stored as a secret for access control (admin-only modification).
+> Individual override values are registered with `::add-mask::` to prevent exposure in workflow logs.
 
 ### 4. Configure GitHub Environments
 
@@ -248,15 +248,13 @@ gh workflow run deploy.yaml -f workspace="iot-operations" -f manifest="opc-ua-so
 │               _siteops-deploy.yaml (reusable)               │
 ├─────────────────────────────────────────────────────────────┤
 │  1. Setup Site Ops                                          │
-│  2. Generate sites.local/ from SITE_OVERRIDES secret        │
-│  3. Show target sites (with overrides applied)              │
-│  4. Azure Login (OIDC)                                      │
-│  5. Start OIDC token refresh service (background)           │
-│  6. Validate inputs (path traversal protection)             │
-│  7. Run: siteops validate -v (validates + shows plan)       │
-│  8. Run: siteops deploy                                     │
-│  9. Upload deployment logs                                  │
-│ 10. Azure Logout                                            │
+│  2. Validate inputs (path traversal protection)             │
+│  3. Generate sites.local/ from SITE_OVERRIDES secret        │
+│  4. Validate and show deployment plan                       │
+│  5. Azure Login (OIDC)                                      │
+│  6. Start OIDC token refresh service (background)           │
+│  7. Run: siteops deploy                                     │
+│  8. Azure Logout                                            │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -268,11 +266,11 @@ gh workflow run deploy.yaml -f workspace="iot-operations" -f manifest="opc-ua-so
 | **Environment Protection** | Required approvals for staging/prod |
 | **Input Validation** | Prevents path traversal and injection attacks |
 | **Site Name Sanitization** | SITE_OVERRIDES keys validated against `^[a-zA-Z0-9_-]+$` |
+| **Override Value Masking** | Individual SITE_OVERRIDES values registered with `::add-mask::` to prevent log exposure |
 | **Concurrency Control** | One deployment per environment at a time |
 | **Least Privilege Permissions** | Workflows request minimal GitHub token scopes |
 | **Token Refresh** | Background service refreshes OIDC token for long deployments |
 | **Audit Trail** | All runs logged with triggering user |
-| **Artifact Retention** | Deployment logs kept 30 days |
 
 ### Security Model
 

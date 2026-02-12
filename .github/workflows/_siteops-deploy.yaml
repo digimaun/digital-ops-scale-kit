@@ -155,24 +155,29 @@ jobs:
             echo "✓ Generated override for: $site_name"
           done
 
-          echo ""
-          echo "Site overrides created:"
-          for f in "$INPUT_WORKSPACE/sites.local/"*.yaml; do
-            [[ -f "$f" ]] || continue
-            echo "--- $f ---"
-            cat "$f"
+          # Register each override value with GitHub's log masking so
+          # subscription IDs, resource groups, etc. appear as *** in all
+          # subsequent step output (logs, summaries, artifacts).
+          echo "$SITE_OVERRIDES" | jq -r '.. | strings' | while IFS= read -r val; do
+            [[ -n "$val" ]] && echo "::add-mask::${val}"
           done
 
-      - name: Show target sites
+          count=$(ls "$INPUT_WORKSPACE/sites.local/"*.yaml 2>/dev/null | wc -l)
+          echo "✓ Generated ${count} site override(s)"
+
+      - name: Validate and show target sites
         shell: bash
         run: |
-          echo "### Target Sites" >> $GITHUB_STEP_SUMMARY
+          # Use validate -v instead of sites — it shows only site names and
+          # locations, not subscription IDs, resource groups, or parameters
+          # which may contain sensitive values from SITE_OVERRIDES.
+          CMD_ARGS=(-w "$INPUT_WORKSPACE" validate "$INPUT_MANIFEST")
+          [[ -n "$INPUT_SELECTOR" ]] && CMD_ARGS+=(-l "$INPUT_SELECTOR")
+          CMD_ARGS+=(-v)
+
+          echo "### Deployment Plan" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          if [[ -n "$INPUT_SELECTOR" ]]; then
-            siteops -w "$INPUT_WORKSPACE" sites -l "$INPUT_SELECTOR" 2>&1 | tee -a $GITHUB_STEP_SUMMARY || echo "No matching sites found" >> $GITHUB_STEP_SUMMARY
-          else
-            siteops -w "$INPUT_WORKSPACE" sites 2>&1 | tee -a $GITHUB_STEP_SUMMARY || echo "No matching sites found" >> $GITHUB_STEP_SUMMARY
-          fi
+          siteops "${CMD_ARGS[@]}" 2>&1 | tee -a $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Azure Login (OIDC)
@@ -202,20 +207,10 @@ jobs:
           ) &
           echo "OIDC token refresh service started (PID: $!)"
 
-      - name: Validate manifest and show plan
-        shell: bash
-        run: |
-          CMD_ARGS=(-w "$INPUT_WORKSPACE" validate "$INPUT_MANIFEST")
-          [[ -n "$INPUT_SELECTOR" ]] && CMD_ARGS+=(-l "$INPUT_SELECTOR")
-          CMD_ARGS+=(-v)
-
-          siteops "${CMD_ARGS[@]}"
-
       - name: Deploy
         id: deploy
         shell: bash
         run: |
-          set -o pipefail
           START_TIME=$(date +%s)
 
           CMD_ARGS=(-w "$INPUT_WORKSPACE" deploy "$INPUT_MANIFEST")
@@ -228,9 +223,12 @@ jobs:
           [[ -n "$INPUT_SELECTOR" ]] && CMD_ARGS+=(-l "$INPUT_SELECTOR")
 
           echo "Executing: siteops ${CMD_ARGS[*]}"
-          siteops "${CMD_ARGS[@]}" 2>&1 | tee deploy-output.txt
+          if siteops "${CMD_ARGS[@]}" 2>&1; then
+            DEPLOY_EXIT_CODE=0
+          else
+            DEPLOY_EXIT_CODE=$?
+          fi
 
-          DEPLOY_EXIT_CODE=${PIPESTATUS[0]}
           END_TIME=$(date +%s)
           DURATION=$((END_TIME - START_TIME))
 
@@ -242,21 +240,7 @@ jobs:
             echo "❌ **Failed** after ${DURATION}s" >> $GITHUB_STEP_SUMMARY
           fi
 
-          {
-            echo "log<<EOF"
-            cat deploy-output.txt
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
           exit $DEPLOY_EXIT_CODE
-
-      - name: Upload deployment log
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: deployment-log-${{ github.run_id }}-${{ github.run_attempt }}
-          path: deploy-output.txt
-          retention-days: 30
 
       - name: Azure Logout
         if: always()

@@ -37,6 +37,48 @@ pytest --cov=siteops --cov-report=term-missing
 2. Update documentation if adding new features
 3. Follow the existing code style
 
+## Versioning
+
+This repository uses two independent version streams with [semantic versioning](https://semver.org/):
+
+### Scale Kit (content)
+
+Git tags: `v1.0.0b1`, `v1.1.0`, `v2.0.0`
+
+Covers workspace content — Bicep templates, manifests, parameter files, site examples, GitHub
+workflows, and documentation. Unscoped `v*` tags are the primary release. GitHub Releases attach
+to these tags and note the minimum required siteops version.
+
+### Site Ops (tool)
+
+Git tags: `siteops/v1.0.0b1`, `siteops/v1.1.0`
+
+Covers the `siteops/` Python package — CLI, orchestrator, executor, models. The `siteops/v*` tag
+stays in sync with the version in `pyproject.toml` and `siteops/__init__.py`.
+
+### Guidelines
+
+- The scale kit version cannot be more stable than siteops. If siteops is beta, the scale kit
+  is beta.
+- When a content release requires a new siteops version, tag both on the same commit.
+- Content-only changes (new templates, manifest updates, doc fixes) bump only the `v*` tag.
+- Tool-only changes (CLI features, orchestrator fixes) bump only the `siteops/v*` tag.
+- Use conventional commits to distinguish change types:
+  - `feat(workspace):` — new content
+  - `feat(siteops):` — new tool feature
+  - `fix(siteops):` — tool bugfix
+  - `docs:` — documentation
+
+### Example timeline
+
+```text
+v1.0.0b1 + siteops/v1.0.0b1    first public beta
+v1.1.0b1                        add secret sync templates (siteops unchanged)
+siteops/v1.0.0b2                tool bugfix (content unchanged)
+v1.2.0b1                        content needing siteops fix (requires siteops >= v1.0.0b2)
+v1.0.0 + siteops/v1.0.0        stable release
+```
+
 ## Microsoft Open Source
 
 Most contributions require you to agree to a Contributor License Agreement (CLA) declaring that you have the right to, and actually do, grant us the rights to use your contribution. For details, visit <https://cla.opensource.microsoft.com>.

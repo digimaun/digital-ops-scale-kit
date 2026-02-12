@@ -58,11 +58,11 @@ steps:
     scope: resourceGroup
 
   - name: aio-enablement
-    template: templates/iot-ops/install/azure-iot-operations-enablement.bicep
+    template: templates/iot-ops/install/2602/azure-iot-operations-enablement.bicep
     scope: resourceGroup
 
   - name: aio-instance
-    template: templates/iot-ops/install/azure-iot-operations-instance.bicep
+    template: templates/iot-ops/install/2602/azure-iot-operations-instance.bicep
     scope: resourceGroup
     parameters:
       - parameters/chaining.yaml

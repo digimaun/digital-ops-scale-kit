@@ -154,7 +154,7 @@ Can also be triggered manually from **Actions → CI → Run workflow**.
 3. Click **"Run workflow"**
 4. Fill in options:
    - **Git ref**: Branch, tag, or commit (optional)
-   - **Workspace**: Directory containing sites/manifests (default: `workspaces/iot-operations`)
+   - **Workspace**: Workspace name (default: `iot-operations`)
    - **Manifest**: Manifest to deploy (default: `aio-install`)
    - **Environment**: `dev`, `staging`, or `prod`
    - **Selector**: Additional site filter (optional, e.g., `region=eastus`)
@@ -183,6 +183,7 @@ curl -X POST \
 
 ```bash
 gh workflow run deploy.yaml \
+  -f workspace="iot-operations" \
   -f manifest="aio-install" \
   -f environment="dev" \
   -f dry-run="true"
@@ -201,8 +202,8 @@ The iot-operations workspace demonstrates key SiteOps capabilities:
 
 ### Site Configuration
 
-| Site | Environment | `deploySolution` | `enableOpcPlcSimulator` |
-|------|-------------|------------------|-------------------------|
+| Site | Environment | `includeSolution` | `includeOpcPlcSimulator` |
+|------|-------------|-------------------|-------------------------|
 | munich-dev | dev | ✅ | ✅ |
 | seattle-dev | dev | ✅ | ✅ |
 | munich-prod | prod | ✅ | ❌ |

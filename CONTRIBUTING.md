@@ -54,7 +54,7 @@ to these tags and note the minimum required siteops version.
 Git tags: `siteops/v1.0.0b1`, `siteops/v1.1.0`
 
 Covers the `siteops/` Python package — CLI, orchestrator, executor, models. The `siteops/v*` tag
-stays in sync with the version in `pyproject.toml` and `siteops/__init__.py`.
+stays in sync with the version in `siteops/__init__.py` (read dynamically by pyproject.toml).
 
 ### Guidelines
 

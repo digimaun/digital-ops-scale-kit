@@ -43,7 +43,7 @@ RG-level sites can reference outputs from subscription-scoped steps. Subscriptio
 
 ```yaml
 # parameters/chaining.yaml
-edgeSiteId: "{{ steps.edge-site.outputs.site.id }}"
+edgeSiteId: "{{ steps.global-edge-site.outputs.site.id }}"
 ```
 
 For `munich-line-1` (subscription: sub-123):
@@ -53,6 +53,7 @@ For `munich-line-2` (subscription: sub-123):
 → Resolves from the same subscription outputs
 
 **Resolution priority:**
+
 1. Per-site step outputs (from RG-scoped steps)
 2. Subscription outputs (from subscription-scoped steps, matched by site's subscription)
 

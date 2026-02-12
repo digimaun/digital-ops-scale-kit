@@ -256,11 +256,15 @@ steps:
     template: templates/iot-ops/deps/schema-registry.bicep
     scope: resourceGroup
 
+  # ... additional steps (adr-ns, aio-enablement) omitted for brevity
+
   - name: aio-instance
-    template: templates/iot-ops/install/azure-iot-operations-instance.bicep
+    template: templates/iot-ops/install/2602/azure-iot-operations-instance.bicep
     scope: resourceGroup
     parameters:
       - parameters/chaining.yaml  # Uses outputs from previous steps
+
+  # ... additional steps (schema-registry-role) omitted for brevity
 
   - name: opc-ua-solution
     template: templates/iot-ops/solutions/opc-ua-solution.bicep
@@ -290,7 +294,7 @@ schemaRegistryId: "{{ steps.schema-registry.outputs.schemaRegistry.id }}"
 adrNamespaceId: "{{ steps.adr-ns.outputs.adrNamespace.id }}"
 
 # Cross-scope output chaining (subscription → resource group)
-edgeSiteId: "{{ steps.edge-site.outputs.site.id }}"
+edgeSiteId: "{{ steps.global-edge-site.outputs.site.id }}"
 ```
 
 See [docs/parameter-resolution.md](docs/parameter-resolution.md) for auto-filtering, merge order, and cross-scope resolution.
@@ -308,12 +312,12 @@ See [docs/parameter-resolution.md](docs/parameter-resolution.md) for auto-filter
 
 ### Common options
 
-| Option | Description | Examples |
-|--------|-------------|----------|
-| `-w, --workspace` | Workspace directory (required) | `-w workspaces/iot-operations` |
-| `-l, --selector` | Filter sites by label | `-l environment=prod`, `-l country=US,city=Seattle` |
-| `-p, --parallel` | Override parallel site count | `-p 5`, `-p 0` (unlimited) |
-| `-v, --verbose` | Verbose output | |
+| Option | Description | Commands | Examples |
+|--------|-------------|----------|----------|
+| `-w, --workspace` | Workspace directory (required) | All | `-w workspaces/iot-operations` |
+| `-l, --selector` | Filter sites by label | All | `-l environment=prod`, `-l country=US,city=Seattle` |
+| `-p, --parallel` | Override parallel site count | `deploy` | `-p 5`, `-p 0` (unlimited) |
+| `-v, --verbose` | Verbose output | `validate`, `sites` | |
 
 ---
 

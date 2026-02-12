@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "siteops"
-version = "1.0.0b1"
+dynamic = ["version"]
 description = "Azure Site Ops - Multi-site orchestration for Azure IaC"
 readme = "README.md"
 license = "MIT"
@@ -36,6 +36,9 @@ siteops = "siteops.cli:main"
 
 [project.urls]
 Repository = "https://github.com/Azure/digital-ops-scale-kit"
+
+[tool.setuptools.dynamic]
+version = {attr = "siteops.__version__"}
 
 [tool.setuptools.packages.find]
 include = ["siteops*"]

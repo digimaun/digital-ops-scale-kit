@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 """Command-line interface for Azure Site Ops.
 
 Commands:

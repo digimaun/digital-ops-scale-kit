@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 """Main orchestration engine.
 
 This module provides the Orchestrator class which handles:

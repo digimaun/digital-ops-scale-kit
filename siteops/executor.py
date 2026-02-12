@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 """Azure CLI and kubectl executor for deployments.
 
 This module handles the low-level execution of:

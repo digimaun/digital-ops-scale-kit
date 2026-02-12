@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 """Core data models for Azure Site Ops.
 
 This module defines the core resource types:

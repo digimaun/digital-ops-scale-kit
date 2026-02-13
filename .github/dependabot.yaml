@@ -3,7 +3,7 @@ updates:
   - package-ecosystem: "pip"
     directory: "/"
     schedule:
-      interval: "daily"
+      interval: "weekly"
     # limit to security updates only
     open-pull-requests-limit: 0
     commit-message:

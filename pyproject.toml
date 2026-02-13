@@ -35,7 +35,10 @@ dev = [
 siteops = "siteops.cli:main"
 
 [project.urls]
+Homepage = "https://github.com/Azure/digital-ops-scale-kit"
+Documentation = "https://github.com/Azure/digital-ops-scale-kit/tree/main/docs"
 Repository = "https://github.com/Azure/digital-ops-scale-kit"
+Issues = "https://github.com/Azure/digital-ops-scale-kit/issues"
 
 [tool.setuptools.dynamic]
 version = {attr = "siteops.__version__"}

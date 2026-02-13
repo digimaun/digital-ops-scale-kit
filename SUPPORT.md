@@ -12,7 +12,7 @@ For help and questions about using this project, please open a GitHub Discussion
 
 - [README.md](README.md) - Installation, quick start, and usage
 - [docs/](docs/) - Extended documentation
-- [.github/WORKFLOWS.md](.github/WORKFLOWS.md) - CI/CD setup guide
+- [docs/ci-cd-setup.md](docs/ci-cd-setup.md) - CI/CD setup guide
 
 ## Microsoft Support Policy
 

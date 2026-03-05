@@ -1,0 +1,44 @@
+# Steps template: Install Python and Site Ops
+# Equivalent to .github/actions/setup-siteops/action.yaml
+
+parameters:
+  - name: pythonVersion
+    displayName: Python version
+    type: string
+    default: '3.11'
+  - name: installDev
+    displayName: Include dev dependencies (pytest, pytest-cov)
+    type: boolean
+    default: false
+
+steps:
+  - task: UsePythonVersion@0
+    displayName: Set up Python ${{ parameters.pythonVersion }}
+    inputs:
+      versionSpec: ${{ parameters.pythonVersion }}
+
+  - script: echo "##vso[task.setvariable variable=PIP_CACHE_DIR]$(pip cache dir)"
+    displayName: Resolve pip cache directory
+
+  - task: Cache@2
+    displayName: Cache pip packages
+    inputs:
+      key: pip | "$(Agent.OS)" | ${{ parameters.installDev }} | pyproject.toml
+      path: $(PIP_CACHE_DIR)
+      restoreKeys: |
+        pip | "$(Agent.OS)" | ${{ parameters.installDev }}
+        pip | "$(Agent.OS)"
+
+  - script: |
+      pip install --upgrade pip
+      if [ "$INSTALL_DEV" = "True" ]; then
+        pip install -e ".[dev]"
+      else
+        pip install -e .
+      fi
+    displayName: Install Site Ops
+    env:
+      INSTALL_DEV: ${{ parameters.installDev }}
+
+  - script: siteops --version
+    displayName: Verify Site Ops installation

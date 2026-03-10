@@ -153,8 +153,4 @@ jobs:
             dry-run: ${{ inputs.dry-run }}
             environment: ${{ needs.prepare.outputs.github-environment }}
             ref: ${{ needs.prepare.outputs.ref }}
-        secrets:
-            AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-            AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-            AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-            SITE_OVERRIDES: ${{ secrets.SITE_OVERRIDES }}
+        secrets: inherit

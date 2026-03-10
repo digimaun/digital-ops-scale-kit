@@ -1,0 +1,194 @@
+# Stage template: Site Ops deployment
+# Equivalent to .github/workflows/_siteops-deploy.yaml
+
+parameters:
+  - name: serviceConnection
+    displayName: Azure service connection name (WIF)
+    type: string
+  - name: workspace
+    displayName: Workspace directory
+    type: string
+    default: workspaces/iot-operations
+  - name: manifest
+    displayName: Manifest path (relative to workspace)
+    type: string
+  - name: environment
+    displayName: ADO environment name (approval gates)
+    type: string
+    default: ''
+  - name: selector
+    displayName: Site selector
+    type: string
+    default: ''
+  - name: dryRun
+    displayName: Preview only
+    type: boolean
+    default: false
+
+stages:
+  - stage: deploy
+    variables:
+      PYTHONUNBUFFERED: '1'
+    jobs:
+      - deployment: siteops_deploy
+        displayName: Deploy
+        environment: ${{ parameters.environment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  fetchDepth: 1
+                  persistCredentials: false
+
+                - template: setup-siteops.yaml
+
+                - script: |
+                    # Prevent path traversal attacks
+                    if [[ "$WORKSPACE" == *".."* ]] || [[ "$MANIFEST" == *".."* ]]; then
+                      echo "##vso[task.logissue type=error]Path traversal not allowed"
+                      exit 1
+                    fi
+
+                    if [[ -n "$SELECTOR" && ! "$SELECTOR" =~ ^[a-zA-Z0-9_=,./:-]+$ ]]; then
+                      echo "##vso[task.logissue type=error]Invalid selector format"
+                      exit 1
+                    fi
+
+                    if [[ ! -d "$WORKSPACE" ]]; then
+                      echo "##vso[task.logissue type=error]Workspace directory not found: $WORKSPACE"
+                      exit 1
+                    fi
+
+                    echo "✓ Inputs validated"
+                  displayName: Validate inputs
+                  env:
+                    WORKSPACE: ${{ parameters.workspace }}
+                    MANIFEST: ${{ parameters.manifest }}
+                    SELECTOR: ${{ parameters.selector }}
+
+                - script: |
+                    # Generate sites.local/ override files from SITE_OVERRIDES JSON secret.
+                    # Supports nested paths using dot notation for parameters:
+                    # {
+                    #   "munich-dev": {
+                    #     "subscription": "...",
+                    #     "resourceGroup": "...",
+                    #     "parameters.clusterName": "actual-cluster-name",
+                    #     "parameters.customLocationName": "actual-custom-location"
+                    #   }
+                    # }
+
+                    if [[ -z "$SITE_OVERRIDES" ]]; then
+                      echo "No site overrides configured, using committed sites"
+                      exit 0
+                    fi
+
+                    if ! echo "$SITE_OVERRIDES" | jq empty 2>/dev/null; then
+                      echo "##vso[task.logissue type=error]SITE_OVERRIDES secret is not valid JSON"
+                      exit 1
+                    fi
+
+                    mkdir -p "$WORKSPACE/sites.local"
+
+                    for site_name in $(echo "$SITE_OVERRIDES" | jq -r 'keys[]'); do
+                      # Sanitize site name - only allow alphanumeric, dash, underscore
+                      if [[ ! "$site_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+                        echo "##vso[task.logissue type=error]Invalid site name in SITE_OVERRIDES: $site_name"
+                        exit 1
+                      fi
+
+                      output_file="$WORKSPACE/sites.local/${site_name}.yaml"
+
+                      # Build the YAML file with proper nesting
+                      {
+                        # Write top-level keys first
+                        echo "$SITE_OVERRIDES" | jq -r --arg site "$site_name" \
+                          '.[$site] | to_entries[] | select(.key | contains(".") | not) | "\(.key): \"\(.value)\""'
+
+                        # Then write nested keys grouped by parent
+                        for parent in $(echo "$SITE_OVERRIDES" | jq -r --arg site "$site_name" \
+                          '.[$site] | keys[] | select(contains(".")) | split(".")[0]' | sort -u); do
+                          echo "${parent}:"
+                          echo "$SITE_OVERRIDES" | jq -r --arg site "$site_name" --arg parent "$parent" \
+                            '.[$site] | to_entries[] | select(.key | startswith($parent + ".")) | "  \(.key | split(".")[1]): \"\(.value)\""'
+                        done
+                      } > "$output_file"
+
+                      echo "✓ Generated override for: $site_name"
+                    done
+
+                    # Mask each override value in ADO logs.
+                    # ADO masking is additive — once a value is registered as secret,
+                    # it stays masked for the remainder of the job.
+                    echo "$SITE_OVERRIDES" | jq -r '.. | strings' | while IFS= read -r val; do
+                      [[ -n "$val" ]] && echo "##vso[task.setvariable variable=masked;issecret=true]${val}"
+                    done
+
+                    count=$(ls "$WORKSPACE/sites.local/"*.yaml 2>/dev/null | wc -l)
+                    echo "✓ Generated ${count} site override(s)"
+                  displayName: Setup site overrides
+                  env:
+                    WORKSPACE: ${{ parameters.workspace }}
+                    SITE_OVERRIDES: $(SITE_OVERRIDES)
+
+                - script: |
+                    CMD_ARGS=(-w "$WORKSPACE" validate "$MANIFEST")
+                    [[ -n "$SELECTOR" ]] && CMD_ARGS+=(-l "$SELECTOR")
+                    CMD_ARGS+=(-v)
+
+                    SUMMARY_FILE="$(Build.ArtifactStagingDirectory)/deployment-plan.md"
+                    echo "### Deployment Plan" > "$SUMMARY_FILE"
+                    echo '```' >> "$SUMMARY_FILE"
+                    siteops "${CMD_ARGS[@]}" 2>&1 | tee -a "$SUMMARY_FILE"
+                    echo '```' >> "$SUMMARY_FILE"
+                    echo "##vso[task.uploadsummary]$SUMMARY_FILE"
+                  displayName: Validate and show target sites
+                  env:
+                    WORKSPACE: ${{ parameters.workspace }}
+                    MANIFEST: ${{ parameters.manifest }}
+                    SELECTOR: ${{ parameters.selector }}
+
+                - task: AzureCLI@2
+                  displayName: Deploy
+                  inputs:
+                    azureSubscription: ${{ parameters.serviceConnection }}
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      START_TIME=$(date +%s)
+
+                      CMD_ARGS=(-w "$WORKSPACE" deploy "$MANIFEST")
+
+                      if [[ "$DRY_RUN" == "True" ]]; then
+                        CMD_ARGS+=(--dry-run)
+                        echo "##vso[task.logissue type=warning]Running in DRY-RUN mode - no actual deployment"
+                      fi
+
+                      [[ -n "$SELECTOR" ]] && CMD_ARGS+=(-l "$SELECTOR")
+
+                      echo "Executing: siteops ${CMD_ARGS[*]}"
+                      if siteops "${CMD_ARGS[@]}" 2>&1; then
+                        DEPLOY_EXIT_CODE=0
+                      else
+                        DEPLOY_EXIT_CODE=$?
+                      fi
+
+                      END_TIME=$(date +%s)
+                      DURATION=$((END_TIME - START_TIME))
+
+                      RESULT_FILE="$(Build.ArtifactStagingDirectory)/deployment-result.md"
+                      echo "### Deployment Result" > "$RESULT_FILE"
+                      if [[ $DEPLOY_EXIT_CODE -eq 0 ]]; then
+                        echo "✅ **Success** in ${DURATION}s" >> "$RESULT_FILE"
+                      else
+                        echo "❌ **Failed** after ${DURATION}s" >> "$RESULT_FILE"
+                      fi
+                      echo "##vso[task.uploadsummary]$RESULT_FILE"
+
+                      exit $DEPLOY_EXIT_CODE
+                  env:
+                    WORKSPACE: ${{ parameters.workspace }}
+                    MANIFEST: ${{ parameters.manifest }}
+                    SELECTOR: ${{ parameters.selector }}
+                    DRY_RUN: ${{ parameters.dryRun }}

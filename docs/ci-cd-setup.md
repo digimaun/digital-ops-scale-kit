@@ -1,14 +1,21 @@
 # CI/CD Setup
 
-This guide covers GitHub Actions configuration for automated deployments.
+This guide covers CI/CD configuration for automated testing and deployments. Site Ops is CI/CD-platform agnostic — it runs anywhere Python and `az` CLI are available. This project provides reference implementations for both GitHub Actions (primary) and Azure DevOps (MVP).
+
+| Platform | Location | Status |
+|----------|----------|--------|
+| [GitHub Actions](#github-actions) | `.github/workflows/` | Primary |
+| [Azure DevOps](#azure-devops) | `.pipelines/` | Reference implementation |
 
 ## Prerequisites
 
 1. Azure subscription with resources to deploy
-2. GitHub repository with Actions enabled
-3. Azure AD application for OIDC authentication
+2. GitHub repository with Actions enabled **or** Azure DevOps project with Pipelines enabled
+3. Azure AD application for OIDC / Workload Identity Federation
 
-## Workflows
+## GitHub Actions
+
+### Workflows
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
@@ -16,11 +23,11 @@ This guide covers GitHub Actions configuration for automated deployments.
 | `deploy.yaml` | Manual (`workflow_dispatch`) | Deploy infrastructure to Azure |
 | `_siteops-deploy.yaml` | Called by deploy.yaml | Reusable deployment logic |
 
-## Azure OIDC Configuration
+### Azure OIDC Configuration
 
 OIDC (OpenID Connect) allows GitHub Actions to authenticate to Azure without storing secrets. Examples use bash syntax.
 
-### 1. Create Azure AD application
+#### 1. Create Azure AD application
 
 ```bash
 # Create app registration
@@ -33,7 +40,7 @@ APP_ID=$(az ad app list --display-name "siteops-github-actions" --query "[0].app
 az ad sp create --id $APP_ID
 ```
 
-### 2. Create federated credentials
+#### 2. Create federated credentials
 
 ```bash
 # For main branch deployments
@@ -61,7 +68,7 @@ done
 
 Alternatively, configure the subject to match a branch (`ref:refs/heads/main`), pull request (`pull_request`), or tag (`ref:refs/tags/v*`) instead of an environment.
 
-### 3. Assign Azure roles
+#### 3. Assign Azure roles
 
 For basic deployments, Contributor is sufficient:
 
@@ -91,7 +98,34 @@ This condition allows creating and deleting role assignments but blocks these pr
 | `18d7d88d-d35e-4fb5-a5c3-7773c20a72d9` | User Access Administrator |
 | `f58310d9-a9f6-439a-9e8d-f62e7b41a168` | Role Based Access Control Administrator |
 
-### 4. Configure GitHub secrets
+#### Kubernetes RBAC for Arc proxy operations
+
+If your manifests include `kubectl` steps that execute via Arc proxy (Cluster Connect), the CI/CD service principal needs authorization to perform operations inside the Kubernetes cluster. The Azure roles above control access to Azure resources — they do not grant permissions within Kubernetes itself.
+
+There are two approaches to grant this access:
+
+- **Azure RBAC for Arc-enabled Kubernetes** — Assign Azure roles like `Azure Arc Kubernetes Cluster Admin` or a custom role to the service principal, scoped to the cluster resource. This is managed entirely through Azure and requires [Azure RBAC to be enabled on the cluster](https://learn.microsoft.com/azure/azure-arc/kubernetes/azure-rbac).
+- **Kubernetes-native RBAC** — Create a `RoleBinding` or `ClusterRoleBinding` on the cluster itself, referencing the service principal's object ID.
+
+The following is a Kubernetes-native example that grants broad access for development. Replace with a least-privilege role for production:
+
+```bash
+# Replace <object-id> with the service principal's object ID
+# Replace <namespace> with the target namespace (e.g., azure-iot-operations)
+
+kubectl create namespace <namespace> --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl create rolebinding ci-cluster-admin \
+  --clusterrole=cluster-admin \
+  --user=<object-id> \
+  --namespace=<namespace>
+```
+
+> **Note:** `cluster-admin` is convenient for getting started but grants full access to the namespace. For production, create a custom `ClusterRole` scoped to the specific resources your manifests manage, or use Azure RBAC with a narrowly scoped role.
+
+This configuration is per-cluster and must be repeated for each Arc-enabled cluster that the CI/CD pipeline targets.
+
+#### 4. Configure GitHub secrets
 
 Go to **Settings → Secrets and variables → Actions** and add:
 
@@ -102,7 +136,7 @@ Go to **Settings → Secrets and variables → Actions** and add:
 | `AZURE_SUBSCRIPTION_ID` | Yes | Default subscription for OIDC login |
 | `SITE_OVERRIDES` | No | JSON object with per-site overrides (see below) |
 
-### 5. Configure GitHub environments
+#### 5. Configure GitHub environments
 
 Go to **Settings → Environments** and create:
 
@@ -121,9 +155,16 @@ Go to **Settings → Environments** and create:
 - Deployment branches: `main` only
 - Wait timer: 5 minutes (optional)
 
-## SITE_OVERRIDES (Optional)
+## SITE_OVERRIDES
 
-Use `SITE_OVERRIDES` when you prefer not to commit configuration values (subscriptions, resource groups, credentials) to the repository. The workflow generates `sites.local/*.yaml` files at runtime from this secret.
+Use `SITE_OVERRIDES` when you prefer not to commit configuration values (subscriptions, resource groups, credentials) to the repository. Both GHA and ADO pipelines generate `sites.local/*.yaml` files at runtime from this value using identical logic.
+
+| Platform | Where to store | Type |
+|----------|---------------|------|
+| GitHub Actions | Repository secret (`Settings → Secrets → Actions`) | Secret |
+| Azure DevOps | Variable group `siteops-secrets` (`Pipelines → Library`) | Secret variable |
+
+The JSON format is identical on both platforms.
 
 **When to use:**
 
@@ -171,11 +212,11 @@ Override subscription, resource group, and parameters per site. Supports nested 
 ```
 
 > **Note:** `SITE_OVERRIDES` is stored as a secret for access control (admin-only modification).
-> Individual override values are registered with `::add-mask::` to prevent exposure in workflow logs.
+> Individual override values are masked in pipeline logs to prevent exposure (`::add-mask::` on GHA, `##vso[task.setvariable issecret=true]` on ADO).
 
 ## Running Deployments
 
-### CI (automatic)
+### CI (automatic — both platforms)
 
 CI runs automatically on pushes to main and PRs that modify:
 
@@ -184,7 +225,7 @@ CI runs automatically on pushes to main and PRs that modify:
 - `tests/**`
 - `pyproject.toml`
 
-Can also be triggered manually from **Actions → CI → Run workflow**.
+Can also be triggered manually from **Actions → CI → Run workflow** (GHA) or **Pipelines → CI → Run pipeline** (ADO).
 
 ### Deploy via GitHub UI
 
@@ -225,6 +266,7 @@ curl -X POST \
   -d '{
     "ref": "main",
     "inputs": {
+      "workspace": "iot-operations",
       "manifest": "aio-install",
       "environment": "dev",
       "selector": "",
@@ -272,6 +314,8 @@ gh workflow run deploy.yaml -f workspace="iot-operations" -f manifest="opc-ua-so
 
 ## Workflow Architecture
 
+### GitHub Actions
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    Trigger Sources                          │
@@ -302,38 +346,52 @@ gh workflow run deploy.yaml -f workspace="iot-operations" -f manifest="opc-ua-so
 └─────────────────────────────────────────────────────────────┘
 ```
 
+See [ADO architecture](#ado-architecture) for the Azure DevOps equivalent.
+
 ## Security
 
-| Feature | Description |
-|---------|-------------|
-| **OIDC Authentication** | No stored Azure credentials; tokens are short-lived |
-| **Environment Protection** | Required approvals for staging/prod |
-| **Input Validation** | Prevents path traversal and injection attacks |
-| **Site Name Sanitization** | SITE_OVERRIDES keys validated against `^[a-zA-Z0-9_-]+$` |
-| **Override Value Masking** | Individual SITE_OVERRIDES values registered with `::add-mask::` to prevent log exposure |
-| **Concurrency Control** | One deployment per environment at a time |
-| **Least Privilege Permissions** | Workflows request minimal GitHub token scopes |
-| **Token Refresh** | Background service refreshes OIDC token for long deployments |
-| **Audit Trail** | All runs logged with triggering user |
+| Feature | GitHub Actions | Azure DevOps |
+|---------|---------------|--------------|
+| **Authentication** | OIDC (no stored credentials, short-lived tokens) | WIF service connection (token managed by `AzureCLI@2`) |
+| **Environment Protection** | Required approvals for staging/prod | Approval checks on ADO environments |
+| **Input Validation** | Prevents path traversal and injection attacks | Same validation logic in pipeline scripts |
+| **Site Name Sanitization** | `SITE_OVERRIDES` keys validated against `^[a-zA-Z0-9_-]+$` | Same |
+| **Override Value Masking** | `::add-mask::` per value | `##vso[task.setvariable issecret=true]` per value |
+| **Concurrency Control** | `concurrency` groups (one deploy per env) | Exclusive lock on ADO environments |
+| **Least Privilege** | `permissions:` block scopes GitHub token | Service connection authorization scopes access |
+| **Token Refresh** | Background OIDC refresh every 4 min | Not needed (`AzureCLI@2` manages lifecycle) |
+| **Credential Isolation** | `persist-credentials: false` on checkout | `persistCredentials: false` on checkout |
+| **Audit Trail** | All runs logged with triggering user | Same |
 
 ### Security model
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  Layer 1: GitHub                                            │
+│  Layer 1: CI/CD Platform                                    │
+│                                                             │
+│  GitHub Actions:                                            │
 │  • Environment protection rules (approvals, branch gates)   │
 │  • Concurrency prevents parallel deploys to same env        │
-│  • Input validation blocks path traversal                   │
 │  • Minimal permissions (contents: read, id-token: write)    │
+│                                                             │
+│  Azure DevOps:                                              │
+│  • Environment approval checks and exclusive locks          │
+│  • Service connection authorization (admin-controlled)      │
+│  • Variable groups with role-based access                   │
+│                                                             │
+│  Both:                                                      │
+│  • Input validation blocks path traversal                   │
+│  • SITE_OVERRIDES values masked in logs                     │
+│  • Credential persistence disabled on checkout              │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  Layer 2: OIDC Federation                                   │
-│  • No stored Azure credentials                              │
-│  • Token scoped to specific environment                     │
-│  • Federated credential must match subject claim            │
-│  • Automatic token refresh for long-running deployments     │
+│  Layer 2: Identity Federation                               │
+│  • No stored Azure credentials on either platform           │
+│  • GHA: OIDC token + federated credential subject matching  │
+│  • ADO: WIF service connection (automatic token exchange)   │
+│  • Token scoped to specific environment/context             │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -341,6 +399,7 @@ gh workflow run deploy.yaml -f workspace="iot-operations" -f manifest="opc-ua-so
 │  Layer 3: Azure RBAC                                        │
 │  • Service principal has scoped permissions                 │
 │  • Can further restrict by subscription/resource group      │
+│  • Same identity and roles for both platforms               │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -348,11 +407,12 @@ gh workflow run deploy.yaml -f workspace="iot-operations" -f manifest="opc-ua-so
 
 ### Adding new manifests
 
-To add a new manifest to the deployment workflow:
+To add a new manifest to the deployment workflows:
 
 1. Create your manifest in `workspaces/<workspace>/manifests/`
-2. Update `.github/workflows/deploy.yaml` to add it to the `manifest` dropdown:
+2. Update the workflow/pipeline to add it to the dropdown:
 
+**GitHub Actions** — `.github/workflows/deploy.yaml`:
 ```yaml
 manifest:
     description: "Manifest to deploy"
@@ -364,13 +424,23 @@ manifest:
         - my-new-manifest  # Add here (without .yaml extension)
 ```
 
+**Azure DevOps** — `.pipelines/deploy.yaml`:
+```yaml
+- name: manifest
+  displayName: Manifest
+  type: string
+  default: aio-install
+  values: [aio-install, opc-ua-solution, my-new-manifest]  # Add here
+```
+
 ### Adding new workspaces
 
 To add a new workspace (e.g., `iot-hub`):
 
 1. Create `workspaces/iot-hub/` with `manifests/`, `sites/`, `parameters/`, `templates/`
-2. Update `.github/workflows/deploy.yaml` to add it to the `workspace` dropdown:
+2. Update the workflow/pipeline to add it to the dropdown:
 
+**GitHub Actions** — `.github/workflows/deploy.yaml`:
 ```yaml
 workspace:
     description: "Workspace to deploy"
@@ -381,9 +451,18 @@ workspace:
         - iot-hub  # Add here
 ```
 
+**Azure DevOps** — `.pipelines/deploy.yaml`:
+```yaml
+- name: workspace
+  displayName: Workspace
+  type: string
+  default: iot-operations
+  values: [iot-operations, iot-hub]  # Add here
+```
+
 ### Custom deployment workflow
 
-Create a new workflow that calls the reusable workflow:
+**GitHub Actions** — Create a new workflow that calls the reusable workflow:
 
 ```yaml
 name: Deploy My Service
@@ -402,19 +481,194 @@ jobs:
     secrets: inherit
 ```
 
-### Setup Site Ops action
+**Azure DevOps** — Create a new pipeline that uses the stage template:
 
-The `setup-siteops` composite action installs Python and Site Ops:
+```yaml
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [services/my-service/**]
+
+pr: none
+
+variables:
+  - group: siteops-secrets
+
+stages:
+  - template: templates/siteops-deploy.yaml
+    parameters:
+      serviceConnection: azure-siteops
+      manifest: manifests/my-service.yaml
+      environment: dev
+```
+
+### Setup templates
+
+**GitHub Actions** — The `setup-siteops` composite action:
 
 | Input | Default | Description |
 |-------|---------|-------------|
 | `python-version` | `3.11` | Python version to install |
 | `install-dev` | `false` | Include dev dependencies (pytest, pytest-cov) |
 
-Example with dev dependencies (for running tests):
-
 ```yaml
 - uses: ./.github/actions/setup-siteops
   with:
     install-dev: "true"
 ```
+
+**Azure DevOps** — The `setup-siteops.yaml` steps template:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `pythonVersion` | `'3.11'` | Python version to install |
+| `installDev` | `false` | Include dev dependencies (pytest, pytest-cov) |
+
+```yaml
+- template: templates/setup-siteops.yaml
+  parameters:
+    installDev: true
+```
+
+---
+
+## Azure DevOps
+
+### Pipelines
+
+| Pipeline file | Purpose | Trigger |
+|---------------|---------|---------|
+| `.pipelines/ci.yaml` | Unit tests + manifest validation | Push to main, PRs |
+| `.pipelines/deploy.yaml` | Manual deploy with environment selection | Manual only |
+| `.pipelines/templates/siteops-deploy.yaml` | Stage template: deployment logic | Called by deploy.yaml |
+| `.pipelines/templates/setup-siteops.yaml` | Steps template: install Python + siteops | Called by all pipelines |
+
+### ADO project setup
+
+#### 1. Create service connection (Workload Identity Federation)
+
+In ADO → **Project settings → Service connections → New → Azure Resource Manager → Workload Identity federation**.
+
+- **Automatic** — creates the Entra app registration and federated credential for you
+- **Manual** — reuse the existing app registration from GitHub Actions OIDC setup (same `APP_ID`)
+
+The service connection name is referenced in the deploy pipeline. Default: `azure-siteops`.
+
+> **Reusing the GitHub Actions app registration:** If you already configured OIDC for GitHub Actions (section above), you can reuse that same app registration. Create a new federated credential for ADO — the issuer and subject claims are different from GitHub's. The Azure roles are shared.
+
+#### 2. Create variable group
+
+In ADO → **Pipelines → Library → + Variable group**:
+
+| Variable group | Variable | Type | Description |
+|----------------|----------|------|-------------|
+| `siteops-secrets` | `SITE_OVERRIDES` | Secret | JSON object — same format as the GitHub secret (see [SITE_OVERRIDES](#site_overrides)) |
+
+#### 3. Create environments
+
+In ADO → **Pipelines → Environments** → create `dev`, `staging`, `prod`.
+
+| Environment | Approvals | Exclusive lock |
+|-------------|-----------|----------------|
+| `dev` | None | Yes |
+| `staging` | 1 approver | Yes |
+| `prod` | 2 approvers | Yes |
+
+Exclusive lock ensures one deployment per environment at a time (equivalent to GitHub `concurrency` groups).
+
+To configure: **Environments → (select env) → Approvals and checks → + → Exclusive lock** and **+ → Approvals**.
+
+#### 4. Create pipelines
+
+In ADO → **Pipelines → New pipeline** → **Azure Repos Git** (or GitHub, if the repo is hosted there) → select repository → **Existing Azure Pipelines YAML file**:
+
+- `.pipelines/ci.yaml` → name it **"CI"**
+- `.pipelines/deploy.yaml` → name it **"Deploy Infrastructure"**
+
+#### 5. Assign Azure roles
+
+Same as GitHub Actions — see [Assign Azure roles](#3-assign-azure-roles). The service connection's managed identity needs the same Contributor (or Owner with conditions) role assignment.
+
+### Running ADO deployments
+
+#### Deploy via ADO UI
+
+1. Go to **Pipelines** → select **"Deploy Infrastructure"**
+2. Click **"Run pipeline"**
+3. Select branch/tag from the branch picker
+4. Fill in parameters:
+   - **Workspace**: `iot-operations`
+   - **Manifest**: `aio-install` or `opc-ua-solution`
+   - **Target environment**: `dev`, `staging`, or `prod`
+   - **Additional site selector**: e.g., `country=US,name=seattle-dev` (optional)
+   - **Dry run**: Check to preview without deploying
+5. Click **"Run"**
+
+#### Deploy via Azure CLI
+
+```bash
+az pipelines run \
+  --name "Deploy Infrastructure" \
+  --parameters workspace=iot-operations manifest=aio-install environment=dev
+
+# With additional options
+az pipelines run \
+  --name "Deploy Infrastructure" \
+  --parameters workspace=iot-operations manifest=aio-install environment=dev \
+               selector="country=US" dryRun=true
+```
+
+### ADO architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Trigger Sources                          │
+├──────────────┬──────────────┬──────────────────────────────┤
+│   ADO UI     │  az CLI      │  Push / PR                   │
+└──────┬───────┴──────┬───────┴──────────────┬───────────────┘
+       │              │                      │
+       ▼              ▼                      ▼
+┌──────────────────────────┐   ┌─────────────────────────────┐
+│    deploy.yaml           │   │         ci.yaml             │
+│    (manual trigger)      │   │    (push + pull_request)    │
+└───────────┬──────────────┘   ├─────────────────────────────┤
+            │                  │  • Unit Tests               │
+            │                  │  • Manifest Validation      │
+            │                  │  • Deployment Plan Preview  │
+            ▼                  └─────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│            siteops-deploy.yaml (stage template)             │
+├─────────────────────────────────────────────────────────────┤
+│  1. Setup Site Ops (steps template)                         │
+│  2. Validate inputs (path traversal protection)             │
+│  3. Generate sites.local/ from SITE_OVERRIDES               │
+│  4. Validate and show deployment plan                       │
+│  5. AzureCLI@2: siteops deploy (auth scoped to this step)  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Key difference from GitHub Actions:** `AzureCLI@2` handles authentication, token lifecycle, and cleanup in a single task — no separate login, token refresh, or logout steps needed.
+
+### Per-environment migration
+
+The deploy pipeline uses object parameter lookup tables for service connections and variable groups. To split per-environment (separate identities and secrets):
+
+```yaml
+# .pipelines/deploy.yaml — edit these defaults:
+- name: serviceConnections
+  type: object
+  default:
+    dev: azure-siteops-dev         # ← separate service connection
+    staging: azure-siteops-staging
+    prod: azure-siteops-prod
+
+- name: secretGroups
+  type: object
+  default:
+    dev: siteops-secrets-dev       # ← separate variable group
+    staging: siteops-secrets-staging
+    prod: siteops-secrets-prod
+```
+
+No structural pipeline changes needed — just edit defaults and create the corresponding ADO resources.

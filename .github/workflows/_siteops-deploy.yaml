@@ -35,6 +35,11 @@ on:
         required: false
         type: boolean
         default: false
+      siteops-source:
+        description: "siteops install source (empty = local editable install)"
+        required: false
+        type: string
+        default: ""
     secrets:
       AZURE_CLIENT_ID:
         description: "Azure AD application client ID"
@@ -77,6 +82,8 @@ jobs:
 
       - name: Setup Site Ops
         uses: ./.github/actions/setup-siteops
+        with:
+          siteops-source: ${{ inputs.siteops-source }}
 
       - name: Validate inputs
         shell: bash

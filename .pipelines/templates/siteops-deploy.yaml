@@ -24,6 +24,10 @@ parameters:
     displayName: Preview only
     type: boolean
     default: false
+  - name: siteopsSource
+    displayName: siteops install source (empty = local editable install)
+    type: string
+    default: ''
 
 stages:
   - stage: deploy
@@ -42,6 +46,8 @@ stages:
                   persistCredentials: false
 
                 - template: setup-siteops.yaml
+                  parameters:
+                    siteopsSource: ${{ parameters.siteopsSource }}
 
                 - script: |
                     # Prevent path traversal attacks

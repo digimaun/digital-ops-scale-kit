@@ -10,6 +10,10 @@ inputs:
     description: "Include dev dependencies (pytest, pytest-cov)"
     required: false
     default: "false"
+  siteops-source:
+    description: "siteops install source (empty = local editable install)"
+    required: false
+    default: ""
 
 runs:
   using: "composite"
@@ -32,9 +36,12 @@ runs:
       shell: bash
       env:
         INSTALL_DEV: ${{ inputs.install-dev }}
+        SITEOPS_SOURCE: ${{ inputs.siteops-source }}
       run: |
         pip install --upgrade pip
-        if [[ "$INSTALL_DEV" == "true" ]]; then
+        if [ -n "$SITEOPS_SOURCE" ]; then
+          pip install "$SITEOPS_SOURCE"
+        elif [[ "$INSTALL_DEV" == "true" ]]; then
           pip install -e ".[dev]"
         else
           pip install -e .

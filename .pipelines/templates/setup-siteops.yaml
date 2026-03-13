@@ -10,6 +10,10 @@ parameters:
     displayName: Include dev dependencies (pytest, pytest-cov)
     type: boolean
     default: false
+  - name: siteopsSource
+    displayName: siteops install source (empty = local editable install)
+    type: string
+    default: ''
 
 steps:
   - task: UsePythonVersion@0
@@ -31,7 +35,9 @@ steps:
 
   - script: |
       pip install --upgrade pip
-      if [ "$INSTALL_DEV" = "True" ]; then
+      if [ -n "$SITEOPS_SOURCE" ]; then
+        pip install "$SITEOPS_SOURCE"
+      elif [ "$INSTALL_DEV" = "True" ]; then
         pip install -e ".[dev]"
       else
         pip install -e .
@@ -39,6 +45,7 @@ steps:
     displayName: Install Site Ops
     env:
       INSTALL_DEV: ${{ parameters.installDev }}
+      SITEOPS_SOURCE: ${{ parameters.siteopsSource }}
 
   - script: siteops --version
     displayName: Verify Site Ops installation

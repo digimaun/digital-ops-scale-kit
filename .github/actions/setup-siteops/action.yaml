@@ -27,7 +27,7 @@ runs:
       uses: actions/cache@v5
       with:
         path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-siteops-${{ inputs.install-dev == 'true' && 'dev-' || '' }}${{ hashFiles('pyproject.toml') }}
+        key: ${{ runner.os }}-pip-siteops-${{ inputs.siteops-source || format('{0}{1}', inputs.install-dev == 'true' && 'dev-' || '', hashFiles('pyproject.toml')) }}
         restore-keys: |
           ${{ runner.os }}-pip-siteops-
           ${{ runner.os }}-pip-

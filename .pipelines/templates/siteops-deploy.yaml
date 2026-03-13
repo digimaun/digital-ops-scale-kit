@@ -48,6 +48,7 @@ stages:
                 - template: setup-siteops.yaml
                   parameters:
                     siteopsSource: ${{ parameters.siteopsSource }}
+                    enableCache: false
 
                 - script: |
                     # Prevent path traversal attacks

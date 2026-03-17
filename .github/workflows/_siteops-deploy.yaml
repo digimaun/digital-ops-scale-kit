@@ -35,6 +35,11 @@ on:
         required: false
         type: boolean
         default: false
+      siteops-source:
+        description: "siteops install source (empty = local editable install)"
+        required: false
+        type: string
+        default: ""
     secrets:
       AZURE_CLIENT_ID:
         description: "Azure AD application client ID"
@@ -77,6 +82,8 @@ jobs:
 
       - name: Setup Site Ops
         uses: ./.github/actions/setup-siteops
+        with:
+          siteops-source: ${{ inputs.siteops-source }}
 
       - name: Validate inputs
         shell: bash
@@ -105,13 +112,13 @@ jobs:
         shell: bash
         run: |
           # Generate sites.local/ override files from SITE_OVERRIDES JSON secret.
-          # Supports nested paths using dot notation for parameters:
+          # Supports nested paths using dot notation at any depth:
           # {
           #   "munich-dev": {
           #     "subscription": "...",
           #     "resourceGroup": "...",
           #     "parameters.clusterName": "actual-cluster-name",
-          #     "parameters.customLocationName": "actual-custom-location"
+          #     "parameters.dataflowIdentity.clientId": "..."
           #   }
           # }
 
@@ -120,40 +127,38 @@ jobs:
             exit 0
           fi
 
-          if ! echo "$SITE_OVERRIDES" | jq empty 2>/dev/null; then
-            echo "::error::SITE_OVERRIDES secret is not valid JSON"
-            exit 1
-          fi
+          python3 - <<'GENERATE_OVERLAYS'
+          import json, os, re, sys, yaml
 
-          mkdir -p "$INPUT_WORKSPACE/sites.local"
+          overrides = json.loads(os.environ["SITE_OVERRIDES"])
+          workspace = os.environ["INPUT_WORKSPACE"]
+          site_name_re = re.compile(r"^[a-zA-Z0-9_-]+$")
 
-          for site_name in $(echo "$SITE_OVERRIDES" | jq -r 'keys[]'); do
-            # Sanitize site name - only allow alphanumeric, dash, underscore
-            if [[ ! "$site_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-              echo "::error::Invalid site name in SITE_OVERRIDES: $site_name"
-              exit 1
-            fi
+          sites_local = os.path.join(workspace, "sites.local")
+          os.makedirs(sites_local, exist_ok=True)
 
-            output_file="$INPUT_WORKSPACE/sites.local/${site_name}.yaml"
-            
-            # Build the YAML file with proper nesting
-            # First, collect all entries and group by parent
-            {
-              # Write top-level keys first
-              echo "$SITE_OVERRIDES" | jq -r --arg site "$site_name" \
-                '.[$site] | to_entries[] | select(.key | contains(".") | not) | "\(.key): \"\(.value)\""'
-              
-              # Then write nested keys grouped by parent
-              for parent in $(echo "$SITE_OVERRIDES" | jq -r --arg site "$site_name" \
-                '.[$site] | keys[] | select(contains(".")) | split(".")[0]' | sort -u); do
-                echo "${parent}:"
-                echo "$SITE_OVERRIDES" | jq -r --arg site "$site_name" --arg parent "$parent" \
-                  '.[$site] | to_entries[] | select(.key | startswith($parent + ".")) | "  \(.key | split(".")[1]): \"\(.value)\""'
-              done
-            } > "$output_file"
+          for site_name, values in overrides.items():
+              if not site_name_re.match(site_name):
+                  print(f"::error::Invalid site name in SITE_OVERRIDES: {site_name}")
+                  sys.exit(1)
 
-            echo "✓ Generated override for: $site_name"
-          done
+              # Expand dot-notation keys into nested dict
+              nested = {}
+              for key, value in values.items():
+                  parts = key.split(".")
+                  current = nested
+                  for part in parts[:-1]:
+                      current = current.setdefault(part, {})
+                  current[parts[-1]] = value
+
+              output_file = os.path.join(sites_local, f"{site_name}.yaml")
+              with open(output_file, "w") as f:
+                  yaml.safe_dump(nested, f, default_flow_style=False)
+
+              print(f"✓ Generated override for: {site_name}")
+
+          print(f"✓ Generated {len(overrides)} site override(s)")
+          GENERATE_OVERLAYS
 
           # Register each override value with GitHub's log masking so
           # subscription IDs, resource groups, etc. appear as *** in all
@@ -161,9 +166,6 @@ jobs:
           echo "$SITE_OVERRIDES" | jq -r '.. | strings' | while IFS= read -r val; do
             [[ -n "$val" ]] && echo "::add-mask::${val}"
           done
-
-          count=$(ls "$INPUT_WORKSPACE/sites.local/"*.yaml 2>/dev/null | wc -l)
-          echo "✓ Generated ${count} site override(s)"
 
       - name: Validate and show target sites
         shell: bash

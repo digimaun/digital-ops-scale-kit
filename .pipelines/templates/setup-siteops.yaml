@@ -10,6 +10,14 @@ parameters:
     displayName: Include dev dependencies (pytest, pytest-cov)
     type: boolean
     default: false
+  - name: siteopsSource
+    displayName: siteops install source (empty = local editable install)
+    type: string
+    default: ''
+  - name: enableCache
+    displayName: Enable pip caching (disable for deployment jobs which lack caching scopes)
+    type: boolean
+    default: true
 
 steps:
   - task: UsePythonVersion@0
@@ -17,21 +25,26 @@ steps:
     inputs:
       versionSpec: ${{ parameters.pythonVersion }}
 
-  - script: echo "##vso[task.setvariable variable=PIP_CACHE_DIR]$(pip cache dir)"
-    displayName: Resolve pip cache directory
+  - ${{ if eq(parameters.enableCache, true) }}:
+    - script: echo "##vso[task.setvariable variable=PIP_CACHE_DIR]$(pip cache dir)"
+      displayName: Resolve pip cache directory
 
-  - task: Cache@2
-    displayName: Cache pip packages
-    inputs:
-      key: pip | "$(Agent.OS)" | ${{ parameters.installDev }} | pyproject.toml
-      path: $(PIP_CACHE_DIR)
-      restoreKeys: |
-        pip | "$(Agent.OS)" | ${{ parameters.installDev }}
-        pip | "$(Agent.OS)"
+    - task: Cache@2
+      displayName: Cache pip packages
+      inputs:
+        ${{ if eq(parameters.siteopsSource, '') }}:
+          key: pip | "$(Agent.OS)" | ${{ parameters.installDev }} | pyproject.toml
+        ${{ else }}:
+          key: pip | "$(Agent.OS)" | "${{ parameters.siteopsSource }}"
+        path: $(PIP_CACHE_DIR)
+        restoreKeys: |
+          pip | "$(Agent.OS)"
 
   - script: |
       pip install --upgrade pip
-      if [ "$INSTALL_DEV" = "True" ]; then
+      if [ -n "$SITEOPS_SOURCE" ]; then
+        pip install "$SITEOPS_SOURCE"
+      elif [ "$INSTALL_DEV" = "True" ]; then
         pip install -e ".[dev]"
       else
         pip install -e .
@@ -39,6 +52,7 @@ steps:
     displayName: Install Site Ops
     env:
       INSTALL_DEV: ${{ parameters.installDev }}
+      SITEOPS_SOURCE: ${{ parameters.siteopsSource }}
 
   - script: siteops --version
     displayName: Verify Site Ops installation

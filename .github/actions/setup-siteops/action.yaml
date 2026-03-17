@@ -10,6 +10,10 @@ inputs:
     description: "Include dev dependencies (pytest, pytest-cov)"
     required: false
     default: "false"
+  siteops-source:
+    description: "siteops install source (empty = local editable install)"
+    required: false
+    default: ""
 
 runs:
   using: "composite"
@@ -23,7 +27,7 @@ runs:
       uses: actions/cache@v5
       with:
         path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-siteops-${{ inputs.install-dev == 'true' && 'dev-' || '' }}${{ hashFiles('pyproject.toml') }}
+        key: ${{ runner.os }}-pip-siteops-${{ inputs.siteops-source || format('{0}{1}', inputs.install-dev == 'true' && 'dev-' || '', hashFiles('pyproject.toml')) }}
         restore-keys: |
           ${{ runner.os }}-pip-siteops-
           ${{ runner.os }}-pip-
@@ -32,9 +36,12 @@ runs:
       shell: bash
       env:
         INSTALL_DEV: ${{ inputs.install-dev }}
+        SITEOPS_SOURCE: ${{ inputs.siteops-source }}
       run: |
         pip install --upgrade pip
-        if [[ "$INSTALL_DEV" == "true" ]]; then
+        if [ -n "$SITEOPS_SOURCE" ]; then
+          pip install "$SITEOPS_SOURCE"
+        elif [[ "$INSTALL_DEV" == "true" ]]; then
           pip install -e ".[dev]"
         else
           pip install -e .

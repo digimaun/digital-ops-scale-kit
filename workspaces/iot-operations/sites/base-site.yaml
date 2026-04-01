@@ -15,6 +15,7 @@ properties:
     includeEdgeSite: true         # RG-scoped edge site (default for RG-level sites)
     includeSolution: false
     includeOpcPlcSimulator: false
+    enableSecretSync: false
 
 parameters:
   # AIO broker configuration defaults

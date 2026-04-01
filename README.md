@@ -149,6 +149,7 @@ digital-ops-scale-kit/
 │   ├── orchestrator.py           # Core orchestration logic
 │   └── executor.py               # Azure CLI and kubectl execution
 ├── tests/                        # Test suite
+├── scripts/                      # Utility scripts (Bicep validation, etc.)
 ├── workspaces/
 │   └── iot-operations/           # Reference implementation
 │       ├── sites/                # Site definitions
@@ -156,12 +157,13 @@ digital-ops-scale-kit/
 │       ├── parameters/           # Parameter files
 │       └── templates/            # Bicep templates
 ├── docs/                         # Extended documentation
-│   ├── ci-cd-setup.md            # GitHub Actions, OIDC, secrets
+│   ├── ci-cd-setup.md            # GitHub Actions, Azure DevOps, OIDC, secrets
 │   ├── manifest-reference.md     # Manifest syntax, step types
 │   ├── parameter-resolution.md   # Variables, output chaining
 │   ├── site-configuration.md     # Sites, inheritance, overlays
 │   └── troubleshooting.md        # Common issues and solutions
-└── .github/                      # CI/CD workflows
+├── .github/                      # GitHub Actions workflows
+└── .pipelines/                   # Azure DevOps pipeline definitions
 ```
 
 ### Workspace anatomy
@@ -406,7 +408,8 @@ See [docs/ci-cd-setup.md](docs/ci-cd-setup.md) for detailed configuration.
 | [docs/site-configuration.md](docs/site-configuration.md) | Site definitions, inheritance, overlays |
 | [docs/manifest-reference.md](docs/manifest-reference.md) | Manifest syntax, step types, conditions |
 | [docs/parameter-resolution.md](docs/parameter-resolution.md) | Template variables, output chaining, auto-filtering |
-| [docs/ci-cd-setup.md](docs/ci-cd-setup.md) | GitHub Actions, OIDC, secrets configuration |
+| [docs/secret-sync.md](docs/secret-sync.md) | Secret sync enablement and usage |
+| [docs/ci-cd-setup.md](docs/ci-cd-setup.md) | GitHub Actions, Azure DevOps, OIDC, secrets configuration |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Common issues and solutions |
 
 ---

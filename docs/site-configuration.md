@@ -113,6 +113,7 @@ properties:
   deployOptions:                     # Control deployment behavior
     includeSolution: true
     includeOpcPlcSimulator: false
+    enableSecretSync: false
   tags:
     costCenter: operations
     team: platform

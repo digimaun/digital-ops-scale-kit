@@ -27,6 +27,10 @@ var generatedStorageAccountName = !empty(storageAccountName)
   ? storageAccountName
   : take('sr${uniqueString(resourceGroup().id, schemaRegistryName)}', 24)
 
+// Uses resourceId() instead of schemaRegistry.id to avoid a circular dependency
+// (storage account → schema registry → storage account)
+var schemaRegistryResourceId = resourceId('Microsoft.DeviceRegistry/schemaRegistries', schemaRegistryName)
+
 resource storageAccount 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   name: generatedStorageAccountName
   location: location
@@ -42,6 +46,16 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2023-05-01' = {
     supportsHttpsTrafficOnly: true
     allowBlobPublicAccess: false
     allowSharedKeyAccess: false
+    networkAcls: {
+      defaultAction: 'Deny'
+      bypass: 'AzureServices'
+      resourceAccessRules: [
+        {
+          resourceId: schemaRegistryResourceId
+          tenantId: tenant().tenantId
+        }
+      ]
+    }
   }
 }
 

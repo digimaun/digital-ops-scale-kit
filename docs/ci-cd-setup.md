@@ -19,7 +19,7 @@ This guide covers CI/CD configuration for automated testing and deployments. Sit
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
-| `ci.yaml` | Push, pull request, manual | Run unit tests and validate manifests |
+| `ci.yaml` | Push, pull request, manual | Validate Bicep templates, run unit tests, and validate manifests |
 | `deploy.yaml` | Manual (`workflow_dispatch`) | Deploy infrastructure to Azure |
 | `_siteops-deploy.yaml` | Called by deploy.yaml | Reusable deployment logic |
 
@@ -539,7 +539,7 @@ stages:
 
 | Pipeline file | Purpose | Trigger |
 |---------------|---------|---------|
-| `.pipelines/ci.yaml` | Unit tests + manifest validation | Push to main, PRs |
+| `.pipelines/ci.yaml` | Bicep validation, unit tests, manifest validation | Push to main, PRs |
 | `.pipelines/deploy.yaml` | Manual deploy with environment selection | Manual only |
 | `.pipelines/templates/siteops-deploy.yaml` | Stage template: deployment logic | Called by deploy.yaml |
 | `.pipelines/templates/setup-siteops.yaml` | Steps template: install Python + siteops | Called by all pipelines |

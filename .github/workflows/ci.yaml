@@ -9,6 +9,7 @@ on:
       - "siteops/**"
       - "workspaces/**"
       - "tests/**"
+      - "scripts/**"
       - "pyproject.toml"
   pull_request:
     branches: [main]
@@ -16,6 +17,7 @@ on:
       - "siteops/**"
       - "workspaces/**"
       - "tests/**"
+      - "scripts/**"
       - "pyproject.toml"
   workflow_dispatch:
 
@@ -113,6 +115,10 @@ jobs:
 
       - name: Setup Site Ops
         uses: ./.github/actions/setup-siteops
+
+      - name: Validate Bicep templates
+        shell: pwsh
+        run: ./scripts/validate-bicep.ps1
 
       - name: Find manifests
         id: find

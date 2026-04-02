@@ -74,6 +74,22 @@ steps:
       - parameters/post-instance.yaml
 
   # ─────────────────────────────────────────────────────────────
+  # Secret Sync Enablement (conditional)
+  # ─────────────────────────────────────────────────────────────
+
+  - name: resolve-aio
+    template: templates/iot-ops/common/resolve-aio.bicep
+    scope: resourceGroup
+    when: "{{ site.properties.deployOptions.enableSecretSync }}"
+
+  - name: secretsync
+    template: templates/iot-ops/secretsync/enable-secretsync.bicep
+    scope: resourceGroup
+    parameters:
+      - parameters/secretsync-chaining.yaml
+    when: "{{ site.properties.deployOptions.enableSecretSync }}"
+
+  # ─────────────────────────────────────────────────────────────
   # Solution Layer (conditional)
   # ─────────────────────────────────────────────────────────────
 

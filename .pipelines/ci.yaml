@@ -9,6 +9,7 @@ trigger:
       - siteops/**
       - workspaces/**
       - tests/**
+      - scripts/**
       - pyproject.toml
 
 pr:
@@ -19,6 +20,7 @@ pr:
       - siteops/**
       - workspaces/**
       - tests/**
+      - scripts/**
       - pyproject.toml
 
 pool:
@@ -66,6 +68,9 @@ jobs:
         persistCredentials: false
 
       - template: templates/setup-siteops.yaml
+
+      - pwsh: ./scripts/validate-bicep.ps1
+        displayName: Validate Bicep templates
 
       - script: |
           WORKSPACE_DIR="workspaces/iot-operations"

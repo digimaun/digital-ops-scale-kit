@@ -492,8 +492,8 @@ class AzCliExecutor:
                     logger.debug(f"Error during proxy cleanup: {e}")
                     try:
                         proxy_process.kill()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"Failed to kill proxy process: {e}")
 
             # Release the allocated port slot
             if allocated_port is not None:

@@ -505,6 +505,33 @@ steps:
         # This validates the exemption logic works correctly.
         assert not any("missing 'resourceGroup'" in e for e in errors)
 
+    def test_validate_duplicate_step_names(self, complete_workspace):
+        """Test behavior when manifest has duplicate step names."""
+        orchestrator = Orchestrator(complete_workspace)
+
+        manifest_data = {
+            "name": "dup-steps",
+            "sites": ["test-site"],
+            "steps": [
+                {
+                    "name": "deploy-infra",
+                    "template": "templates/test.bicep",
+                },
+                {
+                    "name": "deploy-infra",
+                    "template": "templates/test.bicep",
+                },
+            ],
+        }
+        manifest_path = complete_workspace / "manifests" / "dup.yaml"
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            yaml.dump(manifest_data, f)
+
+        errors = orchestrator.validate(manifest_path)
+        dup_errors = [e for e in errors if "duplicate" in e.lower()]
+        assert len(dup_errors) == 1
+        assert "deploy-infra" in dup_errors[0]
+
 
 class TestKubectlValidation:
     """Tests for kubectl step validation."""

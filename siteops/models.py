@@ -371,7 +371,7 @@ class DeploymentStep:
     scope: str = "resourceGroup"
     when: str | None = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.scope not in VALID_SCOPES:
             raise ValueError(f"Invalid scope '{self.scope}'. Must be one of: {VALID_SCOPES}")
 
@@ -431,7 +431,7 @@ class KubectlStep:
     files: list[str] = field(default_factory=list)
     when: str | None = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.operation not in KUBECTL_OPERATIONS:
             raise ValueError(
                 f"Invalid kubectl operation '{self.operation}'. " f"Supported: {', '.join(sorted(KUBECTL_OPERATIONS))}"

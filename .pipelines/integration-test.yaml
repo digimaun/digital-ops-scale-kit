@@ -1,0 +1,79 @@
+# Integration tests: deploy manifests against real Azure and assert outputs
+# On-demand only via manual trigger
+# Equivalent to .github/workflows/integration-test.yaml
+
+trigger: none
+
+pr: none
+
+parameters:
+  - name: manifest
+    displayName: "Manifest to test"
+    type: string
+    default: all
+    values:
+      - all
+      - aio-install
+      - secretsync
+      - opc-ua-solution
+
+  - name: skipCleanup
+    displayName: "Skip resource cleanup (for debugging)"
+    type: boolean
+    default: false
+
+  - name: selector
+    displayName: "Site selector override (default: manifest selector)"
+    type: string
+    default: ""
+
+pool:
+  vmImage: ubuntu-latest
+
+jobs:
+  - deployment: integration_test
+    displayName: Integration Tests
+    environment: test
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - checkout: self
+              fetchDepth: 1
+              persistCredentials: false
+
+            - template: templates/setup-siteops.yaml
+              parameters:
+                installDev: true
+
+            - task: AzureCLI@2
+              displayName: Run integration tests
+              inputs:
+                azureSubscription: $(SERVICE_CONNECTION)
+                scriptType: bash
+                scriptLocation: inlineScript
+                inlineScript: |
+                  MANIFEST="${{ parameters.manifest }}"
+                  if [[ "$MANIFEST" == "all" ]]; then
+                    PYTEST_ARGS="tests/integration/"
+                  else
+                    PYTEST_ARGS="tests/integration/test_${MANIFEST//-/_}_manifest.py"
+                  fi
+
+                  pytest $PYTEST_ARGS \
+                    -v --tb=long \
+                    -m integration \
+                    --junitxml=$(Build.ArtifactStagingDirectory)/integration-results.xml
+              env:
+                SITE_OVERRIDES: $(SITE_OVERRIDES)
+                INTEGRATION_SKIP_CLEANUP: ${{ parameters.skipCleanup }}
+                INTEGRATION_SELECTOR: ${{ parameters.selector }}
+
+            - task: PublishTestResults@2
+              displayName: Publish test results
+              condition: succeededOrFailed()
+              inputs:
+                testResultsFormat: JUnit
+                testResultsFiles: "$(Build.ArtifactStagingDirectory)/integration-results.xml"
+                testRunTitle: Integration Tests

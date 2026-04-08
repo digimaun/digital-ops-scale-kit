@@ -22,10 +22,36 @@ parameters:
     type: boolean
     default: false
 
+  - name: environment
+    displayName: Target environment
+    type: string
+    default: dev
+
   - name: selector
     displayName: "Site selector override (default: manifest selector)"
     type: string
     default: ""
+
+  - name: serviceConnections
+    displayName: Service connection per environment
+    type: object
+    default:
+      dev: azure-siteops
+      staging: azure-siteops
+      prod: azure-siteops
+
+  - name: secretGroups
+    displayName: Variable group per environment
+    type: object
+    default:
+      dev: siteops-secrets
+      staging: siteops-secrets
+      prod: siteops-secrets
+
+variables:
+  - group: ${{ parameters.secretGroups[parameters.environment] }}
+  - name: PYTHONUNBUFFERED
+    value: '1'
 
 pool:
   vmImage: ubuntu-latest
@@ -33,7 +59,7 @@ pool:
 jobs:
   - deployment: integration_test
     displayName: Integration Tests
-    environment: test
+    environment: ${{ parameters.environment }}
 
     strategy:
       runOnce:
@@ -47,10 +73,20 @@ jobs:
               parameters:
                 installDev: true
 
+            - script: |
+                if [[ -n "$SITE_OVERRIDES" ]]; then
+                  echo "$SITE_OVERRIDES" | jq -r '.. | strings' | while IFS= read -r val; do
+                    [[ -n "$val" ]] && echo "##vso[task.setvariable variable=masked;issecret=true]${val}"
+                  done
+                fi
+              displayName: Mask secret values
+              env:
+                SITE_OVERRIDES: $(SITE_OVERRIDES)
+
             - task: AzureCLI@2
               displayName: Run integration tests
               inputs:
-                azureSubscription: $(SERVICE_CONNECTION)
+                azureSubscription: ${{ parameters.serviceConnections[parameters.environment] }}
                 scriptType: bash
                 scriptLocation: inlineScript
                 inlineScript: |

@@ -71,6 +71,10 @@ def generate_overlays(overrides: dict, sites_local: Path) -> list[Path]:
                 f"Invalid site name: '{site_name}' (must match {SITE_NAME_PATTERN.pattern})"
             )
 
+        output_path = sites_local / f"{site_name}.yaml"
+        if output_path.exists():
+            continue
+
         expanded = expand_dot_notation(values)
         output_path = sites_local / f"{site_name}.yaml"
         output_path.write_text(yaml.safe_dump(expanded, default_flow_style=False))

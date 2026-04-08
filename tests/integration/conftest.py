@@ -11,68 +11,57 @@ Configuration is provided via:
 If no sites match the selector, integration tests are skipped gracefully.
 """
 
-import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
-import yaml
 
 from siteops.orchestrator import Orchestrator
 
 WORKSPACE_PATH = Path(__file__).parent.parent.parent / "workspaces" / "iot-operations"
+SCRIPT_PATH = Path(__file__).parent.parent.parent / "scripts" / "generate-site-overrides.py"
 
 
-def _generate_overlays_from_site_overrides() -> list[Path]:
-    """Generate sites.local/ overlays from SITE_OVERRIDES env var.
+def _generate_overlays_from_site_overrides() -> bool:
+    """Generate sites.local/ overlays by calling the shared script.
 
-    Uses the same dot-notation expansion as the CI deploy workflows.
-    Returns list of generated overlay file paths.
+    Returns True if overlays were generated.
     """
     raw = os.environ.get("SITE_OVERRIDES", "")
-    if not raw:
-        return []
+    if not raw.strip():
+        return False
 
-    try:
-        overrides = json.loads(raw)
-    except json.JSONDecodeError:
-        return []
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT_PATH), str(WORKSPACE_PATH)],
+        input=raw,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(f"generate-site-overrides.py failed: {result.stderr}", file=sys.stderr)
+        return False
 
-    generated = []
-    sites_local = WORKSPACE_PATH / "sites.local"
-    sites_local.mkdir(parents=True, exist_ok=True)
-
-    for site_name, site_data in overrides.items():
-        overlay_path = sites_local / f"{site_name}.yaml"
-        if overlay_path.exists():
-            continue
-
-        expanded: dict = {}
-        for key, value in site_data.items():
-            parts = key.split(".")
-            target = expanded
-            for part in parts[:-1]:
-                target = target.setdefault(part, {})
-            target[parts[-1]] = value
-
-        overlay_path.write_text(yaml.dump(expanded, default_flow_style=False))
-        generated.append(overlay_path)
-
-    return generated
+    return True
 
 
-_generated_overlays: list[Path] = []
+_pre_existing_overlays: set[str] = set()
+_generated_overlays = False
 
 
 def pytest_collection_modifyitems(config, items):
     """Generate overlays from SITE_OVERRIDES and skip if no config available."""
-    global _generated_overlays
+    global _generated_overlays, _pre_existing_overlays
+
+    # Snapshot existing overlay files before generation
+    sites_local = WORKSPACE_PATH / "sites.local"
+    if sites_local.is_dir():
+        _pre_existing_overlays = {f.name for f in sites_local.glob("*.yaml")}
+
     _generated_overlays = _generate_overlays_from_site_overrides()
 
-    # Skip integration tests if no real Azure config is available:
-    # no SITE_OVERRIDES env var and no sites.local/ directory
-    sites_local = WORKSPACE_PATH / "sites.local"
-    has_config = bool(_generated_overlays) or (
+    has_config = _generated_overlays or (
         sites_local.is_dir() and any(sites_local.glob("*.yaml"))
     )
 
@@ -90,8 +79,11 @@ def pytest_sessionfinish(session, exitstatus):
     """Clean up generated overlays unless skip-cleanup is set."""
     skip_cleanup = os.environ.get("INTEGRATION_SKIP_CLEANUP", "").lower() in ("true", "1", "yes")
     if _generated_overlays and not skip_cleanup:
-        for path in _generated_overlays:
-            path.unlink(missing_ok=True)
+        sites_local = WORKSPACE_PATH / "sites.local"
+        if sites_local.is_dir():
+            for f in sites_local.glob("*.yaml"):
+                if f.name not in _pre_existing_overlays:
+                    f.unlink(missing_ok=True)
 
 
 @pytest.fixture(scope="session")

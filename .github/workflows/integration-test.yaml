@@ -1,0 +1,103 @@
+# Integration tests: deploy manifests against real Azure and assert outputs
+# On-demand only via workflow_dispatch
+
+name: Integration Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest:
+        description: "Manifest to test"
+        type: choice
+        options:
+          - all
+          - aio-install
+          - secretsync
+          - opc-ua-solution
+        default: all
+      skip-cleanup:
+        description: "Skip resource cleanup (for debugging)"
+        type: boolean
+        default: false
+      selector:
+        description: "Site selector override (default: manifest selector)"
+        type: string
+        default: ""
+      environment:
+        description: "Target environment"
+        type: string
+        default: "dev"
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  integration-test:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Site Ops
+        uses: ./.github/actions/setup-siteops
+        with:
+          install-dev: true
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Select test scope
+        id: scope
+        run: |
+          MANIFEST="${{ inputs.manifest }}"
+          if [[ "$MANIFEST" == "all" ]]; then
+            echo "pytest_args=tests/integration/" >> $GITHUB_OUTPUT
+          else
+            echo "pytest_args=tests/integration/test_${MANIFEST//-/_}_manifest.py" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Mask secret values
+        env:
+          SITE_OVERRIDES: ${{ secrets.SITE_OVERRIDES }}
+        run: |
+          if [[ -n "$SITE_OVERRIDES" ]]; then
+            echo "$SITE_OVERRIDES" | jq -r '.. | strings' | while IFS= read -r val; do
+              [[ -n "$val" ]] && echo "::add-mask::${val}"
+            done
+          fi
+
+      - name: Run integration tests
+        env:
+          SITE_OVERRIDES: ${{ secrets.SITE_OVERRIDES }}
+          INTEGRATION_SKIP_CLEANUP: ${{ inputs.skip-cleanup }}
+          INTEGRATION_SELECTOR: ${{ inputs.selector }}
+        run: >
+          pytest ${{ steps.scope.outputs.pytest_args }}
+          -v --tb=long
+          -m integration
+          --junitxml=integration-results.xml
+
+      - name: Publish test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-test-results
+          path: integration-results.xml
+
+      - name: Azure Logout
+        if: always()
+        run: az logout
+        continue-on-error: true

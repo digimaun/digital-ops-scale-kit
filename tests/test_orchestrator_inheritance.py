@@ -355,6 +355,76 @@ class TestSiteInheritance:
         assert loaded.properties["baseOnly"] == "from-base"  # Preserved from base
         assert loaded.properties["siteOnly"] == "from-site"  # Added by site
 
+    def test_inheritance_preserves_sibling_deploy_options(self, tmp_workspace):
+        """Child overriding one deployOptions key should preserve siblings from parent."""
+        shared_dir = tmp_workspace / "shared"
+        shared_dir.mkdir()
+
+        parent_template = {
+            "kind": "SiteTemplate",
+            "subscription": "inherited-sub",
+            "properties": {
+                "deployOptions": {"enableSecretSync": False, "includeSolution": True},
+            },
+        }
+        (shared_dir / "parent.yaml").write_text(yaml.dump(parent_template))
+
+        site = {
+            "inherits": "../shared/parent.yaml",
+            "name": "deploy-opts-test",
+            "location": "eastus",
+            "properties": {
+                "deployOptions": {"enableSecretSync": True},
+            },
+        }
+        (tmp_workspace / "sites" / "deploy-opts-test.yaml").write_text(yaml.dump(site))
+
+        orchestrator = Orchestrator(tmp_workspace)
+        loaded = orchestrator.load_site("deploy-opts-test")
+
+        assert loaded.properties["deployOptions"]["enableSecretSync"] is True  # Overridden
+        assert loaded.properties["deployOptions"]["includeSolution"] is True  # Preserved from parent
+
+    def test_three_level_inheritance_preserves_deep_properties(self, tmp_workspace):
+        """Properties from all three levels should be preserved through deep merge."""
+        shared_dir = tmp_workspace / "shared"
+        shared_dir.mkdir()
+
+        grandparent = {
+            "kind": "SiteTemplate",
+            "subscription": "org-sub",
+            "properties": {
+                "deployOptions": {"enableSecretSync": False},
+            },
+        }
+        (shared_dir / "grandparent.yaml").write_text(yaml.dump(grandparent))
+
+        parent = {
+            "kind": "SiteTemplate",
+            "inherits": "grandparent.yaml",
+            "properties": {
+                "deployOptions": {"includeSolution": True},
+            },
+        }
+        (shared_dir / "parent.yaml").write_text(yaml.dump(parent))
+
+        site = {
+            "inherits": "../shared/parent.yaml",
+            "name": "three-level-test",
+            "location": "eastus",
+            "properties": {
+                "deployOptions": {"enableOpcPlcSimulator": True},
+            },
+        }
+        (tmp_workspace / "sites" / "three-level-test.yaml").write_text(yaml.dump(site))
+
+        orchestrator = Orchestrator(tmp_workspace)
+        loaded = orchestrator.load_site("three-level-test")
+
+        assert loaded.properties["deployOptions"]["enableSecretSync"] is False  # From grandparent
+        assert loaded.properties["deployOptions"]["includeSolution"] is True  # From parent
+        assert loaded.properties["deployOptions"]["enableOpcPlcSimulator"] is True  # From site
+
 
 class TestSiteTemplateExclusion:
     """Tests for SiteTemplate handling in site discovery and loading."""

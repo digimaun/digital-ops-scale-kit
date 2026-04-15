@@ -19,7 +19,7 @@ from siteops import __version__
 from siteops.orchestrator import Orchestrator
 
 
-def setup_logging(verbose: bool = False):
+def setup_logging(verbose: bool = False) -> None:
     """Configure logging based on verbosity level."""
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
@@ -37,7 +37,7 @@ def resolve_manifest_path(manifest: Path, workspace: Path) -> Path:
     return workspace / manifest
 
 
-def cmd_deploy(args, orchestrator: Orchestrator) -> int:
+def cmd_deploy(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
     """Execute deployment."""
     manifest_path = resolve_manifest_path(args.manifest, args.workspace)
 
@@ -79,7 +79,7 @@ def cmd_deploy(args, orchestrator: Orchestrator) -> int:
     return 0
 
 
-def cmd_validate(args, orchestrator: Orchestrator) -> int:
+def cmd_validate(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
     """Validate manifest and optionally show deployment plan."""
     manifest_path = resolve_manifest_path(args.manifest, args.workspace)
 
@@ -148,7 +148,7 @@ def _print_value(value: Any, indent: int = 6) -> None:
         print(f"{prefix}{value}")
 
 
-def cmd_sites(args, orchestrator: Orchestrator) -> int:
+def cmd_sites(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
     """List available sites in the workspace."""
     all_sites = orchestrator.load_all_sites()
 
@@ -204,7 +204,7 @@ def cmd_sites(args, orchestrator: Orchestrator) -> int:
     return 0
 
 
-def main():
+def main() -> None:
     """Main entry point for the Site Ops CLI."""
     parser = argparse.ArgumentParser(
         prog="siteops",

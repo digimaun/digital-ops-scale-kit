@@ -486,6 +486,10 @@ class TestDeployResourceGroup:
 
         assert result.success is True
         assert result.outputs == {}
+        assert result.error is None
+        assert result.step_name == "step-1"
+        assert result.site_name == "site-1"
+        assert result.deployment_name == "test-deploy"
 
     def test_deploy_resource_group_dry_run(self, tmp_workspace, sample_bicep_template):
         executor = AzCliExecutor(workspace=tmp_workspace, dry_run=True)
@@ -503,6 +507,61 @@ class TestDeployResourceGroup:
 
         assert result.success is True
         mock_run.assert_not_called()
+
+    def test_deploy_resource_group_plain_text_stdout(self, tmp_workspace, sample_bicep_template, monkeypatch):
+        """Test that plain non-JSON stdout with success returncode doesn't crash."""
+        executor = AzCliExecutor(workspace=tmp_workspace)
+        monkeypatch.setattr(executor, "_az_path", "/usr/bin/az")
+
+        mock_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="not json at all",
+            stderr="",
+        )
+
+        with patch("subprocess.run", return_value=mock_result):
+            result = executor.deploy_resource_group(
+                subscription="sub-123",
+                resource_group="rg-test",
+                template_path=sample_bicep_template,
+                parameters={},
+                deployment_name="test-deploy",
+                step_name="step-1",
+                site_name="site-1",
+            )
+
+        assert result.success is True
+        assert result.outputs == {}
+
+    def test_deploy_resource_group_truncated_json_stdout(self, tmp_workspace, sample_bicep_template, monkeypatch):
+        """Test that truncated JSON stdout with success returncode doesn't crash."""
+        executor = AzCliExecutor(workspace=tmp_workspace)
+        monkeypatch.setattr(executor, "_az_path", "/usr/bin/az")
+
+        mock_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout='{"properties": {"outputs":',
+            stderr="",
+        )
+
+        with patch("subprocess.run", return_value=mock_result):
+            result = executor.deploy_resource_group(
+                subscription="sub-123",
+                resource_group="rg-test",
+                template_path=sample_bicep_template,
+                parameters={},
+                deployment_name="test-deploy",
+                step_name="step-1",
+                site_name="site-1",
+            )
+
+        assert result.success is True
+        assert result.outputs == {}
+        assert result.error is None
+        assert result.step_name == "step-1"
+        assert result.site_name == "site-1"
 
 
 class TestDeploySubscription:

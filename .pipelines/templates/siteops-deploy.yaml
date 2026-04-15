@@ -75,58 +75,14 @@ stages:
                     SELECTOR: ${{ parameters.selector }}
 
                 - script: |
-                    # Generate sites.local/ override files from SITE_OVERRIDES JSON secret.
-                    # Supports nested paths using dot notation at any depth:
-                    # {
-                    #   "munich-dev": {
-                    #     "subscription": "...",
-                    #     "resourceGroup": "...",
-                    #     "parameters.clusterName": "actual-cluster-name",
-                    #     "parameters.dataflowIdentity.clientId": "..."
-                    #   }
-                    # }
-
                     if [[ -z "$SITE_OVERRIDES" ]]; then
                       echo "No site overrides configured, using committed sites"
                       exit 0
                     fi
 
-                    python3 - <<'GENERATE_OVERLAYS'
-                    import json, os, re, sys, yaml
+                    echo "$SITE_OVERRIDES" | python3 scripts/generate-site-overrides.py "$WORKSPACE"
 
-                    overrides = json.loads(os.environ["SITE_OVERRIDES"])
-                    workspace = os.environ["WORKSPACE"]
-                    site_name_re = re.compile(r"^[a-zA-Z0-9_-]+$")
-
-                    sites_local = os.path.join(workspace, "sites.local")
-                    os.makedirs(sites_local, exist_ok=True)
-
-                    for site_name, values in overrides.items():
-                        if not site_name_re.match(site_name):
-                            print(f"##vso[task.logissue type=error]Invalid site name in SITE_OVERRIDES: {site_name}")
-                            sys.exit(1)
-
-                        # Expand dot-notation keys into nested dict
-                        nested = {}
-                        for key, value in values.items():
-                            parts = key.split(".")
-                            current = nested
-                            for part in parts[:-1]:
-                                current = current.setdefault(part, {})
-                            current[parts[-1]] = value
-
-                        output_file = os.path.join(sites_local, f"{site_name}.yaml")
-                        with open(output_file, "w") as f:
-                            yaml.safe_dump(nested, f, default_flow_style=False)
-
-                        print(f"✓ Generated override for: {site_name}")
-
-                    print(f"✓ Generated {len(overrides)} site override(s)")
-                    GENERATE_OVERLAYS
-
-                    # Mask each override value in ADO logs.
-                    # ADO masking is additive — once a value is registered as secret,
-                    # it stays masked for the remainder of the job.
+                    # Mask override values in ADO logs
                     echo "$SITE_OVERRIDES" | jq -r '.. | strings' | while IFS= read -r val; do
                       [[ -n "$val" ]] && echo "##vso[task.setvariable variable=masked;issecret=true]${val}"
                     done

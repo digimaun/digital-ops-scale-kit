@@ -121,6 +121,41 @@ class TestStepOutputChaining:
 
         assert result == ["id-1", "id-2", "id-3"]
 
+    def test_deep_nested_output_three_plus_levels(self, complete_workspace):
+        """Test resolving output nested 3+ levels deep."""
+        orchestrator = Orchestrator(complete_workspace)
+        step_outputs = {
+            "deploy": {
+                "config": {
+                    "value": {"nested": {"deep": {"value": "found"}}},
+                    "type": "Object",
+                },
+            },
+        }
+
+        value = "{{ steps.deploy.outputs.config.nested.deep.value }}"
+        result = orchestrator._resolve_step_outputs(value, step_outputs)
+
+        assert result == "found"
+
+    def test_output_with_missing_mid_path(self, complete_workspace):
+        """Test resolving output when an intermediate key is missing."""
+        orchestrator = Orchestrator(complete_workspace)
+        step_outputs = {
+            "deploy": {
+                "config": {
+                    "value": {"a": "b"},
+                    "type": "Object",
+                },
+            },
+        }
+
+        value = "{{ steps.deploy.outputs.config.nonexistent.subfield }}"
+        result = orchestrator._resolve_step_outputs(value, step_outputs)
+
+        # Missing path should leave the template unresolved
+        assert result == value
+
 
 class TestConditionEvaluation:
     """Tests for when condition evaluation."""
@@ -2319,4 +2354,67 @@ class TestConditionEdgeCases:
         assert result is True
 
         result = orchestrator._evaluate_condition("{{ site.properties.env != 'staging' }}", site)
+        assert result is False
+
+    def test_enable_secret_sync_truthy_true(self, tmp_workspace):
+        """Test truthy evaluation of enableSecretSync set to True."""
+        orchestrator = Orchestrator(tmp_workspace)
+        site = Site(
+            name="test",
+            subscription="sub",
+            resource_group="rg",
+            location="eastus",
+            properties={"deployOptions": {"enableSecretSync": True}},
+        )
+
+        result = orchestrator._evaluate_condition(
+            "{{ site.properties.deployOptions.enableSecretSync }}", site
+        )
+        assert result is True
+
+    def test_enable_secret_sync_truthy_false(self, tmp_workspace):
+        """Test truthy evaluation of enableSecretSync set to False."""
+        orchestrator = Orchestrator(tmp_workspace)
+        site = Site(
+            name="test",
+            subscription="sub",
+            resource_group="rg",
+            location="eastus",
+            properties={"deployOptions": {"enableSecretSync": False}},
+        )
+
+        result = orchestrator._evaluate_condition(
+            "{{ site.properties.deployOptions.enableSecretSync }}", site
+        )
+        assert result is False
+
+    def test_missing_intermediate_property_path_returns_falsy(self, tmp_workspace):
+        """Test that missing intermediate key 'deployOptions' returns False."""
+        orchestrator = Orchestrator(tmp_workspace)
+        site = Site(
+            name="test",
+            subscription="sub",
+            resource_group="rg",
+            location="eastus",
+            properties={},
+        )
+
+        result = orchestrator._evaluate_condition(
+            "{{ site.properties.deployOptions.enableSecretSync }}", site
+        )
+        assert result is False
+
+    def test_string_false_treated_as_falsy(self, tmp_workspace):
+        """Test that string 'false' is treated as falsy in truthy context."""
+        orchestrator = Orchestrator(tmp_workspace)
+        site = Site(
+            name="test",
+            subscription="sub",
+            resource_group="rg",
+            location="eastus",
+            properties={"flag": "false"},
+        )
+
+        result = orchestrator._evaluate_condition("{{ site.properties.flag }}", site)
+        # The string "false" is treated as falsy (case-insensitive check)
         assert result is False

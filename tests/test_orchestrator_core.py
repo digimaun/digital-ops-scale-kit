@@ -238,6 +238,78 @@ class TestSiteOverlayMerging:
         assert site.is_subscription_level is False
         assert site.resource_group == "rg-from-overlay"
 
+    def test_properties_deep_merge_preserves_sibling_keys(self, tmp_workspace):
+        """Overlay overriding one nested key should preserve sibling keys from base."""
+        base_site = {
+            "name": "sibling-test",
+            "subscription": "sub",
+            "location": "eastus",
+            "properties": {
+                "deployOptions": {"enableSecretSync": True, "includeSolution": False},
+            },
+        }
+        (tmp_workspace / "sites" / "sibling-test.yaml").write_text(yaml.dump(base_site))
+
+        (tmp_workspace / "sites.local").mkdir()
+        local_override = {
+            "properties": {"deployOptions": {"enableSecretSync": False}},
+        }
+        (tmp_workspace / "sites.local" / "sibling-test.yaml").write_text(yaml.dump(local_override))
+
+        orchestrator = Orchestrator(tmp_workspace)
+        site = orchestrator.load_site("sibling-test")
+
+        assert site.properties["deployOptions"]["enableSecretSync"] is False  # Overridden
+        assert site.properties["deployOptions"]["includeSolution"] is False  # Preserved from base
+
+    def test_properties_deep_merge_overlay_adds_new_nested_key(self, tmp_workspace):
+        """Overlay adding a new nested key should merge with existing base keys."""
+        base_site = {
+            "name": "add-key-test",
+            "subscription": "sub",
+            "location": "eastus",
+            "properties": {
+                "deployOptions": {"includeSolution": True},
+            },
+        }
+        (tmp_workspace / "sites" / "add-key-test.yaml").write_text(yaml.dump(base_site))
+
+        (tmp_workspace / "sites.local").mkdir()
+        local_override = {
+            "properties": {"deployOptions": {"enableSecretSync": True}},
+        }
+        (tmp_workspace / "sites.local" / "add-key-test.yaml").write_text(yaml.dump(local_override))
+
+        orchestrator = Orchestrator(tmp_workspace)
+        site = orchestrator.load_site("add-key-test")
+
+        assert site.properties["deployOptions"]["includeSolution"] is True  # Preserved from base
+        assert site.properties["deployOptions"]["enableSecretSync"] is True  # Added by overlay
+
+    def test_parameters_deep_merge_preserves_sibling_keys(self, tmp_workspace):
+        """Overlay overriding one nested parameter key should preserve siblings from base."""
+        base_site = {
+            "name": "params-merge-test",
+            "subscription": "sub",
+            "location": "eastus",
+            "parameters": {
+                "brokerConfig": {"memoryProfile": "Medium", "replicas": 3},
+            },
+        }
+        (tmp_workspace / "sites" / "params-merge-test.yaml").write_text(yaml.dump(base_site))
+
+        (tmp_workspace / "sites.local").mkdir()
+        local_override = {
+            "parameters": {"brokerConfig": {"memoryProfile": "Low"}},
+        }
+        (tmp_workspace / "sites.local" / "params-merge-test.yaml").write_text(yaml.dump(local_override))
+
+        orchestrator = Orchestrator(tmp_workspace)
+        site = orchestrator.load_site("params-merge-test")
+
+        assert site.parameters["brokerConfig"]["memoryProfile"] == "Low"  # Overridden
+        assert site.parameters["brokerConfig"]["replicas"] == 3  # Preserved from base
+
 
 class TestResolveSites:
     """Tests for site resolution from manifests."""
@@ -842,3 +914,54 @@ class TestGetStepTypeLabel:
 
         label = orchestrator._get_step_type_label(step)
         assert label == "subscription"
+
+
+class TestAllStepsSkipped:
+    """Tests for deployments where all steps are skipped."""
+
+    def test_all_conditional_steps_skipped_succeeds(self, tmp_workspace, sample_bicep_template):
+        """Deployment should succeed with steps_completed=0 when all steps are skipped."""
+        # Create site without the neverTrue property
+        site_data = {
+            "name": "test-site",
+            "subscription": "00000000-0000-0000-0000-000000000000",
+            "resourceGroup": "rg-test",
+            "location": "eastus",
+        }
+        (tmp_workspace / "sites" / "test-site.yaml").write_text(yaml.dump(site_data))
+
+        # Create manifest where every step has a condition that won't be met
+        manifest_data = {
+            "name": "all-skip-manifest",
+            "sites": ["test-site"],
+            "steps": [
+                {
+                    "name": "step1",
+                    "template": "templates/test.bicep",
+                    "when": "{{ site.properties.deployOptions.neverTrue }}",
+                },
+                {
+                    "name": "step2",
+                    "template": "templates/test.bicep",
+                    "when": "{{ site.properties.deployOptions.neverTrue }}",
+                },
+            ],
+        }
+        manifest_path = tmp_workspace / "manifests" / "all-skip.yaml"
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            yaml.dump(manifest_data, f)
+
+        orchestrator = Orchestrator(tmp_workspace)
+
+        with patch.object(orchestrator.executor, "deploy_resource_group") as mock_deploy:
+            result = orchestrator.deploy(manifest_path)
+
+            # Executor should never be called since all steps are skipped
+            mock_deploy.assert_not_called()
+
+        # Deployment should succeed
+        site_result = result["sites"]["test-site"]
+        assert site_result["status"] == "success"
+        assert site_result["steps_completed"] == 0
+        assert site_result["steps_skipped"] == 2
+        assert all(s["status"] == "skipped" for s in site_result["steps"])

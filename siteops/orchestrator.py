@@ -100,7 +100,7 @@ def _resolve_output_path(obj: Any, path: str) -> Any:
 _print_lock = threading.Lock()
 
 
-def _thread_safe_print(*args, **kwargs):
+def _thread_safe_print(*args: Any, **kwargs: Any) -> None:
     """Print with lock to avoid interleaved output from multiple threads."""
     with _print_lock:
         print(*args, **kwargs)
@@ -817,7 +817,7 @@ class Orchestrator:
     def _check_unresolved_templates(self, params: dict[str, Any], site_name: str) -> None:
         """Warn if any {{ ... }} templates weren't resolved."""
 
-        def check_value(v, path=""):
+        def check_value(v: Any, path: str = "") -> None:
             if isinstance(v, str) and "{{" in v and "}}" in v:
                 logger.warning(f"Unresolved template in {path}: {v} (site: {site_name})")
             elif isinstance(v, dict):
@@ -1716,6 +1716,13 @@ class Orchestrator:
 
         # Build step name lookup for output reference validation
         all_step_names = {step.name for step in manifest.steps}
+
+        # Check for duplicate step names
+        seen_names: set[str] = set()
+        for step in manifest.steps:
+            if step.name in seen_names:
+                errors.append(f"Duplicate step name: '{step.name}'")
+            seen_names.add(step.name)
 
         for step_index, step in enumerate(manifest.steps):
             # Steps that execute before this one (valid sources for output references)

@@ -626,6 +626,7 @@ class Manifest:
         - {{ site.resourceGroup }} - Site resource group
         - {{ site.subscription }} - Site subscription
         - {{ site.labels.<key> }} - Site label value
+        - {{ site.properties.<path> }} - Site property value (nested paths supported)
 
         Args:
             param_path: Parameter file path with optional template variables
@@ -642,5 +643,18 @@ class Manifest:
 
         for key, value in site.labels.items():
             result = result.replace(f"{{{{ site.labels.{key} }}}}", value)
+
+        # Resolve {{ site.properties.<path> }} templates
+        for match in re.finditer(r"\{\{\s*site\.properties\.(\S+?)\s*\}\}", result):
+            prop_path = match.group(1)
+            value = site.properties
+            for part in prop_path.split("."):
+                if isinstance(value, dict) and part in value:
+                    value = value[part]
+                else:
+                    value = None
+                    break
+            if value is not None:
+                result = result.replace(match.group(0), str(value))
 
         return result

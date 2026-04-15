@@ -1705,14 +1705,30 @@ class Orchestrator:
 
         # Validate manifest-level parameter files
         for param_path in manifest.parameters:
-            full_path = (self.workspace / param_path).resolve()
-            if not full_path.exists():
-                errors.append(f"Manifest parameter file not found: {param_path}")
+            if "{{" in param_path:
+                # Dynamic path — validate resolved path for each site
+                for site in sites:
+                    resolved = manifest.resolve_parameter_path(param_path, site)
+                    full_path = (self.workspace / resolved).resolve()
+                    if not full_path.exists():
+                        errors.append(
+                            f"Manifest parameter file not found: {resolved} "
+                            f"(resolved from '{param_path}' for site '{site.name}')"
+                        )
+                    else:
+                        try:
+                            self.load_parameters(full_path)
+                        except Exception as e:
+                            errors.append(f"Invalid manifest parameter file {resolved}: {e}")
             else:
-                try:
-                    self.load_parameters(full_path)
-                except Exception as e:
-                    errors.append(f"Invalid manifest parameter file {param_path}: {e}")
+                full_path = (self.workspace / param_path).resolve()
+                if not full_path.exists():
+                    errors.append(f"Manifest parameter file not found: {param_path}")
+                else:
+                    try:
+                        self.load_parameters(full_path)
+                    except Exception as e:
+                        errors.append(f"Invalid manifest parameter file {param_path}: {e}")
 
         # Build step name lookup for output reference validation
         all_step_names = {step.name for step in manifest.steps}
@@ -1747,6 +1763,33 @@ class Orchestrator:
                     continue
 
                 for param_path in step.parameters:
+                    if "{{" in param_path:
+                        # Dynamic path — validate resolved path for each site
+                        for site in sites:
+                            resolved = manifest.resolve_parameter_path(param_path, site)
+                            full_path = (self.workspace / resolved).resolve()
+                            if not full_path.exists():
+                                errors.append(
+                                    f"Parameter file not found: {resolved} "
+                                    f"(step: {step.name}, resolved from '{param_path}' for site '{site.name}')"
+                                )
+                            else:
+                                try:
+                                    params = self.load_parameters(full_path)
+                                    errors.extend(
+                                        self._validate_output_references(
+                                            params,
+                                            step.name,
+                                            prior_step_names,
+                                            all_step_names,
+                                            resolved,
+                                            None,
+                                        )
+                                    )
+                                except Exception as e:
+                                    errors.append(f"Invalid parameter file {resolved}: {e}")
+                        continue
+
                     full_path = (self.workspace / param_path).resolve()
                     if not full_path.exists():
                         errors.append(f"Parameter file not found: {param_path} (step: {step.name})")

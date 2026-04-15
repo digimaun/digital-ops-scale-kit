@@ -533,6 +533,193 @@ steps:
         assert "deploy-infra" in dup_errors[0]
 
 
+    def test_validate_dynamic_parameter_path_resolved(self, complete_workspace):
+        """Validation should resolve {{ site.properties.* }} in parameter paths."""
+        orchestrator = Orchestrator(complete_workspace)
+
+        # Create a site with a property and a matching parameter file
+        site_data = {
+            "name": "test-site",
+            "subscription": "sub-123",
+            "resourceGroup": "rg-test",
+            "location": "eastus",
+            "properties": {"variant": "standard"},
+        }
+        (complete_workspace / "sites" / "test-site.yaml").write_text(yaml.dump(site_data))
+
+        # Create the version-specific parameter file
+        variant_dir = complete_workspace / "parameters" / "variants"
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        (variant_dir / "standard.yaml").write_text(yaml.dump({"someParam": "value"}))
+
+        manifest_data = {
+            "name": "dynamic-path-test",
+            "sites": ["test-site"],
+            "steps": [
+                {
+                    "name": "deploy",
+                    "template": "templates/test.bicep",
+                    "parameters": [
+                        "parameters/variants/{{ site.properties.variant }}.yaml",
+                    ],
+                },
+            ],
+        }
+        manifest_path = complete_workspace / "manifests" / "dynamic-path.yaml"
+        manifest_path.write_text(yaml.dump(manifest_data))
+
+        errors = orchestrator.validate(manifest_path)
+        param_errors = [e for e in errors if "variants" in e]
+        assert param_errors == [], f"Dynamic path should resolve: {param_errors}"
+
+    def test_validate_dynamic_parameter_path_missing_file(self, complete_workspace):
+        """Validation should report missing files for resolved dynamic paths."""
+        orchestrator = Orchestrator(complete_workspace)
+
+        site_data = {
+            "name": "test-site-missing",
+            "subscription": "sub-123",
+            "resourceGroup": "rg-test",
+            "location": "eastus",
+            "properties": {"variant": "nonexistent"},
+        }
+        (complete_workspace / "sites" / "test-site-missing.yaml").write_text(yaml.dump(site_data))
+
+        manifest_data = {
+            "name": "dynamic-path-missing",
+            "sites": ["test-site-missing"],
+            "steps": [
+                {
+                    "name": "deploy",
+                    "template": "templates/test.bicep",
+                    "parameters": [
+                        "parameters/variants/{{ site.properties.variant }}.yaml",
+                    ],
+                },
+            ],
+        }
+        manifest_path = complete_workspace / "manifests" / "dynamic-path-missing.yaml"
+        manifest_path.write_text(yaml.dump(manifest_data))
+
+        errors = orchestrator.validate(manifest_path)
+        param_errors = [e for e in errors if "nonexistent" in e]
+        assert len(param_errors) == 1
+        assert "test-site-missing" in param_errors[0]
+
+    def test_validate_dynamic_manifest_level_parameter_path(self, complete_workspace):
+        """Validation should resolve dynamic paths in manifest-level parameters."""
+        orchestrator = Orchestrator(complete_workspace)
+
+        site_data = {
+            "name": "test-site-manifest-dyn",
+            "subscription": "sub-123",
+            "resourceGroup": "rg-test",
+            "location": "eastus",
+            "properties": {"variant": "standard"},
+        }
+        (complete_workspace / "sites" / "test-site-manifest-dyn.yaml").write_text(yaml.dump(site_data))
+
+        variant_dir = complete_workspace / "parameters" / "variants"
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        (variant_dir / "standard.yaml").write_text(yaml.dump({"someParam": "value"}))
+
+        manifest_data = {
+            "name": "manifest-dyn-path",
+            "sites": ["test-site-manifest-dyn"],
+            "parameters": [
+                "parameters/variants/{{ site.properties.variant }}.yaml",
+            ],
+            "steps": [
+                {
+                    "name": "deploy",
+                    "template": "templates/test.bicep",
+                },
+            ],
+        }
+        manifest_path = complete_workspace / "manifests" / "manifest-dyn.yaml"
+        manifest_path.write_text(yaml.dump(manifest_data))
+
+        errors = orchestrator.validate(manifest_path)
+        param_errors = [e for e in errors if "variants" in e]
+        assert param_errors == [], f"Manifest-level dynamic path should resolve: {param_errors}"
+
+    def test_validate_dynamic_parameter_path_invalid_yaml(self, complete_workspace):
+        """Validation should report invalid YAML in resolved dynamic parameter files."""
+        orchestrator = Orchestrator(complete_workspace)
+
+        site_data = {
+            "name": "test-site-bad-yaml",
+            "subscription": "sub-123",
+            "resourceGroup": "rg-test",
+            "location": "eastus",
+            "properties": {"variant": "broken"},
+        }
+        (complete_workspace / "sites" / "test-site-bad-yaml.yaml").write_text(yaml.dump(site_data))
+
+        variant_dir = complete_workspace / "parameters" / "variants"
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        (variant_dir / "broken.yaml").write_text("{ invalid yaml: [unclosed")
+
+        manifest_data = {
+            "name": "dyn-path-bad-yaml",
+            "sites": ["test-site-bad-yaml"],
+            "steps": [
+                {
+                    "name": "deploy",
+                    "template": "templates/test.bicep",
+                    "parameters": [
+                        "parameters/variants/{{ site.properties.variant }}.yaml",
+                    ],
+                },
+            ],
+        }
+        manifest_path = complete_workspace / "manifests" / "dyn-bad-yaml.yaml"
+        manifest_path.write_text(yaml.dump(manifest_data))
+
+        errors = orchestrator.validate(manifest_path)
+        yaml_errors = [e for e in errors if "Invalid" in e and "broken" in e]
+        assert len(yaml_errors) == 1
+
+    def test_validate_dynamic_parameter_path_checks_output_refs(self, complete_workspace):
+        """Validation should check output references in resolved dynamic parameter files."""
+        orchestrator = Orchestrator(complete_workspace)
+
+        site_data = {
+            "name": "test-site-outref",
+            "subscription": "sub-123",
+            "resourceGroup": "rg-test",
+            "location": "eastus",
+            "properties": {"variant": "with-refs"},
+        }
+        (complete_workspace / "sites" / "test-site-outref.yaml").write_text(yaml.dump(site_data))
+
+        variant_dir = complete_workspace / "parameters" / "variants"
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        (variant_dir / "with-refs.yaml").write_text(yaml.dump({
+            "someId": "{{ steps.nonexistent-step.outputs.id }}"
+        }))
+
+        manifest_data = {
+            "name": "dyn-path-outref",
+            "sites": ["test-site-outref"],
+            "steps": [
+                {
+                    "name": "deploy",
+                    "template": "templates/test.bicep",
+                    "parameters": [
+                        "parameters/variants/{{ site.properties.variant }}.yaml",
+                    ],
+                },
+            ],
+        }
+        manifest_path = complete_workspace / "manifests" / "dyn-outref.yaml"
+        manifest_path.write_text(yaml.dump(manifest_data))
+
+        errors = orchestrator.validate(manifest_path)
+        ref_errors = [e for e in errors if "nonexistent-step" in e]
+        assert len(ref_errors) >= 1
+
+
 class TestKubectlValidation:
     """Tests for kubectl step validation."""
 

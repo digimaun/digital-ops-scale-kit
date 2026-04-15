@@ -940,6 +940,73 @@ class TestManifest:
         result = manifest.resolve_parameter_path(path, site)
         assert result == "westus/rg-prod/sub-456.yaml"
 
+    def test_resolve_parameter_path_with_properties(self):
+        """Test {{ site.properties.<path> }} resolution in parameter file paths."""
+        manifest = Manifest(name="test", description="", sites=[], steps=[])
+        site = Site(
+            name="munich-dev",
+            subscription="sub-123",
+            resource_group="rg-dev",
+            location="eastus",
+            properties={"aioVersion": "2603"},
+        )
+
+        result = manifest.resolve_parameter_path(
+            "parameters/aio-versions/{{ site.properties.aioVersion }}.yaml",
+            site,
+        )
+        assert result == "parameters/aio-versions/2603.yaml"
+
+    def test_resolve_parameter_path_with_nested_properties(self):
+        """Test nested property path resolution."""
+        manifest = Manifest(name="test", description="", sites=[], steps=[])
+        site = Site(
+            name="munich-dev",
+            subscription="sub-123",
+            resource_group="rg-dev",
+            location="eastus",
+            properties={"config": {"variant": "standard"}},
+        )
+
+        result = manifest.resolve_parameter_path(
+            "parameters/{{ site.properties.config.variant }}/defaults.yaml",
+            site,
+        )
+        assert result == "parameters/standard/defaults.yaml"
+
+    def test_resolve_parameter_path_with_missing_property(self):
+        """Unresolvable property path should leave template as-is."""
+        manifest = Manifest(name="test", description="", sites=[], steps=[])
+        site = Site(
+            name="munich-dev",
+            subscription="sub-123",
+            resource_group="rg-dev",
+            location="eastus",
+            properties={},
+        )
+
+        path = "parameters/{{ site.properties.nonexistent }}/defaults.yaml"
+        result = manifest.resolve_parameter_path(path, site)
+        assert result == path
+
+    def test_resolve_parameter_path_mixed_templates(self):
+        """Test mixing site.properties with other template variables."""
+        manifest = Manifest(name="test", description="", sites=[], steps=[])
+        site = Site(
+            name="munich-dev",
+            subscription="sub-123",
+            resource_group="rg-dev",
+            location="eastus",
+            labels={"environment": "dev"},
+            properties={"aioVersion": "2603"},
+        )
+
+        result = manifest.resolve_parameter_path(
+            "parameters/{{ site.labels.environment }}/{{ site.properties.aioVersion }}.yaml",
+            site,
+        )
+        assert result == "parameters/dev/2603.yaml"
+
 
 class TestSiteProperties:
     """Tests for Site properties field."""

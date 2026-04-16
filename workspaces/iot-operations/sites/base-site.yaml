@@ -9,10 +9,14 @@ labels:
   managedBy: siteops
 
 properties:
+  # AIO version (release moniker) - determines extension versions
+  # See: parameters/aio-versions/ for available versions
+  aioVersion: "2603"
+
   # Deployment options - control which components are deployed
   deployOptions:
-    includeGlobalSite: false      # Subscription-scoped edge site (for subscription-level sites)
-    includeEdgeSite: true         # RG-scoped edge site (default for RG-level sites)
+    includeGlobalSite: false      # Subscription-scoped edge site
+    includeEdgeSite: false        # RG-scoped edge site
     includeSolution: false
     includeOpcPlcSimulator: false
     enableSecretSync: false

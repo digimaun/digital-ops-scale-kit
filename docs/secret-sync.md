@@ -128,7 +128,7 @@ After enablement, use `sync-secret.bicep` to synchronize individual Key Vault se
 
 ```
 az deployment group create -g <rg> \
-  -f templates/iot-ops/secretsync/sync-secret.bicep \
+  -f templates/secretsync/sync-secret.bicep \
   -p keyVaultName=<kv> customLocationName=<cl> spcName=<spc> \
      secretName=my-secret secretValue=<value>
 ```
@@ -159,7 +159,7 @@ To sync secrets as part of a manifest, add a step after enablement:
 
 ```yaml
 - name: sync-my-secret
-  template: templates/iot-ops/secretsync/sync-secret.bicep
+  template: templates/secretsync/sync-secret.bicep
   scope: resourceGroup
   parameters:
     - parameters/secretsync-chaining.yaml
@@ -170,7 +170,7 @@ To sync secrets as part of a manifest, add a step after enablement:
 ## Template reference
 
 ```
-templates/iot-ops/
+templates/
 ├── common/
 │   ├── resolve-aio.bicep                    # Read-only instance → CL → cluster resolution
 │   └── modules/

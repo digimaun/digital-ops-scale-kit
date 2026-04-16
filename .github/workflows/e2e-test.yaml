@@ -70,6 +70,10 @@ jobs:
       rg-in: ${{ steps.v.outputs.rg_in }}
       cluster-in: ${{ steps.v.outputs.cluster_in }}
     steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
       - name: Parse inputs
         id: v
         shell: bash
@@ -81,9 +85,23 @@ jobs:
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json, os, sys
+          from pathlib import Path
           vs = [v.strip() for v in os.environ["INPUT_VERSIONS"].split(",") if v.strip()]
           if not vs:
               sys.exit("aio-versions must be non-empty")
+          # Fail fast if any requested version lacks a shipped config YAML.
+          # Without this, a typo (e.g. "2604" when only "2603" is shipped)
+          # proceeds through k3s bring-up + Arc registration and only errors
+          # out at siteops deploy time.
+          versions_dir = Path("workspaces/iot-operations/parameters/aio-versions")
+          missing = [v for v in vs if not (versions_dir / f"{v}.yaml").is_file()]
+          if missing:
+              available = sorted(p.stem for p in versions_dir.glob("*.yaml"))
+              sys.exit(
+                  f"aio-versions entries without a matching "
+                  f"{versions_dir}/<version>.yaml: {missing}. "
+                  f"Available: {available}."
+              )
           rg_in = os.environ["INPUT_RG"].strip()
           cl_in = os.environ["INPUT_CLUSTER"].strip()
           persistent = bool(rg_in)

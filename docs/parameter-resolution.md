@@ -30,19 +30,30 @@ Later values override earlier values. Nested objects merge recursively. This ord
 Reference outputs from previous steps:
 
 ```yaml
-# parameters/chaining.yaml
+# parameters/aio-instance-chaining.yaml
 schemaRegistryId: "{{ steps.schema-registry.outputs.schemaRegistry.id }}"
 clExtensionIds: "{{ steps.aio-enablement.outputs.clExtensionIds }}"
 ```
 
 > **Note**: Output chaining only works during real deployments. In `--dry-run` mode, output templates remain unresolved.
 
+### Chaining file naming convention
+
+Two patterns, picked by whether the file describes inputs or outputs:
+
+| Pattern | Perspective | When to use | Example |
+|---|---|---|---|
+| `<step>-chaining.yaml` | Consumer (fan-in) | A step pulls outputs from **multiple** upstream producers | `aio-instance-chaining.yaml` pulls from `schema-registry`, `adr-ns`, `aio-enablement` |
+| `<step>-outputs.yaml` | Producer (fan-out) | A single step's outputs feed **multiple** downstream consumers | `aio-instance-outputs.yaml` feeds `schema-registry-role` and `opc-ua-solution` |
+
+The `<step>` prefix is always the step being described (the consumer for fan-in, the producer for fan-out). A step that has both fan-in inputs and fan-out outputs gets two files (e.g., `aio-instance-chaining.yaml` + `aio-instance-outputs.yaml`).
+
 ### Cross-scope output chaining
 
 RG-level sites can reference outputs from subscription-scoped steps. Subscription outputs are keyed by subscription ID and resolved automatically:
 
 ```yaml
-# parameters/chaining.yaml
+# parameters/aio-instance-chaining.yaml
 edgeSiteId: "{{ steps.global-edge-site.outputs.site.id }}"
 ```
 
@@ -84,4 +95,5 @@ When deploying:
 |----------------|-----------------|
 | Site-specific sizing (replicas, memory) | `site.parameters` |
 | Derived from site variables | Manifest-level `parameters/common.yaml` |
-| Output chaining | Step-level `parameters/chaining.yaml` |
+| Output chaining (fan-in) | Step-level `parameters/<step>-chaining.yaml` |
+| Output chaining (fan-out) | Step-level `parameters/<step>-outputs.yaml` |

@@ -121,7 +121,12 @@ class Orchestrator:
         executor: The AzCliExecutor instance for running commands
     """
 
-    def __init__(self, workspace: Path, dry_run: bool = False):
+    def __init__(
+        self,
+        workspace: Path,
+        dry_run: bool = False,
+        extra_trusted_sites_dirs: list[Path] | None = None,
+    ):
         self.workspace = Path(workspace).resolve()
         self.dry_run = dry_run
         self.executor = AzCliExecutor(workspace=self.workspace, dry_run=dry_run)
@@ -129,6 +134,81 @@ class Orchestrator:
         self._params_cache_lock = threading.Lock()
         self._site_cache: dict[str, Site] = {}
         self._cache_lock = threading.Lock()
+        self._extra_trusted_sites_dirs = self._normalize_extra_sites_dirs(
+            extra_trusted_sites_dirs or []
+        )
+
+    def _normalize_extra_sites_dirs(self, dirs: list[Path]) -> list[Path]:
+        """Validate and deduplicate extra trusted site directories.
+
+        Extra trusted dirs are searched between the workspace's `sites/` and
+        `sites.local/` directories, and receive the same trust level as
+        `sites/`: site files in them are allowed to declare `inherits`.
+
+        Args:
+            dirs: Candidate directories to add to the trusted search path.
+
+        Returns:
+            Resolved, deduplicated, order-preserving list.
+
+        Raises:
+            FileNotFoundError: If any directory does not exist.
+            ValueError: If a directory collides with the workspace's own
+                `sites/` or `sites.local/`. A `sites.local/` collision
+                is specifically refused because registering it as trusted
+                would let overlays inject inheritance, breaking the overlay
+                security invariant.
+        """
+        primary = (self.workspace / "sites").resolve()
+        overlay = (self.workspace / "sites.local").resolve()
+        result: list[Path] = []
+        seen: set[Path] = set()
+        for candidate in dirs:
+            resolved = Path(candidate).resolve()
+            if not resolved.is_dir():
+                raise FileNotFoundError(
+                    f"Extra trusted site directory not found: {candidate}"
+                )
+            if resolved == primary:
+                raise ValueError(
+                    f"Extra site dir '{candidate}' is the workspace's "
+                    f"sites/ directory; already included by default."
+                )
+            if resolved == overlay:
+                raise ValueError(
+                    f"Extra site dir '{candidate}' is the workspace's "
+                    f"sites.local/ directory. Registering it as trusted "
+                    f"would allow overlays to inject inheritance; refused "
+                    f"for security."
+                )
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            result.append(resolved)
+        return result
+
+    @property
+    def _trusted_sites_dirs(self) -> list[Path]:
+        """All trusted site directories, in merge order.
+
+        Trusted means: `inherits` is honored in files from these dirs.
+        Excludes `sites.local/` (overlay, always strips `inherits`).
+        """
+        return [self.workspace / "sites", *self._extra_trusted_sites_dirs]
+
+    def _find_trusted_site_file(self, name: str) -> Path | None:
+        """Return the first trusted directory path containing `<name>.yaml`.
+
+        Searches `sites/` and each extra trusted directory in order.
+        Does NOT search `sites.local/`: sites must be declared in a
+        code-reviewed (or caller-vouched-for) location to be loadable.
+        """
+        for sites_dir in self._trusted_sites_dirs:
+            for ext in (".yaml", ".yml"):
+                path = sites_dir / f"{name}{ext}"
+                if path.exists():
+                    return path
+        return None
 
     def _deep_merge(self, base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
         """Deep merge two dictionaries, with override taking precedence.
@@ -214,31 +294,40 @@ class Orchestrator:
         """Load and merge site data with inheritance and overlay support.
 
         Merge order (later overrides earlier):
-        1. inherits target  - Parent template (if specified, resolved recursively)
-        2. sites/           - Base site definitions (committed)
-        3. sites.local/     - Local/CI overrides (gitignored)
+        1. inherits target         - Parent template (resolved recursively)
+        2. sites/                  - Primary trusted site definitions (committed)
+        3. extra_trusted_sites_dirs - Additional trusted dirs, in list order
+        4. sites.local/            - Local/CI overrides (gitignored)
 
-        Note: Only the base file (sites/) can specify `inherits`. The sites.local/
-        overlay cannot change inheritance for security reasons.
+        `inherits` handling:
+        - The FIRST trusted directory to contain the site establishes the
+          inheritance chain (`inherits` is honored).
+        - Any later file (in another trusted dir OR in `sites.local/`) has
+          its `inherits` stripped. A site has exactly one inheritance
+          chain, determined by its base file.
+
+        This means `sites.local/` cannot inject inheritance at all: the
+        security invariant is preserved regardless of how many extra trusted
+        dirs are configured.
 
         Args:
-            name: Site name (filename without extension)
+            name: Site name (filename without extension).
 
         Returns:
-            Merged site data dictionary
+            Merged site data dictionary.
 
         Raises:
-            FileNotFoundError: If site file doesn't exist in any directory
-            ValueError: If inheritance creates a cycle or references invalid kind
+            FileNotFoundError: If no trusted dir or sites.local/ has the file.
+            ValueError: If inheritance creates a cycle or references invalid kind.
         """
         site_dirs = [
-            self.workspace / "sites",  # Base (committed)
-            self.workspace / "sites.local",  # Local/CI overrides
+            *self._trusted_sites_dirs,
+            self.workspace / "sites.local",
         ]
 
         merged_data: dict[str, Any] = {}
         found = False
-        is_base_file = True  # Track if we're processing the base file
+        is_base_file = True  # First file found establishes the inheritance chain
 
         for sites_dir in site_dirs:
             for ext in (".yaml", ".yml"):
@@ -247,7 +336,7 @@ class Orchestrator:
                     with open(path, "r", encoding="utf-8") as f:
                         data = yaml.safe_load(f) or {}
 
-                    # Process inheritance only on base file (not local overlay)
+                    # Process inheritance only on the first file found (the base)
                     if is_base_file and "inherits" in data:
                         inherits_path = (path.parent / data["inherits"]).resolve()
                         # Initialize seen list with current file to detect self-reference
@@ -256,7 +345,11 @@ class Orchestrator:
                         # Remove inherits from data before merging
                         data = {k: v for k, v in data.items() if k != "inherits"}
                     elif not is_base_file and "inherits" in data:
-                        # Strip inherits from local overlay (security: can't inject inheritance)
+                        # Strip inherits from any non-base file. For sites.local/
+                        # this prevents runtime injection of inheritance (security).
+                        # For additional trusted dirs it reflects the rule that a
+                        # site has exactly one inheritance chain, established by
+                        # the base file.
                         data = {k: v for k, v in data.items() if k != "inherits"}
 
                     merged_data = self._deep_merge(merged_data, data)
@@ -266,7 +359,11 @@ class Orchestrator:
                     break  # Only load one file per directory (prefer .yaml)
 
         if not found:
-            raise FileNotFoundError(f"Site '{name}' not found in sites/ or sites.local/")
+            where = "sites/"
+            if self._extra_trusted_sites_dirs:
+                where += ", extra trusted sites dirs,"
+            where += " or sites.local/"
+            raise FileNotFoundError(f"Site '{name}' not found in {where}")
 
         return merged_data
 
@@ -274,33 +371,39 @@ class Orchestrator:
         """Load a site by name, applying inheritance and local overlays.
 
         Resolution order (later sources override earlier):
-        1. Inherited site/template (if 'inherits' specified)
-        2. Base site file from sites/{name}.yaml
-        3. Local overlay from sites.local/{name}.yaml (if exists)
+        1. Inherited site/template (if 'inherits' specified on the base file).
+        2. Base site file from `sites/` or any extra trusted dir (first
+           trusted dir containing the file wins; see `_find_trusted_site_file`).
+        3. Overlays from any remaining trusted dirs (`inherits` stripped).
+        4. Local overlay from `sites.local/{name}.yaml` (if it exists;
+           `inherits` stripped).
 
         Args:
-            name: Site name (corresponds to sites/{name}.yaml)
+            name: Site name (filename stem, without extension).
 
         Returns:
-            Fully resolved Site instance
+            Fully resolved Site instance.
 
         Raises:
             ValueError: If site file is invalid, missing required fields,
-                       or references non-existent inherited files
-            FileNotFoundError: If sites/{name}.yaml doesn't exist
+                       or references non-existent inherited files.
+            FileNotFoundError: If `{name}.yaml` is not found in `sites/`
+                or any extra trusted directory.
         """
         # Check cache first
         with self._cache_lock:
             if name in self._site_cache:
                 return self._site_cache[name]
 
-        # Check if site file exists
-        site_path = self.workspace / "sites" / f"{name}.yaml"
-        if not site_path.exists():
-            # Also check .yml extension
-            site_path = self.workspace / "sites" / f"{name}.yml"
-            if not site_path.exists():
-                raise FileNotFoundError(f"Site file not found: sites/{name}.yaml")
+        # Locate the site file in a trusted directory (sites/ or extras).
+        # sites.local/ cannot be the primary source. Sites must be declared
+        # in a code-reviewed / caller-vouched-for location.
+        site_path = self._find_trusted_site_file(name)
+        if site_path is None:
+            where = "sites/"
+            if self._extra_trusted_sites_dirs:
+                where += " or extra trusted sites dirs"
+            raise FileNotFoundError(f"Site file not found: {name} (searched {where})")
 
         # Check if this is a SiteTemplate (cannot be loaded directly)
         if self._is_site_template(site_path):
@@ -348,30 +451,33 @@ class Orchestrator:
         return site
 
     def _get_all_site_names(self) -> list[str]:
-        """Get all deployable site names from the sites directory.
+        """Get all deployable site names from trusted site directories.
 
-        Scans the workspace's sites/ directory for YAML files and returns
-        the names of files that represent deployable sites (kind: Site).
-        Files with kind: SiteTemplate are excluded as they are only used
-        for inheritance.
+        Scans the workspace's `sites/` directory and every extra trusted
+        site directory for YAML files and returns names of files that
+        represent deployable sites (`kind: Site`). Files with
+        `kind: SiteTemplate` are excluded (inheritance-only). Files in
+        `sites.local/` are NOT discoverable. That directory is the
+        overlay for committed/trusted sites, not a source of new site
+        identities.
 
         Returns:
-            List of site names (filename stems without .yaml extension)
+            Sorted list of site names (filename stems without extension).
 
         Note:
-            - Files that cannot be parsed are included and will error during load_site()
-            - This allows proper error reporting with full context
+            Files that cannot be parsed are included and will error during
+            `load_site()`. This allows proper error reporting with full
+            context rather than silent omission.
         """
-        sites_dir = self.workspace / "sites"
-        if not sites_dir.exists():
-            return []
-
-        site_names = set()  # Use set to avoid duplicates if both .yaml and .yml exist
-        for ext in ("*.yaml", "*.yml"):
-            for path in sites_dir.glob(ext):
-                if self._is_site_template(path):
-                    continue
-                site_names.add(path.stem)
+        site_names: set[str] = set()
+        for sites_dir in self._trusted_sites_dirs:
+            if not sites_dir.exists():
+                continue
+            for ext in ("*.yaml", "*.yml"):
+                for path in sites_dir.glob(ext):
+                    if self._is_site_template(path):
+                        continue
+                    site_names.add(path.stem)
 
         return sorted(site_names)  # Sort for deterministic order
 
@@ -397,13 +503,15 @@ class Orchestrator:
             return False
 
     def load_all_sites(self) -> list[Site]:
-        """Load all sites from sites/ and sites.local/ directories.
+        """Load all deployable sites from trusted site directories.
 
-        Sites are merged across directories with the following precedence:
-        sites.local/ > sites/
+        Discovers sites from `sites/` and any extra trusted directories,
+        then loads each (applying `sites.local/` overlays where present).
+        Precedence within a single site: `sites.local/` > extra trusted
+        dirs (last wins) > `sites/`.
 
         Returns:
-            List of all Site instances found (with merged configuration)
+            List of all Site instances found (with merged configuration).
         """
         sites = []
         skipped = []

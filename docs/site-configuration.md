@@ -174,7 +174,49 @@ subscription: "real-subscription-id"
 resourceGroup: real-resource-group
 ```
 
-> **Security**: Only base files (`sites/`) can specify `inherits`. Overlays cannot inject inheritance.
+> **Security**: Only base files (in trusted site directories) can specify `inherits`. Overlays in `sites.local/` cannot inject inheritance.
+
+## Extra trusted site directories
+
+In addition to the workspace's `sites/` directory, Site Ops can search
+one or more extra trusted directories for site files. Files in these
+directories are treated exactly like files in `sites/`: they are
+discoverable by `siteops sites`, they can declare `inherits`, and they
+serve as valid base files for the inheritance chain.
+
+Use cases include:
+
+- **CI / end-to-end tests**: keep test-only sites out of `workspaces/*/sites/`
+  (production config) and inject them only when the test workflow runs.
+- **Cross-repo site libraries**: pull shared sites from another repository
+  checked out alongside the workspace.
+- **Blueprint catalogs**: keep opinionated site templates in a central
+  location, pointed at from multiple workspaces.
+
+Provide extra directories via the CLI or environment variable:
+
+```bash
+# Repeatable flag
+siteops -w workspace --extra-sites-dir ./tests/e2e/sites sites
+
+# Environment variable (os.pathsep-separated: ';' on Windows, ':' on Unix)
+SITEOPS_EXTRA_SITES_DIRS=/path/to/lib-sites siteops -w workspace sites
+```
+
+When both are provided, the CLI flag wins and an INFO log records that
+the env var was ignored.
+
+**Merge order (full)**:
+
+```
+inherits target → sites/ → <extra dirs, in listed order> → sites.local/
+```
+
+Extras cannot collide with the workspace's own `sites/` or `sites.local/`
+directories; the orchestrator rejects both at construction time.
+Registering `sites.local/` as trusted is specifically refused because it
+would let overlays inject inheritance and break the overlay security
+invariant.
 
 ## Site inheritance
 
@@ -227,8 +269,8 @@ parameters:
 
 ### Merge order with inheritance
 
-`inherits target` → `sites/` → `sites.local/`
+`inherits target` → `sites/` → `<extra trusted dirs>` → `sites.local/`
 
-Inherited values are overridden by child site values. Nested objects (labels, parameters, properties) merge recursively.
+Inherited values are overridden by child site values. Nested objects (labels, parameters, properties) merge recursively. See [Extra trusted site directories](#extra-trusted-site-directories) for how extra dirs participate in the chain.
 
-> **Security**: Only base files (`sites/`) can specify `inherits`. Overlays cannot inject inheritance.
+> **Security**: Only base files (in trusted site directories) can specify `inherits`. Overlays in `sites.local/` cannot inject inheritance, even when extra trusted dirs are configured.

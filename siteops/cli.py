@@ -11,6 +11,7 @@ Commands:
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -204,6 +205,40 @@ def cmd_sites(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
     return 0
 
 
+_EXTRA_SITES_DIRS_ENV = "SITEOPS_EXTRA_SITES_DIRS"
+
+
+def _resolve_extra_sites_dirs(cli_dirs: list[Path] | None) -> list[Path]:
+    """Resolve extra trusted site dirs from CLI flag and/or env var.
+
+    Precedence: `--extra-sites-dir` wins over `SITEOPS_EXTRA_SITES_DIRS`.
+    When both are provided, an INFO log records that the env var was ignored.
+
+    The env var is parsed using `os.pathsep` (`;` on Windows, `:` on
+    Unix) to match platform conventions for `PATH`-style variables. Empty
+    segments are skipped so trailing separators are tolerated.
+
+    Args:
+        cli_dirs: Directories supplied via the `--extra-sites-dir` flag,
+            or `None` if the flag was not used.
+
+    Returns:
+        List of paths to pass to `Orchestrator`. Empty list when neither
+        source provides a value.
+    """
+    env_raw = os.environ.get(_EXTRA_SITES_DIRS_ENV, "")
+    env_dirs = [Path(p) for p in env_raw.split(os.pathsep) if p]
+
+    if cli_dirs:
+        if env_dirs:
+            logging.getLogger("siteops.cli").info(
+                "Ignoring %s (--extra-sites-dir takes precedence).",
+                _EXTRA_SITES_DIRS_ENV,
+            )
+        return list(cli_dirs)
+    return env_dirs
+
+
 def main() -> None:
     """Main entry point for the Site Ops CLI."""
     parser = argparse.ArgumentParser(
@@ -226,6 +261,24 @@ Examples:
         type=Path,
         default=Path.cwd(),
         help="Workspace directory (default: current directory)",
+    )
+    parser.add_argument(
+        "--extra-sites-dir",
+        dest="extra_sites_dirs",
+        action="append",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Additional trusted directory to search for site YAML files "
+            "(repeatable). Treated with the same trust level as the "
+            "workspace's sites/ directory: files may declare 'inherits'. "
+            "Searched after sites/ and before sites.local/. "
+            "Alternatively set SITEOPS_EXTRA_SITES_DIRS to a list of "
+            "directories using the platform path separator "
+            "(';' on Windows, ':' on Unix). When both are provided, "
+            "--extra-sites-dir wins."
+        ),
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -308,10 +361,17 @@ Examples:
         print(f"Error: Workspace directory not found: {args.workspace}", file=sys.stderr)
         sys.exit(1)
 
-    orchestrator = Orchestrator(
-        workspace=args.workspace,
-        dry_run=getattr(args, "dry_run", False),
-    )
+    extra_sites_dirs = _resolve_extra_sites_dirs(args.extra_sites_dirs)
+
+    try:
+        orchestrator = Orchestrator(
+            workspace=args.workspace,
+            dry_run=getattr(args, "dry_run", False),
+            extra_trusted_sites_dirs=extra_sites_dirs,
+        )
+    except (FileNotFoundError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
     commands = {
         "deploy": cmd_deploy,

@@ -218,6 +218,20 @@ Registering `sites.local/` as trusted is specifically refused because it
 would let overlays inject inheritance and break the overlay security
 invariant.
 
+### Leaf sites must live at the top level
+
+Discovery is **flat, not recursive**. Every trusted directory (`sites/`,
+each extras dir, and `sites.local/`) is scanned at its top level only.
+Subdirectories are reserved for inherit targets and are reachable only
+through an explicit subpath in `inherits:`.
+
+| Path | Kind | Discovered? |
+|---|---|---|
+| `sites/munich-prod.yaml` | `Site` | ✅ deployable |
+| `sites/base-site.yaml` | `SiteTemplate` | ✅ as inherit target only |
+| `sites/shared/usa-west.yaml` | `SiteTemplate` | ❌ reachable only via `inherits: shared/usa-west.yaml` |
+| `sites/eu/munich.yaml` | `Site` | ❌ silently ignored; move to top level |
+
 ## Site inheritance
 
 Sites can inherit from shared templates to reduce duplication:
@@ -258,6 +272,30 @@ parameters:
     memoryProfile: Low  # Overrides inherited value
 ```
 
+### How `inherits:` paths are resolved
+
+Resolution is relative to the **child file's own directory**. The only
+exception is the bare-filename fallback (row 1 below), which lets an
+extras-dir site inherit a workspace-owned template without copying it.
+
+| Form | Example | Resolves to |
+|---|---|---|
+| Bare filename | `inherits: base-site.yaml` | `./base-site.yaml` next to the child, then fallback to `<workspace>/sites/base-site.yaml` |
+| Subpath | `inherits: shared/usa-east.yaml` | `<child-dir>/shared/usa-east.yaml` |
+| Parent / sibling | `inherits: ../base-site.yaml` | `<child-dir>/../base-site.yaml` |
+| Absolute | `inherits: /abs/path/tpl.yaml` | Used as-is |
+
+The fallback searches `<workspace>/sites/` only (never across extras
+dirs), so there is no implicit shared-template namespace between trusted
+directories.
+
+> **Trust model.** `inherits:` is author-trusted and not filesystem-sandboxed;
+> it may point to a sibling `shared/` dir or an absolute path. The control is
+> *who may author files in trusted sites locations* (`workspace/sites/` and
+> extras dirs); anyone who can write an `inherits:` value can already set any
+> other site field. `sites.local/` overlays strip `inherits:`, so runtime
+> overlays cannot introduce new inheritance targets.
+
 ### SiteTemplate vs Site
 
 | Aspect | `kind: Site` | `kind: SiteTemplate` |
@@ -274,3 +312,54 @@ parameters:
 Inherited values are overridden by child site values. Nested objects (labels, parameters, properties) merge recursively. See [Extra trusted site directories](#extra-trusted-site-directories) for how extra dirs participate in the chain.
 
 > **Security**: Only base files (in trusted site directories) can specify `inherits`. Overlays in `sites.local/` cannot inject inheritance, even when extra trusted dirs are configured.
+
+## Site selection from a manifest
+
+When a manifest is deployed, Site Ops resolves the target sites through
+three mutually-exclusive precedence tiers:
+
+1. **CLI `--selector` overrides everything.**
+   ```bash
+   siteops deploy manifests/aio-install.yaml --selector environment=dev
+   siteops deploy manifests/aio-install.yaml --selector name=munich-dev
+   ```
+   - If the selector includes `name=X` and a trusted file `X.yaml` (or
+     `X.yml`) exists, the named site is loaded directly; any load
+     error (broken inherits chain, invalid YAML) is surfaced instead of
+     silently resolving to zero sites.
+   - Otherwise the orchestrator loads all discoverable sites and keeps
+     those whose `name:` or `labels` match every `key=value` pair. This
+     path supports selecting by the site's internal `name:` field even
+     when it differs from the filename.
+
+2. **Explicit `sites:` list in the manifest.**
+   ```yaml
+   # manifests/regional-rollout.yaml
+   sites:
+     - chicago-staging
+     - seattle-prod
+   ```
+   Each entry is a filename stem; missing files raise
+   `FileNotFoundError` with the full list.
+
+3. **Manifest `siteSelector:` (label expression).**
+   ```yaml
+   # manifests/aio-install.yaml
+   siteSelector: "environment=dev"
+   ```
+   The orchestrator loads all discoverable sites and keeps those whose
+   labels satisfy the expression.
+
+A manifest with none of the three is rejected at parse time.
+
+### Quick decision table
+
+| I want to… | Do this |
+|---|---|
+| Add a new deployable site | Drop `my-site.yaml` at the root of `workspace/sites/` or an extras dir |
+| Share a reusable template across sites | Put it in `workspace/sites/<name>.yaml` (same dir) or `workspace/sites/shared/<name>.yaml` (subdir) and reference via `inherits:` |
+| Override a committed site at runtime without a PR | Put `my-site.yaml` in `workspace/sites.local/` (overlay merges; `inherits:` stripped) |
+| Inject a site from CI without touching the workspace | Register a dir via `SITEOPS_EXTRA_SITES_DIRS` / `--extra-sites-dir` and drop `my-site.yaml` at its root |
+| Target one specific site at the CLI | `siteops deploy <manifest> --selector name=<site-name>` |
+| Pin the manifest to a labeled cohort | Set `siteSelector:` in the manifest |
+| Hard-code the target list for a manifest | Set `sites:` in the manifest |

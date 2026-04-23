@@ -1,0 +1,433 @@
+# End-to-end test workflow.
+#
+# Runs the full scalekit stack (k3s cluster, Arc registration, siteops deploy,
+# integration tests) against a real Azure subscription. This is the primary
+# live-subscription validation for every AIO version we target.
+#
+# Modes (determined by whether `resource-group` input is set):
+#   - ephemeral (default):  Workflow creates a fresh RG per matrix entry and
+#                           deletes it at the end. Requires subscription-level
+#                           Owner on the service principal.
+#   - persistent:           Operator supplies a pre-existing RG via the
+#                           `resource-group` input. The RG is preserved; only
+#                           resources created during this run (delta vs. the
+#                           pre-run RG snapshot) are deleted. Requires
+#                           RG-level Owner on the SP.
+#
+# The E2E site itself is rendered at runtime via scripts/render-e2e-site.py
+# into $RUNNER_TEMP/e2e-sites/ and picked up by the orchestrator through
+# SITEOPS_EXTRA_SITES_DIRS, so we never commit an Azure-specific site file.
+
+name: E2E Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      aio-versions:
+        description: Comma-separated AIO versions to fan out over (e.g. "2603,2610").
+        type: string
+        default: "2603"
+      environment:
+        description: GitHub Environment whose secrets/approvers apply.
+        type: string
+        default: "dev"
+      location:
+        description: Azure region for ephemeral mode. Ignored in persistent mode (derived from the RG).
+        type: string
+        default: "eastus2"
+      resource-group:
+        description: Pre-existing RG (persistent mode). Empty = ephemeral mode.
+        type: string
+        default: ""
+      cluster-name:
+        description: Arc cluster name to register. Empty = auto-generated.
+        type: string
+        default: ""
+      custom-locations-oid:
+        description: Custom Locations RP object ID in the tenant (see docs/e2e-testing.md).
+        type: string
+        default: ""
+      skip-teardown:
+        description: Preserve the deployment for inspection. Use sparingly.
+        type: boolean
+        default: false
+      keep-cluster-alive-minutes:
+        description: Minutes to keep the runner (and k3s cluster) alive after tests, before teardown. 0 = skip. Capped at 300.
+        type: number
+        default: 0
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  prep:
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.v.outputs.versions }}
+      persistent: ${{ steps.v.outputs.persistent }}
+      rg-key: ${{ steps.v.outputs.rg_key }}
+      rg-in: ${{ steps.v.outputs.rg_in }}
+      cluster-in: ${{ steps.v.outputs.cluster_in }}
+    steps:
+      - name: Parse inputs
+        id: v
+        shell: bash
+        env:
+          INPUT_VERSIONS: "${{ inputs.aio-versions }}"
+          INPUT_RG: "${{ inputs.resource-group }}"
+          INPUT_CLUSTER: "${{ inputs.cluster-name }}"
+          RUN_ID: "${{ github.run_id }}"
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, sys
+          vs = [v.strip() for v in os.environ["INPUT_VERSIONS"].split(",") if v.strip()]
+          if not vs:
+              sys.exit("aio-versions must be non-empty")
+          rg_in = os.environ["INPUT_RG"].strip()
+          cl_in = os.environ["INPUT_CLUSTER"].strip()
+          persistent = bool(rg_in)
+          if cl_in and len(vs) > 1:
+              sys.exit(
+                  "cluster-name cannot be combined with a multi-version "
+                  "aio-versions matrix (each matrix cell registers its own cluster)."
+              )
+          print(f"versions={json.dumps(vs)}")
+          print(f"persistent={'true' if persistent else 'false'}")
+          # Emit trimmed operator inputs so downstream steps use the exact
+          # values the validation was done against (no trailing-whitespace
+          # mismatch between prep and `Compute names`).
+          print(f"rg_in={rg_in}")
+          print(f"cluster_in={cl_in}")
+          # Concurrency key:
+          #  - persistent: shared across all dispatches against the same RG
+          #    (regardless of operator-supplied cluster-name), so concurrent
+          #    persistent runs on one RG serialize. Prevents races where two
+          #    runs' delta snapshots each see the other's in-flight resources.
+          #  - ephemeral:  per-run key; matrix cells parallelize via the
+          #    matrix.aio-version suffix applied at the job level.
+          rg_key = f"persistent-{rg_in}" if persistent else f"ephemeral-{os.environ['RUN_ID']}"
+          print(f"rg_key={rg_key}")
+          PY
+
+  e2e:
+    needs: prep
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    timeout-minutes: ${{ inputs.keep-cluster-alive-minutes > 0 && 360 || 60 }}
+    concurrency:
+      # Persistent: matrix cells share rg_key and omit the version suffix, so
+      # they serialize (same RG can only host one AIO deploy at a time).
+      # Ephemeral: rg_key is per-run and the version suffix distinguishes
+      # cells, so matrix fan-out runs in parallel.
+      group: e2e-${{ needs.prep.outputs.rg-key }}${{ needs.prep.outputs.persistent == 'true' && '-persistent' || format('-{0}', matrix.aio-version) }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix:
+        aio-version: ${{ fromJSON(needs.prep.outputs.versions) }}
+    env:
+      PERSISTENT_RG: ${{ needs.prep.outputs.persistent }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Compute names
+        id: names
+        shell: bash
+        env:
+          RG_IN: "${{ needs.prep.outputs.rg-in }}"
+          CL_IN: "${{ needs.prep.outputs.cluster-in }}"
+          VERSION: "${{ matrix.aio-version }}"
+          RUN_SUFFIX: "${{ github.run_id }}-${{ github.run_attempt }}"
+        # Some AIO version strings contain dots (e.g. "1.0.32"). Arc clusters
+        # and several AIO-derived resource names reject dots, so we derive a
+        # name-safe form (non-alphanumerics → `-`, trailing `-` trimmed) when
+        # generating RG / cluster / site names. E2E_AIO_VERSION still carries
+        # the original string so version pinning inside the site is unaffected.
+        #
+        # site_name is always runtime-unique even in persistent mode so
+        # parallel runs against the same RG cannot silently merge sites.
+        run: |
+          set -euo pipefail
+          SAFE_VER=$(printf '%s' "$VERSION" | tr -c 'a-zA-Z0-9' '-' | sed 's/-*$//')
+          SUFFIX="${RUN_SUFFIX}-${SAFE_VER}"
+          RG="${RG_IN:-rg-e2e-$SUFFIX}"
+          CL="${CL_IN:-e2e-$SUFFIX}"
+          SN="e2e-$SUFFIX"
+          echo "rg=$RG" >> "$GITHUB_OUTPUT"
+          echo "cluster=$CL" >> "$GITHUB_OUTPUT"
+          echo "site_name=$SN" >> "$GITHUB_OUTPUT"
+
+      - uses: ./.github/actions/create-k3s-cluster
+
+      - uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Snapshot RG resources (persistent mode)
+        if: env.PERSISTENT_RG == 'true'
+        shell: bash
+        env:
+          RG: "${{ steps.names.outputs.rg }}"
+        # Snapshot BEFORE any Azure-side creation (connect-arc, AIO deploy,
+        # etc.) so every resource this run creates is in the teardown delta.
+        # Otherwise Arc resources would be treated as pre-existing, and if
+        # `az connectedk8s delete` fails in teardown they would silently
+        # survive. Atomic write guards against a truncated snapshot.
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/e2e-teardown"
+          TMP="$RUNNER_TEMP/e2e-teardown/pre-ids.txt.partial"
+          az resource list -g "$RG" --query "[].id" -o tsv > "$TMP"
+          mv "$TMP" "$RUNNER_TEMP/e2e-teardown/pre-ids.txt"
+          count=$(wc -l < "$RUNNER_TEMP/e2e-teardown/pre-ids.txt")
+          echo "Snapshot: $count pre-existing resource(s) in RG $RG will be preserved."
+
+      - name: Create resource group (ephemeral mode)
+        if: env.PERSISTENT_RG != 'true'
+        shell: bash
+        # Ownership tags are what the teardown guard verifies before
+        # `az group delete`. run_id + run_attempt bind the tag set to THIS
+        # specific workflow run so a pre-existing RG that happens to match
+        # the name pattern cannot be deleted. Only an RG this run just
+        # created can pass the guard.
+        run: |
+          az group create \
+            --name "${{ steps.names.outputs.rg }}" \
+            --location "${{ inputs.location }}" \
+            --tags \
+              managedBy=siteops-e2e \
+              ephemeral=true \
+              run_id="${{ github.run_id }}" \
+              run_attempt="${{ github.run_attempt }}"
+
+      - name: Resolve E2E_LOCATION
+        id: loc
+        shell: bash
+        env:
+          AUTO_LOC: ${{ inputs.location }}
+          RG: ${{ steps.names.outputs.rg }}
+        # Persistent mode: the RG already has a region; using the operator
+        # input would create site/cluster/RG-region mismatches. Derive from
+        # `az group show` to keep them aligned.
+        run: |
+          set -euo pipefail
+          if [[ "$PERSISTENT_RG" == "true" ]]; then
+            LOC=$(az group show --name "$RG" --query location -o tsv)
+          else
+            LOC="$AUTO_LOC"
+          fi
+          echo "location=$LOC" >> "$GITHUB_OUTPUT"
+
+      - name: Preflight Arc cluster name is unused (persistent mode)
+        if: env.PERSISTENT_RG == 'true'
+        shell: bash
+        env:
+          RG: ${{ steps.names.outputs.rg }}
+          CLUSTER: ${{ steps.names.outputs.cluster }}
+        # Persistent mode still uses a fresh k3s on this runner; `connect-arc`
+        # registers it as a NEW Arc resource. An existing connectedClusters
+        # record cannot be reused (it's bound to a different k8s instance),
+        # so fail fast here with an actionable message instead of letting
+        # `az connectedk8s connect` error out opaquely.
+        run: |
+          set -euo pipefail
+          az extension add --name connectedk8s --upgrade --yes --only-show-errors
+          COUNT=$(az connectedk8s list -g "$RG" --query "length([?name=='$CLUSTER'])" -o tsv)
+          if [[ "$COUNT" != "0" ]]; then
+            echo "::error::Arc cluster '$CLUSTER' already exists in RG '$RG'. This workflow registers a fresh k3s under this name; re-using an existing registration is not supported. Delete the Arc resource (\`az connectedk8s delete -n $CLUSTER -g $RG\`) or pick an unused cluster-name."
+            exit 1
+          fi
+
+      - uses: ./.github/actions/connect-arc
+        with:
+          cluster-name: ${{ steps.names.outputs.cluster }}
+          resource-group: ${{ steps.names.outputs.rg }}
+          location: ${{ steps.loc.outputs.location }}
+          custom-locations-oid: ${{ inputs.custom-locations-oid }}
+          enable-workload-identity: "true"
+
+      - uses: ./.github/actions/setup-siteops
+        with:
+          install-dev: "true"
+
+      - name: Render E2E site
+        shell: bash
+        env:
+          E2E_SITE_NAME: ${{ steps.names.outputs.site_name }}
+          E2E_SUBSCRIPTION: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          E2E_RESOURCE_GROUP: ${{ steps.names.outputs.rg }}
+          E2E_LOCATION: ${{ steps.loc.outputs.location }}
+          E2E_CLUSTER_NAME: ${{ steps.names.outputs.cluster }}
+          E2E_AIO_VERSION: ${{ matrix.aio-version }}
+        run: |
+          set -euo pipefail
+          python scripts/render-e2e-site.py \
+            --template tests/e2e/sites/e2e-test.yaml.tmpl \
+            --output-dir "$RUNNER_TEMP/e2e-sites"
+          echo "::group::Rendered site"
+          cat "$RUNNER_TEMP/e2e-sites/${E2E_SITE_NAME}.yaml"
+          echo "::endgroup::"
+
+      - name: Run E2E integration tests
+        shell: bash
+        env:
+          SITEOPS_EXTRA_SITES_DIRS: ${{ runner.temp }}/e2e-sites
+          INTEGRATION_SELECTOR: name=${{ steps.names.outputs.site_name }}
+          AIO_VERSION: ${{ matrix.aio-version }}
+        # AIO_VERSION is routed through env (not ${{ }} interpolated into the
+        # shell line) so a workflow_dispatch input containing shell metachars
+        # cannot break out of the command.
+        run: |
+          set -euo pipefail
+          pytest tests/integration/ -v -m integration --tb=long \
+            --junitxml="e2e-results-${AIO_VERSION}.xml"
+
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: e2e-results-${{ matrix.aio-version }}
+          path: e2e-results-${{ matrix.aio-version }}.xml
+
+      - name: Keep cluster alive (pre-teardown hold)
+        if: always() && inputs.keep-cluster-alive-minutes > 0
+        shell: bash
+        env:
+          HOLD_MIN: "${{ inputs.keep-cluster-alive-minutes }}"
+          RG: "${{ steps.names.outputs.rg }}"
+          CLUSTER: "${{ steps.names.outputs.cluster }}"
+        # Sleep so the runner (and its k3s cluster + Arc connection) remain
+        # reachable for interactive debugging before teardown. Cap at 300min
+        # to leave headroom under the 360min job timeout. Cancel the run to
+        # exit early; teardown still runs via `if: always()`.
+        run: |
+          set -euo pipefail
+          MAX=300
+          MINS=$HOLD_MIN
+          if (( MINS > MAX )); then MINS=$MAX; fi
+          echo "Holding for $MINS minute(s) before teardown. Arc cluster: $CLUSTER in RG: $RG."
+          echo "- Keep-alive: holding cluster \`$CLUSTER\` for ${MINS}m before teardown" >> "$GITHUB_STEP_SUMMARY"
+          for ((i=1; i<=MINS; i++)); do
+            sleep 60
+            echo "keep-alive heartbeat: ${i}/${MINS} minute(s) elapsed"
+          done
+
+      - name: Teardown (ephemeral mode, delete RG)
+        if: always() && env.PERSISTENT_RG != 'true' && !inputs.skip-teardown
+        shell: bash
+        env:
+          RG: "${{ steps.names.outputs.rg }}"
+          EXPECTED_RUN_ID: "${{ github.run_id }}"
+          EXPECTED_RUN_ATTEMPT: "${{ github.run_attempt }}"
+        # Layered defense against ever deleting a non-ephemeral RG:
+        #   1. Name must match `rg-e2e-<run_id>-<attempt>-*`, the exact
+        #      shape `Compute names` emits in ephemeral mode.
+        #   2. RG must carry tags `managedBy=siteops-e2e`, `ephemeral=true`,
+        #      and a `run_id`/`run_attempt` that equal THIS run's values.
+        #      Class-only tags (without run provenance) are not enough; an
+        #      unrelated RG tagged ephemeral could otherwise pass.
+        #   3. If the RG is already gone (e.g. a prior retry cleaned up),
+        #      treat as idempotent success, not failure.
+        # Any other mismatch hard-fails the job so an unexpected state
+        # surfaces loudly rather than destroying data.
+        run: |
+          set -euo pipefail
+          EXPECTED_PREFIX="rg-e2e-${EXPECTED_RUN_ID}-${EXPECTED_RUN_ATTEMPT}-"
+          if [[ "$RG" != "$EXPECTED_PREFIX"* ]]; then
+            echo "::error::Refusing to delete RG '$RG': name does not match this run's ephemeral pattern '${EXPECTED_PREFIX}*'."
+            exit 1
+          fi
+          EXISTS=$(az group exists --name "$RG")
+          if [[ "$EXISTS" != "true" ]]; then
+            echo "RG '$RG' does not exist; teardown is a no-op."
+            echo "- Ephemeral RG already absent: \`$RG\`" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          TAGS_JSON=$(az group show --name "$RG" --query tags -o json)
+          MANAGED=$(echo "$TAGS_JSON" | python3 -c "import json,sys;print((json.load(sys.stdin) or {}).get('managedBy',''))")
+          EPHEMERAL=$(echo "$TAGS_JSON" | python3 -c "import json,sys;print((json.load(sys.stdin) or {}).get('ephemeral',''))")
+          TAG_RUN_ID=$(echo "$TAGS_JSON" | python3 -c "import json,sys;print((json.load(sys.stdin) or {}).get('run_id',''))")
+          TAG_RUN_ATTEMPT=$(echo "$TAGS_JSON" | python3 -c "import json,sys;print((json.load(sys.stdin) or {}).get('run_attempt',''))")
+          if [[ "$MANAGED" != "siteops-e2e" \
+             || "$EPHEMERAL" != "true" \
+             || "$TAG_RUN_ID" != "$EXPECTED_RUN_ID" \
+             || "$TAG_RUN_ATTEMPT" != "$EXPECTED_RUN_ATTEMPT" ]]; then
+            echo "::error::Refusing to delete RG '$RG': tag provenance check failed."
+            echo "  expected: managedBy=siteops-e2e ephemeral=true run_id=$EXPECTED_RUN_ID run_attempt=$EXPECTED_RUN_ATTEMPT"
+            echo "  actual:   managedBy=$MANAGED ephemeral=$EPHEMERAL run_id=$TAG_RUN_ID run_attempt=$TAG_RUN_ATTEMPT"
+            exit 1
+          fi
+          echo "Guards passed; deleting ephemeral RG '$RG'."
+          if ! az group delete --name "$RG" --yes --no-wait; then
+            echo "::warning::Ephemeral RG delete failed; RG $RG may linger."
+            echo "- Ephemeral RG delete failed: \`$RG\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Teardown (persistent mode, delta cleanup, keep RG)
+        if: always() && env.PERSISTENT_RG == 'true' && !inputs.skip-teardown
+        shell: bash
+        env:
+          RG: "${{ steps.names.outputs.rg }}"
+          CLUSTER: "${{ steps.names.outputs.cluster }}"
+        # Deletes only resources that did not exist in the pre-run snapshot
+        # (see `Snapshot RG resources` step). If the snapshot file is missing
+        # we refuse to compute a delta and skip cleanup; an operator must
+        # clean up manually. Cluster delete runs first (when this run owns
+        # it) so Arc extensions cascade out cleanly. Role assignments (proxy
+        # resources) are not listed by `az resource list` and are cleaned
+        # up implicitly when scoped resources are deleted.
+        run: |
+          set +e
+          PRE_FILE="$RUNNER_TEMP/e2e-teardown/pre-ids.txt"
+          if [[ ! -f "$PRE_FILE" ]]; then
+            echo "::warning::Snapshot file missing; skipping delta cleanup. Inspect RG $RG manually."
+            echo "- Persistent-mode teardown skipped for RG \`$RG\` (snapshot missing)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # Only delete the Arc cluster if it was created by THIS run: grep
+          # the pre-snapshot for a matching connectedClusters/<name> id. If
+          # it was already there, the operator owns it — skip.
+          if grep -qiE "/providers/Microsoft\.Kubernetes/connectedClusters/${CLUSTER}$" "$PRE_FILE"; then
+            echo "Skipping cluster delete: Arc resource '$CLUSTER' pre-existed the snapshot (operator-owned)."
+          else
+            az connectedk8s delete -n "$CLUSTER" -g "$RG" --yes --only-show-errors || true
+          fi
+          LIST_OK=0
+          for i in 1 2 3; do
+            POST_IDS=$(az resource list -g "$RG" --query "[].id" -o tsv 2>/dev/null)
+            if [[ $? -ne 0 ]]; then
+              echo "::warning::Teardown pass $i: az resource list failed; retrying."
+              sleep 15
+              continue
+            fi
+            LIST_OK=1
+            DELTA=$(comm -23 <(printf '%s\n' "$POST_IDS" | sort -u) <(sort -u "$PRE_FILE") | sed '/^$/d')
+            [[ -z "$DELTA" ]] && break
+            count=$(printf '%s\n' "$DELTA" | wc -l)
+            echo "Teardown pass $i: deleting $count resource(s) created by this run"
+            printf '%s\n' "$DELTA" | xargs -r -I{} az resource delete --ids {} --verbose || true
+            sleep 15
+          done
+          if [[ $LIST_OK -eq 0 ]]; then
+            echo "::error::Persistent-mode teardown could not enumerate RG $RG; delta cleanup did not run. Inspect the RG manually."
+            echo "- Persistent-mode teardown unable to enumerate RG \`$RG\` (az resource list failed)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          POST_IDS=$(az resource list -g "$RG" --query "[].id" -o tsv 2>/dev/null)
+          if [[ $? -ne 0 ]]; then
+            echo "::warning::Final residual check: az resource list failed; residual state unknown."
+            echo "- Persistent-mode teardown final check failed for RG \`$RG\`" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          FINAL_DELTA=$(comm -23 <(printf '%s\n' "$POST_IDS" | sort -u) <(sort -u "$PRE_FILE") | sed '/^$/d')
+          if [[ -n "$FINAL_DELTA" ]]; then
+            residual=$(printf '%s\n' "$FINAL_DELTA" | wc -l)
+            echo "::warning::Persistent-mode teardown left $residual resource(s) in RG $RG created by this run."
+            echo "- Persistent-mode teardown incomplete in RG \`$RG\` ($residual residual resource(s))" >> "$GITHUB_STEP_SUMMARY"
+            printf '%s\n' "$FINAL_DELTA"
+          fi
+

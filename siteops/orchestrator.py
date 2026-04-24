@@ -239,6 +239,60 @@ class Orchestrator:
                 result[key] = copy.deepcopy(value)
         return result
 
+    def _resolve_inherits(self, child_path: Path, inherits_value: str) -> Path:
+        """Resolve an `inherits:` reference to an absolute path.
+
+        Resolution order:
+        1. Relative to the child file's directory (default, locality-preserving).
+        2. Narrow fallback: if the relative path does not exist AND
+           `inherits_value` is a bare filename (no path separators), look for
+           it in the workspace's `sites/` directory. This lets a site file
+           in an extra trusted dir reference a workspace-owned template
+           (e.g. `base-site.yaml`) without copying the template or inventing
+           a new syntax. The fallback is intentionally limited to
+           `workspace/sites/`. It does NOT search other extras or
+           `sites.local/`, so there is no cross-extra-dir shared namespace
+           and no way for an overlay to inject a new inheritance target.
+
+        `inherits:` is author-trusted: the value comes from a trusted site
+        file (workspace `sites/` or an operator-vouched extras dir), so the
+        resolver deliberately does NOT sandbox the resolved path to a
+        specific set of filesystem roots. The real control is who may
+        author files in those trusted locations. See the "Trust model"
+        section in docs/site-configuration.md.
+
+        Args:
+            child_path: Absolute path of the file that declares `inherits`.
+            inherits_value: The raw `inherits:` value from that file.
+
+        Returns:
+            Absolute, resolved path to the parent template.
+
+        Raises:
+            FileNotFoundError: If the parent cannot be resolved by either
+                strategy. The error lists every path that was probed so
+                the operator can see why fallback did not help.
+        """
+        tried: list[Path] = []
+
+        relative = (child_path.parent / inherits_value).resolve()
+        tried.append(relative)
+        if relative.exists():
+            return relative
+
+        if "/" not in inherits_value and "\\" not in inherits_value:
+            workspace_candidate = (self.workspace / "sites" / inherits_value).resolve()
+            if workspace_candidate != relative:
+                tried.append(workspace_candidate)
+                if workspace_candidate.exists():
+                    return workspace_candidate
+
+        searched = "\n  - ".join(str(p) for p in tried)
+        raise FileNotFoundError(
+            f"Inherited file not found for `inherits: {inherits_value}` "
+            f"declared in {child_path}. Searched:\n  - {searched}"
+        )
+
     def _load_inherited_data(self, path: Path, seen: list[Path] | None = None) -> dict[str, Any]:
         """Load inherited site template with support for chained inheritance.
 
@@ -278,7 +332,7 @@ class Orchestrator:
 
         # Handle chained inheritance
         if "inherits" in data:
-            parent_path = (path.parent / data["inherits"]).resolve()
+            parent_path = self._resolve_inherits(path, data["inherits"])
             parent_data = self._load_inherited_data(parent_path, seen)
             # Remove metadata fields before merging
             child_data = {k: v for k, v in data.items() if k not in ("inherits", "kind", "apiVersion")}
@@ -338,7 +392,7 @@ class Orchestrator:
 
                     # Process inheritance only on the first file found (the base)
                     if is_base_file and "inherits" in data:
-                        inherits_path = (path.parent / data["inherits"]).resolve()
+                        inherits_path = self._resolve_inherits(path, data["inherits"])
                         # Initialize seen list with current file to detect self-reference
                         inherited_data = self._load_inherited_data(inherits_path, seen=[path.resolve()])
                         merged_data = self._deep_merge(merged_data, inherited_data)
@@ -1750,8 +1804,23 @@ class Orchestrator:
         """
         # CLI selector requires loading all sites for filtering
         if cli_selector:
-            all_sites = self.load_all_sites()
             selector = parse_selector(cli_selector)
+            # When the operator explicitly names a site via `name=X`, and a
+            # trusted site file is named `X.yaml` (or `X.yml`), route through
+            # load_site() so load errors (broken inherits chain, invalid
+            # YAML) propagate instead of being silently swallowed by
+            # load_all_sites() and reported as "no sites matched".
+            #
+            # If there is no trusted file whose filename (without extension)
+            # is `X`, fall through to load_all_sites(): the operator may be
+            # selecting by the site's internal `name:` field, which is
+            # permitted to differ from the filename.
+            if "name" in selector and self._find_trusted_site_file(selector["name"]) is not None:
+                site = self.load_site(selector["name"])
+                if site.matches_selector(selector):
+                    return [site]
+                return []
+            all_sites = self.load_all_sites()
             return [s for s in all_sites if s.matches_selector(selector)]
 
         # Explicit sites list - load only the named sites (most common case)

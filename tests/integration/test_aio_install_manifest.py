@@ -4,6 +4,7 @@ import pytest
 
 from tests.integration.helpers.assertions import (
     assert_output_exists,
+    assert_step_skipped,
     assert_step_succeeded,
     find_step,
 )
@@ -59,6 +60,55 @@ class TestAioInstallConditionalSteps:
             step = find_step(aio_install_result, name, "global-edge-site")
             assert step["status"] == "skipped", (
                 f"Site '{name}': global-edge-site should be skipped for RG-level sites"
+            )
+
+    def test_secretsync_steps_skipped_when_disabled(
+        self, aio_install_result, orchestrator
+    ):
+        """Sites with deployOptions.enableSecretSync=false should skip both
+        secretsync steps embedded in aio-install.yaml (a regression guard for
+        the E2E site template and anyone reusing the same deployOptions)."""
+        for name in aio_install_result["sites"]:
+            site = orchestrator.load_site(name)
+            enabled = site.properties.get("deployOptions", {}).get("enableSecretSync", True)
+            if enabled:
+                continue
+            assert_step_skipped(aio_install_result, name, "resolve-aio")
+            assert_step_skipped(aio_install_result, name, "secretsync")
+
+    def test_solution_step_skipped_when_disabled(
+        self, aio_install_result, orchestrator
+    ):
+        """Sites with deployOptions.includeSolution=false should skip the
+        opc-ua-solution step embedded in aio-install.yaml."""
+        for name in aio_install_result["sites"]:
+            site = orchestrator.load_site(name)
+            included = site.properties.get("deployOptions", {}).get("includeSolution", True)
+            if included:
+                continue
+            assert_step_skipped(aio_install_result, name, "opc-ua-solution")
+
+
+class TestAioInstallVersioning:
+    """Validate that the AIO extension Azure actually deployed matches the
+    versioned-templates contract (requested aioVersion selects a template dir
+    that pins the extension version)."""
+
+    def test_aio_extension_version_reported(self, aio_install_result):
+        """The bicep output `aioExtension.version` reflects
+        `Microsoft.KubernetesConfiguration/extensions/.../properties/version`
+        from Azure. Assert it is present and non-empty for every site; this
+        is the primary regression guard for versioned-templates wiring."""
+        for name in aio_install_result["sites"]:
+            step = assert_step_succeeded(aio_install_result, name, "aio-instance")
+            aio_extension = assert_output_exists(step, "aioExtension")
+            assert isinstance(aio_extension, dict), (
+                f"Site '{name}': aioExtension output is not an object: {aio_extension!r}"
+            )
+            version = aio_extension.get("version")
+            assert version, (
+                f"Site '{name}': aioExtension.version is missing or empty "
+                f"(keys: {sorted(aio_extension.keys())})"
             )
 
 

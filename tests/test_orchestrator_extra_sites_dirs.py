@@ -210,6 +210,148 @@ class TestExtraSitesDirsBehavior:
         assert "real" in names
         assert "base" not in names
 
+    def test_bare_inherits_in_extra_dir_falls_back_to_workspace_sites(
+        self, tmp_workspace, tmp_path
+    ):
+        """A site in an extra dir can inherit from `workspace/sites/<name>.yaml`
+        using a bare filename.
+
+        Regression guard: the E2E workflow renders its site into an extra
+        dir and declares `inherits: base-site.yaml`. Without the narrow
+        workspace-sites fallback, the inherits target is unreachable from
+        the extra dir, `load_site()` raises, `load_all_sites()` swallows
+        the error, and every integration test passes vacuously against an
+        empty deploy result.
+        """
+        _write_template(
+            tmp_workspace / "sites" / "base-site.yaml",
+            subscription="from-workspace",
+            labels={"team": "platform"},
+        )
+
+        extra = tmp_path / "extra-sites"
+        extra.mkdir()
+        _write_site(
+            extra / "rendered.yaml",
+            subscription=None,
+            inherits="base-site.yaml",
+            labels={"environment": "e2e"},
+        )
+
+        orchestrator = Orchestrator(tmp_workspace, extra_trusted_sites_dirs=[extra])
+        site = orchestrator.load_site("rendered")
+
+        assert site.subscription == "from-workspace"
+        assert site.labels["team"] == "platform"
+        assert site.labels["environment"] == "e2e"
+
+    def test_bare_inherits_fallback_does_not_cross_extra_dirs(
+        self, tmp_workspace, tmp_path
+    ):
+        """The bare-filename fallback is intentionally narrow: it ONLY
+        searches `workspace/sites/`. A site in one extra dir must not be
+        able to inherit from a template in a sibling extra dir purely by
+        filename — that would create an implicit shared-template namespace
+        across trusted dirs, which is a larger semantic change than the
+        fallback is meant to enable.
+        """
+        extra_a = tmp_path / "extra-a"
+        extra_b = tmp_path / "extra-b"
+        extra_a.mkdir()
+        extra_b.mkdir()
+
+        _write_template(extra_b / "sibling-tpl.yaml", subscription="cross-extra")
+        _write_site(
+            extra_a / "child.yaml",
+            subscription=None,
+            inherits="sibling-tpl.yaml",
+        )
+
+        orchestrator = Orchestrator(
+            tmp_workspace, extra_trusted_sites_dirs=[extra_a, extra_b]
+        )
+        with pytest.raises(FileNotFoundError, match="sibling-tpl.yaml"):
+            orchestrator.load_site("child")
+
+
+class TestResolveSitesNameSelector:
+    """Behavior of `resolve_sites(cli_selector='name=X')`.
+
+    A CLI `name=X` selector has two valid operator intents:
+    1. X is the filename of a committed/trusted site (minus extension).
+    2. X is the site's internal `name:` field, which may differ from the
+       filename (e.g. runtime-rendered E2E sites).
+
+    Intent 1 must propagate load errors so a broken site file fails loud
+    instead of silently resolving to zero sites. Intent 2 must still work
+    because the filename is not the canonical site identity in siteops.
+    """
+
+    def test_name_selector_matching_filename_propagates_load_errors(
+        self, tmp_workspace, tmp_path
+    ):
+        """When a file `X.yaml` exists and is broken, `resolve_sites(name=X)`
+        raises the underlying load error instead of returning `[]`. This is
+        the guard against vacuous passes from latent config rot.
+        """
+        _write_site(
+            tmp_workspace / "sites" / "broken.yaml",
+            subscription=None,
+            inherits="does-not-exist.yaml",
+        )
+        manifest_path = tmp_workspace / "manifests" / "m.yaml"
+        manifest_path.write_text(
+            yaml.dump(
+                {
+                    "apiVersion": "siteops/v1",
+                    "kind": "Manifest",
+                    "name": "m",
+                    "steps": [],
+                }
+            )
+        )
+
+        from siteops.models import Manifest
+
+        orchestrator = Orchestrator(tmp_workspace)
+        manifest = Manifest.from_file(manifest_path)
+        with pytest.raises(FileNotFoundError, match="does-not-exist.yaml"):
+            orchestrator.resolve_sites(manifest, cli_selector="name=broken")
+
+    def test_name_selector_matches_internal_name_when_filename_differs(
+        self, tmp_workspace, tmp_path
+    ):
+        """When no trusted file matches X as a filename, `resolve_sites`
+        falls back to loading all sites and filtering by their internal
+        `name:` field. This preserves the site-identity semantics relied
+        on by runtime-rendered sites whose filename is intentionally
+        decoupled from the site name.
+        """
+        _write_site(
+            tmp_workspace / "sites" / "renamed-file.yaml",
+            name="internal-identity",
+        )
+        manifest_path = tmp_workspace / "manifests" / "m.yaml"
+        manifest_path.write_text(
+            yaml.dump(
+                {
+                    "apiVersion": "siteops/v1",
+                    "kind": "Manifest",
+                    "name": "m",
+                    "steps": [],
+                }
+            )
+        )
+
+        from siteops.models import Manifest
+
+        orchestrator = Orchestrator(tmp_workspace)
+        manifest = Manifest.from_file(manifest_path)
+        resolved = orchestrator.resolve_sites(
+            manifest, cli_selector="name=internal-identity"
+        )
+        assert [s.name for s in resolved] == ["internal-identity"]
+
 
 class TestExtraSitesDirsValidation:
     """Constructor-time validation of extra_trusted_sites_dirs."""

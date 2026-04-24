@@ -401,16 +401,32 @@ jobs:
             POST_IDS=$(az resource list -g "$RG" --query "[].id" -o tsv 2>/dev/null)
             if [[ $? -ne 0 ]]; then
               echo "::warning::Teardown pass $i: az resource list failed; retrying."
-              sleep 15
+              sleep 30
               continue
             fi
             LIST_OK=1
             DELTA=$(comm -23 <(printf '%s\n' "$POST_IDS" | sort -u) <(sort -u "$PRE_FILE") | sed '/^$/d')
             [[ -z "$DELTA" ]] && break
             count=$(printf '%s\n' "$DELTA" | wc -l)
-            echo "Teardown pass $i: deleting $count resource(s) created by this run"
-            printf '%s\n' "$DELTA" | xargs -r -I{} az resource delete --ids {} --verbose || true
-            sleep 15
+            echo "::group::Teardown pass $i: deleting $count resource(s) in parallel"
+            printf '%s\n' "$DELTA"
+            echo "::endgroup::"
+            # Parallel deletes (-P 10) with per-resource stdout/stderr
+            # prefixing so the GHA log shows which delete emitted what.
+            # Dependency-order failures on the first pass are expected; the
+            # retry loop handles them. We surface each failure as a warning
+            # instead of silently swallowing it with `|| true`.
+            printf '%s\n' "$DELTA" | xargs -r -P 10 -I{} bash -c '
+              id="$1"
+              short="${id##*/}"
+              if out=$(az resource delete --ids "$id" --verbose 2>&1); then
+                echo "[delete-ok pass='"$2"'] $short"
+              else
+                echo "::warning::[delete-failed pass='"$2"'] $short"
+                printf "%s\n" "$out" | sed "s/^/[delete-failed $short] /"
+              fi
+            ' _ {} "$i"
+            sleep 30
           done
           if [[ $LIST_OK -eq 0 ]]; then
             echo "::error::Persistent-mode teardown could not enumerate RG $RG; delta cleanup did not run. Inspect the RG manually."

@@ -397,10 +397,15 @@ jobs:
             az connectedk8s delete -n "$CLUSTER" -g "$RG" --yes --only-show-errors || true
           fi
           LIST_OK=0
-          for i in 1 2 3; do
-            POST_IDS=$(az resource list -g "$RG" --query "[].id" -o tsv 2>/dev/null)
+          redact() { sed -E 's/eyJ[A-Za-z0-9_.=-]{10,}/<redacted-jwt>/g' "$1"; }
+          for i in 1 2 3 4 5; do
+            LIST_ERR="$RUNNER_TEMP/e2e-teardown/list-err-$i.log"
+            POST_IDS=$(az resource list -g "$RG" --query "[].id" -o tsv 2>"$LIST_ERR")
             if [[ $? -ne 0 ]]; then
               echo "::warning::Teardown pass $i: az resource list failed; retrying."
+              echo "::group::az resource list stderr (pass $i)"
+              redact "$LIST_ERR"
+              echo "::endgroup::"
               sleep 30
               continue
             fi
@@ -433,9 +438,13 @@ jobs:
             echo "- Persistent-mode teardown unable to enumerate RG \`$RG\` (az resource list failed)" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          POST_IDS=$(az resource list -g "$RG" --query "[].id" -o tsv 2>/dev/null)
+          FINAL_ERR="$RUNNER_TEMP/e2e-teardown/list-err-final.log"
+          POST_IDS=$(az resource list -g "$RG" --query "[].id" -o tsv 2>"$FINAL_ERR")
           if [[ $? -ne 0 ]]; then
             echo "::warning::Final residual check: az resource list failed; residual state unknown."
+            echo "::group::az resource list stderr (final)"
+            redact "$FINAL_ERR"
+            echo "::endgroup::"
             echo "- Persistent-mode teardown final check failed for RG \`$RG\`" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi

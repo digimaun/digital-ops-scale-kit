@@ -103,7 +103,16 @@ class TestCollectValues:
 class TestComputeDefaults:
     def test_site_name_default_uses_unix_epoch(self, monkeypatch):
         monkeypatch.setattr(time, "time", lambda: 1700000000)
-        out = render_e2e_site.compute_defaults(dict.fromkeys(render_e2e_site.ALL_VARS, ""))
+        monkeypatch.setattr(
+            render_e2e_site,
+            "_run_az",
+            lambda args: pytest.fail(f"_run_az should not be called: {args}"),
+        )
+        values = dict.fromkeys(render_e2e_site.ALL_VARS, "")
+        # Pre-fill the other defaults so only the site-name branch executes.
+        values["E2E_SUBSCRIPTION"] = "sub"
+        values["E2E_LOCATION"] = "westus"
+        out = render_e2e_site.compute_defaults(values)
         assert out["E2E_SITE_NAME"] == "e2e-local-1700000000"
 
     def test_subscription_default_uses_az(self, monkeypatch):

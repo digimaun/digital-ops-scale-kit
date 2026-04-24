@@ -46,7 +46,7 @@ resource customLocation 'Microsoft.ExtendedLocation/customLocations@2021-08-31-p
   name: customLocationName
 }
 
-// Derive extension name from cluster ID if not provided (matches azure-iot-operations-instance.bicep convention)
+// Derive extension name from cluster ID if not provided (matches the aio/instance.bicep convention)
 var resolvedExtensionName = !empty(aioExtensionName)
   ? aioExtensionName
   : 'azure-iot-operations-${take(uniqueString(connectedCluster.id), 5)}'

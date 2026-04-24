@@ -12,28 +12,21 @@ description: |
       - ADR Namespace: {{ site.name }}-ns
       - Custom Location: {{ site.name }}-cl
 
+# Max concurrent sites. 0 = unlimited, 1 = serial.
 parallel: 3
 
-# Site selection via CLI: siteops deploy ... -l "environment=staging"
-# Or uncomment one of the options below:
-#
-# Option 1: Explicit site list
-# sites:
-#   - chicago-staging
-#
-# Option 2: Label selector (override with -l flag)
+# Default selector; override at the CLI with `-l <key>=<value>`.
 siteSelector: "environment=dev"
 
 parameters:
   - parameters/common.yaml
 
 steps:
-  # Deploy OPC UA solution (asset, Event Hub, dataflow)
   - name: opc-ua-solution
-    template: templates/iot-ops/solutions/opc-ua-solution.bicep
+    template: templates/solutions/opc-ua-solution.bicep
     scope: resourceGroup
 
-  # Deploy OPC PLC simulator (conditional, dev only)
+  # Conditional on deployOptions.includeOpcPlcSimulator.
   - name: opc-plc-simulator
     type: kubectl
     operation: apply

@@ -1,44 +1,5 @@
-@export()
-type AdvancedConfig = {
-  platform: {
-    version: string?
-    train: string?
-  }?
-  certManager: {
-    version: string?
-    train: string?
-    telemetry: {
-      enabled: string?
-    }?
-  }?
-  aio: {
-    version: string?
-    train: string?
-    configurationSettingsOverride: object?
-  }?
-  secretSyncController: {
-    version: string?
-    train: string?
-  }?
-  observability: {
-    enabled: bool?
-    otelCollectorAddress: string?
-    otelExportIntervalSeconds: int?
-  }?
-  openServiceMesh: {
-    version: string?
-    train: string?
-  }?
-  edgeStorageAccelerator: {
-    version: string?
-    train: string?
-    // The Kubernetes storage class used when storing Schemas
-    diskStorageClass: string?
-    faultToleranceEnabled: bool?
-    diskMountPoint: string?
-  }?
-  resourceSuffix: string?
-}
+// types.bicep
+// Shared type definitions for AIO deployment templates.
 
 @export()
 @discriminator('source')
@@ -161,7 +122,6 @@ Optional, defaults to enabling encryption.
   encryption: BrokerPersistenceEncryption?
 }
 
-
 @description('Encryption settings for the persistence database.')
 type BrokerPersistenceEncryption = {
   @description('Determines if encryption is enabled.')
@@ -258,7 +218,7 @@ type BrokerSubscriberQueueCustomPolicy = {
 type BrokerSubscriberQueueCustomPolicySettings = {
   @description('Subscriber client IDs to persist (wildcard * supported).')
   subscriberClientIds: string[]?
-  
+
   @description('Dynamic toggle via MQTTv5 user property.')
   dynamic: BrokerSubscriberQueueDynamic?
 }

@@ -1,7 +1,8 @@
-# Parameters that chain outputs from aio-instance step to subsequent steps.
-# Used by: schema-registry-role, opc-ua-solution
+# Fan-out outputs from the aio-instance step, forwarded to later consumers.
+# See docs/parameter-resolution.md for the *-outputs.yaml convention.
+# Consumed by: schema-registry-role, opc-ua-solution
 
-# ADR namespace resource name (for DeviceRegistry operations)
+# From adr-ns step (namespace resource name, for DeviceRegistry operations)
 adrNamespaceName: "{{ steps.adr-ns.outputs.adrNamespace.name }}"
 
 # AIO extension outputs (for role assignments)
@@ -11,6 +12,6 @@ aioExtensionPrincipalId: "{{ steps.aio-instance.outputs.aioExtension.identityPri
 # AIO instance outputs
 aioInstanceName: "{{ steps.aio-instance.outputs.aio.name }}"
 
-# Custom location outputs  
+# Custom location outputs
 customLocationId: "{{ steps.aio-instance.outputs.customLocation.id }}"
 customLocationName: "{{ steps.aio-instance.outputs.customLocation.name }}"

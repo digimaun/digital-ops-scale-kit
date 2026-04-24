@@ -90,15 +90,27 @@ class TestSecretSyncIdempotency:
     """Validate that re-deploying produces consistent results."""
 
     def test_redeploy_succeeds_with_same_outputs(self, orchestrator, selector, secretsync_result):
+        """Every resource secretsync creates is expected to be idempotent. A
+        regression where the MI, KV, or SPC silently gets recreated would
+        break workload-identity federation and any dependent site."""
         result2 = orchestrator.deploy(
             manifest_path=WORKSPACE_PATH / "manifests" / "secretsync.yaml",
             selector=selector,
         )
         assert result2["summary"]["failed"] == 0
 
+        stable_outputs = (
+            "spcResourceId",
+            "managedIdentityResourceId",
+            "keyVaultResourceId",
+        )
         for name in secretsync_result["sites"]:
             step1 = find_step(secretsync_result, name, "secretsync")
             step2 = find_step(result2, name, "secretsync")
-            spc1 = assert_output_exists(step1, "spcResourceId")
-            spc2 = assert_output_exists(step2, "spcResourceId")
-            assert spc1 == spc2, f"Site '{name}': SPC resource ID changed on redeploy"
+            for output_name in stable_outputs:
+                v1 = assert_output_exists(step1, output_name)
+                v2 = assert_output_exists(step2, output_name)
+                assert v1 == v2, (
+                    f"Site '{name}': {output_name} changed on redeploy "
+                    f"({v1!r} -> {v2!r})"
+                )

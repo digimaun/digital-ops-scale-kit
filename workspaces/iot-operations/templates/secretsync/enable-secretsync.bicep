@@ -78,6 +78,17 @@ param features object = {}
 param instanceDescription string = ''
 
 // =====================================================================================
+// Parameters — AIO API version (drives update-instance dispatch)
+// =====================================================================================
+
+@description('IoT Operations API version for the instance PUT. Must match the version the instance was created with.')
+@allowed([
+  '2025-10-01'
+  '2026-03-01'
+])
+param aioApiVersion string
+
+// =====================================================================================
 // Parameters — secret sync configuration
 // =====================================================================================
 
@@ -225,13 +236,16 @@ resource spc 'Microsoft.SecretSyncController/azureKeyVaultSecretProviderClasses@
 
 // =====================================================================================
 // Instance Update
-//   Uses a module to reset compile-time constraints. All known writable properties
-//   for the pinned API version (2025-10-01) are forwarded to prevent data loss.
+//   Dispatched via ../aio/modules/update-instance.bicep (the shared UPDATE primitive
+//   for Microsoft.IoTOperations/instances) to the correct API-versioned module based
+//   on aioApiVersion. All known writable properties for the pinned API version are
+//   forwarded to prevent data loss.
 // =====================================================================================
 
-module instanceUpdate './modules/update-instance.bicep' = {
+module instanceUpdate '../aio/modules/update-instance.bicep' = {
   name: 'update-instance-spc-${uniqueString(aioInstanceName, spc.id)}'
   params: {
+    aioApiVersion: aioApiVersion
     instanceName: aioInstanceName
     instanceLocation: instanceLocation
     extendedLocationName: customLocationId

@@ -9,6 +9,7 @@ Extended documentation for the Digital Operations Scale Kit.
 | [site-configuration.md](site-configuration.md) | Site definitions, inheritance, overlays |
 | [manifest-reference.md](manifest-reference.md) | Manifest syntax, step types, conditions |
 | [parameter-resolution.md](parameter-resolution.md) | Template variables, output chaining, auto-filtering |
+| [aio-versions.md](aio-versions.md) | Pinning an AIO version per site, upgrade caveats, adding a new version |
 | [ci-cd-setup.md](ci-cd-setup.md) | GitHub Actions, OIDC, secrets configuration |
 | [e2e-testing.md](e2e-testing.md) | End-to-end live-subscription test workflow |
 | [troubleshooting.md](troubleshooting.md) | Common issues and solutions |

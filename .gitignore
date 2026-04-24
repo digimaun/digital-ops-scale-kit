@@ -211,3 +211,6 @@ __marimo__/
 **/.siteops/
 **/sites.local/
 **/*.sites.local.json
+
+# Bicep build artifacts (compiled ARM JSON)
+**/templates/**/*.json

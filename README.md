@@ -258,21 +258,21 @@ steps:
     when: "{{ site.properties.deployOptions.includeEdgeSite }}"
 
   - name: schema-registry
-    template: templates/iot-ops/deps/schema-registry.bicep
+    template: templates/deps/schema-registry.bicep
     scope: resourceGroup
 
   # ... additional steps (adr-ns, aio-enablement) omitted for brevity
 
   - name: aio-instance
-    template: templates/iot-ops/install/2602/azure-iot-operations-instance.bicep
+    template: templates/aio/instance.bicep
     scope: resourceGroup
     parameters:
-      - parameters/chaining.yaml  # Uses outputs from previous steps
+      - parameters/aio-instance-chaining.yaml  # Uses outputs from previous steps
 
   # ... additional steps (schema-registry-role) omitted for brevity
 
   - name: opc-ua-solution
-    template: templates/iot-ops/solutions/opc-ua-solution.bicep
+    template: templates/solutions/opc-ua-solution.bicep
     scope: resourceGroup
     when: "{{ site.properties.deployOptions.includeSolution }}"
 ```
@@ -294,7 +294,7 @@ tags:
 ```
 
 ```yaml
-# parameters/chaining.yaml (step-level, for output chaining)
+# parameters/aio-instance-chaining.yaml (step-level, for output chaining)
 schemaRegistryId: "{{ steps.schema-registry.outputs.schemaRegistry.id }}"
 adrNamespaceId: "{{ steps.adr-ns.outputs.adrNamespace.id }}"
 

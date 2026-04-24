@@ -94,30 +94,73 @@ class TestAioInstallVersioning:
     versioned-templates contract (requested aioVersion selects a template dir
     that pins the extension version)."""
 
-    def test_aio_extension_version_reported(self, aio_install_result):
+    def test_aio_extension_version_matches_version_config(
+        self, aio_install_result, orchestrator
+    ):
         """The bicep output `aioExtension.version` reflects
         `Microsoft.KubernetesConfiguration/extensions/.../properties/version`
-        from Azure. Assert it is present and non-empty for every site; this
-        is the primary regression guard for versioned-templates wiring."""
+        from Azure. Cross-check it against the `aioVersion` declared in the
+        site's aio-versions config file — this is the primary regression
+        guard for versioned-templates wiring. A drift here means the wrong
+        template dispatched, even if everything else looks green.
+        """
+        import yaml
+
         for name in aio_install_result["sites"]:
             step = assert_step_succeeded(aio_install_result, name, "aio-instance")
             aio_extension = assert_output_exists(step, "aioExtension")
             assert isinstance(aio_extension, dict), (
                 f"Site '{name}': aioExtension output is not an object: {aio_extension!r}"
             )
-            version = aio_extension.get("version")
-            assert version, (
-                f"Site '{name}': aioExtension.version is missing or empty "
+            deployed_version = aio_extension.get("version")
+            assert deployed_version, (
+                f"Site '{name}': aioExtension.version missing "
                 f"(keys: {sorted(aio_extension.keys())})"
+            )
+
+            site = orchestrator.load_site(name)
+            aio_version_key = site.properties.get("aioVersion")
+            assert aio_version_key, f"Site '{name}': missing properties.aioVersion"
+
+            version_config = (
+                WORKSPACE_PATH / "parameters" / "aio-versions" / f"{aio_version_key}.yaml"
+            )
+            assert version_config.is_file(), (
+                f"Site '{name}': version config not found: {version_config}"
+            )
+            expected = yaml.safe_load(version_config.read_text(encoding="utf-8"))["aioVersion"]
+            assert deployed_version == expected, (
+                f"Site '{name}': aio extension version drift — "
+                f"expected {expected!r} (from {version_config.name}), "
+                f"deployed {deployed_version!r}. The versioned-templates dispatch "
+                f"selected the wrong API version or the version YAML is stale."
             )
 
 
 class TestAioInstallIdempotency:
     """Validate that re-deploying produces the same results."""
 
-    def test_redeploy_succeeds(self, orchestrator, selector, aio_install_result):
+    def test_redeploy_preserves_resource_ids(
+        self, orchestrator, selector, aio_install_result
+    ):
+        """Re-deploying must not recreate core AIO resources. Recreation would
+        break every downstream step (secretsync, opc-ua) that captured the
+        original IDs. Mirrors the stability guard in the secretsync suite."""
         result2 = orchestrator.deploy(
             manifest_path=WORKSPACE_PATH / "manifests" / "aio-install.yaml",
             selector=selector,
         )
         assert result2["summary"]["failed"] == 0
+
+        for name in aio_install_result["sites"]:
+            step1 = find_step(aio_install_result, name, "aio-instance")
+            step2 = find_step(result2, name, "aio-instance")
+            for output_name in ("aio", "customLocation", "aioExtension"):
+                v1 = assert_output_exists(step1, output_name)
+                v2 = assert_output_exists(step2, output_name)
+                id1 = v1.get("id") if isinstance(v1, dict) else v1
+                id2 = v2.get("id") if isinstance(v2, dict) else v2
+                assert id1 == id2, (
+                    f"Site '{name}': {output_name} resource ID changed on redeploy "
+                    f"({id1!r} -> {id2!r})"
+                )

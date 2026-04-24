@@ -152,7 +152,7 @@ steps:
     template: templates/schema-registry.bicep
     scope: resourceGroup  # Phase 2: per RG-level site
     parameters:
-      - parameters/chaining.yaml  # Can reference global-edge-site outputs
+      - parameters/aio-instance-chaining.yaml  # Can reference global-edge-site outputs
 ```
 
 See [parameter-resolution.md](parameter-resolution.md) for cross-scope output chaining details.

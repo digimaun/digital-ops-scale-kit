@@ -1,4 +1,14 @@
-import * as types from './types.bicep'
+// enablement.bicep
+// -------------------------------------------------------------------------------------
+// Deploys the AIO platform enablement extensions (cert-manager and secret store)
+// onto an Arc-enabled Kubernetes cluster.
+//
+// This template is version-agnostic: callers supply the extension versions and
+// release trains explicitly, so the same template works across AIO releases
+// without embedding version constants.
+// -------------------------------------------------------------------------------------
+
+import * as types from './modules/types.bicep'
 
 /*****************************************************************************/
 /*                          Deployment Parameters                            */
@@ -18,27 +28,29 @@ param trustConfig types.TrustConfig = {
   source: 'SelfSigned'
 }
 
-/*                               Other Parameters                            */
+/*                          Extension Version Parameters                     */
 ///////////////////////////////////////////////////////////////////////////////
 
-@description('Advanced Configuration for development')
-param advancedConfig types.AdvancedConfig = {}
+@description('Version of the cert-manager extension to install.')
+param certManagerVersion string
 
-/*****************************************************************************/
-/*                                Constants                                  */
-/*****************************************************************************/
+@description('Release train of the cert-manager extension.')
+param certManagerTrain string = 'stable'
 
-// Note: Do NOT update the keys of this object. The AIO Portal Wizard depends on the
-// format of this object. Updating keys will break the UI.
-var VERSIONS = {
-  certManager: '0.9.0'
-  secretStore: '1.1.6'
-}
+@description('Version of the secret store extension to install.')
+#disable-next-line secure-secrets-in-params
+param secretStoreVersion string
 
-var TRAINS = {
-  certManager: 'stable'
-  secretStore: 'stable'
-}
+@description('Release train of the secret store extension.')
+#disable-next-line secure-secrets-in-params
+param secretStoreTrain string = 'stable'
+
+@description('Additional configuration settings for the cert-manager extension.')
+param certManagerConfigurationOverrides object = {}
+
+@description('Additional configuration settings for the secret store extension.')
+#disable-next-line secure-secrets-in-params // Configuration overrides, not a secret
+param secretStoreConfigurationOverrides object = {}
 
 /*****************************************************************************/
 /*         Existing Arc-enabled cluster where AIO will be deployed.          */
@@ -54,42 +66,42 @@ resource cluster 'Microsoft.Kubernetes/connectedClusters@2021-03-01' existing = 
 
 resource certManagerExtension 'Microsoft.KubernetesConfiguration/extensions@2023-05-01' = if (trustConfig.source == 'SelfSigned') {
   scope: cluster
-  name: 'cert-manager' // This is the enforced Managed Extension name for Cert Manager. Do not update.
+  name: 'cert-manager'
   identity: {
     type: 'SystemAssigned'
   }
   properties: {
     extensionType: 'microsoft.certmanagement'
-    releaseTrain: advancedConfig.?certManager.?train ?? TRAINS.certManager
-    version: advancedConfig.?certManager.?version ?? VERSIONS.certManager
+    releaseTrain: certManagerTrain
+    version: certManagerVersion
     autoUpgradeMinorVersion: false
     scope: {
       cluster: {
         releaseNamespace: 'cert-manager'
       }
     }
-    configurationSettings: {
-      AgentOperationTimeoutInMinutes: '20'
-      'global.telemetry.enabled': advancedConfig.?certManager.?telemetry.?enabled ?? 'true'
-    }
+    configurationSettings: union({
+        AgentOperationTimeoutInMinutes: '20'
+        'global.telemetry.enabled': 'true'
+      }, certManagerConfigurationOverrides)
   }
 }
 
 resource secretStoreExtension 'Microsoft.KubernetesConfiguration/extensions@2023-05-01' = {
   scope: cluster
-  name: 'azure-secret-store' // This is the enforced Managed Extension name for SSC. Do not update.
+  name: 'azure-secret-store'
   identity: {
     type: 'SystemAssigned'
   }
   properties: {
     extensionType: 'microsoft.azure.secretstore'
-    version: advancedConfig.?secretSyncController.?version ?? VERSIONS.secretStore
-    releaseTrain: advancedConfig.?secretSyncController.?train ?? TRAINS.secretStore
+    version: secretStoreVersion
+    releaseTrain: secretStoreTrain
     autoUpgradeMinorVersion: false
-    configurationSettings: {
-      rotationPollIntervalInSeconds: '120'
-      'validatingAdmissionPolicies.applyPolicies': 'false'
-    }
+    configurationSettings: union({
+        rotationPollIntervalInSeconds: '120'
+        'validatingAdmissionPolicies.applyPolicies': 'false'
+      }, secretStoreConfigurationOverrides)
   }
   dependsOn: (trustConfig.source == 'SelfSigned') ? [certManagerExtension] : []
 }

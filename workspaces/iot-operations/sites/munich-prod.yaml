@@ -26,4 +26,3 @@ parameters:
     backendWorkers: 4
     backendPartitions: 2
     memoryProfile: Medium
-  defaultDataflowInstanceCount: 1

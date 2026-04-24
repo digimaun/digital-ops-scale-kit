@@ -1,5 +1,6 @@
-# Output chaining for aio-instance step
-# Contains outputs from steps that run BEFORE aio-instance
+# Fan-in inputs into the aio-instance step, pulled from multiple upstream producers.
+# See docs/parameter-resolution.md for the *-chaining.yaml convention.
+# Consumed by: aio-instance
 
 # From schema-registry step
 schemaRegistryId: "{{ steps.schema-registry.outputs.schemaRegistry.id }}"

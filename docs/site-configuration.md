@@ -110,14 +110,15 @@ Structured **metadata** and **deployment options**:
 
 ```yaml
 properties:
-  deployOptions:                     # Control deployment behavior
+  aioVersion: "2603"                   # Target AIO version (see [aio-versions.md](aio-versions.md))
+  deployOptions:                       # Control deployment behavior
     includeSolution: true
     includeOpcPlcSimulator: false
     enableSecretSync: false
   tags:
     costCenter: operations
     team: platform
-  opcUaEndpoints:                    # Arrays of configuration
+  opcUaEndpoints:                      # Arrays of configuration
     - name: cnc-machine-1
       address: opc.tcp://10.1.1.100:4840
 ```

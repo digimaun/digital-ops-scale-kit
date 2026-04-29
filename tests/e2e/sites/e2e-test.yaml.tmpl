@@ -27,7 +27,7 @@
 #   E2E_RESOURCE_GROUP   Resource group (operator-supplied in persistent mode; workflow-created in ephemeral)
 #   E2E_LOCATION         Azure region (ephemeral: workflow input; persistent: from `az group show`)
 #   E2E_CLUSTER_NAME     Arc-connected cluster name created earlier in the run
-#   E2E_AIO_VERSION      AIO version selector (drives versioned-templates path)
+#   E2E_AIO_RELEASE      AIO release selector (drives versioned-templates path)
 
 apiVersion: siteops/v1
 kind: Site
@@ -45,13 +45,13 @@ labels:
   city: E2E
 
 properties:
-  aioVersion: "${E2E_AIO_VERSION}"
+  aioRelease: "${E2E_AIO_RELEASE}"
   deployOptions:
     includeGlobalSite: false
     includeEdgeSite: false
-    includeSolution: false
-    includeOpcPlcSimulator: false
-    enableSecretSync: false
+    includeSolution: true
+    includeOpcPlcSimulator: true
+    enableSecretSync: true
 
 parameters:
   clusterName: "${E2E_CLUSTER_NAME}"

@@ -18,6 +18,8 @@
 //        secretName=<name> secretValue=<value>
 // -------------------------------------------------------------------------------------
 
+import { aioSecretSyncServiceAccountName } from '../common/extension-names.bicep'
+
 // =====================================================================================
 // Parameters
 // =====================================================================================
@@ -59,7 +61,7 @@ var resolvedK8sSecretKey = !empty(kubernetesSecretKey) ? kubernetesSecretKey : s
 // Existing Resources
 // =====================================================================================
 
-resource keyVault 'Microsoft.KeyVault/vaults@2022-07-01' existing = {
+resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' existing = {
   name: keyVaultName
 }
 
@@ -75,7 +77,7 @@ resource spc 'Microsoft.SecretSyncController/azureKeyVaultSecretProviderClasses@
 // Key Vault Secret
 // =====================================================================================
 
-resource kvSecret 'Microsoft.KeyVault/vaults/secrets@2022-07-01' = {
+resource kvSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
   parent: keyVault
   name: secretName
   properties: {
@@ -98,7 +100,7 @@ resource secretSync 'Microsoft.SecretSyncController/secretSyncs@2024-08-21-previ
   }
   properties: {
     secretProviderClassName: spc.name
-    serviceAccountName: 'aio-ssc-sa'
+    serviceAccountName: aioSecretSyncServiceAccountName
     kubernetesSecretType: 'Opaque'
     objectSecretMapping: [
       {

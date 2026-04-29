@@ -90,7 +90,6 @@ jobs:
                 scriptType: bash
                 scriptLocation: inlineScript
                 inlineScript: |
-                  MANIFEST="${{ parameters.manifest }}"
                   if [[ "$MANIFEST" == "all" ]]; then
                     PYTEST_ARGS="tests/integration/"
                   else
@@ -102,6 +101,7 @@ jobs:
                     -m integration \
                     --junitxml=$(Build.ArtifactStagingDirectory)/integration-results.xml
               env:
+                MANIFEST: ${{ parameters.manifest }}
                 SITE_OVERRIDES: $(SITE_OVERRIDES)
                 INTEGRATION_SKIP_CLEANUP: ${{ parameters.skipCleanup }}
                 INTEGRATION_SELECTOR: ${{ parameters.selector }}

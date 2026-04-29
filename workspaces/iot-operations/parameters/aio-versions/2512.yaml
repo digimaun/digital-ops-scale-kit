@@ -4,6 +4,7 @@
 aioVersion: "1.2.154"
 aioTrain: stable
 aioApiVersion: "2025-10-01"
+adrApiVersion: "2025-10-01"
 certManagerVersion: "0.7.0"
 certManagerTrain: stable
 secretStoreVersion: "1.1.5"

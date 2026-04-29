@@ -1,44 +1,66 @@
+// opc-ua-solution.bicep
+// -------------------------------------------------------------------------------------
+// Sample solution layered onto an existing AIO instance: OPC UA device + asset,
+// Event Hub destination, role assignment, and a dataflow mapping oven telemetry
+// from the broker to the Event Hub.
+//
+// Inputs:  cluster + AIO instance refs (custom location, instance name, default
+//          dataflow endpoint/profile names), ADR namespace, Event Hub name.
+// Outputs: created Event Hub identity, resolved AIO extension name.
+//
+// Sample API-version policy: pinned to the oldest supported AIO/ADR API
+// versions, relying on RP backward-compatibility to work across all
+// supported releases. See docs/aio-versions.md.
+// -------------------------------------------------------------------------------------
+
 metadata description = 'This template deploys components that are required to show data flowing after cluster provisioning and AIO deployment.'
+
+import { aioExtensionName as deriveAioExtensionName } from '../common/extension-names.bicep'
 
 /*****************************************************************************/
 /*                          Deployment Parameters                            */
 /*****************************************************************************/
 
+@description('Name of the existing Arc-connected Kubernetes cluster hosting the AIO instance.')
 param clusterName string
 
-@allowed([
-  'eastus'
-  'eastus2'
-  'westus'
-  'westus2'
-  'westus3'
-  'westeurope'
-  'northeurope'
-  'eastus2euap'
-  'germanywestcentral'
-])
-@description('Location of the existing arc-enabled cluster where AIO is deployed.')
-param clusterLocation string = any(resourceGroup().location)
+@description('Region of the existing Arc-connected cluster hosting AIO. The Event Hub namespace created by this template is co-located in this region. Defaults to the resource group location.')
+param clusterLocation string = resourceGroup().location
 
+@description('Name of the AIO custom location bound to the existing AIO instance.')
 param customLocationName string
 
 @description('Name of the AIO extension. If empty, derived from cluster ID using convention.')
 param aioExtensionName string = ''
 
+@description('Name of the existing AIO instance to layer the sample onto.')
 param aioInstanceName string
+
+@description('Short hash appended to created resource names to keep them globally unique. Defaults to a stable hash of subscription + RG + cluster.')
 param resourceSuffix string = substring(uniqueString(subscription().id, resourceGroup().id, clusterName), 0, 10)
+
+@description('Name of the Event Hub namespace created by this template (also used as the Event Hub name).')
 param eventHubName string = 'aio-eh-${resourceSuffix}'
+
+@description('Name of the default dataflow endpoint child resource on the AIO instance.')
 param defaultDataflowEndpointName string = 'default'
+
+@description('Name of the default dataflow profile child resource on the AIO instance.')
 param defaultDataflowProfileName string = 'default'
+
+@description('Whether to create the Event Hubs Data Sender role assignment for the AIO extension principal. Disable when the principal already has the role at a higher scope.')
 param createRoleAssignment bool = true
 @description('Name of the ADR namespace where assets will be created.')
 param adrNamespaceName string
+
+@description('Tags to apply to created resources.')
+param tags object = {}
 
 /*****************************************************************************/
 /*                          Existing AIO cluster                             */
 /*****************************************************************************/
 
-resource connectedCluster 'Microsoft.Kubernetes/connectedClusters@2021-10-01' existing = {
+resource connectedCluster 'Microsoft.Kubernetes/connectedClusters@2024-07-15-preview' existing = {
   name: clusterName
 }
 
@@ -49,22 +71,23 @@ resource customLocation 'Microsoft.ExtendedLocation/customLocations@2021-08-31-p
 // Derive extension name from cluster ID if not provided (matches the aio/instance.bicep convention)
 var resolvedExtensionName = !empty(aioExtensionName)
   ? aioExtensionName
-  : 'azure-iot-operations-${take(uniqueString(connectedCluster.id), 5)}'
+  : deriveAioExtensionName(connectedCluster.id)
 
-resource aioExtension 'Microsoft.KubernetesConfiguration/extensions@2022-11-01' existing = {
+resource aioExtension 'Microsoft.KubernetesConfiguration/extensions@2023-05-01' existing = {
   name: resolvedExtensionName
   scope: connectedCluster
 }
 
-resource aioInstance 'Microsoft.IoTOperations/instances@2025-04-01' existing = {
+resource aioInstance 'Microsoft.IoTOperations/instances@2025-10-01' existing = {
   name: aioInstanceName
 }
 
-resource defaultDataflowEndpoint 'Microsoft.IoTOperations/instances/dataflowEndpoints@2025-04-01' existing = {
+resource defaultDataflowEndpoint 'Microsoft.IoTOperations/instances/dataflowEndpoints@2025-10-01' existing = {
   name: defaultDataflowEndpointName
+  parent: aioInstance
 }
 
-resource defaultDataflowProfile 'Microsoft.IoTOperations/instances/dataflowProfiles@2025-04-01' existing = {
+resource defaultDataflowProfile 'Microsoft.IoTOperations/instances/dataflowProfiles@2025-10-01' existing = {
   name: defaultDataflowProfileName
   parent: aioInstance
 }
@@ -85,6 +108,7 @@ resource device 'Microsoft.DeviceRegistry/namespaces/devices@2025-10-01' = {
   name: deviceName
   parent: namespace
   location: clusterLocation
+  tags: tags
   extendedLocation: {
     type: 'CustomLocation'
     name: customLocation.id
@@ -111,6 +135,7 @@ resource asset 'Microsoft.DeviceRegistry/namespaces/assets@2025-10-01' = {
   name: assetName
   parent: namespace
   location: clusterLocation
+  tags: tags
   extendedLocation: {
     type: 'CustomLocation'
     name: customLocation.id
@@ -180,19 +205,21 @@ resource asset 'Microsoft.DeviceRegistry/namespaces/assets@2025-10-01' = {
 resource eventHubNamespace 'Microsoft.EventHub/namespaces@2024-01-01' = {
   name: eventHubName
   location: clusterLocation
+  tags: tags
   properties: {
-    disableLocalAuth: false
+    disableLocalAuth: true
   }
 }
 
 // Role assignment for Event Hubs Data Sender role
 resource roleAssignmentDataSender 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (createRoleAssignment) {
-  name: guid(eventHubNamespace.id, aioExtension.id, '69b88ce2-a752-421f-bd8b-e230189e1d63')
+  name: guid(eventHubNamespace.id, aioExtension.id, '2b629674-e913-4c01-ae53-ef4638d8f975')
   scope: eventHubNamespace
   properties: {
     // ID for Event Hubs Data Sender role is 2b629674-e913-4c01-ae53-ef4638d8f975
-    roleDefinitionId: resourceId('Microsoft.Authorization/roleDefinitions', '2b629674-e913-4c01-ae53-ef4638d8f975')
-    principalId: aioExtension.identity.principalId
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '2b629674-e913-4c01-ae53-ef4638d8f975')
+    // Safe-access in case identity was not provisioned on the AIO extension.
+    principalId: aioExtension.?identity.?principalId ?? ''
     principalType: 'ServicePrincipal'
   }
 }
@@ -210,7 +237,7 @@ resource eventHub 'Microsoft.EventHub/namespaces/eventhubs@2024-01-01' = {
 /*                                    Data flow                              */
 /*****************************************************************************/
 
-resource dataflowEndpointEventHub 'Microsoft.IoTOperations/instances/dataflowEndpoints@2025-04-01' = {
+resource dataflowEndpointEventHub 'Microsoft.IoTOperations/instances/dataflowEndpoints@2025-10-01' = {
   parent: aioInstance
   name: 'opc-ua-solution-eh-endpoint'
   extendedLocation: {
@@ -241,7 +268,7 @@ resource dataflowEndpointEventHub 'Microsoft.IoTOperations/instances/dataflowEnd
   ]
 }
 
-resource dataflowCToF 'Microsoft.IoTOperations/instances/dataflowProfiles/dataflows@2025-04-01' = {
+resource dataflowCToF 'Microsoft.IoTOperations/instances/dataflowProfiles/dataflows@2025-10-01' = {
   parent: defaultDataflowProfile
   name: 'opc-ua-solution-oven-dataflow'
   extendedLocation: {

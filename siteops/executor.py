@@ -22,6 +22,7 @@ import signal
 import subprocess
 import threading
 import time
+import uuid
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -517,7 +518,11 @@ class AzCliExecutor:
         }
 
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-        filename = f"{site_name}-{step_name}-{timestamp}.json"
+        # Add a short uuid suffix to avoid collisions when the same step
+        # writes multiple param files within a single second (parallel sites
+        # or rapid successive deploys on the same site).
+        unique = uuid.uuid4().hex[:8]
+        filename = f"{site_name}-{step_name}-{timestamp}-{unique}.json"
 
         tmp_dir = self.tmp_dir
         tmp_dir.mkdir(parents=True, exist_ok=True)

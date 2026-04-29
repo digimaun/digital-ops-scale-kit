@@ -40,7 +40,7 @@ param features object = {}
 @description('Instance description.')
 param instanceDescription string = ''
 
-@description('Secret Provider Class resource ID to set as the default. Empty to omit.')
+@description('Secret Provider Class resource ID to set as the default. Empty clears the SPC reference on PUT.')
 param spcResourceId string = ''
 
 resource instance 'Microsoft.IoTOperations/instances@2025-10-01' = {

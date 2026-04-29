@@ -9,6 +9,7 @@
 // -------------------------------------------------------------------------------------
 
 import * as types from './modules/types.bicep'
+import { certManagerExtensionName, secretStoreExtensionName, certManagerExtensionType, secretStoreExtensionType } from '../common/extension-names.bicep'
 
 /*****************************************************************************/
 /*                          Deployment Parameters                            */
@@ -56,7 +57,7 @@ param secretStoreConfigurationOverrides object = {}
 /*         Existing Arc-enabled cluster where AIO will be deployed.          */
 /*****************************************************************************/
 
-resource cluster 'Microsoft.Kubernetes/connectedClusters@2021-03-01' existing = {
+resource cluster 'Microsoft.Kubernetes/connectedClusters@2024-07-15-preview' existing = {
   name: clusterName
 }
 
@@ -66,12 +67,12 @@ resource cluster 'Microsoft.Kubernetes/connectedClusters@2021-03-01' existing = 
 
 resource certManagerExtension 'Microsoft.KubernetesConfiguration/extensions@2023-05-01' = if (trustConfig.source == 'SelfSigned') {
   scope: cluster
-  name: 'cert-manager'
+  name: certManagerExtensionName
   identity: {
     type: 'SystemAssigned'
   }
   properties: {
-    extensionType: 'microsoft.certmanagement'
+    extensionType: certManagerExtensionType
     releaseTrain: certManagerTrain
     version: certManagerVersion
     autoUpgradeMinorVersion: false
@@ -89,12 +90,12 @@ resource certManagerExtension 'Microsoft.KubernetesConfiguration/extensions@2023
 
 resource secretStoreExtension 'Microsoft.KubernetesConfiguration/extensions@2023-05-01' = {
   scope: cluster
-  name: 'azure-secret-store'
+  name: secretStoreExtensionName
   identity: {
     type: 'SystemAssigned'
   }
   properties: {
-    extensionType: 'microsoft.azure.secretstore'
+    extensionType: secretStoreExtensionType
     version: secretStoreVersion
     releaseTrain: secretStoreTrain
     autoUpgradeMinorVersion: false

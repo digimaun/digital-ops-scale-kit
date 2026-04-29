@@ -1,0 +1,11 @@
+# Fan-in inputs into the opc-ua-solution step, pulled from the resolve-aio upstream.
+# See docs/parameter-resolution.md for the *-chaining.yaml convention.
+# Consumed by: opc-ua-solution (in standalone manifests/opc-ua-solution.yaml).
+#
+# In aio-install.yaml the same template is fed by aio-instance-outputs.yaml
+# because it runs alongside the install. Standalone runs use this file instead
+# so the deployed names are discovered (via resolve-aio) rather than assumed
+# from common.yaml's site-name conventions.
+
+customLocationName: "{{ steps.resolve-aio.outputs.customLocationName }}"
+adrNamespaceName: "{{ steps.resolve-aio.outputs.adrNamespaceName }}"

@@ -91,7 +91,7 @@ class TestAioInstallConditionalSteps:
 
 class TestAioInstallVersioning:
     """Validate that the AIO extension Azure actually deployed matches the
-    versioned-templates contract (requested aioVersion selects a template dir
+    versioned-templates contract (requested aioRelease selects a template dir
     that pins the extension version)."""
 
     def test_aio_extension_version_matches_version_config(
@@ -100,9 +100,10 @@ class TestAioInstallVersioning:
         """The bicep output `aioExtension.version` reflects
         `Microsoft.KubernetesConfiguration/extensions/.../properties/version`
         from Azure. Cross-check it against the `aioVersion` declared in the
-        site's aio-versions config file — this is the primary regression
-        guard for versioned-templates wiring. A drift here means the wrong
-        template dispatched, even if everything else looks green.
+        site's aio-versions config file (selected by the site's aioRelease) —
+        this is the primary regression guard for versioned-templates wiring.
+        A drift here means the wrong template dispatched, even if everything
+        else looks green.
         """
         import yaml
 
@@ -119,11 +120,11 @@ class TestAioInstallVersioning:
             )
 
             site = orchestrator.load_site(name)
-            aio_version_key = site.properties.get("aioVersion")
-            assert aio_version_key, f"Site '{name}': missing properties.aioVersion"
+            aio_release_key = site.properties.get("aioRelease")
+            assert aio_release_key, f"Site '{name}': missing properties.aioRelease"
 
             version_config = (
-                WORKSPACE_PATH / "parameters" / "aio-versions" / f"{aio_version_key}.yaml"
+                WORKSPACE_PATH / "parameters" / "aio-versions" / f"{aio_release_key}.yaml"
             )
             assert version_config.is_file(), (
                 f"Site '{name}': version config not found: {version_config}"

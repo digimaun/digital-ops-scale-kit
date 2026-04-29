@@ -23,6 +23,9 @@ resource connectedCluster 'Microsoft.Kubernetes/connectedClusters@2024-07-15-pre
 @description('Connected cluster name (parsed from resource ID).')
 output name string = connectedCluster.name
 
+@description('Full ARM resource ID of the connected cluster. Used by upgrade flow to compute the AIO Arc extension name via aioExtensionName(clusterResourceId), mirroring the install-time derivation.')
+output id string = connectedCluster.id
+
 @description('Public OIDC issuer URL for workload identity federation.')
 output oidcIssuerUrl string = connectedCluster.properties.oidcIssuerProfile.issuerUrl
 

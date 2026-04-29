@@ -29,6 +29,8 @@ on:
                 type: choice
                 options:
                     - aio-install
+                    - aio-upgrade
+                    - secretsync
                     - opc-ua-solution
                 default: "aio-install"
             environment:
@@ -77,18 +79,21 @@ jobs:
             INPUT_WORKSPACE: "workspaces/${{ inputs.workspace }}"
             INPUT_MANIFEST: "manifests/${{ inputs.manifest }}.yaml"
             INPUT_REF: ${{ inputs.ref }}
+            CURRENT_REF: ${{ github.ref }}
         steps:
             - name: Resolve git ref
               id: resolve-ref
               shell: bash
               run: |
-                  # Use provided ref, or fall back to the branch/tag that triggered the workflow
+                  # Use provided ref, or fall back to the branch/tag that triggered the workflow.
+                  # CURRENT_REF is routed through env (not interpolated into shell) because
+                  # branch names allow shell metacharacters and would otherwise be injectable.
                   if [[ -n "$INPUT_REF" ]]; then
                     echo "ref=$INPUT_REF" >> $GITHUB_OUTPUT
                     echo "✓ Using specified ref: $INPUT_REF"
                   else
-                    echo "ref=${{ github.ref }}" >> $GITHUB_OUTPUT
-                    echo "✓ Using current ref: ${{ github.ref }}"
+                    echo "ref=$CURRENT_REF" >> $GITHUB_OUTPUT
+                    echo "✓ Using current ref: $CURRENT_REF"
                   fi
 
             - name: Checkout repository

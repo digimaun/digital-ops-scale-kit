@@ -9,6 +9,7 @@
 // -------------------------------------------------------------------------------------
 
 import * as types from './types.bicep'
+import { aioExtensionName as deriveAioExtensionName, aioExtensionType } from '../../common/extension-names.bicep'
 
 // =====================================================================================
 // Parameters (raw inputs from parent)
@@ -51,7 +52,7 @@ param clExtensionIds string[]
 // Variables (version-specific logic owned by this module)
 // =====================================================================================
 
-var AIO_EXTENSION_SUFFIX = take(uniqueString(clusterResourceId), 5)
+var AIO_EXTENSION_NAME = deriveAioExtensionName(clusterResourceId)
 
 var customerManagedTrust = trustConfig.source == 'CustomerManaged'
 var ISSUER_NAME = customerManagedTrust
@@ -102,7 +103,7 @@ var defaultAioConfigurationSettings = {
 // Existing Resources
 // =====================================================================================
 
-resource cluster 'Microsoft.Kubernetes/connectedClusters@2021-03-01' existing = {
+resource cluster 'Microsoft.Kubernetes/connectedClusters@2024-07-15-preview' existing = {
   name: clusterName
 }
 
@@ -112,12 +113,12 @@ resource cluster 'Microsoft.Kubernetes/connectedClusters@2021-03-01' existing = 
 
 resource aioExtension 'Microsoft.KubernetesConfiguration/extensions@2023-05-01' = {
   scope: cluster
-  name: 'azure-iot-operations-${AIO_EXTENSION_SUFFIX}'
+  name: AIO_EXTENSION_NAME
   identity: {
     type: 'SystemAssigned'
   }
   properties: {
-    extensionType: 'microsoft.iotoperations'
+    extensionType: aioExtensionType
     version: aioVersion
     releaseTrain: aioTrain
     autoUpgradeMinorVersion: false

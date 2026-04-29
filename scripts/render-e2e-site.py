@@ -8,7 +8,7 @@ use with `SITEOPS_EXTRA_SITES_DIRS`.
 Required environment variables:
     E2E_RESOURCE_GROUP   Resource group (operator-supplied in persistent mode; workflow-created in ephemeral)
     E2E_CLUSTER_NAME     Arc-connected cluster name
-    E2E_AIO_VERSION      AIO version selector
+    E2E_AIO_RELEASE      AIO release selector
 
 Auto-computed when unset (local developer convenience; CI sets these explicitly):
     E2E_SITE_NAME        Defaults to `e2e-local-<unix_epoch>`
@@ -36,7 +36,7 @@ import sys
 import time
 from pathlib import Path
 
-REQUIRED_VARS = ("E2E_RESOURCE_GROUP", "E2E_CLUSTER_NAME", "E2E_AIO_VERSION")
+REQUIRED_VARS = ("E2E_RESOURCE_GROUP", "E2E_CLUSTER_NAME", "E2E_AIO_RELEASE")
 OPTIONAL_VARS = ("E2E_SITE_NAME", "E2E_SUBSCRIPTION", "E2E_LOCATION")
 ALL_VARS = REQUIRED_VARS + OPTIONAL_VARS
 
@@ -105,13 +105,11 @@ def collect_values() -> dict[str, str]:
 
 def render(template_path: Path, values: dict[str, str]) -> str:
     template = string.Template(template_path.read_text(encoding="utf-8"))
-    try:
-        rendered = template.substitute(values)
-    except KeyError as e:
-        raise SystemExit(
-            f"Template references unknown variable: {e.args[0]}. "
-            f"Known vars: {', '.join(ALL_VARS)}"
-        ) from e
+    # `safe_substitute` lets bare `$` characters (e.g. shell-style `$VAR` in
+    # comments, or `$$` literals) pass through unchanged. The
+    # `UNRESOLVED_PATTERN` check below still catches genuine missing
+    # `${...}` placeholders, which is the failure mode that matters.
+    rendered = template.safe_substitute(values)
 
     leftovers = UNRESOLVED_PATTERN.findall(rendered)
     if leftovers:

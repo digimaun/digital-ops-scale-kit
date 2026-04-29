@@ -157,9 +157,12 @@ digital-ops-scale-kit/
 │       ├── parameters/           # Parameter files
 │       └── templates/            # Bicep templates
 ├── docs/                         # Extended documentation
+│   ├── aio-versions.md           # AIO version pinning, upgrades, adding a new version
 │   ├── ci-cd-setup.md            # GitHub Actions, Azure DevOps, OIDC, secrets
+│   ├── e2e-testing.md            # End-to-end live-subscription test workflow
 │   ├── manifest-reference.md     # Manifest syntax, step types
 │   ├── parameter-resolution.md   # Variables, output chaining
+│   ├── secret-sync.md            # Secret sync enablement and usage
 │   ├── site-configuration.md     # Sites, inheritance, overlays
 │   └── troubleshooting.md        # Common issues and solutions
 ├── .github/                      # GitHub Actions workflows
@@ -408,8 +411,10 @@ See [docs/ci-cd-setup.md](docs/ci-cd-setup.md) for detailed configuration.
 | [docs/site-configuration.md](docs/site-configuration.md) | Site definitions, inheritance, overlays |
 | [docs/manifest-reference.md](docs/manifest-reference.md) | Manifest syntax, step types, conditions |
 | [docs/parameter-resolution.md](docs/parameter-resolution.md) | Template variables, output chaining, auto-filtering |
+| [docs/aio-versions.md](docs/aio-versions.md) | Pinning an AIO version per site, in-place upgrades, adding a new version |
 | [docs/secret-sync.md](docs/secret-sync.md) | Secret sync enablement and usage |
 | [docs/ci-cd-setup.md](docs/ci-cd-setup.md) | GitHub Actions, Azure DevOps, OIDC, secrets configuration |
+| [docs/e2e-testing.md](docs/e2e-testing.md) | End-to-end live-subscription test workflow |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Common issues and solutions |
 
 ---

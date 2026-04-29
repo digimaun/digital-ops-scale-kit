@@ -149,7 +149,7 @@ steps:
     when: "{{ site.properties.deployOptions.includeEdgeSite }}"
 
   - name: schema-registry
-    template: templates/schema-registry.bicep
+    template: templates/deps/schema-registry.bicep
     scope: resourceGroup  # Phase 2: per RG-level site
     parameters:
       - parameters/aio-instance-chaining.yaml  # Can reference global-edge-site outputs

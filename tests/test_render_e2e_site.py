@@ -35,7 +35,7 @@ render_e2e_site = _load_render_module()
 REQUIRED_ENV = {
     "E2E_RESOURCE_GROUP": "rg-test",
     "E2E_CLUSTER_NAME": "cl-test",
-    "E2E_AIO_VERSION": "2603",
+    "E2E_AIO_RELEASE": "2603",
 }
 
 FULL_ENV = {
@@ -56,11 +56,11 @@ def _clean_env(monkeypatch):
 class TestCollectValues:
     def test_missing_required_var_exits(self, monkeypatch):
         for k, v in REQUIRED_ENV.items():
-            if k != "E2E_AIO_VERSION":
+            if k != "E2E_AIO_RELEASE":
                 monkeypatch.setenv(k, v)
         with pytest.raises(SystemExit) as exc:
             render_e2e_site.collect_values()
-        assert "E2E_AIO_VERSION" in str(exc.value)
+        assert "E2E_AIO_RELEASE" in str(exc.value)
 
     def test_all_required_missing_lists_all(self, monkeypatch):
         with pytest.raises(SystemExit) as exc:
@@ -72,7 +72,7 @@ class TestCollectValues:
     def test_whitespace_only_counts_as_missing(self, monkeypatch):
         monkeypatch.setenv("E2E_RESOURCE_GROUP", "   ")
         monkeypatch.setenv("E2E_CLUSTER_NAME", "cl")
-        monkeypatch.setenv("E2E_AIO_VERSION", "2603")
+        monkeypatch.setenv("E2E_AIO_RELEASE", "2603")
         with pytest.raises(SystemExit) as exc:
             render_e2e_site.collect_values()
         assert "E2E_RESOURCE_GROUP" in str(exc.value)
@@ -159,20 +159,31 @@ class TestRender:
         assert "NOT_AN_E2E_VAR" in str(exc.value)
 
     def test_unresolved_leftover_detected(self, tmp_path, monkeypatch):
-        """If Template.substitute somehow leaves a placeholder behind (e.g. future
-        substitution mode change), the explicit post-render scan must still catch
-        it before the file is written."""
+        """If `Template.safe_substitute` somehow leaves a placeholder behind
+        (e.g. future substitution mode change), the explicit post-render scan
+        must still catch it before the file is written."""
         tmpl = self._make_template(tmp_path, "good: ${E2E_SITE_NAME}\n")
-        real_sub = render_e2e_site.string.Template.substitute
+        real_sub = render_e2e_site.string.Template.safe_substitute
 
         def _leaky_sub(self, *args, **kwargs):
             # Simulate a regression where a placeholder slips through.
             return real_sub(self, *args, **kwargs) + "\nbad: ${FORGOTTEN_VAR}\n"
 
-        monkeypatch.setattr(render_e2e_site.string.Template, "substitute", _leaky_sub)
+        monkeypatch.setattr(render_e2e_site.string.Template, "safe_substitute", _leaky_sub)
         with pytest.raises(SystemExit) as exc:
             render_e2e_site.render(tmpl, FULL_ENV)
         assert "${FORGOTTEN_VAR}" in str(exc.value)
+
+    def test_bare_dollar_passes_through(self, tmp_path):
+        """A literal `$` not part of `${name}` must not raise. Templates may
+        contain shell-style `$VAR` refs in comments, regex examples, or doc
+        snippets — `safe_substitute` lets those through; the leftover-pattern
+        only fires on `${...}` forms."""
+        body = "comment: '# uses $RUNNER_TEMP at runtime'\nname: ${E2E_SITE_NAME}\n"
+        tmpl = self._make_template(tmp_path, body)
+        out = render_e2e_site.render(tmpl, FULL_ENV)
+        assert "$RUNNER_TEMP" in out
+        assert "name: e2e-unit-test" in out
 
     def test_template_placeholders_preserved_verbatim_outside_dollar_brace(self, tmp_path):
         """`{{ ... }}` and `$VAR` (no braces) must pass through untouched — those
@@ -196,4 +207,4 @@ class TestRealTemplate:
         assert doc["name"] == FULL_ENV["E2E_SITE_NAME"]
         assert doc["resourceGroup"] == FULL_ENV["E2E_RESOURCE_GROUP"]
         assert doc["subscription"] == FULL_ENV["E2E_SUBSCRIPTION"]
-        assert doc["properties"]["aioVersion"] == FULL_ENV["E2E_AIO_VERSION"]
+        assert doc["properties"]["aioRelease"] == FULL_ENV["E2E_AIO_RELEASE"]

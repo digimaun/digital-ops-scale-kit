@@ -125,7 +125,7 @@ var instanceIdentity = !hasIdentity
 /*         Existing Arc-enabled cluster where AIO will be deployed.          */
 /*****************************************************************************/
 
-resource cluster 'Microsoft.Kubernetes/connectedClusters@2021-03-01' existing = {
+resource cluster 'Microsoft.Kubernetes/connectedClusters@2024-07-15-preview' existing = {
   name: clusterName
 }
 

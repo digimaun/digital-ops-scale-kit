@@ -7,6 +7,13 @@
 # This site has no resourceGroup, so only `scope: subscription` steps run.
 # The global-edge-site step deploys here, then munich-dev, seattle-dev, etc.
 # can reference its outputs.
+#
+# Target with: -l scope=subscription   (the default `environment=dev` selector
+# in aio-install.yaml does not match this site, by design.)
+#
+# AIO-install fields inherited from base-site.yaml (aioRelease, brokerConfig,
+# defaultDataflowInstanceCount, deployOptions.enableSecretSync, etc.) are
+# inert here — no resourceGroup-scoped step runs against this site.
 
 apiVersion: siteops/v1
 kind: Site

@@ -34,6 +34,27 @@ WORKSPACE_PATH = Path(__file__).parent.parent.parent / "workspaces" / "iot-opera
 SCRIPT_PATH = Path(__file__).parent.parent.parent / "scripts" / "generate-site-overrides.py"
 
 _EXTRA_SITES_DIRS_ENV = "SITEOPS_EXTRA_SITES_DIRS"
+_UPGRADE_PHASE_ENV = "SITEOPS_E2E_UPGRADE_PHASE"
+
+# Sentinel returned by `aio_install_result` in upgrade phase. Shape is
+# deliberately not a real deploy result so any leaked consumer fails loudly.
+_UPGRADE_PHASE_INSTALL_SENTINEL = {"_upgrade_phase_sentinel": True}
+
+# Upgrade-phase allowlist: classes whose tests read only upgrade-step outputs.
+# Allowlisted classes must not consume `aio_install_result` content (the
+# sentinel has no `sites`/`summary` keys, so direct access would KeyError
+# with a non-obvious traceback). Depending on the fixture for ordering only
+# is fine; reading from it is not.
+_UPGRADE_PHASE_ALLOWED_CLASSES = frozenset({
+    "TestAioUpgradeDeployment",
+    "TestAioUpgradeResolveExtensions",
+    "TestAioUpgradeSelfConsistency",
+    "TestAioUpgradeIdempotency",
+})
+
+
+def _is_upgrade_phase() -> bool:
+    return os.environ.get(_UPGRADE_PHASE_ENV, "").strip() in ("1", "true", "yes")
 
 
 def _extra_sites_dirs() -> list[Path]:
@@ -103,6 +124,19 @@ def pytest_collection_modifyitems(config, items):
             if "integration" in item.keywords:
                 item.add_marker(skip)
 
+    if _is_upgrade_phase():
+        skip_upgrade = pytest.mark.skip(
+            reason=f"{_UPGRADE_PHASE_ENV} active: only upgrade-step tests run "
+            f"in this phase (install fixtures are stubbed)"
+        )
+        for item in items:
+            if "integration" not in item.keywords:
+                continue
+            cls = getattr(item, "cls", None)
+            cls_name = cls.__name__ if cls is not None else None
+            if cls_name not in _UPGRADE_PHASE_ALLOWED_CLASSES:
+                item.add_marker(skip_upgrade)
+
 
 def pytest_sessionfinish(session, exitstatus):
     """Clean up generated overlays unless skip-cleanup is set."""
@@ -167,7 +201,15 @@ def _resolve_or_fail(
 
 @pytest.fixture(scope="session")
 def aio_install_result(orchestrator: Orchestrator, selector: str | None) -> dict:
-    """Deploy aio-install.yaml once, shared by all dependent tests."""
+    """Deploy aio-install.yaml once, shared by all dependent tests.
+
+    Upgrade phase short-circuits to a sentinel: aio-install is desired-state,
+    so re-running it at a new release against an existing instance can
+    overwrite operator config on the live instance.
+    """
+    if _is_upgrade_phase():
+        return _UPGRADE_PHASE_INSTALL_SENTINEL
+
     manifest_path = WORKSPACE_PATH / "manifests" / "aio-install.yaml"
     manifest, sites = _resolve_or_fail(orchestrator, manifest_path, selector)
     result = orchestrator.deploy(
@@ -201,6 +243,26 @@ def opc_ua_solution_result(
 ) -> dict:
     """Deploy opc-ua-solution.yaml after AIO is installed."""
     manifest_path = WORKSPACE_PATH / "manifests" / "opc-ua-solution.yaml"
+    manifest, sites = _resolve_or_fail(orchestrator, manifest_path, selector)
+    return orchestrator.deploy(
+        manifest_path=manifest_path,
+        manifest=manifest,
+        sites=sites,
+    )
+
+
+@pytest.fixture(scope="session")
+def aio_upgrade_result(
+    orchestrator: Orchestrator, selector: str | None, aio_install_result: dict
+) -> dict:
+    """Deploy aio-upgrade.yaml after AIO is installed.
+
+    Without an aioRelease bump, the upgrade is a no-op same-version re-PUT
+    that exercises the resolve-then-update round-trip and asserts that
+    extension identity, configurationSettings, and releaseNamespace are
+    preserved.
+    """
+    manifest_path = WORKSPACE_PATH / "manifests" / "aio-upgrade.yaml"
     manifest, sites = _resolve_or_fail(orchestrator, manifest_path, selector)
     return orchestrator.deploy(
         manifest_path=manifest_path,

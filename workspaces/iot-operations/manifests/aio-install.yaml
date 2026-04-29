@@ -19,9 +19,13 @@ parallel: 3
 # intentionally excluded here; target them with `-l scope=subscription`.
 siteSelector: "environment=dev"
 
-# Shared parameters applied to all steps (auto-filtered per template)
+# Shared parameters applied to all steps (auto-filtered per template). The
+# aio-versions YAML lives at the manifest level so any step that declares
+# aioVersion / aioApiVersion / adrApiVersion / certManagerVersion /
+# secretStoreVersion (etc.) picks it up without per-step duplication.
 parameters:
   - parameters/common.yaml
+  - "parameters/aio-versions/{{ site.properties.aioRelease }}.yaml"
 
 steps:
   # ─────────────────────────────────────────────────────────────
@@ -52,14 +56,11 @@ steps:
   - name: aio-enablement
     template: templates/aio/enablement.bicep
     scope: resourceGroup
-    parameters:
-      - "parameters/aio-versions/{{ site.properties.aioVersion }}.yaml"
 
   - name: aio-instance
     template: templates/aio/instance.bicep
     scope: resourceGroup
     parameters:
-      - "parameters/aio-versions/{{ site.properties.aioVersion }}.yaml"
       - parameters/aio-instance-chaining.yaml
 
   - name: schema-registry-role
@@ -73,7 +74,7 @@ steps:
   # ─────────────────────────────────────────────────────────────
 
   - name: resolve-aio
-    template: templates/common/resolve-aio.bicep
+    template: templates/aio/resolve-aio.bicep
     scope: resourceGroup
     when: "{{ site.properties.deployOptions.enableSecretSync }}"
 
@@ -81,7 +82,6 @@ steps:
     template: templates/secretsync/enable-secretsync.bicep
     scope: resourceGroup
     parameters:
-      - "parameters/aio-versions/{{ site.properties.aioVersion }}.yaml"
       - parameters/secretsync-chaining.yaml
     when: "{{ site.properties.deployOptions.enableSecretSync }}"
 
@@ -103,5 +103,5 @@ steps:
       name: "{{ site.parameters.clusterName }}"
       resourceGroup: "{{ site.resourceGroup }}"
     files:
-      - https://raw.githubusercontent.com/Azure-Samples/explore-iot-operations/main/samples/quickstarts/opc-plc-deployment.yaml
+      - https://raw.githubusercontent.com/Azure-Samples/explore-iot-operations/0072eb6cdd3602bbd48858f21cf097e36a6b0b7e/samples/quickstarts/opc-plc-deployment.yaml
     when: "{{ site.properties.deployOptions.includeOpcPlcSimulator }}"

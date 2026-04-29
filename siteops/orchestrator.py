@@ -962,34 +962,73 @@ class Orchestrator:
                 site.subscription,
             )
 
-        # 6. Warn about any unresolved templates
-        self._check_unresolved_templates(params, site.name)
-
-        # 7. Filter to only parameters accepted by the template
+        # 6. Filter to template-accepted parameters before the unresolved-check
+        # so that defaults injected for steps that don't consume them (e.g.
+        # `siteAddress.{country,city}` from common.yaml) don't trip the check.
         template_path = (self.workspace / step.template).resolve()
+        filter_succeeded = False
         if template_path.exists():
             try:
                 params = filter_parameters(params, str(template_path), step.name)
+                filter_succeeded = True
             except (ValueError, FileNotFoundError) as e:
-                logger.warning(f"Could not filter parameters for step '{step.name}': {e}")
-                # Continue with unfiltered params - let ARM validate
+                logger.warning(
+                    f"Could not filter parameters for step '{step.name}': {e}; "
+                    f"skipping unresolved-template precheck so the original error "
+                    f"is not masked by a follow-on 'unresolved templates' failure"
+                )
+
+        # 7. Fail fast on any unresolved {{ ... }} templates. In dry-run mode
+        # downgrade to warning since `{{ steps.X.outputs.Y }}` cannot be
+        # resolved without real deployment outputs. Skipped when filtering
+        # failed: an unfiltered param set may carry tokens for params the
+        # template doesn't accept (which filtering would have stripped), and
+        # raising here would hide the upstream filter failure.
+        if filter_succeeded:
+            self._check_unresolved_templates(params, site.name, step.name)
 
         return params
 
-    def _check_unresolved_templates(self, params: dict[str, Any], site_name: str) -> None:
-        """Warn if any {{ ... }} templates weren't resolved."""
+    def _check_unresolved_templates(
+        self, params: dict[str, Any], site_name: str, step_name: str
+    ) -> None:
+        """Fail (or warn in dry-run) if any {{ ... }} templates remain.
 
-        def check_value(v: Any, path: str = "") -> None:
+        Unresolved templates at this stage mean a parameter source did not
+        produce the expected output, a step reference points at a non-existent
+        step/output, or a `{{ site.X }}` path is wrong. Letting the deployment
+        proceed would silently send literal `{{ ... }}` strings to ARM.
+
+        In `--dry-run` mode `{{ steps.X.outputs.Y }}` references cannot be
+        resolved (no real outputs exist), so we log a warning instead of
+        failing.
+        """
+        unresolved: list[tuple[str, str]] = []
+
+        def collect(v: Any, path: str = "") -> None:
             if isinstance(v, str) and "{{" in v and "}}" in v:
-                logger.warning(f"Unresolved template in {path}: {v} (site: {site_name})")
+                unresolved.append((path, v))
             elif isinstance(v, dict):
                 for k, val in v.items():
-                    check_value(val, f"{path}.{k}" if path else k)
+                    collect(val, f"{path}.{k}" if path else k)
             elif isinstance(v, list):
                 for i, item in enumerate(v):
-                    check_value(item, f"{path}[{i}]")
+                    collect(item, f"{path}[{i}]")
 
-        check_value(params)
+        collect(params)
+
+        if not unresolved:
+            return
+
+        details = "; ".join(f"{path}={value}" for path, value in unresolved)
+        message = (
+            f"Unresolved template(s) for step '{step_name}' (site: {site_name}): "
+            f"{details}"
+        )
+        if self.dry_run:
+            logger.warning(message)
+            return
+        raise ValueError(message)
 
     def _evaluate_condition(self, condition: str | None, site: Site) -> bool:
         """Evaluate a step condition against a site.
@@ -2225,7 +2264,13 @@ class Orchestrator:
                 print(f"       └─ {step.template}")
 
         print(f"\n{'═'*60}")
-        total = sum(1 for site in sites for step in manifest.steps if self._evaluate_condition(step.when, site))
+        total = sum(
+            1
+            for site in sites
+            for step in manifest.steps
+            if self._check_step_site_compatibility(step, site) is None
+            and self._evaluate_condition(step.when, site)
+        )
         print(f"  Total: {total} operation(s)")
 
         if len(sites) > 1:

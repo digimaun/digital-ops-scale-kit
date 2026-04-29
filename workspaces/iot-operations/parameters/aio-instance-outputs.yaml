@@ -2,9 +2,6 @@
 # See docs/parameter-resolution.md for the *-outputs.yaml convention.
 # Consumed by: schema-registry-role, opc-ua-solution
 
-# From adr-ns step (namespace resource name, for DeviceRegistry operations)
-adrNamespaceName: "{{ steps.adr-ns.outputs.adrNamespace.name }}"
-
 # AIO extension outputs (for role assignments)
 aioExtensionName: "{{ steps.aio-instance.outputs.aioExtension.name }}"
 aioExtensionPrincipalId: "{{ steps.aio-instance.outputs.aioExtension.identityPrincipalId }}"

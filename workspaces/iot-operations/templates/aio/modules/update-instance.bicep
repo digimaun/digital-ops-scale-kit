@@ -59,7 +59,7 @@ param features object = {}
 @description('Instance description.')
 param instanceDescription string = ''
 
-@description('Secret Provider Class resource ID to set as the default. Leave empty to preserve the existing value.')
+@description('Secret Provider Class resource ID to set as the default. Empty clears the SPC reference on PUT.')
 param spcResourceId string = ''
 
 module update_2025 './update-instance-2025-10-01.bicep' = if (aioApiVersion == '2025-10-01') {

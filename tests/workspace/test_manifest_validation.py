@@ -27,6 +27,11 @@ class TestManifestValidation:
         errors = orchestrator.validate(workspace / "manifests" / "secretsync.yaml")
         assert errors == [], f"secretsync.yaml validation errors: {errors}"
 
+    def test_aio_upgrade_validates(self, workspace, orchestrator):
+        """aio-upgrade.yaml should validate with no errors."""
+        errors = orchestrator.validate(workspace / "manifests" / "aio-upgrade.yaml")
+        assert errors == [], f"aio-upgrade.yaml validation errors: {errors}"
+
     def test_opc_ua_solution_validates(self, workspace, orchestrator):
         """opc-ua-solution.yaml should validate with no errors."""
         errors = orchestrator.validate(workspace / "manifests" / "opc-ua-solution.yaml")

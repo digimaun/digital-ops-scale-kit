@@ -48,6 +48,8 @@ Two patterns, picked by whether the file describes inputs or outputs:
 
 The `<step>` prefix is always the step being described (the consumer for fan-in, the producer for fan-out). A step that has both fan-in inputs and fan-out outputs gets two files (e.g., `aio-instance-chaining.yaml` + `aio-instance-outputs.yaml`).
 
+When one chaining file would be shared by multiple consumer steps **within the same manifest**, prefer one file per consumer step named `<manifest>-<step>.yaml` (e.g. `aio-upgrade-resolve-extensions.yaml`, `aio-upgrade-update-extensions.yaml`). A single shared file ends up with `{{ steps.X.outputs.Y }}` references that look forward from the perspective of the earliest consumer, which structural validation correctly rejects.
+
 ### Cross-scope output chaining
 
 RG-level sites can reference outputs from subscription-scoped steps. Subscription outputs are keyed by subscription ID and resolved automatically:

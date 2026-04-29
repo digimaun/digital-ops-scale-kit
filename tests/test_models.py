@@ -948,11 +948,11 @@ class TestManifest:
             subscription="sub-123",
             resource_group="rg-dev",
             location="eastus",
-            properties={"aioVersion": "2603"},
+            properties={"aioRelease": "2603"},
         )
 
         result = manifest.resolve_parameter_path(
-            "parameters/aio-versions/{{ site.properties.aioVersion }}.yaml",
+            "parameters/aio-versions/{{ site.properties.aioRelease }}.yaml",
             site,
         )
         assert result == "parameters/aio-versions/2603.yaml"
@@ -998,11 +998,11 @@ class TestManifest:
             resource_group="rg-dev",
             location="eastus",
             labels={"environment": "dev"},
-            properties={"aioVersion": "2603"},
+            properties={"aioRelease": "2603"},
         )
 
         result = manifest.resolve_parameter_path(
-            "parameters/{{ site.labels.environment }}/{{ site.properties.aioVersion }}.yaml",
+            "parameters/{{ site.labels.environment }}/{{ site.properties.aioRelease }}.yaml",
             site,
         )
         assert result == "parameters/dev/2603.yaml"

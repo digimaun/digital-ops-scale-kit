@@ -1,6 +1,6 @@
 # CI/CD Setup
 
-This guide covers CI/CD configuration for automated testing and deployments. Site Ops is CI/CD-platform agnostic — it runs anywhere Python and `az` CLI are available. This project provides reference implementations for both GitHub Actions (primary) and Azure DevOps (MVP).
+This guide covers CI/CD configuration for automated testing and deployments. Site Ops is CI/CD-platform agnostic. It runs anywhere Python and `az` CLI are available. This project provides reference implementations for both GitHub Actions (primary) and Azure DevOps (MVP).
 
 | Platform | Location | Status |
 |----------|----------|--------|
@@ -22,6 +22,8 @@ This guide covers CI/CD configuration for automated testing and deployments. Sit
 | `ci.yaml` | Push, pull request, manual | Validate Bicep templates, run unit tests, and validate manifests |
 | `deploy.yaml` | Manual (`workflow_dispatch`) | Deploy infrastructure to Azure |
 | `_siteops-deploy.yaml` | Called by deploy.yaml | Reusable deployment logic |
+| `integration-test.yaml` | Manual (`workflow_dispatch`) | Deploy a manifest against real Azure and assert outputs |
+| `e2e-test.yaml` | Manual (`workflow_dispatch`) | Full-stack E2E: k3s + Arc + AIO deploy + integration tests (see [E2E testing](e2e-testing.md)) |
 
 ### Azure OIDC Configuration
 
@@ -100,12 +102,12 @@ This condition allows creating and deleting role assignments but blocks these pr
 
 #### Kubernetes RBAC for Arc proxy operations
 
-If your manifests include `kubectl` steps that execute via Arc proxy (Cluster Connect), the CI/CD service principal needs authorization to perform operations inside the Kubernetes cluster. The Azure roles above control access to Azure resources — they do not grant permissions within Kubernetes itself.
+If your manifests include `kubectl` steps that execute via Arc proxy (Cluster Connect), the CI/CD service principal needs authorization to perform operations inside the Kubernetes cluster. The Azure roles above control access to Azure resources. They do not grant permissions within Kubernetes itself.
 
 There are two approaches to grant this access:
 
-- **Azure RBAC for Arc-enabled Kubernetes** — Assign Azure roles like `Azure Arc Kubernetes Cluster Admin` or a custom role to the service principal, scoped to the cluster resource. This is managed entirely through Azure and requires [Azure RBAC to be enabled on the cluster](https://learn.microsoft.com/azure/azure-arc/kubernetes/azure-rbac).
-- **Kubernetes-native RBAC** — Create a `RoleBinding` or `ClusterRoleBinding` on the cluster itself, referencing the service principal's object ID.
+- **Azure RBAC for Arc-enabled Kubernetes**: Assign Azure roles like `Azure Arc Kubernetes Cluster Admin` or a custom role to the service principal, scoped to the cluster resource. This is managed entirely through Azure and requires [Azure RBAC to be enabled on the cluster](https://learn.microsoft.com/azure/azure-arc/kubernetes/azure-rbac).
+- **Kubernetes-native RBAC**: Create a `RoleBinding` or `ClusterRoleBinding` on the cluster itself, referencing the service principal's object ID.
 
 The following is a Kubernetes-native example that grants broad access for development. Replace with a least-privilege role for production:
 
@@ -216,7 +218,7 @@ Override subscription, resource group, and parameters per site. Supports nested 
 
 ## Running Deployments
 
-### CI (automatic — both platforms)
+### CI (automatic, both platforms)
 
 CI runs automatically on pushes to main and PRs that modify:
 
@@ -252,9 +254,9 @@ gh workflow run deploy.yaml \
 
 Add `-f selector="<value>"` to filter sites further:
 
-- `selector="country=US"` — sites with country label
-- `selector="name=seattle-dev"` — specific site by name
-- `selector="country=US,name=seattle-dev"` — multiple filters
+- `selector="country=US"`: sites with country label
+- `selector="name=seattle-dev"`: specific site by name
+- `selector="country=US,name=seattle-dev"`: multiple filters
 
 ### Deploy via REST API
 
@@ -285,6 +287,7 @@ The iot-operations workspace demonstrates key Site Ops capabilities:
 | 2 | `aio-install` | `dev` | munich-dev, seattle-dev | Parallel deployment + simulator |
 | 3 | `aio-install` | `prod` | munich-prod, seattle-prod | Parallel deployment, no simulator |
 | 4 | `opc-ua-solution` | `staging` | chicago-staging | Solution layer on existing AIO |
+| 5 | `aio-upgrade` | any | any AIO-installed site | Upgrade an existing AIO instance to the site's current `aioRelease` (bump the site's `aioRelease` first, then dispatch) |
 
 ### Site configuration
 
@@ -412,7 +415,7 @@ To add a new manifest to the deployment workflows:
 1. Create your manifest in `workspaces/<workspace>/manifests/`
 2. Update the workflow/pipeline to add it to the dropdown:
 
-**GitHub Actions** — `.github/workflows/deploy.yaml`:
+**GitHub Actions** (`.github/workflows/deploy.yaml`):
 ```yaml
 manifest:
     description: "Manifest to deploy"
@@ -420,17 +423,19 @@ manifest:
     type: choice
     options:
         - aio-install
+        - aio-upgrade
+        - secretsync
         - opc-ua-solution
         - my-new-manifest  # Add here (without .yaml extension)
 ```
 
-**Azure DevOps** — `.pipelines/deploy.yaml`:
+**Azure DevOps** (`.pipelines/deploy.yaml`):
 ```yaml
 - name: manifest
   displayName: Manifest
   type: string
   default: aio-install
-  values: [aio-install, opc-ua-solution, my-new-manifest]  # Add here
+  values: [aio-install, aio-upgrade, secretsync, opc-ua-solution, my-new-manifest]  # Add here
 ```
 
 ### Adding new workspaces
@@ -440,7 +445,7 @@ To add a new workspace (e.g., `iot-hub`):
 1. Create `workspaces/iot-hub/` with `manifests/`, `sites/`, `parameters/`, `templates/`
 2. Update the workflow/pipeline to add it to the dropdown:
 
-**GitHub Actions** — `.github/workflows/deploy.yaml`:
+**GitHub Actions** (`.github/workflows/deploy.yaml`):
 ```yaml
 workspace:
     description: "Workspace to deploy"
@@ -451,7 +456,7 @@ workspace:
         - iot-hub  # Add here
 ```
 
-**Azure DevOps** — `.pipelines/deploy.yaml`:
+**Azure DevOps** (`.pipelines/deploy.yaml`):
 ```yaml
 - name: workspace
   displayName: Workspace
@@ -462,7 +467,7 @@ workspace:
 
 ### Custom deployment workflow
 
-**GitHub Actions** — Create a new workflow that calls the reusable workflow:
+**GitHub Actions**: create a new workflow that calls the reusable workflow:
 
 ```yaml
 name: Deploy My Service
@@ -481,7 +486,7 @@ jobs:
     secrets: inherit
 ```
 
-**Azure DevOps** — Create a new pipeline that uses the stage template:
+**Azure DevOps**: create a new pipeline that uses the stage template:
 
 ```yaml
 trigger:
@@ -505,7 +510,7 @@ stages:
 
 ### Setup templates
 
-**GitHub Actions** — The `setup-siteops` composite action:
+**GitHub Actions**: the `setup-siteops` composite action:
 
 | Input | Default | Description |
 |-------|---------|-------------|
@@ -518,7 +523,7 @@ stages:
     install-dev: "true"
 ```
 
-**Azure DevOps** — The `setup-siteops.yaml` steps template:
+**Azure DevOps**: the `setup-siteops.yaml` steps template:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -550,8 +555,8 @@ stages:
 
 In ADO → **Project settings → Service connections → New → Azure Resource Manager → Workload Identity federation**.
 
-- **Automatic** — creates the Entra app registration and federated credential for you
-- **Manual** — reuse the existing app registration from GitHub Actions OIDC setup (same `APP_ID`)
+- **Automatic**: creates the Entra app registration and federated credential for you
+- **Manual**: reuse the existing app registration from GitHub Actions OIDC setup (same `APP_ID`)
 
 The service connection name is referenced in the deploy pipeline. Default: `azure-siteops`.
 
@@ -563,7 +568,7 @@ In ADO → **Pipelines → Library → + Variable group**:
 
 | Variable group | Variable | Type | Description |
 |----------------|----------|------|-------------|
-| `siteops-secrets` | `SITE_OVERRIDES` | Secret | JSON object — same format as the GitHub secret (see [SITE_OVERRIDES](#site_overrides)) |
+| `siteops-secrets` | `SITE_OVERRIDES` | Secret | JSON object, same format as the GitHub secret (see [SITE_OVERRIDES](#site_overrides)) |
 
 #### 3. Create environments
 
@@ -599,7 +604,7 @@ Same as GitHub Actions — see [Assign Azure roles](#3-assign-azure-roles). The 
 3. Select branch/tag from the branch picker
 4. Fill in parameters:
    - **Workspace**: `iot-operations`
-   - **Manifest**: `aio-install` or `opc-ua-solution`
+   - **Manifest**: `aio-install`, `aio-upgrade`, `secretsync`, or `opc-ua-solution`
    - **Target environment**: `dev`, `staging`, or `prod`
    - **Additional site selector**: e.g., `country=US,name=seattle-dev` (optional)
    - **Dry run**: Check to preview without deploying
@@ -648,14 +653,14 @@ az pipelines run \
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Key difference from GitHub Actions:** `AzureCLI@2` handles authentication, token lifecycle, and cleanup in a single task — no separate login, token refresh, or logout steps needed.
+**Key difference from GitHub Actions:** `AzureCLI@2` handles authentication, token lifecycle, and cleanup in a single task. No separate login, token refresh, or logout steps needed.
 
 ### Per-environment migration
 
 The deploy pipeline uses object parameter lookup tables for service connections and variable groups. To split per-environment (separate identities and secrets):
 
 ```yaml
-# .pipelines/deploy.yaml — edit these defaults:
+# .pipelines/deploy.yaml: edit these defaults:
 - name: serviceConnections
   type: object
   default:
@@ -671,4 +676,4 @@ The deploy pipeline uses object parameter lookup tables for service connections 
     prod: siteops-secrets-prod
 ```
 
-No structural pipeline changes needed — just edit defaults and create the corresponding ADO resources.
+No structural pipeline changes needed. Just edit defaults and create the corresponding ADO resources.

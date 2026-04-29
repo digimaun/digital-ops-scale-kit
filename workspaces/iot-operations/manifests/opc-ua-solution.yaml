@@ -2,15 +2,19 @@ apiVersion: siteops/v1
 kind: Manifest
 name: opc-ua-solution
 description: |
-  Deploy OPC UA solution to an existing Azure IoT Operations instance.
-  Creates an OPC UA asset, Event Hub destination, and data transformation pipeline.
+  Deploy a sample OPC UA solution layered onto an existing Azure IoT Operations
+  instance. Creates an OPC UA device + asset, an Event Hub destination with a
+  managed-identity role assignment, and a dataflow that maps oven telemetry
+  from the broker to the Event Hub.
+
+  Discovers actual deployed names (custom location, ADR namespace) from the AIO
+  instance via resolve-aio, so the manifest works against any AIO install
+  including those whose resource names diverge from the default
+  `<site>-aio` / `<site>-cl` / `<site>-ns` conventions.
 
   Prerequisites:
-    - AIO instance deployed (via aio-install.yaml or AIO CLI)
-    - Sites must have existing AIO resources:
-      - AIO Instance: {{ site.name }}-aio
-      - ADR Namespace: {{ site.name }}-ns
-      - Custom Location: {{ site.name }}-cl
+    - AIO instance must be deployed and running (via aio-install.yaml or AIO CLI)
+    - The site's aioRelease must point to a parameters/aio-versions/<ver>.yaml file
 
 # Max concurrent sites. 0 = unlimited, 1 = serial.
 parallel: 3
@@ -20,11 +24,18 @@ siteSelector: "environment=dev"
 
 parameters:
   - parameters/common.yaml
+  - "parameters/aio-versions/{{ site.properties.aioRelease }}.yaml"
 
 steps:
+  - name: resolve-aio
+    template: templates/aio/resolve-aio.bicep
+    scope: resourceGroup
+
   - name: opc-ua-solution
     template: templates/solutions/opc-ua-solution.bicep
     scope: resourceGroup
+    parameters:
+      - parameters/opc-ua-solution-chaining.yaml
 
   # Conditional on deployOptions.includeOpcPlcSimulator.
   - name: opc-plc-simulator
@@ -34,5 +45,5 @@ steps:
       name: "{{ site.parameters.clusterName }}"
       resourceGroup: "{{ site.resourceGroup }}"
     files:
-      - https://raw.githubusercontent.com/Azure-Samples/explore-iot-operations/main/samples/quickstarts/opc-plc-deployment.yaml
+      - https://raw.githubusercontent.com/Azure-Samples/explore-iot-operations/0072eb6cdd3602bbd48858f21cf097e36a6b0b7e/samples/quickstarts/opc-plc-deployment.yaml
     when: "{{ site.properties.deployOptions.includeOpcPlcSimulator }}"

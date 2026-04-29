@@ -31,6 +31,8 @@
 // Parameters — resolved infrastructure (from resolve-aio output chaining)
 // =====================================================================================
 
+import { aioSecretSyncServiceAccountName } from '../common/extension-names.bicep'
+
 @description('Name of the existing IoT Operations instance.')
 param aioInstanceName string
 
@@ -132,7 +134,7 @@ var resolvedSpcName = !empty(spcName)
 var fedCredName = 'fc-${uniqueString(connectedClusterName, customLocationName, aioInstanceName)}'
 
 // Kubernetes service account subject for the secret sync controller
-var credSubject = 'system:serviceaccount:${customLocationNamespace}:aio-ssc-sa'
+var credSubject = 'system:serviceaccount:${customLocationNamespace}:${aioSecretSyncServiceAccountName}'
 
 // =====================================================================================
 // Existing Resources
@@ -160,7 +162,7 @@ resource managedIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-
 //   in place with RBAC authorization enabled.
 // =====================================================================================
 
-resource newKeyVault 'Microsoft.KeyVault/vaults@2022-07-01' = if (!useExistingKv) {
+resource newKeyVault 'Microsoft.KeyVault/vaults@2023-07-01' = if (!useExistingKv) {
   name: resolvedKvName
   location: instanceLocation
   tags: tags

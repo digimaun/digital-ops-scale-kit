@@ -5,7 +5,7 @@ End-to-end (E2E) tests are the primary live-subscription validation for the scal
 Use E2E tests when:
 
 - Validating a PR that changes orchestration, merge, or deployment logic.
-- Qualifying a new AIO version before updating workspace defaults.
+- Qualifying a new AIO release before updating workspace defaults.
 - Reproducing a field issue end-to-end against a real subscription.
 
 Unit tests (`pytest tests/ -m "not integration"`) cover every code path that does not require Azure and should remain the default pre-commit gate. E2E is intentionally opt-in (`workflow_dispatch`).
@@ -16,7 +16,7 @@ Unit tests (`pytest tests/ -m "not integration"`) cover every code path that doe
  ┌────────────────────────────────────────────────────────────┐
  │ GitHub workflow: e2e-test.yaml                             │
  │                                                            │
- │  prep  ──►  e2e (matrix over aio-versions)                 │
+ │  prep  ──►  e2e (matrix over aio-releases)                 │
  │                  │                                         │
  │                  ├─ create-k3s-cluster  (composite action) │
  │                  ├─ azure/login         (OIDC)             │
@@ -27,6 +27,18 @@ Unit tests (`pytest tests/ -m "not integration"`) cover every code path that doe
  │                  ├─ pytest tests/integration               │
  │                  │    (SITEOPS_EXTRA_SITES_DIRS points to  │
  │                  │     the rendered-site dir above)        │
+ │                  ├─ upload e2e-results-<release>.xml       │
+ │                  │                                         │
+ │                  │  ── if upgrade-to set and != cell ──    │
+ │                  ├─ render-e2e-site.py at upgrade-to       │
+ │                  │    (overwrites same site file)          │
+ │                  ├─ pytest tests/integration               │
+ │                  │    (SITEOPS_E2E_UPGRADE_PHASE=1;        │
+ │                  │     only TestAioUpgrade* classes run,   │
+ │                  │     install fixture short-circuits)     │
+ │                  ├─ upload e2e-results-<release>-to-       │
+ │                  │           <upgrade-to>.xml              │
+ │                  │                                         │
  │                  └─ teardown (ephemeral: delete RG;        │
  │                               persistent: delta cleanup)   │
  └────────────────────────────────────────────────────────────┘
@@ -39,7 +51,7 @@ No Azure-specific site file is committed. The E2E site is rendered at run time f
 | Mode | Resource group | SP scope | When to use |
 |------|---------------|----------|-------------|
 | ephemeral (default) | Workflow creates and deletes per run. | Subscription-level `Owner`. | Routine CI validation, fully automated. |
-| persistent | Operator supplies a pre-existing RG; only resources created during the run are deleted (snapshot delta). The cluster itself is always a fresh k3s on the runner (bring-your-own-cluster is not supported). | RG-level `Owner`. | Restricted subscriptions where sub-level Owner is not acceptable. Multi-version matrices are serialized in the shared RG. |
+| persistent | Operator supplies a pre-existing RG; only resources created during the run are deleted (snapshot delta). The cluster itself is always a fresh k3s on the runner (bring-your-own-cluster is not supported). | RG-level `Owner`. | Restricted subscriptions where sub-level Owner is not acceptable. Multi-release matrices are serialized in the shared RG. |
 
 `Owner` is required (not `Contributor`) because AIO deployments make role assignments (for example, schema registry and Key Vault). `Contributor` cannot grant roles.
 
@@ -66,25 +78,33 @@ Pass the value as the `custom-locations-oid` workflow input, or set it as a repo
 
 Create a GitHub Environment (for example, `dev`) and set these secrets:
 
-| Secret | Source |
-|--------|--------|
-| `AZURE_CLIENT_ID` | App registration client ID |
-| `AZURE_TENANT_ID` | `az account show --query tenantId -o tsv` |
-| `AZURE_SUBSCRIPTION_ID` | `az account show --query id -o tsv` |
+| Secret | Source | Required |
+|--------|--------|----------|
+| `AZURE_CLIENT_ID` | App registration client ID | yes |
+| `AZURE_TENANT_ID` | `az account show --query tenantId -o tsv` | yes |
+| `AZURE_SUBSCRIPTION_ID` | `az account show --query id -o tsv` | yes |
+| `AZURE_CLIENT_OID` | `az ad sp show --id <AZURE_CLIENT_ID> --query id -o tsv` | optional |
+| `DEBUG_USER_OID` | `az ad signed-in-user show --query id -o tsv` (or a group OID) | optional |
+
+`AZURE_CLIENT_OID` is the SP's directory object ID. The e2e job binds it to namespace-admin on `azure-iot-operations` so kubectl steps that traverse the Arc proxy (e.g. the OPC PLC simulator) succeed. If unset, the workflow falls back to a Microsoft Graph lookup, which requires the SP to have `Directory.Read.All`.
+
+`DEBUG_USER_OID` is a human user (or group) AAD object ID. When set, the e2e job binds it to `cluster-admin` on the runner k3s so you can inspect the live cluster via `az connectedk8s proxy -n <cluster> -g <rg>`. Pair with `skip-teardown: true` and/or `keep-cluster-alive-minutes` to keep the cluster around long enough to debug.
 
 ```bash
 gh secret set AZURE_CLIENT_ID       --env dev --body "<app-client-id>"
 gh secret set AZURE_TENANT_ID       --env dev --body "$(az account show --query tenantId -o tsv)"
 gh secret set AZURE_SUBSCRIPTION_ID --env dev --body "$(az account show --query id -o tsv)"
+gh secret set AZURE_CLIENT_OID      --env dev --body "$(az ad sp show --id <app-client-id> --query id -o tsv)"
+gh secret set DEBUG_USER_OID        --env dev --body "$(az ad signed-in-user show --query id -o tsv)"
 ```
 
 ## Running in CI
 
-From the **Actions** tab, dispatch **E2E Tests** with the defaults to run a single-version ephemeral-mode pass against the `dev` environment:
+From the **Actions** tab, dispatch **E2E Tests** with the defaults to run a single-release ephemeral-mode pass against the `dev` environment:
 
 | Input | Typical value | Notes |
 |-------|--------------|-------|
-| `aio-versions` | `2603` or `2603,2610` | Comma-separated. Ephemeral fans out in parallel; persistent serializes cells in the same RG. See [aio-versions.md](aio-versions.md) for how versions are defined and pinned. |
+| `aio-releases` | `2603` or `2603,2604` | Comma-separated. Ephemeral fans out in parallel; persistent serializes cells in the same RG. See [aio-versions.md](aio-versions.md) for how releases are defined and pinned. |
 | `environment` | `dev` | GitHub Environment whose secrets/approvers apply. |
 | `location` | `eastus2` | ephemeral mode only; persistent derives from the RG. |
 | `resource-group` | empty (ephemeral) or existing RG (persistent) | |
@@ -92,6 +112,7 @@ From the **Actions** tab, dispatch **E2E Tests** with the defaults to run a sing
 | `custom-locations-oid` | tenant value | See prerequisite 2. |
 | `skip-teardown` | false | Preserve the deployment for inspection. Scope depends on mode (see below). |
 | `keep-cluster-alive-minutes` | `0` | Hold the runner for N min before teardown for debugging. Max 300. Nothing should be added to the persistent RG during the hold (it'll be deleted by teardown). |
+| `upgrade-to` | empty or `2604` | Optional AIO release to upgrade to after install-phase tests pass. Empty skips the upgrade phase. Per-cell skip when equal to the cell's `aio-releases` value. |
 
 ### What `skip-teardown` leaves behind
 
@@ -112,7 +133,7 @@ Persistent teardown deletes the Arc cluster only if it was not present in the pr
 
 **Use a dedicated RG for persistent mode.** Anything added to the RG between the snapshot and teardown — by operators, automation, or a `keep-cluster-alive-minutes` hold — appears in the delta and is deleted.
 
-A JUnit XML artifact is uploaded per matrix cell (`e2e-results-<version>.xml`).
+A JUnit XML artifact is uploaded per matrix cell (`e2e-results-<release>.xml`). When `upgrade-to` is set and the cell exercises the upgrade phase, a second artifact (`e2e-results-<release>-to-<upgrade-to>.xml`) is uploaded with the upgrade-only test results.
 
 ## Running locally
 
@@ -124,7 +145,7 @@ Set three required env vars; three more are auto-computed on first use.
 |----------|----------|---------|
 | `E2E_RESOURCE_GROUP` | yes | n/a |
 | `E2E_CLUSTER_NAME` | yes | n/a |
-| `E2E_AIO_VERSION` | yes | n/a |
+| `E2E_AIO_RELEASE` | yes | n/a |
 | `E2E_SITE_NAME` | no | `e2e-local-<unix_time>` |
 | `E2E_SUBSCRIPTION` | no | `az account show --query id -o tsv` |
 | `E2E_LOCATION` | no | `az group show -n $E2E_RESOURCE_GROUP --query location -o tsv` |
@@ -134,7 +155,7 @@ Set three required env vars; three more are auto-computed on first use.
 ```powershell
 $env:E2E_RESOURCE_GROUP = "rg-e2e-dev"
 $env:E2E_CLUSTER_NAME   = "arc-e2e-dev"
-$env:E2E_AIO_VERSION    = "2603"
+$env:E2E_AIO_RELEASE    = "2603"
 $env:E2E_SITE_NAME      = "e2e-local-$([DateTimeOffset]::Now.ToUnixTimeSeconds())"
 
 $sitesDir = Join-Path $env:TEMP "e2e-sites"
@@ -151,7 +172,7 @@ pytest tests/integration/ -v -m integration
 ```bash
 export E2E_RESOURCE_GROUP=rg-e2e-dev
 export E2E_CLUSTER_NAME=arc-e2e-dev
-export E2E_AIO_VERSION=2603
+export E2E_AIO_RELEASE=2603
 export E2E_SITE_NAME="e2e-local-$(date +%s)"
 
 SITES_DIR="${TMPDIR:-/tmp}/e2e-sites"
@@ -166,6 +187,24 @@ pytest tests/integration/ -v -m integration
 Setting `E2E_SITE_NAME` explicitly (or letting the renderer default to `e2e-local-<unix_time>`) gives you a predictable site name up front; the renderer also writes the file as `<E2E_SITE_NAME>.yaml` so the filename matches the site's `name:` field (the standard siteops convention).
 
 You must already be logged in (`az login`) and have the cluster registered with Arc; the workflow automates these steps but local runs assume you already have an Arc-enabled target.
+
+### Running upgrade-phase tests locally
+
+To exercise the cross-release upgrade locally, install at one release first (block above), then re-render the site at the upgrade target and run the upgrade-only test classes:
+
+```bash
+# Re-render with the upgrade target; same E2E_SITE_NAME so the file overwrites in place.
+export E2E_AIO_RELEASE=2604
+python scripts/render-e2e-site.py --output-dir "$SITES_DIR"
+
+export SITEOPS_E2E_UPGRADE_PHASE=1
+pytest tests/integration/ -v -m integration
+```
+
+`SITEOPS_E2E_UPGRADE_PHASE=1` does two things:
+
+- **Narrows test collection** to `TestAioUpgradeDeployment`, `TestAioUpgradeResolveExtensions`, `TestAioUpgradeSelfConsistency`, and `TestAioUpgradeIdempotency`. Everything else is skipped. `TestAioUpgradePreservation` is excluded because its assertions consume install-phase outputs that are not available across separately rendered phases.
+- **Short-circuits the `aio_install_result` fixture** so `aio-install.yaml` is not re-deployed at the new release on top of the existing instance.
 
 ## Troubleshooting
 

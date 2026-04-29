@@ -1,3 +1,12 @@
+// schema-registry-role.bicep
+// -------------------------------------------------------------------------------------
+// Grants the AIO extension's system-assigned MI Contributor on an existing
+// Schema Registry. Run after both schema-registry and the AIO instance exist.
+//
+// Inputs:  schemaRegistryName, aioExtensionPrincipalId.
+// Outputs: none (role assignment is idempotent on the same triple of scope/principal/role).
+// -------------------------------------------------------------------------------------
+
 metadata description = 'Assigns Contributor role to AIO extension on Schema Registry.'
 
 /*****************************************************************************/
@@ -14,7 +23,7 @@ param aioExtensionPrincipalId string
 /*                          Existing Resources                               */
 /*****************************************************************************/
 
-resource schemaRegistry 'Microsoft.DeviceRegistry/schemaRegistries@2024-09-01-preview' existing = {
+resource schemaRegistry 'Microsoft.DeviceRegistry/schemaRegistries@2025-10-01' existing = {
   name: schemaRegistryName
 }
 
@@ -28,7 +37,7 @@ resource aioExtensionSchemaRegistryRole 'Microsoft.Authorization/roleAssignments
   name: guid(schemaRegistry.id, aioExtensionPrincipalId, 'b24988ac-6180-42a0-ab88-20f7382dd24c')
   scope: schemaRegistry
   properties: {
-    roleDefinitionId: resourceId('Microsoft.Authorization/roleDefinitions', 'b24988ac-6180-42a0-ab88-20f7382dd24c')
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'b24988ac-6180-42a0-ab88-20f7382dd24c')
     principalId: aioExtensionPrincipalId
     principalType: 'ServicePrincipal'
   }

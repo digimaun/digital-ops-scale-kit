@@ -31,6 +31,10 @@ on:
 env:
   PYTHONUNBUFFERED: "1"
 
+concurrency:
+  group: integration-test-${{ inputs.environment }}
+  cancel-in-progress: false
+
 jobs:
   integration-test:
     name: Integration Tests
@@ -61,8 +65,9 @@ jobs:
 
       - name: Select test scope
         id: scope
+        env:
+          MANIFEST: ${{ inputs.manifest }}
         run: |
-          MANIFEST="${{ inputs.manifest }}"
           if [[ "$MANIFEST" == "all" ]]; then
             echo "pytest_args=tests/integration/" >> $GITHUB_OUTPUT
           else
@@ -84,8 +89,9 @@ jobs:
           SITE_OVERRIDES: ${{ secrets.SITE_OVERRIDES }}
           INTEGRATION_SKIP_CLEANUP: ${{ inputs.skip-cleanup }}
           INTEGRATION_SELECTOR: ${{ inputs.selector }}
+          PYTEST_ARGS: ${{ steps.scope.outputs.pytest_args }}
         run: >
-          pytest ${{ steps.scope.outputs.pytest_args }}
+          pytest $PYTEST_ARGS
           -v --tb=long
           -m integration
           --junitxml=integration-results.xml

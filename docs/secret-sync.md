@@ -171,28 +171,33 @@ To sync secrets as part of a manifest, add a step after enablement:
 
 ```
 templates/
+├── aio/
+│   ├── resolve-aio.bicep                    # Read-only instance → CL → cluster resolution (router)
+│   └── modules/
+│       ├── resolve-instance-2025-10-01.bicep  # Per-API-version instance read
+│       ├── resolve-instance-2026-03-01.bicep  # Per-API-version instance read
+│       └── update-instance.bicep            # Shared safe instance PUT (router); used by the secretsync flow
 ├── common/
-│   ├── resolve-aio.bicep                    # Read-only instance → CL → cluster resolution
 │   └── modules/
 │       ├── resolve-custom-location.bicep    # CL resource ID → name, namespace, hostResourceId
 │       └── resolve-cluster.bicep            # Cluster resource ID → name, OIDC issuer URLs
-├── secretsync/
-│   ├── enable-secretsync.bicep              # Creates MI, KV, roles, FIC, SPC, instance update
-│   ├── sync-secret.bicep                    # Syncs a KV secret to a K8s secret
-│   └── modules/
-│       ├── update-instance.bicep            # Safe instance PUT with identity forwarding
-│       └── keyvault-roles.bicep             # KV role assignments (cross-RG capable)
+└── secretsync/
+    ├── enable-secretsync.bicep              # Creates MI, KV, roles, FIC, SPC, instance update
+    ├── sync-secret.bicep                    # Syncs a KV secret to a K8s secret
+    └── modules/
+        └── keyvault-roles.bicep             # KV role assignments (cross-RG capable)
 ```
 
 ### Resolve modules
 
-The `common/` directory contains reusable resolution templates. `resolve-aio.bicep` is the entry point and chains through co-located modules:
+`resolve-aio.bicep` is the entry point. It is a router on `aioApiVersion` (sourced from `parameters/aio-versions/<v>.yaml`) that dispatches the instance read to a per-API-version inner module, then chains the (version-stable) custom-location and connected-cluster lookups:
 
 | Module | Input | Outputs |
 |--------|-------|---------|
-| `resolve-aio.bicep` | `aioInstanceName` | All infrastructure names + instance properties |
-| `resolve-custom-location.bicep` | CL resource ID | `name`, `namespace`, `hostResourceId` |
-| `resolve-cluster.bicep` | Cluster resource ID | `name`, `oidcIssuerUrl`, `selfHostedIssuerUrl` |
+| `aio/resolve-aio.bicep` | `aioInstanceName`, `aioApiVersion` | All infrastructure names + instance properties |
+| `aio/modules/resolve-instance-<v>.bicep` | `aioInstanceName` | Instance fields read at API version `<v>` |
+| `common/modules/resolve-custom-location.bicep` | CL resource ID | `name`, `namespace`, `hostResourceId` |
+| `common/modules/resolve-cluster.bicep` | Cluster resource ID | `name`, `oidcIssuerUrl`, `selfHostedIssuerUrl` |
 
 These modules use Bicep's **module boundary** pattern: runtime resource IDs passed as module parameters become compile-time values inside the module, enabling chained `existing` resource lookups.
 
@@ -200,8 +205,8 @@ These modules use Bicep's **module boundary** pattern: runtime resource IDs pass
 
 | Module | Purpose |
 |--------|---------|
-| `update-instance.bicep` | Safe instance PUT that forwards all writable properties for the pinned API version, with conditional identity handling |
-| `keyvault-roles.bicep` | Key Vault role assignments via module scope, supporting cross-resource-group Key Vaults |
+| `aio/modules/update-instance.bicep` | Safe instance PUT that forwards all writable properties for the pinned API version, with conditional identity handling |
+| `secretsync/modules/keyvault-roles.bicep` | Key Vault role assignments via module scope, supporting cross-resource-group Key Vaults |
 
 ## Troubleshooting
 

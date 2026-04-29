@@ -17,7 +17,7 @@ parameters:
     displayName: Manifest
     type: string
     default: aio-install
-    values: [aio-install, opc-ua-solution]
+    values: [aio-install, aio-upgrade, secretsync, opc-ua-solution]
 
   - name: environment
     displayName: Target environment
@@ -87,24 +87,33 @@ stages:
             displayName: Validate manifest exists
 
           - script: |
-              SELECTOR="$(echo "${{ parameters.selector }}" | xargs)"
+              SELECTOR="$(echo "$INPUT_SELECTOR" | xargs)"
               if [ -n "$SELECTOR" ]; then
-                COMBINED="environment=${{ parameters.environment }},$SELECTOR"
+                COMBINED="environment=$ENV,$SELECTOR"
               else
-                COMBINED="environment=${{ parameters.environment }}"
+                COMBINED="environment=$ENV"
               fi
 
               SUMMARY_FILE="$(Build.ArtifactStagingDirectory)/deploy-config.md"
               echo "### Deployment Configuration" > "$SUMMARY_FILE"
               echo "| Setting | Value |" >> "$SUMMARY_FILE"
               echo "|---------|-------|" >> "$SUMMARY_FILE"
-              echo "| Workspace | \`workspaces/${{ parameters.workspace }}\` |" >> "$SUMMARY_FILE"
-              echo "| Manifest | \`manifests/${{ parameters.manifest }}.yaml\` |" >> "$SUMMARY_FILE"
-              echo "| Environment | \`${{ parameters.environment }}\` |" >> "$SUMMARY_FILE"
+              echo "| Workspace | \`$WORKSPACE_DIR\` |" >> "$SUMMARY_FILE"
+              echo "| Manifest | \`$MANIFEST_REL\` |" >> "$SUMMARY_FILE"
+              echo "| Environment | \`$ENV\` |" >> "$SUMMARY_FILE"
               echo "| Selector | \`$COMBINED\` |" >> "$SUMMARY_FILE"
-              echo "| Dry Run | \`${{ parameters.dryRun }}\` |" >> "$SUMMARY_FILE"
+              echo "| Dry Run | \`$DRY_RUN\` |" >> "$SUMMARY_FILE"
               echo "##vso[task.uploadsummary]$SUMMARY_FILE"
             displayName: Write deployment summary
+            # Free-form params (selector) are routed through env vars rather
+            # than interpolated into the script body so a parameter containing
+            # shell metachars cannot break out of the command.
+            env:
+              ENV: ${{ parameters.environment }}
+              INPUT_SELECTOR: ${{ parameters.selector }}
+              WORKSPACE_DIR: workspaces/${{ parameters.workspace }}
+              MANIFEST_REL: manifests/${{ parameters.manifest }}.yaml
+              DRY_RUN: ${{ parameters.dryRun }}
 
   - template: templates/siteops-deploy.yaml
     parameters:

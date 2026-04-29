@@ -23,8 +23,8 @@ name: E2E Tests
 on:
   workflow_dispatch:
     inputs:
-      aio-versions:
-        description: Comma-separated AIO versions to fan out over (e.g. "2603,2610").
+      aio-releases:
+        description: Comma-separated AIO releases to fan out over (e.g. "2603,2604").
         type: string
         default: "2603"
       environment:
@@ -55,6 +55,10 @@ on:
         description: Minutes to keep the runner (and k3s cluster) alive after tests, before teardown. 0 = skip. Capped at 300.
         type: number
         default: 0
+      upgrade-to:
+        description: Optional AIO release to upgrade to after the install-phase tests pass. Empty = skip the upgrade phase. Each matrix cell whose `aio-releases` value differs from this re-renders the site at the upgrade-to release and runs aio-upgrade.yaml + the upgrade-only integration tests.
+        type: string
+        default: ""
 
 permissions:
   id-token: write
@@ -69,6 +73,7 @@ jobs:
       rg-key: ${{ steps.v.outputs.rg_key }}
       rg-in: ${{ steps.v.outputs.rg_in }}
       cluster-in: ${{ steps.v.outputs.cluster_in }}
+      upgrade-to: ${{ steps.v.outputs.upgrade_to }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -78,39 +83,60 @@ jobs:
         id: v
         shell: bash
         env:
-          INPUT_VERSIONS: "${{ inputs.aio-versions }}"
+          INPUT_RELEASES: "${{ inputs.aio-releases }}"
           INPUT_RG: "${{ inputs.resource-group }}"
           INPUT_CLUSTER: "${{ inputs.cluster-name }}"
+          INPUT_UPGRADE_TO: "${{ inputs.upgrade-to }}"
           RUN_ID: "${{ github.run_id }}"
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json, os, sys
           from pathlib import Path
-          vs = [v.strip() for v in os.environ["INPUT_VERSIONS"].split(",") if v.strip()]
-          if not vs:
-              sys.exit("aio-versions must be non-empty")
-          # Fail fast if any requested version lacks a shipped config YAML.
+          rs = [r.strip() for r in os.environ["INPUT_RELEASES"].split(",") if r.strip()]
+          if not rs:
+              sys.exit("aio-releases must be non-empty")
+          # Fail fast if any requested release lacks a shipped config YAML.
           # Without this, a typo (e.g. "2604" when only "2603" is shipped)
           # proceeds through k3s bring-up + Arc registration and only errors
           # out at siteops deploy time.
           versions_dir = Path("workspaces/iot-operations/parameters/aio-versions")
-          missing = [v for v in vs if not (versions_dir / f"{v}.yaml").is_file()]
+          missing = [r for r in rs if not (versions_dir / f"{r}.yaml").is_file()]
           if missing:
               available = sorted(p.stem for p in versions_dir.glob("*.yaml"))
               sys.exit(
-                  f"aio-versions entries without a matching "
-                  f"{versions_dir}/<version>.yaml: {missing}. "
+                  f"aio-releases entries without a matching "
+                  f"{versions_dir}/<release>.yaml: {missing}. "
                   f"Available: {available}."
               )
           rg_in = os.environ["INPUT_RG"].strip()
           cl_in = os.environ["INPUT_CLUSTER"].strip()
+          upgrade_to = os.environ["INPUT_UPGRADE_TO"].strip()
           persistent = bool(rg_in)
-          if cl_in and len(vs) > 1:
+          if cl_in and len(rs) > 1:
               sys.exit(
-                  "cluster-name cannot be combined with a multi-version "
-                  "aio-versions matrix (each matrix cell registers its own cluster)."
+                  "cluster-name cannot be combined with a multi-release "
+                  "aio-releases matrix (each matrix cell registers its own cluster)."
               )
-          print(f"versions={json.dumps(vs)}")
+          # Validate upgrade-to against shipped versions. Same-version cells
+          # are NOT a hard error here: a matrix like `aio-releases=2603,2604`
+          # with `upgrade-to=2604` is a legitimate "test 2603->2604 plus
+          # exercise 2604 install" shape. Each cell decides per-cell whether
+          # to skip the upgrade phase based on `matrix.aio-release == upgrade-to`.
+          if upgrade_to and not (versions_dir / f"{upgrade_to}.yaml").is_file():
+              available = sorted(p.stem for p in versions_dir.glob("*.yaml"))
+              sys.exit(
+                  f"upgrade-to '{upgrade_to}' has no matching "
+                  f"{versions_dir}/{upgrade_to}.yaml. Available: {available}."
+              )
+          if upgrade_to and all(r == upgrade_to for r in rs):
+              sys.exit(
+                  f"upgrade-to '{upgrade_to}' equals every entry in aio-releases "
+                  f"({rs}); the upgrade phase would be vacuous on every cell. "
+                  f"Same-version round-trip is already covered by the install-phase "
+                  f"test_aio_upgrade_manifest tests."
+              )
+          print(f"versions={json.dumps(rs)}")
+          print(f"upgrade_to={upgrade_to}")
           print(f"persistent={'true' if persistent else 'false'}")
           # Emit trimmed operator inputs so downstream steps use the exact
           # values the validation was done against (no trailing-whitespace
@@ -123,7 +149,7 @@ jobs:
           #    persistent runs on one RG serialize. Prevents races where two
           #    runs' delta snapshots each see the other's in-flight resources.
           #  - ephemeral:  per-run key; matrix cells parallelize via the
-          #    matrix.aio-version suffix applied at the job level.
+          #    matrix.aio-release suffix applied at the job level.
           rg_key = f"persistent-{rg_in}" if persistent else f"ephemeral-{os.environ['RUN_ID']}"
           print(f"rg_key={rg_key}")
           PY
@@ -132,20 +158,21 @@ jobs:
     needs: prep
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
-    timeout-minutes: ${{ inputs.keep-cluster-alive-minutes > 0 && 360 || 60 }}
+    timeout-minutes: ${{ (inputs.keep-cluster-alive-minutes > 0 || inputs.upgrade-to != '') && 360 || 120 }}
     concurrency:
-      # Persistent: matrix cells share rg_key and omit the version suffix, so
+      # Persistent: matrix cells share rg_key and omit the release suffix, so
       # they serialize (same RG can only host one AIO deploy at a time).
-      # Ephemeral: rg_key is per-run and the version suffix distinguishes
+      # Ephemeral: rg_key is per-run and the release suffix distinguishes
       # cells, so matrix fan-out runs in parallel.
-      group: e2e-${{ needs.prep.outputs.rg-key }}${{ needs.prep.outputs.persistent == 'true' && '-persistent' || format('-{0}', matrix.aio-version) }}
+      group: e2e-${{ needs.prep.outputs.rg-key }}${{ needs.prep.outputs.persistent == 'true' && '-persistent' || format('-{0}', matrix.aio-release) }}
       cancel-in-progress: false
     strategy:
       fail-fast: false
       matrix:
-        aio-version: ${{ fromJSON(needs.prep.outputs.versions) }}
+        aio-release: ${{ fromJSON(needs.prep.outputs.versions) }}
     env:
       PERSISTENT_RG: ${{ needs.prep.outputs.persistent }}
+      DEBUG_USER_OID: ${{ secrets.DEBUG_USER_OID }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -157,19 +184,19 @@ jobs:
         env:
           RG_IN: "${{ needs.prep.outputs.rg-in }}"
           CL_IN: "${{ needs.prep.outputs.cluster-in }}"
-          VERSION: "${{ matrix.aio-version }}"
+          RELEASE: "${{ matrix.aio-release }}"
           RUN_SUFFIX: "${{ github.run_id }}-${{ github.run_attempt }}"
-        # Some AIO version strings contain dots (e.g. "1.0.32"). Arc clusters
+        # Some AIO release strings may contain dots. Arc clusters
         # and several AIO-derived resource names reject dots, so we derive a
         # name-safe form (non-alphanumerics → `-`, trailing `-` trimmed) when
-        # generating RG / cluster / site names. E2E_AIO_VERSION still carries
-        # the original string so version pinning inside the site is unaffected.
+        # generating RG / cluster / site names. E2E_AIO_RELEASE still carries
+        # the original string so release pinning inside the site is unaffected.
         #
         # site_name is always runtime-unique even in persistent mode so
         # parallel runs against the same RG cannot silently merge sites.
         run: |
           set -euo pipefail
-          SAFE_VER=$(printf '%s' "$VERSION" | tr -c 'a-zA-Z0-9' '-' | sed 's/-*$//')
+          SAFE_VER=$(printf '%s' "$RELEASE" | tr -c 'a-zA-Z0-9' '-' | sed 's/-*$//')
           SUFFIX="${RUN_SUFFIX}-${SAFE_VER}"
           RG="${RG_IN:-rg-e2e-$SUFFIX}"
           CL="${CL_IN:-e2e-$SUFFIX}"
@@ -185,6 +212,36 @@ jobs:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Start OIDC token refresh service
+        shell: bash
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+        # Background re-auth every 4 minutes. GitHub OIDC tokens expire after
+        # ~5 minutes and Azure access tokens after ~60-90 minutes. Without this,
+        # long-running e2e jobs (upgrade phase, keep-cluster-alive, ephemeral
+        # teardown) silently fail az commands once the token expires, leaking
+        # Azure resources. Mirrors the pattern in _siteops-deploy.yaml.
+        run: |
+          (
+            while true; do
+              sleep 240
+              token=$(curl -sH "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+                "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange" | jq -r .value)
+              if [[ -z "$token" || "$token" == "null" ]]; then
+                echo "::warning::OIDC token refresh failed: could not obtain token"
+                continue
+              fi
+              if az login --service-principal -u "$AZURE_CLIENT_ID" -t "$AZURE_TENANT_ID" \
+                --federated-token "$token" --output none 2>&1; then
+                echo "OIDC token refreshed successfully"
+              else
+                echo "::warning::OIDC token refresh failed: az login returned error"
+              fi
+            done
+          ) &
+          echo "OIDC token refresh service started (PID: $!)"
 
       - name: Snapshot RG resources (persistent mode)
         if: env.PERSISTENT_RG == 'true'
@@ -208,20 +265,28 @@ jobs:
       - name: Create resource group (ephemeral mode)
         if: env.PERSISTENT_RG != 'true'
         shell: bash
+        env:
+          RG: ${{ steps.names.outputs.rg }}
+          LOCATION: ${{ inputs.location }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
         # Ownership tags are what the teardown guard verifies before
         # `az group delete`. run_id + run_attempt bind the tag set to THIS
         # specific workflow run so a pre-existing RG that happens to match
         # the name pattern cannot be deleted. Only an RG this run just
         # created can pass the guard.
+        # Inputs are routed through env (not ${{ }} interpolated into the
+        # shell line) so a workflow_dispatch input containing shell metachars
+        # cannot break out of the command.
         run: |
           az group create \
-            --name "${{ steps.names.outputs.rg }}" \
-            --location "${{ inputs.location }}" \
+            --name "$RG" \
+            --location "$LOCATION" \
             --tags \
               managedBy=siteops-e2e \
               ephemeral=true \
-              run_id="${{ github.run_id }}" \
-              run_attempt="${{ github.run_attempt }}"
+              run_id="$RUN_ID" \
+              run_attempt="$RUN_ATTEMPT"
 
       - name: Resolve E2E_LOCATION
         id: loc
@@ -269,6 +334,66 @@ jobs:
           custom-locations-oid: ${{ inputs.custom-locations-oid }}
           enable-workload-identity: "true"
 
+      - name: Check for kubectl manifest steps
+        id: rbac-check
+        shell: bash
+        # Any `type: kubectl` step in the workspace will dispatch through the
+        # Arc proxy and need namespace RBAC for the workflow SP. Skip the
+        # binding when no such step exists.
+        run: |
+          set -euo pipefail
+          if grep -rqE '^\s*type:\s*kubectl\s*$' workspaces/*/manifests/ 2>/dev/null; then
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Grant SP namespace-admin on azure-iot-operations (e2e bootstrap)
+        if: steps.rbac-check.outputs.needed == 'true'
+        shell: bash
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_OID: ${{ secrets.AZURE_CLIENT_OID }}
+        # kubectl steps that go through the Arc proxy authenticate as the
+        # workflow SP. k3s has no record of that identity, so bind it to
+        # namespace-admin on azure-iot-operations via the runner's local
+        # kubeconfig before siteops runs. Provide AZURE_CLIENT_OID as a
+        # secret to skip the Graph lookup (some SPs lack Directory.Read).
+        # Idempotent across reruns.
+        run: |
+          set -euo pipefail
+          if [[ -n "$AZURE_CLIENT_OID" ]]; then
+            SP_OID="$AZURE_CLIENT_OID"
+          else
+            echo "AZURE_CLIENT_OID not set; falling back to Graph lookup."
+            SP_OID=$(az ad sp show --id "$AZURE_CLIENT_ID" --query id -o tsv 2>/dev/null || true)
+            if [[ -z "$SP_OID" ]]; then
+              echo "::error::Could not resolve SP object ID. Set AZURE_CLIENT_OID secret to the SP's object ID, or grant the SP Directory.Read.All on Microsoft Graph."
+              exit 1
+            fi
+          fi
+          kubectl create namespace azure-iot-operations \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create rolebinding e2e-sp-admin \
+            --clusterrole=admin \
+            --user="$SP_OID" \
+            --namespace=azure-iot-operations \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Grant debug user cluster-admin on k3s (Arc proxy access)
+        if: env.DEBUG_USER_OID != ''
+        shell: bash
+        # Bind a human user (or group) to cluster-admin so they can inspect
+        # the k3s cluster via `az connectedk8s proxy`. Cluster-admin is
+        # appropriate for live debugging; the cluster is ephemeral. Set the
+        # DEBUG_USER_OID secret to enable.
+        run: |
+          set -euo pipefail
+          kubectl create clusterrolebinding e2e-debug-admin \
+            --clusterrole=cluster-admin \
+            --user="$DEBUG_USER_OID" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
       - uses: ./.github/actions/setup-siteops
         with:
           install-dev: "true"
@@ -281,7 +406,7 @@ jobs:
           E2E_RESOURCE_GROUP: ${{ steps.names.outputs.rg }}
           E2E_LOCATION: ${{ steps.loc.outputs.location }}
           E2E_CLUSTER_NAME: ${{ steps.names.outputs.cluster }}
-          E2E_AIO_VERSION: ${{ matrix.aio-version }}
+          E2E_AIO_RELEASE: ${{ matrix.aio-release }}
         run: |
           set -euo pipefail
           python scripts/render-e2e-site.py \
@@ -296,20 +421,68 @@ jobs:
         env:
           SITEOPS_EXTRA_SITES_DIRS: ${{ runner.temp }}/e2e-sites
           INTEGRATION_SELECTOR: name=${{ steps.names.outputs.site_name }}
-          AIO_VERSION: ${{ matrix.aio-version }}
-        # AIO_VERSION is routed through env (not ${{ }} interpolated into the
+          AIO_RELEASE: ${{ matrix.aio-release }}
+        # AIO_RELEASE is routed through env (not ${{ }} interpolated into the
         # shell line) so a workflow_dispatch input containing shell metachars
         # cannot break out of the command.
         run: |
           set -euo pipefail
           pytest tests/integration/ -v -m integration --tb=long \
-            --junitxml="e2e-results-${AIO_VERSION}.xml"
+            --junitxml="e2e-results-${AIO_RELEASE}.xml"
 
       - uses: actions/upload-artifact@v6
         if: always()
         with:
-          name: e2e-results-${{ matrix.aio-version }}
-          path: e2e-results-${{ matrix.aio-version }}.xml
+          name: e2e-results-${{ matrix.aio-release }}
+          path: e2e-results-${{ matrix.aio-release }}.xml
+
+      - name: Re-render E2E site at upgrade-to
+        id: upgrade_render
+        if: success() && needs.prep.outputs.upgrade-to != '' && needs.prep.outputs.upgrade-to != matrix.aio-release
+        shell: bash
+        env:
+          E2E_SITE_NAME: ${{ steps.names.outputs.site_name }}
+          E2E_SUBSCRIPTION: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          E2E_RESOURCE_GROUP: ${{ steps.names.outputs.rg }}
+          E2E_LOCATION: ${{ steps.loc.outputs.location }}
+          E2E_CLUSTER_NAME: ${{ steps.names.outputs.cluster }}
+          E2E_AIO_RELEASE: ${{ needs.prep.outputs.upgrade-to }}
+        # Overwrites the rendered site at the same path (E2E_SITE_NAME is
+        # unchanged) so SITEOPS_EXTRA_SITES_DIRS still resolves the same
+        # site key but with the upgrade-to release pinned.
+        run: |
+          set -euo pipefail
+          python scripts/render-e2e-site.py \
+            --template tests/e2e/sites/e2e-test.yaml.tmpl \
+            --output-dir "$RUNNER_TEMP/e2e-sites"
+          echo "::group::Rendered site (upgrade-to ${E2E_AIO_RELEASE})"
+          cat "$RUNNER_TEMP/e2e-sites/${E2E_SITE_NAME}.yaml"
+          echo "::endgroup::"
+
+      - name: Run upgrade-phase integration tests
+        if: success() && needs.prep.outputs.upgrade-to != '' && needs.prep.outputs.upgrade-to != matrix.aio-release
+        shell: bash
+        env:
+          SITEOPS_EXTRA_SITES_DIRS: ${{ runner.temp }}/e2e-sites
+          INTEGRATION_SELECTOR: name=${{ steps.names.outputs.site_name }}
+          SITEOPS_E2E_UPGRADE_PHASE: "1"
+          AIO_RELEASE_FROM: ${{ matrix.aio-release }}
+          AIO_RELEASE_TO: ${{ needs.prep.outputs.upgrade-to }}
+        # SITEOPS_E2E_UPGRADE_PHASE is the contract with conftest.py:
+        #   - aio_install_result becomes a sentinel (re-running install on
+        #     an existing instance at a new release is unsupported).
+        #   - pytest_collection_modifyitems narrows the run to the upgrade
+        #     test classes that operate purely on upgrade-step outputs.
+        run: |
+          set -euo pipefail
+          pytest tests/integration/ -v -m integration --tb=long \
+            --junitxml="e2e-results-${AIO_RELEASE_FROM}-to-${AIO_RELEASE_TO}.xml"
+
+      - uses: actions/upload-artifact@v6
+        if: always() && needs.prep.outputs.upgrade-to != '' && needs.prep.outputs.upgrade-to != matrix.aio-release
+        with:
+          name: e2e-results-${{ matrix.aio-release }}-to-${{ needs.prep.outputs.upgrade-to }}
+          path: e2e-results-${{ matrix.aio-release }}-to-${{ needs.prep.outputs.upgrade-to }}.xml
 
       - name: Keep cluster alive (pre-teardown hold)
         if: always() && inputs.keep-cluster-alive-minutes > 0

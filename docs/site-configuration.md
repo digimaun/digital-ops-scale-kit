@@ -110,7 +110,7 @@ Structured **metadata** and **deployment options**:
 
 ```yaml
 properties:
-  aioVersion: "2603"                   # Target AIO version (see [aio-versions.md](aio-versions.md))
+  aioRelease: "2603"                   # Target AIO release (see [aio-versions.md](aio-versions.md))
   deployOptions:                       # Control deployment behavior
     includeSolution: true
     includeOpcPlcSimulator: false

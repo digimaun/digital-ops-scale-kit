@@ -68,7 +68,7 @@ param certManagerPresent bool
 
 // =====================================================================================
 // Parameters — target versions (all optional; empty = preserve resolved).
-// Names mirror the keys in `parameters/aio-versions/<ver>.yaml` so the version config
+// Names mirror the keys in `parameters/aio-releases/<release>.yaml` so the release config
 // can be wired in directly via the manifest's `parameters:` list (same source the
 // install path consumes).
 // =====================================================================================

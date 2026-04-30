@@ -437,7 +437,7 @@ steps:
 """
         )
 
-        manifest = Manifest.from_file(manifest_path)
+        manifest = Manifest.from_file(manifest_path, workspace_root=manifest_path.parent)
 
         assert manifest.parallel.sites == 2
         assert manifest.parallel.max_workers == 2

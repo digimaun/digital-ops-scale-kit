@@ -47,7 +47,7 @@ This pattern keeps templates portable. `enable-secretsync.bicep` never makes ass
 
 ### Output chaining
 
-The parameter file `parameters/secretsync-chaining.yaml` maps outputs from the resolve step to the enablement step's inputs:
+The parameter file `parameters/inputs/secretsync.yaml` maps outputs from the resolve step to the enablement step's inputs:
 
 ```yaml
 # Resolved infrastructure names
@@ -162,7 +162,7 @@ To sync secrets as part of a manifest, add a step after enablement:
   template: templates/secretsync/sync-secret.bicep
   scope: resourceGroup
   parameters:
-    - parameters/secretsync-chaining.yaml
+    - parameters/inputs/secretsync.yaml
     # secretValue comes from sites.local/ or CI secrets
   when: "{{ site.properties.deployOptions.enableSecretSync }}"
 ```
@@ -190,7 +190,7 @@ templates/
 
 ### Resolve modules
 
-`resolve-aio.bicep` is the entry point. It is a router on `aioApiVersion` (sourced from `parameters/aio-versions/<v>.yaml`) that dispatches the instance read to a per-API-version inner module, then chains the (version-stable) custom-location and connected-cluster lookups:
+`resolve-aio.bicep` is the entry point. It is a router on `aioApiVersion` (sourced from `parameters/aio-releases/<release>.yaml`) that dispatches the instance read to a per-API-version inner module, then chains the (version-stable) custom-location and connected-cluster lookups:
 
 | Module | Input | Outputs |
 |--------|-------|---------|

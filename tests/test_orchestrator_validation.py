@@ -1625,7 +1625,7 @@ resourceGroup: rg-test
 location: eastus
 properties:
   deployOptions:
-    includeGlobalSite: false
+    enableGlobalSite: false
 """
         )
 
@@ -1640,7 +1640,7 @@ steps:
   - name: global-edge-site
     template: templates/test.bicep
     scope: subscription
-    when: "{{ site.properties.deployOptions.includeGlobalSite }}"
+    when: "{{ site.properties.deployOptions.enableGlobalSite }}"
   - name: rg-step
     template: templates/test.bicep
     scope: resourceGroup
@@ -1668,7 +1668,7 @@ resourceGroup: rg-test
 location: eastus
 properties:
   deployOptions:
-    includeGlobalSite: true
+    enableGlobalSite: true
 """
         )
 
@@ -1683,7 +1683,7 @@ steps:
   - name: global-edge-site
     template: templates/test.bicep
     scope: subscription
-    when: "{{ site.properties.deployOptions.includeGlobalSite }}"
+    when: "{{ site.properties.deployOptions.enableGlobalSite }}"
   - name: rg-step
     template: templates/test.bicep
     scope: resourceGroup
@@ -1711,7 +1711,7 @@ resourceGroup: rg-skip
 location: eastus
 properties:
   deployOptions:
-    includeGlobalSite: false
+    enableGlobalSite: false
 """
         )
         (tmp_workspace / "sites" / "run-site.yaml").write_text(
@@ -1724,7 +1724,7 @@ resourceGroup: rg-run
 location: eastus
 properties:
   deployOptions:
-    includeGlobalSite: true
+    enableGlobalSite: true
 """
         )
 
@@ -1740,7 +1740,7 @@ steps:
   - name: global-edge-site
     template: templates/test.bicep
     scope: subscription
-    when: "{{ site.properties.deployOptions.includeGlobalSite }}"
+    when: "{{ site.properties.deployOptions.enableGlobalSite }}"
   - name: rg-step
     template: templates/test.bicep
     scope: resourceGroup
@@ -1768,8 +1768,8 @@ resourceGroup: rg-test
 location: eastus
 properties:
   deployOptions:
-    includeGlobalSite: false
-    includeEdgeSite: false
+    enableGlobalSite: false
+    enableEdgeSite: false
 """
         )
 
@@ -1784,11 +1784,11 @@ steps:
   - name: global-edge-site
     template: templates/test.bicep
     scope: subscription
-    when: "{{ site.properties.deployOptions.includeGlobalSite }}"
+    when: "{{ site.properties.deployOptions.enableGlobalSite }}"
   - name: another-sub-step
     template: templates/test.bicep
     scope: subscription
-    when: "{{ site.properties.deployOptions.includeEdgeSite }}"
+    when: "{{ site.properties.deployOptions.enableEdgeSite }}"
   - name: rg-step
     template: templates/test.bicep
     scope: resourceGroup

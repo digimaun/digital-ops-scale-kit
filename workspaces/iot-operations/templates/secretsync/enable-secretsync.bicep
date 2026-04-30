@@ -16,7 +16,7 @@
 //   6. IoT Operations instance update — sets defaultSecretProviderClassRef to the SPC
 //
 // Usage (with siteops output chaining from resolve-aio):
-//   The resolve-aio step outputs all required values. The secretsync-chaining.yaml
+//   The resolve-aio step outputs all required values. The inputs/secretsync.yaml
 //   parameter file maps those outputs to this template's parameters.
 //
 // Usage (standalone):

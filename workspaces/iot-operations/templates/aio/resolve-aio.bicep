@@ -17,14 +17,14 @@
 //
 // Why route on aioApiVersion: Microsoft.IoTOperations is an Arc-mapped RP;
 // the ARM API version on `existing` issues a real GET against that version's
-// CRD generation. The site's selected version config (aio-versions/<v>.yaml)
+// CRD generation. The site's selected release config (aio-releases/<release>.yaml)
 // is the source of truth for which API version to read with. During an
 // upgrade, this is the *target* API version; the GET against a source-version
 // instance relies on RP forward-compat for read shape.
 //
 // Usage (siteops manifest step):
 //   parameters:
-//     - "parameters/aio-versions/{{ site.properties.aioRelease }}.yaml"
+//     - "parameters/aio-releases/{{ site.properties.aioRelease }}.yaml"
 // -------------------------------------------------------------------------------------
 
 // =====================================================================================
@@ -34,7 +34,7 @@
 @description('Name of the existing IoT Operations instance.')
 param aioInstanceName string
 
-@description('IoT Operations API version for the instance read. Sourced from parameters/aio-versions/<v>.yaml; pin must match the version the site is currently on.')
+@description('IoT Operations API version for the instance read. Sourced from parameters/aio-releases/<release>.yaml; pin must match the version the site is currently on.')
 @allowed([
   '2025-10-01'
   '2026-03-01'

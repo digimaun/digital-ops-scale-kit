@@ -17,8 +17,7 @@ labels:
 
 properties:
   deployOptions:
-    includeSolution: false
-    includeOpcPlcSimulator: false
+    enableSecretSync: false
 
 parameters:
   clusterName: chicago-staging-arc

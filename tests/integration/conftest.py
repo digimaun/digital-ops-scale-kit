@@ -182,13 +182,13 @@ def _resolve_or_fail(
     test body's `for name in result["sites"]:` loop became a no-op. This
     helper makes that impossible at the fixture boundary.
     """
-    manifest = Manifest.from_file(manifest_path)
+    manifest = Manifest.from_file(manifest_path, workspace_root=WORKSPACE_PATH)
     sites = orchestrator.resolve_sites(manifest, selector)
     if not sites:
         raise RuntimeError(
             f"Integration fixture resolved zero sites for manifest "
             f"'{manifest_path.name}' (selector={selector!r}, "
-            f"manifest.siteSelector={manifest.site_selector!r}, "
+            f"manifest.selector={manifest.site_selector!r}, "
             f"manifest.sites={manifest.sites!r}, "
             f"extra_trusted_sites_dirs={[str(p) for p in _extra_sites_dirs()]}). "
             f"A zero-site integration run indicates a configuration mismatch "
@@ -241,8 +241,8 @@ def secretsync_result(
 def opc_ua_solution_result(
     orchestrator: Orchestrator, selector: str | None, aio_install_result: dict
 ) -> dict:
-    """Deploy opc-ua-solution.yaml after AIO is installed."""
-    manifest_path = WORKSPACE_PATH / "manifests" / "opc-ua-solution.yaml"
+    """Deploy samples/opc-ua-solution/manifest.yaml after AIO is installed."""
+    manifest_path = WORKSPACE_PATH / "samples" / "opc-ua-solution" / "manifest.yaml"
     manifest, sites = _resolve_or_fail(orchestrator, manifest_path, selector)
     return orchestrator.deploy(
         manifest_path=manifest_path,

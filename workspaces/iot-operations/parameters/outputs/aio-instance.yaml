@@ -1,6 +1,6 @@
 # Fan-out outputs from the aio-instance step, forwarded to later consumers.
-# See docs/parameter-resolution.md for the *-outputs.yaml convention.
-# Consumed by: schema-registry-role, opc-ua-solution
+# See docs/parameter-resolution.md for the inputs/outputs convention.
+# Consumed by: schema-registry-role
 
 # AIO extension outputs (for role assignments)
 aioExtensionName: "{{ steps.aio-instance.outputs.aioExtension.name }}"

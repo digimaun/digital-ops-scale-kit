@@ -14,8 +14,7 @@ labels:
 
 properties:
   deployOptions:
-    includeSolution: true
-    includeOpcPlcSimulator: false
+    enableSecretSync: false
 
 parameters:
   clusterName: munich-prod-arc

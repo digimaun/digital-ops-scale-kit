@@ -10,15 +10,13 @@ labels:
 
 properties:
   # AIO version (release moniker) - determines extension versions
-  # See: parameters/aio-versions/ for available versions
+  # See: parameters/aio-releases/ for available releases
   aioRelease: "2603"
 
   # Deployment options - control which components are deployed
   deployOptions:
-    includeGlobalSite: false      # Subscription-scoped edge site
-    includeEdgeSite: false        # RG-scoped edge site
-    includeSolution: false
-    includeOpcPlcSimulator: false
+    enableGlobalSite: false      # Subscription-scoped edge site
+    enableEdgeSite: false        # RG-scoped edge site
     enableSecretSync: false
 
 parameters:

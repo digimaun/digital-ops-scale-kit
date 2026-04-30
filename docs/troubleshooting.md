@@ -34,6 +34,16 @@ Error: Step 'aio-instance' references unknown step 'schema-reg'
 
 **Solution**: Check step names in manifest match the references in parameter files.
 
+### Site looks wrong after inheritance / overlay
+
+When a site's resolved values disagree with what you expect (wrong location, missing label, an overlay in `sites.local/` or an extras dir not taking effect), preview the fully-resolved shape:
+
+```
+siteops -w <workspace> sites <name> --render
+```
+
+The output is the post-inherit + post-overlay site as a single YAML doc, with empty `resourceGroup:` omitted for subscription-scoped sites. Use it to verify which file contributed which field before re-running a deploy.
+
 ## Deployment errors
 
 ### "ResourceGroupNotFound"

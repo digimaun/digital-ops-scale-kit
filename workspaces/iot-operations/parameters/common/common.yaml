@@ -1,5 +1,9 @@
 # Common parameters applied to all steps via manifest-level parameters.
 # Auto-filtering ensures each template only receives parameters it accepts.
+#
+# This file lives under `parameters/common/` (not at `parameters/` root) so
+# the dir mirrors the {common, inputs, outputs, aio-releases} convention
+# documented in `parameters/README.md`.
 
 # ─────────────────────────────────────────────────────────────
 # Site Identity
@@ -22,6 +26,8 @@ adrNamespaceName: "{{ site.name }}-ns"
 siteAddress:
   country: "{{ site.labels.country }}"
   city: "{{ site.labels.city }}"
+# `labels` here populates the Microsoft.Edge/sites `labels` Bicep param
+# (distinct from `site.labels` used for selectors / template substitution).
 labels:
   managedBy: siteops
 

@@ -104,7 +104,7 @@ From the **Actions** tab, dispatch **E2E Tests** with the defaults to run a sing
 
 | Input | Typical value | Notes |
 |-------|--------------|-------|
-| `aio-releases` | `2603` or `2603,2604` | Comma-separated. Ephemeral fans out in parallel; persistent serializes cells in the same RG. See [aio-versions.md](aio-versions.md) for how releases are defined and pinned. |
+| `aio-releases` | `2603` or `2603,2604` | Comma-separated. Ephemeral fans out in parallel; persistent serializes cells in the same RG. See [aio-releases.md](aio-releases.md) for how releases are defined and pinned. |
 | `environment` | `dev` | GitHub Environment whose secrets/approvers apply. |
 | `location` | `eastus2` | ephemeral mode only; persistent derives from the RG. |
 | `resource-group` | empty (ephemeral) or existing RG (persistent) | |

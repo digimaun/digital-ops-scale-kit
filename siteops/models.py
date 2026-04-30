@@ -25,6 +25,22 @@ VALID_SCOPES = {"subscription", "resourceGroup"}
 DEFAULT_API_VERSION = "siteops/v1"
 SUPPORTED_API_VERSIONS = {"siteops/v1"}
 
+# Maximum depth of recursive `include:` resolution. Anything deeper is a smell;
+# the cap exists to surface mistakes early rather than to bound real designs.
+MAX_INCLUDE_DEPTH = 8
+
+# Reserved keys for the `include:` step shape. Any other key on an include step
+# is an authoring error.
+_INCLUDE_ALLOWED_KEYS = {"include", "when"}
+
+
+class IncludeError(ValueError):
+    """Raised when a manifest `include:` directive cannot be resolved.
+
+    Subclass of ValueError so existing callers that catch ValueError still work.
+    """
+
+
 # Pattern for condition expressions in 'when' clauses
 # Supports:
 #   - Comparison: site.labels.<key> == 'value' or site.properties.<path> != 'value'
@@ -293,6 +309,11 @@ class Site:
 
         Raises:
             ValueError: If file is empty, invalid, or missing required fields
+
+        Note:
+            This is a low-level loader. It does NOT apply `inherits:` chains
+            or overlays from `sites.local/` / extras dirs. Use
+            `Orchestrator.load_site(name)` for fully-resolved sites.
         """
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
@@ -491,8 +512,12 @@ class Manifest:
     parameters: list[str] = field(default_factory=list)
 
     @classmethod
-    def from_file(cls, path: Path) -> "Manifest":
+    def from_file(cls, path: Path, *, workspace_root: Path) -> "Manifest":
         """Load a manifest from a YAML file.
+
+        Resolves any `- include: <path>` steps recursively, splicing the
+        included manifests' steps into this one's step list at the include's
+        position. See docs/manifest-includes.md for the full include contract.
 
         Example manifest:
             ```yaml
@@ -524,88 +549,65 @@ class Manifest:
             ```
 
         Args:
-            path: Path to the YAML file
+            path: Path to the YAML file.
+            workspace_root: Workspace root directory. Required, keyword-only.
+                Used as the anti-traversal boundary when resolving any
+                `include:` step paths and to scope all workspace-relative
+                references. In production this is `Orchestrator.workspace`;
+                in tests, pass the workspace fixture (or `manifest_path.parent`
+                for a self-contained synthetic manifest).
 
         Returns:
-            Manifest instance
+            Manifest instance with all includes resolved into a flat step list.
 
         Raises:
-            ValueError: If file is empty, invalid, or steps are misconfigured
+            ValueError: If file is empty, invalid, or steps are misconfigured.
+            IncludeError: If an include cycles, exceeds depth, escapes the
+                workspace root, names a missing or non-Manifest file,
+                conflicts with a step's own `when:`, or contributes zero steps.
         """
-        with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
+        path = Path(path)
+        root = Path(workspace_root)
 
-        if not data:
-            raise ValueError(f"Empty or invalid YAML file: {path}")
-
-        _validate_resource(data, "Manifest", path)
-
-        if "spec" in data:
-            metadata = data.get("metadata", {})
-            spec = data["spec"]
-            name = metadata.get("name", path.stem)
-            description = metadata.get("description", "")
-        else:
-            spec = data
-            name = data.get("name", path.stem)
-            description = data.get("description", "")
+        spec, name, description = _read_manifest_spec(path)
 
         sites = []
         for item in spec.get("sites", []):
             if isinstance(item, str):
                 sites.append(item)
 
-        site_selector = spec.get("siteSelector")
+        # `selector:` is the preferred manifest field. `siteSelector:` is
+        # accepted for backward compatibility but logs a one-time deprecation
+        # notice per file. Both refer to the same label expression.
+        if "selector" in spec and "siteSelector" in spec:
+            raise ValueError(
+                f"Manifest '{path}' declares both `selector:` and "
+                f"`siteSelector:`. Use `selector:` only."
+            )
+        if "siteSelector" in spec:
+            import logging as _logging
+            _logging.getLogger("siteops.models").warning(
+                "%s uses deprecated `siteSelector:`. Rename to `selector:`.",
+                path,
+            )
+            site_selector = spec.get("siteSelector")
+        else:
+            site_selector = spec.get("selector")
         parallel = ParallelConfig.from_value(spec.get("parallel"))
 
-        steps: list[ManifestStep] = []
-        for i, step_data in enumerate(spec.get("steps", [])):
-            if "name" not in step_data:
-                raise ValueError(f"Step {i+1} missing required field 'name' in manifest: {path}")
+        # Recursive include resolution. The recursion stack tracks the current
+        # DFS path so a fragment shared by two siblings is not flagged as a
+        # cycle. The include chain captures the full provenance for diagnostics.
+        steps, parameters = _resolve_steps_and_params(
+            spec=spec,
+            manifest_path=path,
+            workspace_root=root.resolve(),
+            recursion_stack=[path.resolve()],
+            include_chain=[path],
+            depth=0,
+        )
 
-            step_type = step_data.get("type", "deployment")
-
-            if step_type == "kubectl":
-                if "operation" not in step_data:
-                    raise ValueError(
-                        f"Step '{step_data['name']}' (type: kubectl) missing 'operation' in manifest: {path}"
-                    )
-                if "arc" not in step_data:
-                    raise ValueError(
-                        f"Step '{step_data['name']}' (type: kubectl) missing 'arc' configuration in manifest: {path}"
-                    )
-                arc_data = step_data["arc"]
-                if "name" not in arc_data or "resourceGroup" not in arc_data:
-                    raise ValueError(
-                        f"Step '{step_data['name']}' arc config must have 'name' and 'resourceGroup': {path}"
-                    )
-                if "files" not in step_data or not step_data["files"]:
-                    raise ValueError(f"Step '{step_data['name']}' (type: kubectl) missing 'files' in manifest: {path}")
-
-                steps.append(
-                    KubectlStep(
-                        name=step_data["name"],
-                        operation=step_data["operation"],
-                        arc=ArcCluster(
-                            name=arc_data["name"],
-                            resource_group=arc_data["resourceGroup"],
-                        ),
-                        files=step_data["files"],
-                        when=step_data.get("when"),
-                    )
-                )
-            else:
-                if "template" not in step_data:
-                    raise ValueError(f"Step '{step_data['name']}' missing 'template' in manifest: {path}")
-                steps.append(
-                    DeploymentStep(
-                        name=step_data["name"],
-                        template=step_data["template"],
-                        parameters=step_data.get("parameters", []),
-                        scope=step_data.get("scope", "resourceGroup"),
-                        when=step_data.get("when"),
-                    )
-                )
+        _validate_no_step_name_collisions(steps)
 
         return cls(
             name=name,
@@ -614,7 +616,7 @@ class Manifest:
             steps=steps,
             site_selector=site_selector,
             parallel=parallel,
-            parameters=spec.get("parameters", []),
+            parameters=parameters,
         )
 
     def resolve_parameter_path(self, param_path: str, site: "Site") -> str:
@@ -658,3 +660,271 @@ class Manifest:
                 result = result.replace(match.group(0), str(value))
 
         return result
+
+
+# ---------------------------------------------------------------------------
+# Manifest loading helpers (include resolution, step parsing)
+# ---------------------------------------------------------------------------
+
+
+def _read_manifest_spec(path: Path) -> tuple[dict[str, Any], str, str]:
+    """Read a manifest YAML file and return (spec, name, description).
+
+    Validates apiVersion + kind and unwraps the K8s-style `spec:` envelope
+    when present. Raises ValueError on empty files or wrong kind.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+
+    if not data:
+        raise ValueError(f"Empty or invalid YAML file: {path}")
+
+    _validate_resource(data, "Manifest", path)
+
+    if "spec" in data:
+        metadata = data.get("metadata", {})
+        spec = data["spec"]
+        name = metadata.get("name", path.stem)
+        description = metadata.get("description", "")
+    else:
+        spec = data
+        name = data.get("name", path.stem)
+        description = data.get("description", "")
+
+    return spec, name, description
+
+
+def _is_include_step(step_data: dict[str, Any]) -> bool:
+    return isinstance(step_data, dict) and "include" in step_data
+
+
+def _format_include_chain(chain: list[Path]) -> str:
+    return " -> ".join(str(p) for p in chain)
+
+
+def _validate_include_step(step_data: dict[str, Any], parent_path: Path, index: int) -> str:
+    """Validate an `include:` step shape and return the path string."""
+    extra = set(step_data.keys()) - _INCLUDE_ALLOWED_KEYS
+    if extra:
+        raise IncludeError(
+            f"Step {index + 1} in '{parent_path}' has unexpected keys alongside "
+            f"`include:`: {sorted(extra)}. Only `include` and `when` are allowed."
+        )
+    target = step_data.get("include")
+    if not isinstance(target, str) or not target.strip():
+        raise IncludeError(
+            f"Step {index + 1} in '{parent_path}' must provide a non-empty "
+            f"string path for `include`."
+        )
+    return target
+
+
+def _resolve_include_path(raw: str, parent_path: Path, workspace_root: Path) -> Path:
+    """Resolve a relative include path under the workspace root.
+
+    The resolved absolute path must be a descendant of workspace_root.
+    Site-driven (Mustache) include paths are not supported in v1 and will
+    fail the workspace-root check or the file-exists check.
+    """
+    candidate = (parent_path.parent / raw).resolve()
+    try:
+        candidate.relative_to(workspace_root)
+    except ValueError:
+        raise IncludeError(
+            f"Include path '{raw}' in '{parent_path}' resolves outside the "
+            f"workspace root '{workspace_root}'."
+        ) from None
+    if not candidate.exists():
+        raise IncludeError(
+            f"Include path '{raw}' in '{parent_path}' does not exist "
+            f"(resolved to '{candidate}')."
+        )
+    return candidate
+
+
+def _propagate_when(step: "ManifestStep", include_when: str | None, source: Path) -> None:
+    """Apply an include's `when:` to a spliced step.
+
+    Raises IncludeError if the step already has its own `when:`. Combining
+    two expressions is not supported in v1.
+    """
+    if include_when is None:
+        return
+    if step.when:
+        raise IncludeError(
+            f"Step '{step.name}' from '{source}' already has a `when:` "
+            f"and the parent include also sets one. Consolidate into a "
+            f"single condition on either the include or the step."
+        )
+    step.when = include_when
+
+
+def _parse_inline_step(step_data: dict[str, Any], source_path: Path, index: int) -> "ManifestStep":
+    """Parse a single non-include step into a DeploymentStep or KubectlStep."""
+    if "name" not in step_data:
+        raise ValueError(f"Step {index + 1} missing required field 'name' in manifest: {source_path}")
+
+    step_type = step_data.get("type", "deployment")
+
+    if step_type == "kubectl":
+        if "operation" not in step_data:
+            raise ValueError(
+                f"Step '{step_data['name']}' (type: kubectl) missing 'operation' in manifest: {source_path}"
+            )
+        if "arc" not in step_data:
+            raise ValueError(
+                f"Step '{step_data['name']}' (type: kubectl) missing 'arc' configuration in manifest: {source_path}"
+            )
+        arc_data = step_data["arc"]
+        if "name" not in arc_data or "resourceGroup" not in arc_data:
+            raise ValueError(
+                f"Step '{step_data['name']}' arc config must have 'name' and 'resourceGroup': {source_path}"
+            )
+        if "files" not in step_data or not step_data["files"]:
+            raise ValueError(
+                f"Step '{step_data['name']}' (type: kubectl) missing 'files' in manifest: {source_path}"
+            )
+        return KubectlStep(
+            name=step_data["name"],
+            operation=step_data["operation"],
+            arc=ArcCluster(
+                name=arc_data["name"],
+                resource_group=arc_data["resourceGroup"],
+            ),
+            files=step_data["files"],
+            when=step_data.get("when"),
+        )
+
+    if "template" not in step_data:
+        raise ValueError(f"Step '{step_data['name']}' missing 'template' in manifest: {source_path}")
+    return DeploymentStep(
+        name=step_data["name"],
+        template=step_data["template"],
+        parameters=step_data.get("parameters", []),
+        scope=step_data.get("scope", "resourceGroup"),
+        when=step_data.get("when"),
+    )
+
+
+def _merge_parameters(parent: list[str], fragment: list[str]) -> list[str]:
+    """Append fragment parameters after parent's, deduplicating by raw path.
+
+    Parent wins on duplicate paths. Comparison is on the normalized POSIX
+    string of the raw path, not on the resolved-with-Mustache path.
+    """
+    seen = {Path(p).as_posix() for p in parent}
+    merged = list(parent)
+    for p in fragment:
+        key = Path(p).as_posix()
+        if key not in seen:
+            merged.append(p)
+            seen.add(key)
+    return merged
+
+
+def _resolve_steps_and_params(
+    spec: dict[str, Any],
+    manifest_path: Path,
+    workspace_root: Path,
+    recursion_stack: list[Path],
+    include_chain: list[Path],
+    depth: int,
+) -> tuple[list["ManifestStep"], list[str]]:
+    """Recursively resolve `include:` steps into a flat (steps, parameters) pair.
+
+    Args:
+        spec: The current manifest's parsed `spec` dict (i.e., the body
+            holding `steps:` and `parameters:`).
+        manifest_path: Path of the manifest whose spec is being processed.
+        workspace_root: Resolved absolute workspace root for traversal checks.
+        recursion_stack: Resolved paths of manifests on the current DFS path.
+            Used for cycle detection (NOT a global visited set).
+        include_chain: Human-readable include chain for diagnostics.
+        depth: Current recursion depth, capped by MAX_INCLUDE_DEPTH.
+    """
+    if depth > MAX_INCLUDE_DEPTH:
+        raise IncludeError(
+            f"Include depth exceeded {MAX_INCLUDE_DEPTH} levels at "
+            f"{_format_include_chain(include_chain)}."
+        )
+
+    steps: list[ManifestStep] = []
+    parameters: list[str] = list(spec.get("parameters", []))
+
+    raw_steps = spec.get("steps") or []
+    for index, step_data in enumerate(raw_steps):
+        if not isinstance(step_data, dict):
+            raise ValueError(
+                f"Step {index + 1} in '{manifest_path}' is not a mapping."
+            )
+
+        if not _is_include_step(step_data):
+            steps.append(_parse_inline_step(step_data, manifest_path, index))
+            continue
+
+        raw_target = _validate_include_step(step_data, manifest_path, index)
+        include_when = step_data.get("when")
+
+        target_path = _resolve_include_path(raw_target, manifest_path, workspace_root)
+
+        if target_path in recursion_stack:
+            cycle = include_chain + [target_path]
+            raise IncludeError(
+                f"Include cycle detected: {_format_include_chain(cycle)}."
+            )
+
+        try:
+            sub_spec, _, _ = _read_manifest_spec(target_path)
+        except ValueError as exc:
+            raise IncludeError(
+                f"Include '{raw_target}' in '{manifest_path}' could not be loaded as a Manifest: {exc}"
+            ) from exc
+
+        sub_steps, sub_params = _resolve_steps_and_params(
+            spec=sub_spec,
+            manifest_path=target_path,
+            workspace_root=workspace_root,
+            recursion_stack=recursion_stack + [target_path],
+            include_chain=include_chain + [target_path],
+            depth=depth + 1,
+        )
+
+        # Manifest-level parameters merge unconditionally into every parent
+        # step. A gated include that contributes parameters would silently
+        # affect ungated parent steps. Check sub_params (post-recursion) so a
+        # fragment that only includes another fragment with parameters is
+        # still caught.
+        if include_when and sub_params:
+            raise IncludeError(
+                f"Include '{raw_target}' in '{manifest_path}' has a `when:` "
+                f"but its include subtree contributes manifest-level "
+                f"`parameters:`. Drop the `when:` or move the parameters onto "
+                f"individual fragment steps."
+            )
+
+        if not sub_steps:
+            raise IncludeError(
+                f"Include '{raw_target}' in '{manifest_path}' contributed "
+                f"zero steps. An include must define at least one step."
+            )
+
+        for sub_step in sub_steps:
+            _propagate_when(sub_step, include_when, target_path)
+
+        steps.extend(sub_steps)
+        parameters = _merge_parameters(parameters, sub_params)
+
+    return steps, parameters
+
+
+def _validate_no_step_name_collisions(steps: list["ManifestStep"]) -> None:
+    """Reject duplicate step names in the post-flatten step list."""
+    seen: set[str] = set()
+    for step in steps:
+        if step.name in seen:
+            raise ValueError(
+                f"Duplicate step name '{step.name}' after include flattening. "
+                f"Step names must be unique across the entire flattened "
+                f"pipeline (parent steps and all included fragments)."
+            )
+        seen.add(step.name)

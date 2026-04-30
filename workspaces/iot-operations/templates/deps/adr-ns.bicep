@@ -1,12 +1,12 @@
 // adr-ns.bicep
 // -------------------------------------------------------------------------------------
 // Creates an Azure Device Registry namespace. Devices and assets created later
-// (e.g. by templates/solutions/opc-ua-solution.bicep) live under this namespace.
+// (e.g. by samples/opc-ua-solution/template.bicep) live under this namespace.
 //
 // Routes to a per-API-version module under ./modules; ADR namespace API can
 // move per AIO release.
 //
-// Inputs:  adrNamespaceName, adrApiVersion (sourced from aio-versions YAML),
+// Inputs:  adrNamespaceName, adrApiVersion (sourced from aio-releases YAML),
 //          optional location/tags.
 // Outputs: adrNamespace { id, name, principalId }.
 // -------------------------------------------------------------------------------------
@@ -26,7 +26,7 @@ param location string = resourceGroup().location
 @description('Tags to apply to resources')
 param tags object = {}
 
-@description('Azure Device Registry API version for the namespace deployment. Sourced from parameters/aio-versions/<release>.yaml.')
+@description('Azure Device Registry API version for the namespace deployment. Sourced from parameters/aio-releases/<release>.yaml.')
 @allowed([
   '2025-10-01'
   '2026-04-01'

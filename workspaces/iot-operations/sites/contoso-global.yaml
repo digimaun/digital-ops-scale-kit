@@ -31,8 +31,8 @@ labels:
 
 properties:
   deployOptions:
-    includeGlobalSite: true       # Deploy subscription-scoped edge site
-    includeEdgeSite: false        # No RG — skip RG-scoped edge site
+    enableGlobalSite: true        # Deploy subscription-scoped edge site
+    enableEdgeSite: false         # No RG, skip RG-scoped edge site
 
 parameters:
   siteName: contoso-edge-site

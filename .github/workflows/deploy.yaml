@@ -2,7 +2,7 @@
 #
 # UI: Actions tab → "Deploy Infrastructure" → Run workflow
 # API: POST /repos/{owner}/{repo}/actions/workflows/deploy.yaml/dispatches
-#      Body: {"ref": "main", "inputs": {"workspace": "iot-operations", "manifest": "aio-install", "environment": "dev"}}
+#      Body: {"ref": "main", "inputs": {"workspace": "iot-operations", "manifest": "manifests/aio-install.yaml", "environment": "dev"}}
 
 name: Deploy Infrastructure
 
@@ -24,15 +24,16 @@ on:
                     - iot-operations
                 default: "iot-operations"
             manifest:
-                description: "Manifest to deploy"
+                description: "Manifest to deploy (path relative to the workspace root)"
                 required: true
                 type: choice
                 options:
-                    - aio-install
-                    - aio-upgrade
-                    - secretsync
-                    - opc-ua-solution
-                default: "aio-install"
+                    - manifests/aio-install.yaml
+                    - manifests/aio-upgrade.yaml
+                    - manifests/secretsync.yaml
+                    - samples/opc-ua-solution/manifest.yaml
+                    - scenarios/aio-with-opc-ua.yaml
+                default: "manifests/aio-install.yaml"
             environment:
                 description: "Target environment"
                 required: true
@@ -77,7 +78,7 @@ jobs:
             INPUT_ENVIRONMENT: ${{ inputs.environment }}
             INPUT_SELECTOR: ${{ inputs.selector }}
             INPUT_WORKSPACE: "workspaces/${{ inputs.workspace }}"
-            INPUT_MANIFEST: "manifests/${{ inputs.manifest }}.yaml"
+            INPUT_MANIFEST: ${{ inputs.manifest }}
             INPUT_REF: ${{ inputs.ref }}
             CURRENT_REF: ${{ github.ref }}
         steps:
@@ -112,7 +113,11 @@ jobs:
                     echo "::error::Manifest not found: $INPUT_WORKSPACE/$INPUT_MANIFEST"
                     echo ""
                     echo "Available manifests:"
-                    find "$INPUT_WORKSPACE/manifests" -name "*.yaml" -o -name "*.yml" 2>/dev/null || echo "  (none found)"
+                    { find "$INPUT_WORKSPACE/manifests" "$INPUT_WORKSPACE/scenarios" -maxdepth 1 \
+                        \( -name "*.yaml" -o -name "*.yml" \) -not -name "_*" 2>/dev/null
+                      find "$INPUT_WORKSPACE/samples" -mindepth 2 -maxdepth 2 \
+                        \( -name "manifest.yaml" -o -name "manifest.yml" \) 2>/dev/null
+                    } || echo "  (none found)"
                     exit 1
                   fi
                   echo "✓ Manifest found: $INPUT_MANIFEST"

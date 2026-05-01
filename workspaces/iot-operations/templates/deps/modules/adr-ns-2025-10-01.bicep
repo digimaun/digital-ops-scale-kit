@@ -1,7 +1,7 @@
 // adr-ns-2025-10-01.bicep
 // -------------------------------------------------------------------------------------
 // Per-API-version implementation of the ADR namespace resource. Selected by
-// templates/deps/adr-ns.bicep when the resolved aio-versions YAML declares
+// templates/deps/adr-ns.bicep when the resolved aio-releases YAML declares
 // adrApiVersion '2025-10-01'.
 // -------------------------------------------------------------------------------------
 

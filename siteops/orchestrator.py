@@ -285,6 +285,10 @@ class Orchestrator:
             if workspace_candidate != relative:
                 tried.append(workspace_candidate)
                 if workspace_candidate.exists():
+                    logger.debug(
+                        f"`inherits: {inherits_value}` in {child_path} resolved "
+                        f"via workspace fallback to {workspace_candidate}"
+                    )
                     return workspace_candidate
 
         searched = "\n  - ".join(str(p) for p in tried)
@@ -325,10 +329,16 @@ class Orchestrator:
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
 
-        # Validate kind if present (allow Site or SiteTemplate)
+        # Inherits parents must be SiteTemplates. A `kind: Site` parent
+        # would chain deployable sites together, where editing one would
+        # silently change the other; that is almost always an authoring
+        # mistake. Use SiteTemplate for any reusable base.
         kind = data.get("kind")
-        if kind is not None and kind not in ("Site", "SiteTemplate"):
-            raise ValueError(f"Cannot inherit from kind '{kind}' in {path}. " f"Expected 'Site' or 'SiteTemplate'")
+        if kind is not None and kind != "SiteTemplate":
+            raise ValueError(
+                f"Cannot inherit from kind '{kind}' in {path}. "
+                f"Inherits parents must be SiteTemplate."
+            )
 
         # Handle chained inheritance
         if "inherits" in data:
@@ -408,8 +418,12 @@ class Orchestrator:
 
                     merged_data = self._deep_merge(merged_data, data)
                     found = True
+                    if is_base_file:
+                        logger.debug(f"Loaded site data from: {path}")
+                    else:
+                        # DEBUG: avoids per-overlay noise across large fleets.
+                        logger.debug(f"Site '{name}': applied overlay {path}")
                     is_base_file = False  # Subsequent files are overlays
-                    logger.debug(f"Loaded site data from: {path}")
                     break  # Only load one file per directory (prefer .yaml)
 
         if not found:
@@ -1066,7 +1080,7 @@ class Orchestrator:
             logger.warning(f"Invalid condition syntax: {condition}")
             return True
 
-        field_path = match.group(1)  # e.g., "labels.environment" or "properties.deployOptions.includeSolution"
+        field_path = match.group(1)  # e.g., "labels.environment" or "properties.deployOptions.enableSecretSync"
         operator = match.group(2)  # "==" or "!=" or None (for truthy check)
         # Group 3 is quoted string value, group 4 is unquoted boolean
         expected_value = match.group(3) if match.group(3) is not None else match.group(4)
@@ -1832,7 +1846,7 @@ class Orchestrator:
         Priority:
         1. CLI --selector overrides everything
         2. Explicit sites list in manifest
-        3. Manifest siteSelector
+        3. Manifest selector (`selector:`, or legacy `siteSelector:`)
 
         Args:
             manifest: The manifest
@@ -1910,7 +1924,7 @@ class Orchestrator:
         errors: list[str] = []
 
         try:
-            manifest = Manifest.from_file(manifest_path)
+            manifest = Manifest.from_file(manifest_path, workspace_root=self.workspace)
         except Exception as e:
             return [f"Failed to parse manifest: {e}"]
 
@@ -2222,7 +2236,7 @@ class Orchestrator:
             manifest_path: Path to manifest file
             selector: Optional site selector
         """
-        manifest = Manifest.from_file(manifest_path)
+        manifest = Manifest.from_file(manifest_path, workspace_root=self.workspace)
         sites = self.resolve_sites(manifest, selector)
 
         if not sites:
@@ -2230,7 +2244,7 @@ class Orchestrator:
             if selector:
                 print(f"  Selector: {selector}")
             elif manifest.site_selector:
-                print(f"  Manifest siteSelector: {manifest.site_selector}")
+                print(f"  Manifest selector: {manifest.site_selector}")
             print()
             return
 
@@ -2304,7 +2318,7 @@ class Orchestrator:
             Dict with deployment results keyed by site name and summary
         """
         if manifest is None:
-            manifest = Manifest.from_file(manifest_path)
+            manifest = Manifest.from_file(manifest_path, workspace_root=self.workspace)
         if sites is None:
             sites = self.resolve_sites(manifest, selector)
 

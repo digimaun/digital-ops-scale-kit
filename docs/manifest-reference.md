@@ -15,14 +15,14 @@ sites:
   - munich-dev
   - seattle-dev
 # OR
-siteSelector: "environment=dev"
+selector: "environment=dev"
 
 # Parallel execution
 parallel: 3  # Deploy up to 3 sites concurrently
 
 # Manifest-level parameters (applied to all steps)
 parameters:
-  - parameters/common.yaml
+  - parameters/common/common.yaml
 
 steps:
   - name: step-name
@@ -38,7 +38,7 @@ steps:
 | Method | Behavior |
 |--------|----------|
 | `sites:` list | Deploy to named sites only |
-| `siteSelector:` | Deploy to all sites matching label |
+| `selector:` | Deploy to all sites matching label |
 | CLI `-l` flag | **Overrides** manifest selection |
 
 ```bash
@@ -72,16 +72,27 @@ siteops deploy manifest.yaml -l "environment=prod"
     - configs/local-manifest.yaml
 ```
 
+### Include steps
+
+Splice another manifest's steps into this one's step list at the include's position:
+
+```yaml
+- include: ../samples/opc-ua-solution/_partial.yaml
+  when: "{{ site.properties.deployOptions.enableOpcUa }}"  # optional
+```
+
+See [manifest-includes.md](manifest-includes.md) for the full include contract (path resolution, cycle detection, parameter merge, standalone-vs-partial conventions).
+
 ## Conditional steps
 
 Control step execution based on site labels or properties:
 
 ```yaml
 # Truthy check on properties (recommended for booleans)
-- name: deploy-solution
-  template: templates/solution.bicep
+- name: secretsync
+  template: templates/secretsync/enable-secretsync.bicep
   scope: resourceGroup
-  when: "{{ site.properties.deployOptions.includeSolution }}"
+  when: "{{ site.properties.deployOptions.enableSecretSync }}"
 
 # String comparison on labels
 - name: prod-only-feature
@@ -141,18 +152,18 @@ steps:
   - name: global-edge-site
     template: templates/edge-site/subscription.bicep
     scope: subscription  # Phase 1: once per subscription
-    when: "{{ site.properties.deployOptions.includeGlobalSite }}"
+    when: "{{ site.properties.deployOptions.enableGlobalSite }}"
 
   - name: edge-site
     template: templates/edge-site/main.bicep
     scope: resourceGroup  # Phase 2: per RG-level site
-    when: "{{ site.properties.deployOptions.includeEdgeSite }}"
+    when: "{{ site.properties.deployOptions.enableEdgeSite }}"
 
   - name: schema-registry
     template: templates/deps/schema-registry.bicep
     scope: resourceGroup  # Phase 2: per RG-level site
     parameters:
-      - parameters/aio-instance-chaining.yaml  # Can reference global-edge-site outputs
+      - parameters/inputs/aio-instance.yaml  # Can reference global-edge-site outputs
 ```
 
 See [parameter-resolution.md](parameter-resolution.md) for cross-scope output chaining details.

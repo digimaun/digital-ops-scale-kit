@@ -14,10 +14,15 @@ parameters:
     values: [iot-operations]
 
   - name: manifest
-    displayName: Manifest
+    displayName: Manifest (path relative to the workspace root)
     type: string
-    default: aio-install
-    values: [aio-install, aio-upgrade, secretsync, opc-ua-solution]
+    default: manifests/aio-install.yaml
+    values:
+      - manifests/aio-install.yaml
+      - manifests/aio-upgrade.yaml
+      - manifests/secretsync.yaml
+      - samples/opc-ua-solution/manifest.yaml
+      - scenarios/aio-with-opc-ua.yaml
 
   - name: environment
     displayName: Target environment
@@ -75,12 +80,16 @@ stages:
           - template: templates/setup-siteops.yaml
 
           - script: |
-              MANIFEST_PATH="workspaces/${{ parameters.workspace }}/manifests/${{ parameters.manifest }}.yaml"
+              MANIFEST_PATH="workspaces/${{ parameters.workspace }}/${{ parameters.manifest }}"
               if [[ ! -f "$MANIFEST_PATH" ]]; then
                 echo "##vso[task.logissue type=error]Manifest not found: $MANIFEST_PATH"
                 echo ""
                 echo "Available manifests:"
-                find "workspaces/${{ parameters.workspace }}/manifests" -name "*.yaml" -o -name "*.yml" 2>/dev/null || echo "  (none found)"
+                { find "workspaces/${{ parameters.workspace }}/manifests" "workspaces/${{ parameters.workspace }}/scenarios" -maxdepth 1 \
+                    \( -name "*.yaml" -o -name "*.yml" \) -not -name "_*" 2>/dev/null
+                  find "workspaces/${{ parameters.workspace }}/samples" -mindepth 2 -maxdepth 2 \
+                    \( -name "manifest.yaml" -o -name "manifest.yml" \) 2>/dev/null
+                } || echo "  (none found)"
                 exit 1
               fi
               echo "✓ Manifest found: $MANIFEST_PATH"
@@ -112,14 +121,14 @@ stages:
               ENV: ${{ parameters.environment }}
               INPUT_SELECTOR: ${{ parameters.selector }}
               WORKSPACE_DIR: workspaces/${{ parameters.workspace }}
-              MANIFEST_REL: manifests/${{ parameters.manifest }}.yaml
+              MANIFEST_REL: ${{ parameters.manifest }}
               DRY_RUN: ${{ parameters.dryRun }}
 
   - template: templates/siteops-deploy.yaml
     parameters:
       serviceConnection: ${{ parameters.serviceConnections[parameters.environment] }}
       workspace: workspaces/${{ parameters.workspace }}
-      manifest: manifests/${{ parameters.manifest }}.yaml
+      manifest: ${{ parameters.manifest }}
       environment: ${{ parameters.environment }}
       ${{ if not(in(parameters.selector, '', ' ')) }}:
         selector: environment=${{ parameters.environment }},${{ parameters.selector }}

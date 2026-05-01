@@ -237,7 +237,7 @@ Can also be triggered manually from **Actions → CI → Run workflow** (GHA) or
 4. Fill in options:
    - **Git ref**: Branch, tag, or commit (optional)
    - **Workspace**: Workspace name (default: `iot-operations`)
-   - **Manifest**: Manifest to deploy (default: `aio-install`)
+   - **Manifest**: Path to manifest, relative to the workspace root (default: `manifests/aio-install.yaml`)
    - **Environment**: `dev`, `staging`, or `prod`
    - **Selector**: Additional site filter (optional, e.g., `region=eastus`)
    - **Dry run**: Preview only, no actual deployment
@@ -248,7 +248,7 @@ Can also be triggered manually from **Actions → CI → Run workflow** (GHA) or
 ```bash
 gh workflow run deploy.yaml \
   -f workspace=iot-operations \
-  -f manifest=aio-install \
+  -f manifest=manifests/aio-install.yaml \
   -f environment=dev
 ```
 
@@ -269,7 +269,7 @@ curl -X POST \
     "ref": "main",
     "inputs": {
       "workspace": "iot-operations",
-      "manifest": "aio-install",
+      "manifest": "manifests/aio-install.yaml",
       "environment": "dev",
       "selector": "",
       "dry-run": "false"
@@ -277,42 +277,46 @@ curl -X POST \
   }'
 ```
 
-## Demo Scenarios
+## Demo Workflows
 
 The iot-operations workspace demonstrates key Site Ops capabilities:
 
 | Step | Manifest | Environment | Sites | Demonstrates |
 |------|----------|-------------|-------|--------------|
-| 1 | `aio-install` | `staging` | chicago-staging | Base AIO platform only |
-| 2 | `aio-install` | `dev` | munich-dev, seattle-dev | Parallel deployment + simulator |
-| 3 | `aio-install` | `prod` | munich-prod, seattle-prod | Parallel deployment, no simulator |
-| 4 | `opc-ua-solution` | `staging` | chicago-staging | Solution layer on existing AIO |
-| 5 | `aio-upgrade` | any | any AIO-installed site | Upgrade an existing AIO instance to the site's current `aioRelease` (bump the site's `aioRelease` first, then dispatch) |
+| 1 | `manifests/aio-install.yaml` | `staging` | chicago-staging | Base AIO platform only |
+| 2 | `manifests/aio-install.yaml` | `dev` | munich-dev, seattle-dev | Parallel deployment |
+| 3 | `manifests/aio-install.yaml` | `prod` | munich-prod, seattle-prod | Parallel deployment |
+| 4 | `samples/opc-ua-solution/manifest.yaml` | `staging` | chicago-staging | OPC UA sample on existing AIO |
+| 5 | `scenarios/aio-with-opc-ua.yaml` | any | any | Composed install + sample in one shot |
+| 6 | `manifests/aio-upgrade.yaml` | any | any AIO-installed site | Upgrade an existing AIO instance to the site's current `aioRelease` (bump the site's `aioRelease` first, then dispatch) |
 
 ### Site configuration
 
-| Site | Environment | `includeSolution` | `includeOpcPlcSimulator` |
-|------|-------------|-------------------|-------------------------|
-| munich-dev | dev | ✅ | ✅ |
-| seattle-dev | dev | ✅ | ✅ |
-| munich-prod | prod | ✅ | ❌ |
-| seattle-prod | prod | ✅ | ❌ |
-| chicago-staging | staging | ❌ | ❌ |
+| Site | Environment | `enableSecretSync` |
+|------|-------------|--------------------|
+| munich-dev | dev | optional |
+| seattle-dev | dev | optional |
+| munich-prod | prod | recommended |
+| seattle-prod | prod | recommended |
+| chicago-staging | staging | off |
 
 ### Running the demo
 
 ```bash
-# Step 1: Deploy base AIO to staging (no solution)
-gh workflow run deploy.yaml -f workspace="iot-operations" -f manifest="aio-install" -f environment="staging"
+# Step 1: Deploy base AIO to staging
+gh workflow run deploy.yaml -f workspace="iot-operations" -f manifest="manifests/aio-install.yaml" -f environment="staging"
 
-# Step 2: Deploy full stack to dev (parallel, with simulator)
-gh workflow run deploy.yaml -f workspace="iot-operations" -f manifest="aio-install" -f environment="dev"
+# Step 2: Deploy AIO to dev (parallel across sites)
+gh workflow run deploy.yaml -f workspace="iot-operations" -f manifest="manifests/aio-install.yaml" -f environment="dev"
 
-# Step 3: Deploy full stack to prod (parallel, no simulator)
-gh workflow run deploy.yaml -f workspace="iot-operations" -f manifest="aio-install" -f environment="prod"
+# Step 3: Deploy AIO to prod (parallel across sites)
+gh workflow run deploy.yaml -f workspace="iot-operations" -f manifest="manifests/aio-install.yaml" -f environment="prod"
 
-# Step 4: Add solution layer to staging
-gh workflow run deploy.yaml -f workspace="iot-operations" -f manifest="opc-ua-solution" -f environment="staging"
+# Step 4: Add the OPC UA sample on top of the staging install
+gh workflow run deploy.yaml -f workspace="iot-operations" -f manifest="samples/opc-ua-solution/manifest.yaml" -f environment="staging"
+
+# Step 5: Composed install + sample in one shot (alternative to steps 1+4)
+gh workflow run deploy.yaml -f workspace="iot-operations" -f manifest="scenarios/aio-with-opc-ua.yaml" -f environment="staging"
 ```
 
 ## Workflow Architecture
@@ -412,30 +416,40 @@ See [ADO architecture](#ado-architecture) for the Azure DevOps equivalent.
 
 To add a new manifest to the deployment workflows:
 
-1. Create your manifest in `workspaces/<workspace>/manifests/`
-2. Update the workflow/pipeline to add it to the dropdown:
+1. Create your manifest at the appropriate location in the workspace:
+   - Standalone day-2 manifests under `workspaces/<workspace>/manifests/`
+   - Self-contained workload bundles under `workspaces/<workspace>/samples/<name>/`
+   - Composed (include-based) manifests under `workspaces/<workspace>/scenarios/`
+2. Update the workflow/pipeline to add the path to the dropdown:
 
 **GitHub Actions** (`.github/workflows/deploy.yaml`):
 ```yaml
 manifest:
-    description: "Manifest to deploy"
+    description: "Manifest to deploy (path relative to the workspace root)"
     required: true
     type: choice
     options:
-        - aio-install
-        - aio-upgrade
-        - secretsync
-        - opc-ua-solution
-        - my-new-manifest  # Add here (without .yaml extension)
+        - manifests/aio-install.yaml
+        - manifests/aio-upgrade.yaml
+        - manifests/secretsync.yaml
+        - samples/opc-ua-solution/manifest.yaml
+        - scenarios/aio-with-opc-ua.yaml
+        - manifests/my-new-manifest.yaml  # Add here (full path)
 ```
 
 **Azure DevOps** (`.pipelines/deploy.yaml`):
 ```yaml
 - name: manifest
-  displayName: Manifest
+  displayName: Manifest (path relative to the workspace root)
   type: string
-  default: aio-install
-  values: [aio-install, aio-upgrade, secretsync, opc-ua-solution, my-new-manifest]  # Add here
+  default: manifests/aio-install.yaml
+  values:
+    - manifests/aio-install.yaml
+    - manifests/aio-upgrade.yaml
+    - manifests/secretsync.yaml
+    - samples/opc-ua-solution/manifest.yaml
+    - scenarios/aio-with-opc-ua.yaml
+    - manifests/my-new-manifest.yaml  # Add here (full path)
 ```
 
 ### Adding new workspaces
@@ -604,7 +618,7 @@ Same as GitHub Actions — see [Assign Azure roles](#3-assign-azure-roles). The 
 3. Select branch/tag from the branch picker
 4. Fill in parameters:
    - **Workspace**: `iot-operations`
-   - **Manifest**: `aio-install`, `aio-upgrade`, `secretsync`, or `opc-ua-solution`
+   - **Manifest**: path relative to the workspace root (e.g., `manifests/aio-install.yaml`, `samples/opc-ua-solution/manifest.yaml`, `scenarios/aio-with-opc-ua.yaml`)
    - **Target environment**: `dev`, `staging`, or `prod`
    - **Additional site selector**: e.g., `country=US,name=seattle-dev` (optional)
    - **Dry run**: Check to preview without deploying
@@ -615,12 +629,12 @@ Same as GitHub Actions — see [Assign Azure roles](#3-assign-azure-roles). The 
 ```bash
 az pipelines run \
   --name "Deploy Infrastructure" \
-  --parameters workspace=iot-operations manifest=aio-install environment=dev
+  --parameters workspace=iot-operations manifest=manifests/aio-install.yaml environment=dev
 
 # With additional options
 az pipelines run \
   --name "Deploy Infrastructure" \
-  --parameters workspace=iot-operations manifest=aio-install environment=dev \
+  --parameters workspace=iot-operations manifest=manifests/aio-install.yaml environment=dev \
                selector="country=US" dryRun=true
 ```
 

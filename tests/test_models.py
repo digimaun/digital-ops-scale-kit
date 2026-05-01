@@ -632,7 +632,7 @@ class TestManifest:
         with open(manifest_path, "w", encoding="utf-8") as f:
             yaml.dump(manifest_data, f)
 
-        manifest = Manifest.from_file(manifest_path)
+        manifest = Manifest.from_file(manifest_path, workspace_root=manifest_path.parent)
 
         assert manifest.name == "test-manifest"
         assert manifest.description == "Test description"
@@ -661,7 +661,7 @@ class TestManifest:
         with open(manifest_path, "w", encoding="utf-8") as f:
             yaml.dump(manifest_data, f)
 
-        manifest = Manifest.from_file(manifest_path)
+        manifest = Manifest.from_file(manifest_path, workspace_root=manifest_path.parent)
 
         assert len(manifest.steps) == 1
         assert isinstance(manifest.steps[0], KubectlStep)
@@ -687,7 +687,7 @@ class TestManifest:
         with open(manifest_path, "w", encoding="utf-8") as f:
             yaml.dump(manifest_data, f)
 
-        manifest = Manifest.from_file(manifest_path)
+        manifest = Manifest.from_file(manifest_path, workspace_root=manifest_path.parent)
 
         assert len(manifest.steps) == 2
         assert isinstance(manifest.steps[0], DeploymentStep)
@@ -703,7 +703,7 @@ class TestManifest:
         with open(manifest_path, "w", encoding="utf-8") as f:
             yaml.dump(manifest_data, f)
 
-        manifest = Manifest.from_file(manifest_path)
+        manifest = Manifest.from_file(manifest_path, workspace_root=manifest_path.parent)
         assert manifest.site_selector == "environment=prod"
         assert manifest.sites == []
 
@@ -718,7 +718,7 @@ class TestManifest:
         with open(manifest_path, "w", encoding="utf-8") as f:
             yaml.dump(manifest_data, f)
 
-        manifest = Manifest.from_file(manifest_path)
+        manifest = Manifest.from_file(manifest_path, workspace_root=manifest_path.parent)
         assert manifest.parallel.is_unlimited is True
 
     def test_from_file_parallel_defaults_false(self, tmp_path):
@@ -731,7 +731,7 @@ class TestManifest:
         with open(manifest_path, "w", encoding="utf-8") as f:
             yaml.dump(manifest_data, f)
 
-        manifest = Manifest.from_file(manifest_path)
+        manifest = Manifest.from_file(manifest_path, workspace_root=manifest_path.parent)
         assert manifest.parallel.is_sequential is True
 
     def test_from_file_uses_filename_as_default_name(self, tmp_path):
@@ -743,7 +743,7 @@ class TestManifest:
         with open(manifest_path, "w", encoding="utf-8") as f:
             yaml.dump(manifest_data, f)
 
-        manifest = Manifest.from_file(manifest_path)
+        manifest = Manifest.from_file(manifest_path, workspace_root=manifest_path.parent)
         assert manifest.name == "my-deployment"
 
     def test_from_file_missing_step_name(self, tmp_path):
@@ -757,7 +757,7 @@ class TestManifest:
             yaml.dump(manifest_data, f)
 
         with pytest.raises(ValueError, match="missing required field 'name'"):
-            Manifest.from_file(manifest_path)
+            Manifest.from_file(manifest_path, workspace_root=manifest_path.parent)
 
     def test_from_file_deployment_missing_template(self, tmp_path):
         manifest_data = {
@@ -770,7 +770,7 @@ class TestManifest:
             yaml.dump(manifest_data, f)
 
         with pytest.raises(ValueError, match="missing 'template'"):
-            Manifest.from_file(manifest_path)
+            Manifest.from_file(manifest_path, workspace_root=manifest_path.parent)
 
     def test_from_file_kubectl_missing_arc(self, tmp_path):
         manifest_data = {
@@ -791,7 +791,7 @@ class TestManifest:
             yaml.dump(manifest_data, f)
 
         with pytest.raises(ValueError, match="missing 'arc' configuration"):
-            Manifest.from_file(manifest_path)
+            Manifest.from_file(manifest_path, workspace_root=manifest_path.parent)
 
     def test_from_file_kubectl_missing_files(self, tmp_path):
         manifest_data = {
@@ -812,7 +812,7 @@ class TestManifest:
             yaml.dump(manifest_data, f)
 
         with pytest.raises(ValueError, match="missing 'files'"):
-            Manifest.from_file(manifest_path)
+            Manifest.from_file(manifest_path, workspace_root=manifest_path.parent)
 
     def test_from_file_kubectl_missing_operation(self, tmp_path):
         """Kubectl step without operation field should raise ValueError."""
@@ -834,7 +834,7 @@ class TestManifest:
             yaml.dump(manifest_data, f)
 
         with pytest.raises(ValueError, match="missing 'operation'"):
-            Manifest.from_file(manifest_path)
+            Manifest.from_file(manifest_path, workspace_root=manifest_path.parent)
 
     def test_from_file_kubectl_arc_missing_name(self, tmp_path):
         """Kubectl step with arc config missing name should raise ValueError."""
@@ -856,7 +856,7 @@ class TestManifest:
             yaml.dump(manifest_data, f)
 
         with pytest.raises(ValueError, match="must have 'name' and 'resourceGroup'"):
-            Manifest.from_file(manifest_path)
+            Manifest.from_file(manifest_path, workspace_root=manifest_path.parent)
 
     def test_from_file_kubectl_arc_missing_resource_group(self, tmp_path):
         """Kubectl step with arc config missing resourceGroup should raise ValueError."""
@@ -878,14 +878,14 @@ class TestManifest:
             yaml.dump(manifest_data, f)
 
         with pytest.raises(ValueError, match="must have 'name' and 'resourceGroup'"):
-            Manifest.from_file(manifest_path)
+            Manifest.from_file(manifest_path, workspace_root=manifest_path.parent)
 
     def test_from_file_empty_file(self, tmp_path):
         manifest_path = tmp_path / "empty.yaml"
         manifest_path.write_text("")
 
         with pytest.raises(ValueError, match="Empty or invalid"):
-            Manifest.from_file(manifest_path)
+            Manifest.from_file(manifest_path, workspace_root=manifest_path.parent)
 
     def test_resolve_parameter_path_simple(self):
         manifest = Manifest(
@@ -952,10 +952,10 @@ class TestManifest:
         )
 
         result = manifest.resolve_parameter_path(
-            "parameters/aio-versions/{{ site.properties.aioRelease }}.yaml",
+            "parameters/aio-releases/{{ site.properties.aioRelease }}.yaml",
             site,
         )
-        assert result == "parameters/aio-versions/2603.yaml"
+        assert result == "parameters/aio-releases/2603.yaml"
 
     def test_resolve_parameter_path_with_nested_properties(self):
         """Test nested property path resolution."""
@@ -1110,7 +1110,7 @@ steps:
 """
         )
 
-        manifest = Manifest.from_file(manifest_file)
+        manifest = Manifest.from_file(manifest_file, workspace_root=manifest_file.parent)
 
         assert manifest.parameters == ["parameters/common.yaml", "parameters/shared.yaml"]
 
@@ -1134,7 +1134,7 @@ steps:
 """
         )
 
-        manifest = Manifest.from_file(manifest_file)
+        manifest = Manifest.from_file(manifest_file, workspace_root=manifest_file.parent)
 
         assert manifest.parameters == []
 
@@ -1160,7 +1160,7 @@ steps:
 """
         )
 
-        manifest = Manifest.from_file(manifest_file)
+        manifest = Manifest.from_file(manifest_file, workspace_root=manifest_file.parent)
 
         assert manifest.parameters == []
 
@@ -1275,7 +1275,7 @@ steps:
 """
         )
 
-        manifest = Manifest.from_file(manifest_file)
+        manifest = Manifest.from_file(manifest_file, workspace_root=manifest_file.parent)
         assert manifest.parallel.sites == 3
         assert manifest.parallel.max_workers == 3
 
@@ -1294,7 +1294,7 @@ steps:
 """
         )
 
-        manifest = Manifest.from_file(manifest_file)
+        manifest = Manifest.from_file(manifest_file, workspace_root=manifest_file.parent)
         assert manifest.parallel.is_unlimited is True
 
     def test_manifest_parallel_false(self, tmp_path):
@@ -1312,7 +1312,7 @@ steps:
 """
         )
 
-        manifest = Manifest.from_file(manifest_file)
+        manifest = Manifest.from_file(manifest_file, workspace_root=manifest_file.parent)
         assert manifest.parallel.is_sequential is True
 
     def test_manifest_parallel_object(self, tmp_path):
@@ -1331,7 +1331,7 @@ steps:
 """
         )
 
-        manifest = Manifest.from_file(manifest_file)
+        manifest = Manifest.from_file(manifest_file, workspace_root=manifest_file.parent)
         assert manifest.parallel.sites == 2
 
     def test_manifest_parallel_zero_unlimited(self, tmp_path):
@@ -1349,7 +1349,7 @@ steps:
 """
         )
 
-        manifest = Manifest.from_file(manifest_file)
+        manifest = Manifest.from_file(manifest_file, workspace_root=manifest_file.parent)
         assert manifest.parallel.is_unlimited is True
 
     def test_manifest_parallel_default_sequential(self, tmp_path):
@@ -1366,7 +1366,7 @@ steps:
 """
         )
 
-        manifest = Manifest.from_file(manifest_file)
+        manifest = Manifest.from_file(manifest_file, workspace_root=manifest_file.parent)
         assert manifest.parallel.is_sequential is True
 
 

@@ -214,7 +214,7 @@ class TestAioUpgradeIdempotency:
         self, orchestrator, selector, aio_upgrade_result
     ):
         manifest_path = WORKSPACE_PATH / "manifests" / "aio-upgrade.yaml"
-        manifest = Manifest.from_file(manifest_path)
+        manifest = Manifest.from_file(manifest_path, workspace_root=WORKSPACE_PATH)
         sites = orchestrator.resolve_sites(manifest, selector)
         result2 = orchestrator.deploy(
             manifest_path=manifest_path,

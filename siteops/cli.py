@@ -54,7 +54,7 @@ def cmd_deploy(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
 
     from siteops.models import Manifest
 
-    manifest = Manifest.from_file(manifest_path)
+    manifest = Manifest.from_file(manifest_path, workspace_root=args.workspace)
     sites = orchestrator.resolve_sites(manifest, getattr(args, "selector", None))
 
     if not sites:
@@ -150,7 +150,13 @@ def _print_value(value: Any, indent: int = 6) -> None:
 
 
 def cmd_sites(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
-    """List available sites in the workspace."""
+    """List available sites in the workspace.
+
+    With `--render`, emits the merged YAML for each matched site instead of
+    the human-readable summary. Useful for confirming what an overlay or
+    extras-dir file actually changed (typically combined with a single-site
+    selector like `-l name=munich-dev`).
+    """
     all_sites = orchestrator.load_all_sites()
 
     # Filter by selector if provided
@@ -168,6 +174,32 @@ def cmd_sites(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
             print(f"\nNo sites matched selector: {selector_str}\n")
         else:
             print("\nNo sites found in workspace\n")
+        return 0
+
+    if getattr(args, "render", False) is True:
+        import yaml
+
+        for i, site in enumerate(sorted(sites, key=lambda s: s.name)):
+            resolved = {
+                "apiVersion": "siteops/v1",
+                "kind": "Site",
+                "name": site.name,
+                "subscription": site.subscription,
+            }
+            # Subscription-scoped sites have no resourceGroup; emitting "" would
+            # falsely imply RG-scoped behavior on a round-trip.
+            if site.resource_group:
+                resolved["resourceGroup"] = site.resource_group
+            resolved["location"] = site.location
+            if site.labels:
+                resolved["labels"] = site.labels
+            if site.parameters:
+                resolved["parameters"] = site.parameters
+            if site.properties:
+                resolved["properties"] = site.properties
+            if i > 0:
+                print("---")
+            print(yaml.safe_dump(resolved, sort_keys=False, default_flow_style=False), end="")
         return 0
 
     verbose = getattr(args, "verbose", False)
@@ -340,13 +372,22 @@ Examples:
         "-l",
         "--selector",
         type=str,
-        help="Filter sites by labels (e.g., 'environment=prod')",
+        help="Filter sites by labels (e.g., 'environment=prod', 'name=munich-dev')",
     )
     p_sites.add_argument(
         "-v",
         "--verbose",
         action="store_true",
         help="Show additional details (properties)",
+    )
+    p_sites.add_argument(
+        "--render",
+        action="store_true",
+        help=(
+            "Emit the merged YAML for each matched site instead of the "
+            "summary. Combine with `-l name=<site>` to inspect one site's "
+            "full resolved configuration after inheritance and overlays."
+        ),
     )
 
     args = parser.parse_args()

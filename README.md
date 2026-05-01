@@ -157,7 +157,7 @@ digital-ops-scale-kit/
 │       ├── parameters/           # Parameter files
 │       └── templates/            # Bicep templates
 ├── docs/                         # Extended documentation
-│   ├── aio-versions.md           # AIO version pinning, upgrades, adding a new version
+│   ├── aio-releases.md           # AIO release pinning, upgrades, adding a new release
 │   ├── ci-cd-setup.md            # GitHub Actions, Azure DevOps, OIDC, secrets
 │   ├── e2e-testing.md            # End-to-end live-subscription test workflow
 │   ├── manifest-reference.md     # Manifest syntax, step types
@@ -244,21 +244,21 @@ name: aio-install
 description: Deploy Azure IoT Operations
 parallel: 3  # Deploy up to 3 sites concurrently
 
-siteSelector: "environment=dev"
+selector: "environment=dev"
 
 parameters:
-  - parameters/common.yaml  # Applied to all steps
+  - parameters/common/common.yaml  # Applied to all steps
 
 steps:
   - name: global-edge-site
     template: templates/edge-site/subscription.bicep
     scope: subscription  # Deploys once per subscription
-    when: "{{ site.properties.deployOptions.includeGlobalSite }}"
+    when: "{{ site.properties.deployOptions.enableGlobalSite }}"
 
   - name: edge-site
     template: templates/edge-site/main.bicep
     scope: resourceGroup  # Deploys per-site
-    when: "{{ site.properties.deployOptions.includeEdgeSite }}"
+    when: "{{ site.properties.deployOptions.enableEdgeSite }}"
 
   - name: schema-registry
     template: templates/deps/schema-registry.bicep
@@ -270,14 +270,9 @@ steps:
     template: templates/aio/instance.bicep
     scope: resourceGroup
     parameters:
-      - parameters/aio-instance-chaining.yaml  # Uses outputs from previous steps
+      - parameters/inputs/aio-instance.yaml  # Uses outputs from previous steps
 
-  # ... additional steps (schema-registry-role) omitted for brevity
-
-  - name: opc-ua-solution
-    template: templates/solutions/opc-ua-solution.bicep
-    scope: resourceGroup
-    when: "{{ site.properties.deployOptions.includeSolution }}"
+  # ... additional steps (schema-registry-role, secretsync) omitted for brevity
 ```
 
 ### Template variables
@@ -285,7 +280,7 @@ steps:
 Reference site values in parameter files:
 
 ```yaml
-# parameters/common.yaml (manifest-level)
+# parameters/common/common.yaml (manifest-level)
 location: "{{ site.location }}"
 customLocationName: "{{ site.name }}-cl"
 aioInstanceName: "{{ site.name }}-aio"
@@ -297,7 +292,7 @@ tags:
 ```
 
 ```yaml
-# parameters/aio-instance-chaining.yaml (step-level, for output chaining)
+# parameters/inputs/aio-instance.yaml (step-level, for output chaining)
 schemaRegistryId: "{{ steps.schema-registry.outputs.schemaRegistry.id }}"
 adrNamespaceId: "{{ steps.adr-ns.outputs.adrNamespace.id }}"
 
@@ -411,7 +406,7 @@ See [docs/ci-cd-setup.md](docs/ci-cd-setup.md) for detailed configuration.
 | [docs/site-configuration.md](docs/site-configuration.md) | Site definitions, inheritance, overlays |
 | [docs/manifest-reference.md](docs/manifest-reference.md) | Manifest syntax, step types, conditions |
 | [docs/parameter-resolution.md](docs/parameter-resolution.md) | Template variables, output chaining, auto-filtering |
-| [docs/aio-versions.md](docs/aio-versions.md) | Pinning an AIO version per site, in-place upgrades, adding a new version |
+| [docs/aio-releases.md](docs/aio-releases.md) | Pinning an AIO release per site, in-place upgrades, adding a new release |
 | [docs/secret-sync.md](docs/secret-sync.md) | Secret sync enablement and usage |
 | [docs/ci-cd-setup.md](docs/ci-cd-setup.md) | GitHub Actions, Azure DevOps, OIDC, secrets configuration |
 | [docs/e2e-testing.md](docs/e2e-testing.md) | End-to-end live-subscription test workflow |

@@ -1,6 +1,6 @@
-// opc-ua-solution.bicep
+// samples/opc-ua-solution/template.bicep
 // -------------------------------------------------------------------------------------
-// Sample solution layered onto an existing AIO instance: OPC UA device + asset,
+// Sample solution that runs on top of an existing AIO instance: OPC UA device + asset,
 // Event Hub destination, role assignment, and a dataflow mapping oven telemetry
 // from the broker to the Event Hub.
 //
@@ -10,12 +10,12 @@
 //
 // Sample API-version policy: pinned to the oldest supported AIO/ADR API
 // versions, relying on RP backward-compatibility to work across all
-// supported releases. See docs/aio-versions.md.
+// supported releases. See docs/aio-releases.md.
 // -------------------------------------------------------------------------------------
 
 metadata description = 'This template deploys components that are required to show data flowing after cluster provisioning and AIO deployment.'
 
-import { aioExtensionName as deriveAioExtensionName } from '../common/extension-names.bicep'
+import { aioExtensionName as deriveAioExtensionName } from '../../templates/common/extension-names.bicep'
 
 /*****************************************************************************/
 /*                          Deployment Parameters                            */
@@ -33,7 +33,7 @@ param customLocationName string
 @description('Name of the AIO extension. If empty, derived from cluster ID using convention.')
 param aioExtensionName string = ''
 
-@description('Name of the existing AIO instance to layer the sample onto.')
+@description('Name of the existing AIO instance the sample binds to.')
 param aioInstanceName string
 
 @description('Short hash appended to created resource names to keep them globally unique. Defaults to a stable hash of subscription + RG + cluster.')

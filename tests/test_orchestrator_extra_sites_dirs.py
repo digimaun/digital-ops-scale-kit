@@ -314,7 +314,7 @@ class TestResolveSitesNameSelector:
         from siteops.models import Manifest
 
         orchestrator = Orchestrator(tmp_workspace)
-        manifest = Manifest.from_file(manifest_path)
+        manifest = Manifest.from_file(manifest_path, workspace_root=manifest_path.parent)
         with pytest.raises(FileNotFoundError, match="does-not-exist.yaml"):
             orchestrator.resolve_sites(manifest, cli_selector="name=broken")
 
@@ -346,7 +346,7 @@ class TestResolveSitesNameSelector:
         from siteops.models import Manifest
 
         orchestrator = Orchestrator(tmp_workspace)
-        manifest = Manifest.from_file(manifest_path)
+        manifest = Manifest.from_file(manifest_path, workspace_root=manifest_path.parent)
         resolved = orchestrator.resolve_sites(
             manifest, cli_selector="name=internal-identity"
         )

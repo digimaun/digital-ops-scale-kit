@@ -51,7 +51,7 @@ def _make_manifest(workspace, step_name: str, template_rel: str) -> Manifest:
     }
     manifest_path = workspace / "manifests" / "unresolved-test.yaml"
     manifest_path.write_text(yaml.dump(manifest_data), encoding="utf-8")
-    return Manifest.from_file(manifest_path)
+    return Manifest.from_file(manifest_path, workspace_root=manifest_path.parent)
 
 
 def _make_site() -> Site:

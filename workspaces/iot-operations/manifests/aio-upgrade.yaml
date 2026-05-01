@@ -6,11 +6,12 @@ description: |
   existing Azure IoT Operations instances, preserving each extension's existing
   configurationSettings, releaseTrain, and identity.
 
-  Reads target versions from parameters/aio-versions/<ver>.yaml — the same source
-  the install path uses. Operators select the target version per site via
-  site.properties.aioRelease (re-pin the site to the new release, then run this
-  manifest). Drives only Arc extension bumps; the AIO instance ARM resource has
-  no writable version property and is not mutated.
+  Reads target versions from parameters/aio-releases/<release>.yaml, the same
+  source aio-install.yaml uses for the initial deployment. Operators select the
+  target version per site via site.properties.aioRelease (re-pin the site to
+  the new release, then run this manifest). Drives only Arc extension bumps;
+  the AIO instance ARM resource has no writable version property and is not
+  mutated.
 
   cert-manager is upgraded only when the cluster's trust source is SelfSigned
   (auto-detected from the AIO extension's configurationSettings.trustSource).
@@ -18,7 +19,7 @@ description: |
 
   Prerequisites:
     - AIO instance must be deployed and running
-    - The site's aioRelease must point to a parameters/aio-versions/<ver>.yaml file
+    - The site's aioRelease must point to a parameters/aio-releases/<release>.yaml file
 
   Out of scope (not yet supported):
     - New child resource types introduced by future AIO releases (instance
@@ -28,11 +29,11 @@ description: |
 parallel: 3
 
 # Default selector; override at the CLI with `-l <key>=<value>`.
-siteSelector: "environment=dev"
+selector: "environment=dev"
 
 parameters:
-  - parameters/common.yaml
-  - "parameters/aio-versions/{{ site.properties.aioRelease }}.yaml"
+  - parameters/common/common.yaml
+  - "parameters/aio-releases/{{ site.properties.aioRelease }}.yaml"
 
 steps:
   - name: resolve-aio
@@ -43,16 +44,16 @@ steps:
     template: templates/aio/upgrade/resolve-extensions.bicep
     scope: resourceGroup
     parameters:
-      - parameters/aio-upgrade-resolve-extensions.yaml
+      - parameters/inputs/aio-upgrade-resolve-extensions.yaml
 
   - name: resolve-cert-manager
     template: templates/aio/upgrade/resolve-cert-manager.bicep
     scope: resourceGroup
     parameters:
-      - parameters/aio-upgrade-resolve-cert-manager.yaml
+      - parameters/inputs/aio-upgrade-resolve-cert-manager.yaml
 
   - name: update-extensions
     template: templates/aio/upgrade/update-extensions.bicep
     scope: resourceGroup
     parameters:
-      - parameters/aio-upgrade-update-extensions.yaml
+      - parameters/inputs/aio-upgrade-update-extensions.yaml

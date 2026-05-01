@@ -99,13 +99,13 @@ jobs:
           # Without this, a typo (e.g. "2604" when only "2603" is shipped)
           # proceeds through k3s bring-up + Arc registration and only errors
           # out at siteops deploy time.
-          versions_dir = Path("workspaces/iot-operations/parameters/aio-versions")
-          missing = [r for r in rs if not (versions_dir / f"{r}.yaml").is_file()]
+          releases_dir = Path("workspaces/iot-operations/parameters/aio-releases")
+          missing = [r for r in rs if not (releases_dir / f"{r}.yaml").is_file()]
           if missing:
-              available = sorted(p.stem for p in versions_dir.glob("*.yaml"))
+              available = sorted(p.stem for p in releases_dir.glob("*.yaml"))
               sys.exit(
                   f"aio-releases entries without a matching "
-                  f"{versions_dir}/<release>.yaml: {missing}. "
+                  f"{releases_dir}/<release>.yaml: {missing}. "
                   f"Available: {available}."
               )
           rg_in = os.environ["INPUT_RG"].strip()
@@ -122,11 +122,11 @@ jobs:
           # with `upgrade-to=2604` is a legitimate "test 2603->2604 plus
           # exercise 2604 install" shape. Each cell decides per-cell whether
           # to skip the upgrade phase based on `matrix.aio-release == upgrade-to`.
-          if upgrade_to and not (versions_dir / f"{upgrade_to}.yaml").is_file():
-              available = sorted(p.stem for p in versions_dir.glob("*.yaml"))
+          if upgrade_to and not (releases_dir / f"{upgrade_to}.yaml").is_file():
+              available = sorted(p.stem for p in releases_dir.glob("*.yaml"))
               sys.exit(
                   f"upgrade-to '{upgrade_to}' has no matching "
-                  f"{versions_dir}/{upgrade_to}.yaml. Available: {available}."
+                  f"{releases_dir}/{upgrade_to}.yaml. Available: {available}."
               )
           if upgrade_to and all(r == upgrade_to for r in rs):
               sys.exit(
@@ -339,10 +339,11 @@ jobs:
         shell: bash
         # Any `type: kubectl` step in the workspace will dispatch through the
         # Arc proxy and need namespace RBAC for the workflow SP. Skip the
-        # binding when no such step exists.
+        # binding when no such step exists. Walks manifests/, samples/, and
+        # scenarios/ since any of them can declare kubectl steps.
         run: |
           set -euo pipefail
-          if grep -rqE '^\s*type:\s*kubectl\s*$' workspaces/*/manifests/ 2>/dev/null; then
+          if grep -rqE '^\s*type:\s*kubectl\s*$' workspaces/*/manifests/ workspaces/*/samples/ workspaces/*/scenarios/ 2>/dev/null; then
             echo "needed=true" >> "$GITHUB_OUTPUT"
           else
             echo "needed=false" >> "$GITHUB_OUTPUT"

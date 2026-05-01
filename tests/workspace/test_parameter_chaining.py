@@ -25,31 +25,31 @@ class TestParameterChaining:
             refs.append((step_name, output_path, match.group(0)))
         return refs
 
-    def _get_manifest_step_names(self, manifest_path: Path) -> set[str]:
-        """Get all step names from a manifest."""
+    def _get_manifest_step_names(self, manifest_path: Path, workspace_root: Path | None = None) -> set[str]:
+        """Get all step names from a manifest (post-include flatten)."""
         from siteops.models import Manifest
-        manifest = Manifest.from_file(manifest_path)
+        manifest = Manifest.from_file(manifest_path, workspace_root=workspace_root)
         return {s.name for s in manifest.steps}
 
-    def test_secretsync_chaining_refs_valid_steps(self, workspace):
-        """secretsync-chaining.yaml should only reference steps that exist in manifests."""
-        chaining_file = workspace / "parameters" / "secretsync-chaining.yaml"
+    def test_secretsync_inputs_refs_valid_steps(self, workspace):
+        """parameters/inputs/secretsync.yaml should only reference steps that exist in manifests."""
+        chaining_file = workspace / "parameters" / "inputs" / "secretsync.yaml"
         refs = self._get_chaining_refs(chaining_file)
-        assert len(refs) > 0, "No step output references found in secretsync-chaining.yaml"
+        assert len(refs) > 0, "No step output references found in inputs/secretsync.yaml"
 
-        # Get step names from both manifests that use this chaining file
-        aio_steps = self._get_manifest_step_names(workspace / "manifests" / "aio-install.yaml")
-        secretsync_steps = self._get_manifest_step_names(workspace / "manifests" / "secretsync.yaml")
+        # Get step names from both manifests that use this inputs file
+        aio_steps = self._get_manifest_step_names(workspace / "manifests" / "aio-install.yaml", workspace_root=workspace)
+        secretsync_steps = self._get_manifest_step_names(workspace / "manifests" / "secretsync.yaml", workspace_root=workspace)
         all_valid_steps = aio_steps | secretsync_steps
 
         for step_name, output_path, raw in refs:
             assert step_name in all_valid_steps, (
-                f"secretsync-chaining.yaml references unknown step '{step_name}': {raw}"
+                f"inputs/secretsync.yaml references unknown step '{step_name}': {raw}"
             )
 
-    def test_secretsync_chaining_refs_valid_outputs(self, workspace):
-        """Every output referenced in secretsync-chaining.yaml should exist in resolve-aio.bicep."""
-        chaining_file = workspace / "parameters" / "secretsync-chaining.yaml"
+    def test_secretsync_inputs_refs_valid_outputs(self, workspace):
+        """Every output referenced in inputs/secretsync.yaml should exist in resolve-aio.bicep."""
+        chaining_file = workspace / "parameters" / "inputs" / "secretsync.yaml"
         refs = self._get_chaining_refs(chaining_file)
 
         # Parse output names from resolve-aio.bicep
@@ -64,57 +64,57 @@ class TestParameterChaining:
             # The top-level output name is the first segment of the path
             top_level_output = output_path.split(".")[0]
             assert top_level_output in output_names, (
-                f"secretsync-chaining.yaml references unknown output "
+                f"inputs/secretsync.yaml references unknown output "
                 f"'{top_level_output}' from resolve-aio: {raw}\n"
                 f"Available outputs: {sorted(output_names)}"
             )
 
-    def test_chaining_yaml_refs_in_aio_install(self, workspace):
-        """aio-instance-chaining.yaml should only reference steps that exist in aio-install.yaml."""
-        chaining_file = workspace / "parameters" / "aio-instance-chaining.yaml"
+    def test_aio_instance_inputs_refs_in_aio_install(self, workspace):
+        """parameters/inputs/aio-instance.yaml should only reference steps that exist in aio-install.yaml."""
+        chaining_file = workspace / "parameters" / "inputs" / "aio-instance.yaml"
         refs = self._get_chaining_refs(chaining_file)
 
         if not refs:
             return
 
-        aio_steps = self._get_manifest_step_names(workspace / "manifests" / "aio-install.yaml")
+        aio_steps = self._get_manifest_step_names(workspace / "manifests" / "aio-install.yaml", workspace_root=workspace)
 
         for step_name, output_path, raw in refs:
             assert step_name in aio_steps, (
-                f"aio-instance-chaining.yaml references unknown step '{step_name}': {raw}"
+                f"inputs/aio-instance.yaml references unknown step '{step_name}': {raw}"
             )
 
     def test_aio_instance_outputs_refs_in_aio_install(self, workspace):
-        """aio-instance-outputs.yaml should only reference steps that exist in aio-install.yaml."""
-        chaining_file = workspace / "parameters" / "aio-instance-outputs.yaml"
+        """parameters/outputs/aio-instance.yaml should only reference steps that exist in aio-install.yaml."""
+        chaining_file = workspace / "parameters" / "outputs" / "aio-instance.yaml"
         refs = self._get_chaining_refs(chaining_file)
 
         if not refs:
             return
 
-        aio_steps = self._get_manifest_step_names(workspace / "manifests" / "aio-install.yaml")
+        aio_steps = self._get_manifest_step_names(workspace / "manifests" / "aio-install.yaml", workspace_root=workspace)
 
         for step_name, output_path, raw in refs:
             assert step_name in aio_steps, (
-                f"aio-instance-outputs.yaml references unknown step '{step_name}': {raw}"
+                f"outputs/aio-instance.yaml references unknown step '{step_name}': {raw}"
             )
 
-    def test_opc_ua_solution_chaining_refs_valid_steps(self, workspace):
-        """opc-ua-solution-chaining.yaml should only reference steps that exist in opc-ua-solution.yaml."""
-        chaining_file = workspace / "parameters" / "opc-ua-solution-chaining.yaml"
+    def test_opc_ua_solution_inputs_refs_valid_steps(self, workspace):
+        """opc-ua-solution inputs.yaml only references steps in the standalone manifest."""
+        chaining_file = workspace / "samples" / "opc-ua-solution" / "inputs.yaml"
         refs = self._get_chaining_refs(chaining_file)
-        assert len(refs) > 0, "No step output references found in opc-ua-solution-chaining.yaml"
+        assert len(refs) > 0, "No step output references found in samples/opc-ua-solution/inputs.yaml"
 
-        opc_ua_steps = self._get_manifest_step_names(workspace / "manifests" / "opc-ua-solution.yaml")
+        opc_ua_steps = self._get_manifest_step_names(workspace / "samples" / "opc-ua-solution" / "manifest.yaml", workspace_root=workspace)
 
         for step_name, output_path, raw in refs:
             assert step_name in opc_ua_steps, (
-                f"opc-ua-solution-chaining.yaml references unknown step '{step_name}': {raw}"
+                f"samples/opc-ua-solution/inputs.yaml references unknown step '{step_name}': {raw}"
             )
 
-    def test_opc_ua_solution_chaining_refs_valid_outputs(self, workspace):
-        """Every output referenced in opc-ua-solution-chaining.yaml should exist in resolve-aio.bicep."""
-        chaining_file = workspace / "parameters" / "opc-ua-solution-chaining.yaml"
+    def test_opc_ua_solution_inputs_refs_valid_outputs(self, workspace):
+        """Every output referenced in samples/opc-ua-solution/inputs.yaml exists in resolve-aio.bicep."""
+        chaining_file = workspace / "samples" / "opc-ua-solution" / "inputs.yaml"
         refs = self._get_chaining_refs(chaining_file)
 
         resolve_aio = workspace / "templates" / "aio" / "resolve-aio.bicep"
@@ -127,7 +127,7 @@ class TestParameterChaining:
                 continue
             top_level_output = output_path.split(".")[0]
             assert top_level_output in output_names, (
-                f"opc-ua-solution-chaining.yaml references unknown output "
+                f"samples/opc-ua-solution/inputs.yaml references unknown output "
                 f"'{top_level_output}' from resolve-aio: {raw}\n"
                 f"Available outputs: {sorted(output_names)}"
             )
@@ -136,10 +136,10 @@ class TestParameterChaining:
 class TestConditionalStepCoverage:
     """Every when: condition should reference a property that exists in base-site.yaml."""
 
-    def _get_conditions_from_manifest(self, manifest_path: Path) -> list[tuple[str, str]]:
+    def _get_conditions_from_manifest(self, manifest_path: Path, workspace: Path) -> list[tuple[str, str]]:
         """Extract (step_name, condition) pairs from a manifest."""
         from siteops.models import Manifest
-        manifest = Manifest.from_file(manifest_path)
+        manifest = Manifest.from_file(manifest_path, workspace_root=workspace)
         conditions = []
         for step in manifest.steps:
             if step.when:
@@ -172,7 +172,7 @@ class TestConditionalStepCoverage:
 
         manifests_dir = workspace / "manifests"
         for manifest_file in sorted(manifests_dir.glob("*.yaml")):
-            conditions = self._get_conditions_from_manifest(manifest_file)
+            conditions = self._get_conditions_from_manifest(manifest_file, workspace)
 
             for step_name, condition in conditions:
                 match = prop_pattern.search(condition)
@@ -251,7 +251,7 @@ class TestAioUpgradeChaining:
     files (one chaining YAML per consumer step, named after the manifest +
     consumer step). Each consumer step's required Bicep params must be
     satisfied by either its chaining file or the version YAML
-    (parameters/aio-versions/<ver>.yaml), and every chained
+    (parameters/aio-releases/<release>.yaml), and every chained
     `{{ steps.X.outputs.Y }}` reference must hit a real output. A break
     here would silently produce wrong PUTs at deploy time.
 
@@ -271,21 +271,21 @@ class TestAioUpgradeChaining:
     )
     OUTPUT_RE = re.compile(r"^\s*output\s+(\w+)\s+", re.MULTILINE)
 
-    # consumer step name -> (chaining file name, bicep template path parts)
+    # consumer step name -> (chaining file path under parameters/, bicep template path parts)
     CONSUMERS = [
         (
             "resolve-extensions",
-            "aio-upgrade-resolve-extensions.yaml",
+            ("inputs", "aio-upgrade-resolve-extensions.yaml"),
             ("templates", "aio", "upgrade", "resolve-extensions.bicep"),
         ),
         (
             "resolve-cert-manager",
-            "aio-upgrade-resolve-cert-manager.yaml",
+            ("inputs", "aio-upgrade-resolve-cert-manager.yaml"),
             ("templates", "aio", "upgrade", "resolve-cert-manager.bicep"),
         ),
         (
             "update-extensions",
-            "aio-upgrade-update-extensions.yaml",
+            ("inputs", "aio-upgrade-update-extensions.yaml"),
             ("templates", "aio", "upgrade", "update-extensions.bicep"),
         ),
     ]
@@ -311,19 +311,19 @@ class TestAioUpgradeChaining:
             data = yaml.safe_load(f) or {}
         return set(data.keys())
 
-    def _version_yaml_keys(self, workspace: Path) -> set[str]:
-        """Return the INTERSECTION of keys across all version YAML files.
+    def _release_yaml_keys(self, workspace: Path) -> set[str]:
+        """Return the INTERSECTION of keys across all release YAML files.
 
-        Required params must be satisfiable regardless of which version file the
+        Required params must be satisfiable regardless of which release file the
         operator pins; using the intersection guarantees that. A separate test
-        (`TestVersionConfigs.test_version_yaml_keys_consistent_across_files`)
+        (`TestReleaseConfigs.test_release_yaml_keys_consistent_across_files`)
         asserts the key sets match exactly to catch divergence.
         """
-        version_files = sorted((workspace / "parameters" / "aio-versions").glob("*.yaml"))
-        assert version_files, "no aio-versions YAML files found"
+        release_files = sorted((workspace / "parameters" / "aio-releases").glob("*.yaml"))
+        assert release_files, "no aio-releases YAML files found"
         per_file_keys: list[set[str]] = []
-        for version_file in version_files:
-            with open(version_file, "r", encoding="utf-8") as f:
+        for release_file in release_files:
+            with open(release_file, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
             per_file_keys.append(set(data.keys()))
         return set.intersection(*per_file_keys)
@@ -337,11 +337,12 @@ class TestAioUpgradeChaining:
 
     def test_aio_upgrade_chaining_refs_valid_steps(self, workspace):
         from siteops.models import Manifest
-        manifest = Manifest.from_file(workspace / "manifests" / "aio-upgrade.yaml")
+        manifest = Manifest.from_file(workspace / "manifests" / "aio-upgrade.yaml", workspace_root=workspace)
         manifest_steps = {step.name for step in manifest.steps}
 
-        for _, chaining_name, _ in self.CONSUMERS:
-            chaining = workspace / "parameters" / chaining_name
+        for _, chaining_parts, _ in self.CONSUMERS:
+            chaining = workspace / "parameters" / Path(*chaining_parts)
+            chaining_name = chaining_parts[-1]
             for step_name, _, raw in self._get_chaining_refs(chaining):
                 assert step_name in manifest_steps, (
                     f"{chaining_name} references unknown step "
@@ -360,8 +361,9 @@ class TestAioUpgradeChaining:
                 workspace / "templates" / "aio" / "upgrade" / "resolve-cert-manager.bicep"
             ),
         }
-        for _, chaining_name, _ in self.CONSUMERS:
-            chaining = workspace / "parameters" / chaining_name
+        for _, chaining_parts, _ in self.CONSUMERS:
+            chaining = workspace / "parameters" / Path(*chaining_parts)
+            chaining_name = chaining_parts[-1]
             for step_name, output_path, raw in self._get_chaining_refs(chaining):
                 top_level = output_path.split(".")[0]
                 available = outputs_by_step.get(step_name)
@@ -377,18 +379,20 @@ class TestAioUpgradeChaining:
 
     def test_aio_upgrade_required_params_satisfied(self, workspace):
         """Every required Bicep param on each upgrade consumer must be supplied."""
-        version_keys = self._version_yaml_keys(workspace)
-        for _, chaining_name, bicep_parts in self.CONSUMERS:
-            chaining_keys = self._chaining_keys(workspace / "parameters" / chaining_name)
-            supplied = chaining_keys | version_keys
+        release_keys = self._release_yaml_keys(workspace)
+        for _, chaining_parts, bicep_parts in self.CONSUMERS:
+            chaining_path = workspace / "parameters" / Path(*chaining_parts)
+            chaining_name = chaining_parts[-1]
+            chaining_keys = self._chaining_keys(chaining_path)
+            supplied = chaining_keys | release_keys
             consumer = workspace.joinpath(*bicep_parts)
             _, required = self._bicep_params(consumer)
             missing = required - supplied
             assert missing == set(), (
                 f"{consumer.name} has required params not satisfied by "
-                f"{chaining_name} or aio-versions YAML: {sorted(missing)}.\n"
+                f"{chaining_name} or aio-releases YAML: {sorted(missing)}.\n"
                 f"Chaining keys: {sorted(chaining_keys)}\n"
-                f"Version keys: {sorted(version_keys)}"
+                f"Release keys: {sorted(release_keys)}"
             )
 
     def test_aio_upgrade_chaining_keys_consumed(self, workspace):
@@ -398,8 +402,10 @@ class TestAioUpgradeChaining:
         per-consumer chaining files this is now a tight 1:1 check rather
         than a union check.
         """
-        for _, chaining_name, bicep_parts in self.CONSUMERS:
-            chaining_keys = self._chaining_keys(workspace / "parameters" / chaining_name)
+        for _, chaining_parts, bicep_parts in self.CONSUMERS:
+            chaining_path = workspace / "parameters" / Path(*chaining_parts)
+            chaining_name = chaining_parts[-1]
+            chaining_keys = self._chaining_keys(chaining_path)
             consumer = workspace.joinpath(*bicep_parts)
             params, _ = self._bicep_params(consumer)
             unused = chaining_keys - params
@@ -463,40 +469,40 @@ VERSION_CONFIG_REQUIRED_FIELDS = {
 }
 
 
-class TestVersionConfigs:
-    """Version config YAML files should be valid and consistent."""
+class TestReleaseConfigs:
+    """Release config YAML files should be valid and consistent."""
 
-    def _get_version_files(self, workspace: Path) -> list[Path]:
-        versions_dir = workspace / "parameters" / "aio-versions"
-        return sorted(versions_dir.glob("*.yaml"))
+    def _get_release_files(self, workspace: Path) -> list[Path]:
+        releases_dir = workspace / "parameters" / "aio-releases"
+        return sorted(releases_dir.glob("*.yaml"))
 
-    def test_version_files_exist(self, workspace):
-        """At least one version config should exist."""
-        files = self._get_version_files(workspace)
-        assert len(files) >= 1, "No version config files found in parameters/aio-versions/"
+    def test_release_files_exist(self, workspace):
+        """At least one release config should exist."""
+        files = self._get_release_files(workspace)
+        assert len(files) >= 1, "No release config files found in parameters/aio-releases/"
 
-    def test_version_configs_have_required_fields(self, workspace):
-        """Every version config must have all required fields."""
-        for version_file in self._get_version_files(workspace):
-            with open(version_file, "r", encoding="utf-8") as f:
+    def test_release_configs_have_required_fields(self, workspace):
+        """Every release config must have all required fields."""
+        for release_file in self._get_release_files(workspace):
+            with open(release_file, "r", encoding="utf-8") as f:
                 config = yaml.safe_load(f)
 
             actual_keys = set(config.keys())
             missing = VERSION_CONFIG_REQUIRED_FIELDS - actual_keys
             assert missing == set(), (
-                f"{version_file.name} missing required fields: {missing}"
+                f"{release_file.name} missing required fields: {missing}"
             )
 
-    def test_version_config_values_are_non_empty(self, workspace):
-        """All version config values must be non-empty strings."""
-        for version_file in self._get_version_files(workspace):
-            with open(version_file, "r", encoding="utf-8") as f:
+    def test_release_config_values_are_non_empty(self, workspace):
+        """All release config values must be non-empty strings."""
+        for release_file in self._get_release_files(workspace):
+            with open(release_file, "r", encoding="utf-8") as f:
                 config = yaml.safe_load(f)
 
             for key in VERSION_CONFIG_REQUIRED_FIELDS:
                 value = config.get(key)
                 assert value is not None and str(value).strip() != "", (
-                    f"{version_file.name}: '{key}' is empty or missing"
+                    f"{release_file.name}: '{key}' is empty or missing"
                 )
 
     def test_base_site_aio_release_has_config_file(self, workspace):
@@ -508,10 +514,10 @@ class TestVersionConfigs:
         aio_release = data.get("properties", {}).get("aioRelease")
         assert aio_release, "base-site.yaml missing properties.aioRelease"
 
-        version_file = workspace / "parameters" / "aio-versions" / f"{aio_release}.yaml"
-        assert version_file.exists(), (
+        release_file = workspace / "parameters" / "aio-releases" / f"{aio_release}.yaml"
+        assert release_file.exists(), (
             f"base-site.yaml references aioRelease '{aio_release}' "
-            f"but parameters/aio-versions/{aio_release}.yaml does not exist"
+            f"but parameters/aio-releases/{aio_release}.yaml does not exist"
         )
 
     def test_all_sites_aio_releases_have_config_files(self, workspace):
@@ -520,7 +526,7 @@ class TestVersionConfigs:
         Catches drift where a site is added or updated to use a release whose YAML
         was never created (e.g., typo, or deleted release without migrating sites).
         """
-        versions_dir = workspace / "parameters" / "aio-versions"
+        releases_dir = workspace / "parameters" / "aio-releases"
         sites_dir = workspace / "sites"
         if not sites_dir.exists():
             return
@@ -531,36 +537,36 @@ class TestVersionConfigs:
             aio_release = (data.get("properties") or {}).get("aioRelease")
             if not aio_release:
                 continue
-            version_file = versions_dir / f"{aio_release}.yaml"
-            assert version_file.exists(), (
+            release_file = releases_dir / f"{aio_release}.yaml"
+            assert release_file.exists(), (
                 f"{site_file.name} references aioRelease '{aio_release}' "
-                f"but parameters/aio-versions/{aio_release}.yaml does not exist"
+                f"but parameters/aio-releases/{aio_release}.yaml does not exist"
             )
 
-    def test_version_yaml_keys_consistent_across_files(self, workspace):
-        """All aio-versions YAML files should declare the same key set.
+    def test_release_yaml_keys_consistent_across_files(self, workspace):
+        """All aio-releases YAML files should declare the same key set.
 
         If `2603.yaml` adds a key like `storageVersion` that `2512.yaml` doesn't
         have, upgrades to older targets would fail with missing required params
         (or silently use defaults). Catch divergence early.
         """
-        version_files = self._get_version_files(workspace)
-        assert version_files, "no aio-versions YAML files found"
+        release_files = self._get_release_files(workspace)
+        assert release_files, "no aio-releases YAML files found"
         per_file: dict[str, set[str]] = {}
-        for version_file in version_files:
-            with open(version_file, "r", encoding="utf-8") as f:
+        for release_file in release_files:
+            with open(release_file, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
-            per_file[version_file.name] = set(data.keys())
+            per_file[release_file.name] = set(data.keys())
 
         common = set.intersection(*per_file.values())
         for fname, keys in per_file.items():
             extra = keys - common
             missing = common - keys
             assert extra == set() and missing == set(), (
-                f"{fname} key set diverges from other version files.\n"
+                f"{fname} key set diverges from other release files.\n"
                 f"  extra keys: {sorted(extra)}\n"
                 f"  missing keys: {sorted(missing)}\n"
-                f"All version files must declare the same key set."
+                f"All release files must declare the same key set."
             )
 
     def test_version_config_api_versions_are_allowed_in_bicep(self, workspace):
@@ -601,12 +607,12 @@ class TestVersionConfigs:
         allowed = values[0]
         assert allowed, "No @allowed values parsed — regex or template changed"
 
-        for version_file in self._get_version_files(workspace):
-            with open(version_file, "r", encoding="utf-8") as f:
+        for release_file in self._get_release_files(workspace):
+            with open(release_file, "r", encoding="utf-8") as f:
                 config = yaml.safe_load(f)
             api_version = config.get("aioApiVersion")
             assert api_version in allowed, (
-                f"{version_file.name}: aioApiVersion '{api_version}' is not in the "
+                f"{release_file.name}: aioApiVersion '{api_version}' is not in the "
                 f"@allowed set {sorted(allowed)} declared by "
                 f"{', '.join(sorted(allowed_sets.keys()))}. "
                 f"Add the new API version to both dispatchers' @allowed blocks and "
@@ -634,12 +640,12 @@ class TestVersionConfigs:
         allowed = set(re.findall(r"'([^']+)'", match.group(1)))
         assert allowed, "No @allowed values parsed for adrApiVersion"
 
-        for version_file in self._get_version_files(workspace):
-            with open(version_file, "r", encoding="utf-8") as f:
+        for release_file in self._get_release_files(workspace):
+            with open(release_file, "r", encoding="utf-8") as f:
                 config = yaml.safe_load(f)
             api_version = config.get("adrApiVersion")
             assert api_version in allowed, (
-                f"{version_file.name}: adrApiVersion '{api_version}' is not in "
+                f"{release_file.name}: adrApiVersion '{api_version}' is not in "
                 f"the @allowed set {sorted(allowed)} declared by "
                 f"{dispatcher.name}. Add the new API version to the @allowed "
                 f"block and dispatch in {dispatcher.name} (and create a matching "
@@ -655,13 +661,13 @@ class TestVersionConfigs:
         case where the @allowed list is updated but the module file is missing.
         """
         modules_dir = workspace / "templates" / "deps" / "modules"
-        for version_file in self._get_version_files(workspace):
-            with open(version_file, "r", encoding="utf-8") as f:
+        for release_file in self._get_release_files(workspace):
+            with open(release_file, "r", encoding="utf-8") as f:
                 config = yaml.safe_load(f)
             api_version = config.get("adrApiVersion")
             module_path = modules_dir / f"adr-ns-{api_version}.bicep"
             assert module_path.is_file(), (
-                f"{version_file.name}: adrApiVersion '{api_version}' has no "
+                f"{release_file.name}: adrApiVersion '{api_version}' has no "
                 f"matching module at {module_path.relative_to(workspace)}. "
                 f"Create the per-version module by copying the previous one "
                 f"and changing the API version string."
@@ -670,23 +676,23 @@ class TestVersionConfigs:
     def test_version_config_aio_api_versions_have_modules(self, workspace):
         """Every aioApiVersion must have matching instance/resolve-instance/update-instance modules."""
         modules_dir = workspace / "templates" / "aio" / "modules"
-        for version_file in self._get_version_files(workspace):
-            with open(version_file, "r", encoding="utf-8") as f:
+        for release_file in self._get_release_files(workspace):
+            with open(release_file, "r", encoding="utf-8") as f:
                 config = yaml.safe_load(f)
             api_version = config.get("aioApiVersion")
             for prefix in ("instance", "resolve-instance", "update-instance"):
                 module_path = modules_dir / f"{prefix}-{api_version}.bicep"
                 assert module_path.is_file(), (
-                    f"{version_file.name}: aioApiVersion '{api_version}' has no "
+                    f"{release_file.name}: aioApiVersion '{api_version}' has no "
                     f"matching {prefix} module at {module_path.relative_to(workspace)}."
                 )
 
 
-class TestSolutionTemplateApiPolicy:
-    """Sample templates under templates/solutions/ pin to the oldest supported API version.
+class TestSampleTemplateApiPolicy:
+    """Sample templates under samples/ pin to the oldest supported API version.
 
     Rationale: a single sample template that works against every shipped release
-    avoids per-version dispatch in samples. See docs/aio-versions.md
+    avoids per-version dispatch in samples. See docs/aio-releases.md
     ("Sample template API-version policy").
     """
 
@@ -696,10 +702,10 @@ class TestSolutionTemplateApiPolicy:
     }
 
     def _oldest_versions(self, workspace: Path) -> dict[str, str]:
-        versions_dir = workspace / "parameters" / "aio-versions"
+        releases_dir = workspace / "parameters" / "aio-releases"
         oldest: dict[str, str] = {}
-        for version_file in sorted(versions_dir.glob("*.yaml")):
-            with open(version_file, "r", encoding="utf-8") as f:
+        for release_file in sorted(releases_dir.glob("*.yaml")):
+            with open(release_file, "r", encoding="utf-8") as f:
                 config = yaml.safe_load(f)
             for rp, key in self._RP_TO_VERSION_KEY.items():
                 value = config.get(key)
@@ -709,9 +715,9 @@ class TestSolutionTemplateApiPolicy:
                     oldest[rp] = value
         return oldest
 
-    def test_solutions_pin_to_oldest_api_version(self, workspace):
+    def test_samples_pin_to_oldest_api_version(self, workspace):
         """Every Microsoft.IoTOperations / Microsoft.DeviceRegistry reference under
-        templates/solutions/ must equal the oldest API version in the version-YAML matrix.
+        samples/ must equal the oldest API version in the release-YAML matrix.
 
         If this test fails after shipping a newer version YAML, the fix is to
         leave the sample alone. If it fails because the oldest version was
@@ -722,9 +728,9 @@ class TestSolutionTemplateApiPolicy:
         assert oldest, "Could not derive oldest API versions from version YAMLs"
 
         rp_pattern = re.compile(r"(Microsoft\.(?:IoTOperations|DeviceRegistry))/[^@'\s]+@(\d{4}-\d{2}-\d{2}(?:-preview)?)")
-        solutions_dir = workspace / "templates" / "solutions"
-        bicep_files = list(solutions_dir.rglob("*.bicep"))
-        assert bicep_files, f"No bicep files found under {solutions_dir}"
+        samples_dir = workspace / "samples"
+        bicep_files = list(samples_dir.rglob("*.bicep"))
+        assert bicep_files, f"No bicep files found under {samples_dir}"
 
         violations: list[str] = []
         for bicep in bicep_files:
@@ -742,6 +748,6 @@ class TestSolutionTemplateApiPolicy:
                     )
         assert not violations, (
             "Sample templates must pin to the oldest supported API version "
-            "(see docs/aio-versions.md 'Sample template API-version policy'):\n  "
+            "(see docs/aio-releases.md 'Sample template API-version policy'):\n  "
             + "\n  ".join(violations)
         )

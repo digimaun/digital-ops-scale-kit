@@ -76,18 +76,6 @@ class TestAioInstallConditionalSteps:
             assert_step_skipped(aio_install_result, name, "resolve-aio")
             assert_step_skipped(aio_install_result, name, "secretsync")
 
-    def test_solution_step_skipped_when_disabled(
-        self, aio_install_result, orchestrator
-    ):
-        """Sites with deployOptions.includeSolution=false should skip the
-        opc-ua-solution step embedded in aio-install.yaml."""
-        for name in aio_install_result["sites"]:
-            site = orchestrator.load_site(name)
-            included = site.properties.get("deployOptions", {}).get("includeSolution", True)
-            if included:
-                continue
-            assert_step_skipped(aio_install_result, name, "opc-ua-solution")
-
 
 class TestAioInstallVersioning:
     """Validate that the AIO extension Azure actually deployed matches the
@@ -100,7 +88,7 @@ class TestAioInstallVersioning:
         """The bicep output `aioExtension.version` reflects
         `Microsoft.KubernetesConfiguration/extensions/.../properties/version`
         from Azure. Cross-check it against the `aioVersion` declared in the
-        site's aio-versions config file (selected by the site's aioRelease) —
+        site's aio-releases config file (selected by the site's aioRelease) —
         this is the primary regression guard for versioned-templates wiring.
         A drift here means the wrong template dispatched, even if everything
         else looks green.
@@ -124,7 +112,7 @@ class TestAioInstallVersioning:
             assert aio_release_key, f"Site '{name}': missing properties.aioRelease"
 
             version_config = (
-                WORKSPACE_PATH / "parameters" / "aio-versions" / f"{aio_release_key}.yaml"
+                WORKSPACE_PATH / "parameters" / "aio-releases" / f"{aio_release_key}.yaml"
             )
             assert version_config.is_file(), (
                 f"Site '{name}': version config not found: {version_config}"

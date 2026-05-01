@@ -40,7 +40,7 @@ parameters:
 
 properties:
   deployOptions:
-    includeSolution: true
+    enableSecretSync: true
 ```
 
 **Subscription-level site** (for shared resources):
@@ -56,6 +56,7 @@ location: germanywestcentral
 
 labels:
   environment: dev
+  scope: subscription      # Required: lets manifests target with `selector: scope=subscription`
 
 parameters:
   edgeSiteName: germany-edge-site
@@ -110,10 +111,10 @@ Structured **metadata** and **deployment options**:
 
 ```yaml
 properties:
-  aioRelease: "2603"                   # Target AIO release (see [aio-versions.md](aio-versions.md))
-  deployOptions:                       # Control deployment behavior
-    includeSolution: true
-    includeOpcPlcSimulator: false
+  aioRelease: "2603"                   # Target AIO release (see [aio-releases.md](aio-releases.md))
+  deployOptions:                       # Capability gates evaluated by manifest `when:` conditions
+    enableGlobalSite: false
+    enableEdgeSite: false
     enableSecretSync: false
   tags:
     costCenter: operations
@@ -125,7 +126,7 @@ properties:
 
 Use properties for:
 
-- Deployment options (conditionals via `when:`)
+- Capability gates evaluated via `when:` (`deployOptions.*`)
 - Azure resource tags
 - Arrays of endpoints or devices
 - Nested metadata structures
@@ -136,10 +137,10 @@ Properties support conditionals with truthy syntax:
 
 ```yaml
 # Truthy check (recommended for booleans)
-when: "{{ site.properties.deployOptions.includeSolution }}"
+when: "{{ site.properties.deployOptions.enableSecretSync }}"
 
 # Explicit comparison (also supported)
-when: "{{ site.properties.deployOptions.includeSolution == true }}"
+when: "{{ site.properties.deployOptions.enableSecretSync == true }}"
 when: "{{ site.labels.environment == 'prod' }}"
 ```
 
@@ -343,10 +344,10 @@ three mutually-exclusive precedence tiers:
    Each entry is a filename stem; missing files raise
    `FileNotFoundError` with the full list.
 
-3. **Manifest `siteSelector:` (label expression).**
+3. **Manifest `selector:` (label expression).**
    ```yaml
    # manifests/aio-install.yaml
-   siteSelector: "environment=dev"
+   selector: "environment=dev"
    ```
    The orchestrator loads all discoverable sites and keeps those whose
    labels satisfy the expression.
@@ -362,5 +363,27 @@ A manifest with none of the three is rejected at parse time.
 | Override a committed site at runtime without a PR | Put `my-site.yaml` in `workspace/sites.local/` (overlay merges; `inherits:` stripped) |
 | Inject a site from CI without touching the workspace | Register a dir via `SITEOPS_EXTRA_SITES_DIRS` / `--extra-sites-dir` and drop `my-site.yaml` at its root |
 | Target one specific site at the CLI | `siteops deploy <manifest> --selector name=<site-name>` |
-| Pin the manifest to a labeled cohort | Set `siteSelector:` in the manifest |
+| Pin the manifest to a labeled cohort | Set `selector:` in the manifest |
 | Hard-code the target list for a manifest | Set `sites:` in the manifest |
+| Preview a fully-resolved site (post inherit + overlay) | `siteops -w <workspace> sites <name> --render` |
+
+## Scaling to a fleet
+
+Once you cross a handful of sites, two-axis composition (region × environment) duplicates env config across `<region>-dev.yaml` and `<region>-prod.yaml`. The recommended pattern: introduce intermediate `SiteTemplate` files so each concrete site inherits one chain.
+
+```
+sites/
+├── base-site.yaml                # workspace defaults
+├── shared/
+│   ├── env-dev.yaml              # SiteTemplate: dev-only labels + parameters
+│   ├── env-prod.yaml             # SiteTemplate: prod-only labels + parameters
+│   ├── region-eu.yaml            # SiteTemplate: location, country labels
+│   └── region-eu-prod.yaml       # SiteTemplate: inherits region-eu, then env-prod
+├── munich-dev.yaml               # Site: inherits shared/region-eu.yaml + dev override
+├── munich-prod.yaml              # Site: inherits shared/region-eu-prod.yaml
+└── ...
+```
+
+Each concrete site declares a single `inherits:` parent. The intermediate `SiteTemplate` files capture the cross-cutting axes so that adding a new region or environment is a one-file change instead of N edits across N regions.
+
+> Validate the resolved shape with `siteops -w <workspace> sites <name> --render` before committing the new template chain.

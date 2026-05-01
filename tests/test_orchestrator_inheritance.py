@@ -251,12 +251,16 @@ class TestSiteInheritance:
         assert loaded.subscription == "direct-sub"
         assert loaded.location == "eastus"
 
-    def test_inherit_from_site_kind(self, tmp_workspace):
-        """Should be able to inherit from kind: Site (not just SiteTemplate)."""
+    def test_inherit_from_site_kind_rejected(self, tmp_workspace):
+        """Inheriting from kind: Site is rejected. Inherits parents must be SiteTemplate.
+
+        A `kind: Site` parent would chain deployable sites where editing one
+        silently changes the other. Use SiteTemplate for any reusable base.
+        """
         shared_dir = tmp_workspace / "shared"
         shared_dir.mkdir()
 
-        # Base site (not template)
+        # Base site (deliberately the wrong kind for inheritance)
         base_site = {
             "kind": "Site",
             "subscription": "shared-sub",
@@ -268,16 +272,13 @@ class TestSiteInheritance:
         site = {
             "inherits": "../shared/base-site.yaml",
             "name": "inherit-from-site",
-            "location": "eastus",  # Override location
+            "location": "eastus",
         }
         (tmp_workspace / "sites" / "inherit-from-site.yaml").write_text(yaml.dump(site))
 
         orchestrator = Orchestrator(tmp_workspace)
-        loaded = orchestrator.load_site("inherit-from-site")
-
-        assert loaded.subscription == "shared-sub"
-        assert loaded.location == "eastus"  # Overridden
-        assert loaded.labels["shared"] == "true"
+        with pytest.raises(ValueError, match="must be SiteTemplate"):
+            orchestrator.load_site("inherit-from-site")
 
     def test_local_overlay_cannot_add_inheritance(self, tmp_workspace):
         """Local overlay should not be able to add inheritance to a site that doesn't have it."""

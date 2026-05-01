@@ -1,4 +1,4 @@
-"""Integration tests for the opc-ua-solution.yaml manifest."""
+"""Integration tests for the opc-ua-solution sample manifest."""
 
 import pytest
 
@@ -11,9 +11,11 @@ from tests.integration.conftest import WORKSPACE_PATH
 
 pytestmark = [pytest.mark.integration]
 
+OPC_UA_SOLUTION_MANIFEST = WORKSPACE_PATH / "samples" / "opc-ua-solution" / "manifest.yaml"
+
 
 class TestOpcUaSolutionDeployment:
-    """Validate that opc-ua-solution.yaml deploys successfully."""
+    """Validate that samples/opc-ua-solution/manifest.yaml deploys successfully."""
 
     def test_no_failures(self, opc_ua_solution_result):
         assert opc_ua_solution_result["summary"]["failed"] == 0
@@ -50,14 +52,19 @@ class TestOpcUaSolutionDeployment:
             assert_output_exists(step, "resolvedExtensionName")
 
 
-class TestOpcUaSolutionConditionalSteps:
-    """Validate that conditional steps are gated correctly."""
+class TestOpcUaSolutionSimulator:
+    """Validate that the opc-plc-simulator step deploys successfully.
 
-    def test_opc_plc_simulator_conditional(self, opc_ua_solution_result):
-        """OPC PLC simulator should respect includeOpcPlcSimulator deploy option."""
+    The simulator is part of the sample's core layer and runs unconditionally
+    when the sample is deployed.
+    """
+
+    def test_simulator_succeeds(self, opc_ua_solution_result):
         for name in opc_ua_solution_result["sites"]:
             step = find_step(opc_ua_solution_result, name, "opc-plc-simulator")
-            assert step["status"] in ("success", "skipped")
+            assert step["status"] == "success", (
+                f"Site '{name}': opc-plc-simulator status was {step['status']}"
+            )
 
 
 class TestOpcUaSolutionIdempotency:
@@ -70,7 +77,7 @@ class TestOpcUaSolutionIdempotency:
         indicates resources were recreated, which breaks any consumer that
         cached the endpoint."""
         result2 = orchestrator.deploy(
-            manifest_path=WORKSPACE_PATH / "manifests" / "opc-ua-solution.yaml",
+            manifest_path=OPC_UA_SOLUTION_MANIFEST,
             selector=selector,
         )
         assert result2["summary"]["failed"] == 0

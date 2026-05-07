@@ -52,13 +52,18 @@ on:
                 required: false
                 type: boolean
                 default: false
+            siteops-source:
+                description: "siteops install source (e.g. git+https://github.com/.../digital-ops-scale-kit@<tag>). Empty = local editable install."
+                required: false
+                type: string
+                default: ""
 
 env:
     PYTHONUNBUFFERED: "1"
 
-# Prevent concurrent deployments to the same environment
+# Serialize per-environment work across deploy and integration-test
 concurrency:
-    group: deploy-${{ inputs.environment }}
+    group: azure-${{ inputs.environment }}
     cancel-in-progress: false
 
 permissions:
@@ -163,4 +168,5 @@ jobs:
             dry-run: ${{ inputs.dry-run }}
             environment: ${{ needs.prepare.outputs.github-environment }}
             ref: ${{ needs.prepare.outputs.ref }}
+            siteops-source: ${{ inputs.siteops-source }}
         secrets: inherit

@@ -22,7 +22,7 @@ This guide covers CI/CD configuration for automated testing and deployments. Sit
 | `ci.yaml` | Push, pull request, manual | Validate Bicep templates, run unit tests, and validate manifests |
 | `deploy.yaml` | Manual (`workflow_dispatch`) | Deploy infrastructure to Azure |
 | `_siteops-deploy.yaml` | Called by deploy.yaml | Reusable deployment logic |
-| `integration-test.yaml` | Manual (`workflow_dispatch`) | Deploy a manifest against real Azure and assert outputs |
+| `integration-test.yaml` | Manual (`workflow_dispatch`) | Run the integration pytest suite against an environment that was previously deployed via `deploy.yaml` |
 | `e2e-test.yaml` | Manual (`workflow_dispatch`) | Full-stack E2E: k3s + Arc + AIO deploy + integration tests (see [E2E testing](e2e-testing.md)) |
 
 ### Azure OIDC Configuration
@@ -187,27 +187,27 @@ Override subscription, resource group, and parameters per site. Supports nested 
 {
   "munich-dev": {
     "subscription": "00000000-0000-0000-0000-000000000000",
-    "resourceGroup": "rg-aio-munich-dev",
-    "parameters.clusterName": "arc-muc-dev-01"
+    "resourceGroup": "rg-iot-munich-dev",
+    "parameters.clusterName": "munich-dev-arc"
   },
   "munich-prod": {
     "subscription": "00000000-0000-0000-0000-000000000000",
-    "resourceGroup": "rg-aio-munich-prod",
-    "parameters.clusterName": "arc-muc-prod-01"
+    "resourceGroup": "rg-iot-munich-prod",
+    "parameters.clusterName": "munich-prod-arc"
   },
   "seattle-dev": {
     "subscription": "00000000-0000-0000-0000-000000000000",
-    "resourceGroup": "rg-aio-seattle-dev",
+    "resourceGroup": "rg-iot-seattle-dev",
     "parameters.clusterName": "arc-sea-dev-01"
   },
   "seattle-prod": {
     "subscription": "00000000-0000-0000-0000-000000000000",
-    "resourceGroup": "rg-aio-seattle-prod",
+    "resourceGroup": "rg-iot-seattle-prod",
     "parameters.clusterName": "arc-sea-prod-01"
   },
   "chicago-staging": {
     "subscription": "00000000-0000-0000-0000-000000000000",
-    "resourceGroup": "rg-aio-chicago-staging",
+    "resourceGroup": "rg-iot-chicago-staging",
     "parameters.clusterName": "arc-chi-staging-01"
   }
 }
@@ -225,6 +225,7 @@ CI runs automatically on pushes to main and PRs that modify:
 - `siteops/**`
 - `workspaces/**`
 - `tests/**`
+- `scripts/**`
 - `pyproject.toml`
 
 Can also be triggered manually from **Actions → CI → Run workflow** (GHA) or **Pipelines → CI → Run pipeline** (ADO).
@@ -349,7 +350,7 @@ gh workflow run deploy.yaml -f workspace="iot-operations" -f manifest="scenarios
 │  5. Azure Login (OIDC)                                      │
 │  6. Start OIDC token refresh service (background)           │
 │  7. Run: siteops deploy                                     │
-│  8. Azure Logout                                            │
+│  8. Stop OIDC refresh and Azure Logout                      │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -364,7 +365,7 @@ See [ADO architecture](#ado-architecture) for the Azure DevOps equivalent.
 | **Input Validation** | Prevents path traversal and injection attacks | Same validation logic in pipeline scripts |
 | **Site Name Sanitization** | `SITE_OVERRIDES` keys validated against `^[a-zA-Z0-9_-]+$` | Same |
 | **Override Value Masking** | `::add-mask::` per value | `##vso[task.setvariable issecret=true]` per value |
-| **Concurrency Control** | `concurrency` groups (one deploy per env) | Exclusive lock on ADO environments |
+| **Concurrency Control** | `concurrency` groups (one deploy or integration-test per env, shared `azure-${env}` group) | Exclusive lock on ADO environments |
 | **Least Privilege** | `permissions:` block scopes GitHub token | Service connection authorization scopes access |
 | **Token Refresh** | Background OIDC refresh every 4 min | Not needed (`AzureCLI@2` manages lifecycle) |
 | **Credential Isolation** | `persist-credentials: false` on checkout | `persistCredentials: false` on checkout |
@@ -378,7 +379,8 @@ See [ADO architecture](#ado-architecture) for the Azure DevOps equivalent.
 │                                                             │
 │  GitHub Actions:                                            │
 │  • Environment protection rules (approvals, branch gates)   │
-│  • Concurrency prevents parallel deploys to same env        │
+│  • Concurrency prevents parallel deploys or integration-tests│
+│    to the same env                                          │
 │  • Minimal permissions (contents: read, id-token: write)    │
 │                                                             │
 │  Azure DevOps:                                              │
@@ -530,6 +532,7 @@ stages:
 |-------|---------|-------------|
 | `python-version` | `3.11` | Python version to install |
 | `install-dev` | `false` | Include dev dependencies (pytest, pytest-cov) |
+| `siteops-source` | (empty) | pip install spec for siteops. Empty = local editable install. Set to `git+https://github.com/.../digital-ops-scale-kit@<ref>` to pin a release. |
 
 ```yaml
 - uses: ./.github/actions/setup-siteops
@@ -543,6 +546,8 @@ stages:
 |-----------|---------|-------------|
 | `pythonVersion` | `'3.11'` | Python version to install |
 | `installDev` | `false` | Include dev dependencies (pytest, pytest-cov) |
+| `siteopsSource` | (empty) | pip install spec for siteops. Empty = local editable install. |
+| `enableCache` | `true` | Cache the pip wheel directory across pipeline runs. Disable in deployment jobs (no cache scope available). |
 
 ```yaml
 - template: templates/setup-siteops.yaml
@@ -574,7 +579,7 @@ In ADO → **Project settings → Service connections → New → Azure Resource
 
 The service connection name is referenced in the deploy pipeline. Default: `azure-siteops`.
 
-> **Reusing the GitHub Actions app registration:** If you already configured OIDC for GitHub Actions (section above), you can reuse that same app registration. Create a new federated credential for ADO — the issuer and subject claims are different from GitHub's. The Azure roles are shared.
+> **Reusing the GitHub Actions app registration:** If you already configured OIDC for GitHub Actions (section above), you can reuse that same app registration. Create a new federated credential for ADO. The issuer and subject claims are different from GitHub's. The Azure roles are shared.
 
 #### 2. Create variable group
 
@@ -594,7 +599,7 @@ In ADO → **Pipelines → Environments** → create `dev`, `staging`, `prod`.
 | `staging` | 1 approver | Yes |
 | `prod` | 2 approvers | Yes |
 
-Exclusive lock ensures one deployment per environment at a time (equivalent to GitHub `concurrency` groups).
+Exclusive lock ensures one deployment per environment at a time. The GitHub Actions equivalent is the shared `azure-${env}` `concurrency` group on `deploy.yaml` and `integration-test.yaml`, so a deploy and an integration test against the same environment serialize on both platforms.
 
 To configure: **Environments → (select env) → Approvals and checks → + → Exclusive lock** and **+ → Approvals**.
 
@@ -607,7 +612,7 @@ In ADO → **Pipelines → New pipeline** → **Azure Repos Git** (or GitHub, if
 
 #### 5. Assign Azure roles
 
-Same as GitHub Actions — see [Assign Azure roles](#3-assign-azure-roles). The service connection's managed identity needs the same Contributor (or Owner with conditions) role assignment.
+Same as GitHub Actions, see [Assign Azure roles](#3-assign-azure-roles). The service connection's managed identity needs the same Contributor (or Owner with conditions) role assignment.
 
 ### Running ADO deployments
 

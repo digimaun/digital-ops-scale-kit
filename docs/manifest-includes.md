@@ -17,7 +17,7 @@ steps:
 
 After resolution, the parent's step list is a flat sequence of every step the included manifests contribute, in declared order, interleaved with any inline steps the parent defines.
 
-> **Compose partials, not standalone manifests.** Including two standalone manifests that each include `_resolve-aio.yaml` will collide on the `resolve-aio` step name. Compose the leaf partials directly. See `scenarios/README.md` for the full composition rules.
+The standalone-vs-partial distinction matters for composition: scenarios should include the leaf partials, not standalone manifests. See [Standalone manifests vs partials](#standalone-manifests-vs-partials) and `scenarios/README.md`.
 
 ## Step shape
 
@@ -52,7 +52,7 @@ If the included manifest defines manifest-level `parameters:`, the include canno
 
 Includes may include further includes. Cycles are detected (a manifest cannot, directly or indirectly, include itself) and reported with the full include chain. Maximum include depth is 8.
 
-A partial shared by two siblings (A includes B and C; both B and C include D) is allowed. Cycle detection tracks the current depth-first path, not a global visited set. Step-name collisions in the resulting flat list are still rejected; ensure shared partials contribute uniquely-named steps. This is the main reason scenarios should compose `_partial.yaml` files rather than two standalone manifests that each include the same partial.
+A partial shared by two siblings (A includes B and C, both B and C include D) is allowed. Cycle detection tracks the current depth-first path, not a global visited set. Step-name collisions in the resulting flat list are still rejected. Ensure shared partials contribute uniquely-named steps. This is the main reason scenarios should compose `_partial.yaml` files rather than two standalone manifests that each include the same partial.
 
 ## Step name uniqueness
 
@@ -72,7 +72,7 @@ Step-level `parameters:` (on individual steps) are not affected by include resol
 
 Any manifest can be included. When it is, top-level fields that only make sense for standalone deployment are silently ignored:
 
-- `name`, `description`, `selector` (or legacy `siteSelector`), `sites`, and `parallel` flow no further than the included file.
+- `name`, `description`, `selector`, `sites`, and `parallel` flow no further than the included file.
 - Only `steps:` and manifest-level `parameters:` are spliced into the parent.
 
 The convention for files authored primarily to be included is the `_` filename prefix (e.g., `_aio-fundamentals.yaml`, `_partial.yaml`). Standalone manifests such as `manifests/aio-install.yaml` exist as convenience entry points for `siteops deploy`. **Compositions should include the `_` partials, not the standalone manifests**, so that two siblings can share a common preamble without colliding on step names.
@@ -89,3 +89,4 @@ Step output references (`{{ steps.<name>.outputs.<field> }}`) are resolved again
 
 - [manifest-reference.md](manifest-reference.md): step shapes, conditional steps, parallel execution.
 - [parameter-resolution.md](parameter-resolution.md): how parameters merge across manifest, site, and step levels.
+- [targeting.md](targeting.md): how a composed manifest's sites are selected. Partials inherit the parent's targeting.

@@ -39,12 +39,17 @@ steps:
 |--------|----------|
 | `sites:` list | Deploy to named sites only |
 | `selector:` | Deploy to all sites matching label |
-| CLI `-l` flag | **Overrides** manifest selection |
+| CLI `-l` flag | Overrides manifest selection. Repeatable. `name=` may carry multiple values (OR-combined) |
 
 ```bash
-# Overrides manifest's sites: list, deploys to all prod sites
-siteops deploy manifest.yaml -l "environment=prod"
+# Overrides manifest selection, deploys to all prod sites.
+siteops deploy manifest.yaml -l environment=prod
+
+# Multi-site CLI selection (name OR-combines).
+siteops deploy manifest.yaml -l name=munich-dev,name=seattle-dev
 ```
+
+A manifest with neither `sites:` nor `selector:` is a library or partial. It requires `-l` at deploy time. See [targeting.md](targeting.md) for the full grammar, the no-match diagnostic, and validation rules.
 
 ## Step types
 
@@ -136,13 +141,13 @@ CLI override: `siteops deploy manifest.yaml -p 5`
 
 When a manifest contains `scope: subscription` steps, Site Ops uses two-phase deployment:
 
-**Phase 1** — Subscription-scoped steps:
+**Phase 1**: subscription-scoped steps:
 - Groups selected sites by subscription
 - Finds the subscription-level site for each subscription
 - Executes subscription-scoped steps once per subscription
 - Caches outputs keyed by subscription ID
 
-**Phase 2** — RG-scoped steps:
+**Phase 2**: RG-scoped steps:
 - Executes for all RG-level sites (parallelizable)
 - Subscription-level sites are skipped (no resource group)
 - Can reference Phase 1 outputs via cross-scope chaining

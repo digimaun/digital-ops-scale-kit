@@ -1,6 +1,23 @@
 # Site Configuration
 
-Sites define **where** to deploy—the Azure subscription, resource group, location, and site-specific configuration.
+Sites define **where** to deploy: the Azure subscription, resource group, location, and site-specific configuration.
+
+## Quick decision table
+
+| I want to... | Do this |
+|---|---|
+| Add a new deployable site | Drop `my-site.yaml` under `workspace/sites/` (any subdir) or an extras dir |
+| Share a reusable template across sites | Put it in `workspace/sites/<name>.yaml` (same dir) or `workspace/sites/shared/<name>.yaml` (subdir) and reference via `inherits:` |
+| Override a committed site at runtime without a PR | Put `my-site.yaml` in `workspace/sites.local/` (overlay merges, `inherits:` stripped) |
+| Inject a site from CI without touching the workspace | Register a dir via `SITEOPS_EXTRA_SITES_DIRS` / `--extra-sites-dir` and drop `my-site.yaml` in it |
+| Target one specific site at the CLI | `siteops deploy <manifest> -l name=<site-name>` |
+| Target multiple specific sites at the CLI | `siteops deploy <manifest> -l name=<a>,name=<b>` |
+| Pin the manifest to a labeled cohort | Set `selector:` in the manifest |
+| Hard-code the target list for a manifest | Set `sites:` in the manifest |
+| Preview a fully-resolved site (post inherit + overlay) | `siteops -w <workspace> sites <name> --render` |
+| See where every value in a resolved site came from | `siteops -w <workspace> sites <name> -v` |
+
+The reference material below covers the model in depth. See [targeting.md](targeting.md) for the selector grammar and the no-match diagnostic.
 
 ## Site levels
 
@@ -11,9 +28,7 @@ Sites operate at two levels based on whether they have a `resourceGroup`:
 | `subscription` + `resourceGroup` | RG-level | Both subscription and RG-scoped steps |
 | `subscription` only | Subscription-level | `scope: subscription` steps only |
 
-**RG-level sites** are the most common—they deploy resources into a specific resource group.
-
-**Subscription-level sites** deploy shared resources once per subscription (like Azure Edge Sites), then RG-level sites in that subscription can reference those outputs via cross-scope output chaining.
+RG-level sites are the common case. Subscription-level sites deploy shared resources once per subscription (like Azure Edge Sites). RG-level sites in the same subscription pick up those outputs via cross-scope output chaining.
 
 ## Site structure
 
@@ -42,6 +57,10 @@ properties:
   deployOptions:
     enableSecretSync: true
 ```
+
+### Site identity
+
+A site is reachable by its filename basename, its relative path under the trusted directory, or its internal `name:` field. The three forms are symmetric. By convention `name:` matches the basename, but it can differ when a friendlier identifier is needed. See [targeting.md](targeting.md) for the full identity model and the workspace invariants the orchestrator enforces at load time.
 
 **Subscription-level site** (for shared resources):
 
@@ -107,19 +126,29 @@ Use parameters for:
 
 ### Properties
 
-Structured **metadata** and **deployment options**:
+Free-form site state read by manifests and templates via
+`{{ site.properties.<path> }}` substitution and `when:` conditions.
+Open schema. Siteops does not enforce field names or shapes. The
+workspace defines its own conventions.
 
 ```yaml
 properties:
-  aioRelease: "2603"                   # Target AIO release (see [aio-releases.md](aio-releases.md))
-  deployOptions:                       # Capability gates evaluated by manifest `when:` conditions
+  # Pinned AIO release (workspace convention; selects which
+  # `parameters/aio-releases/<release>.yaml` gets loaded).
+  aioRelease: "2603"
+
+  # Capability gates evaluated by manifest `when:` conditions
+  # (workspace convention; the `enable*` prefix is a workspace style).
+  deployOptions:
     enableGlobalSite: false
     enableEdgeSite: false
     enableSecretSync: false
-  tags:
-    costCenter: operations
-    team: platform
-  opcUaEndpoints:                      # Arrays of configuration
+    enableCertManager: true
+
+  # Free-form custom fields. Anything you reference via
+  # `{{ site.properties.X }}` in a manifest, parameters file,
+  # or `when:` condition belongs here.
+  opcUaEndpoints:
     - name: cnc-machine-1
       address: opc.tcp://10.1.1.100:4840
 ```
@@ -127,9 +156,34 @@ properties:
 Use properties for:
 
 - Capability gates evaluated via `when:` (`deployOptions.*`)
-- Azure resource tags
-- Arrays of endpoints or devices
-- Nested metadata structures
+- Workspace-specific orchestration state (release pins, feature toggles)
+- Free-form data structures consumed via `{{ site.properties.X }}`
+
+> **Bicep inputs go in `parameters:`, not `properties:`.** Resource tags,
+> cluster names, and any other value the engine should hand to a Bicep
+> `param` declaration belong in `parameters:` (auto-filtered per template).
+> `properties:` is read by the orchestrator and template substitution
+> only.
+
+### What siteops enforces vs what the workspace conventions are
+
+The siteops engine has a deliberately narrow contract over a site
+file. Knowing where the boundary sits tells you what you can rename
+when forking the workspace:
+
+| Layer | Owned by | What it cares about |
+|---|---|---|
+| YAML mechanics | siteops engine | Top-level fields (`name`, `subscription`, `resourceGroup`, `location`, `labels`, `inherits`, `parameters`, `properties`); the `parameters:` filter against Bicep template params; the `{{ site.X }}` and `{{ site.properties.<path> }}` substitution surface; selector parsing on `labels`. |
+| Field semantics | The workspace | The names of fields under `properties:` (`aioRelease`, `deployOptions`, `enable*` prefix, etc.) and the names of label keys used in selectors (`environment`, `country`, `scope`, etc.). |
+
+Anything in the second row is a convention you can rename for your own
+workspace. The iot-operations workspace happens to use
+`properties.aioRelease`, `properties.deployOptions.enable*`, and
+`labels.environment`. A forked workspace could call them
+`properties.release`, `properties.featureFlags.*`, or `labels.tier`
+without the engine caring. Just keep manifest `when:` conditions and
+`{{ site.properties.X }}` references in sync with whatever the
+workspace decides.
 
 ### Conditionals
 
@@ -214,25 +268,20 @@ the env var was ignored.
 inherits target → sites/ → <extra dirs, in listed order> → sites.local/
 ```
 
-Extras cannot collide with the workspace's own `sites/` or `sites.local/`
-directories; the orchestrator rejects both at construction time.
-Registering `sites.local/` as trusted is specifically refused because it
-would let overlays inject inheritance and break the overlay security
-invariant.
+Extras cannot collide with the workspace's own `sites/` or `sites.local/` directories. The orchestrator rejects both at construction time. Registering `sites.local/` as trusted is specifically refused because it would let overlays inject inheritance and break the overlay security invariant.
 
-### Leaf sites must live at the top level
+### Discovery walks subdirectories
 
-Discovery is **flat, not recursive**. Every trusted directory (`sites/`,
-each extras dir, and `sites.local/`) is scanned at its top level only.
-Subdirectories are reserved for inherit targets and are reachable only
-through an explicit subpath in `inherits:`.
+Every trusted directory (`sites/`, each extras dir, `sites.local/`) is scanned recursively. A site at any depth is reachable by its basename (filename without extension), by its relative path under the trusted dir, or by its internal `name:` field. Basename uniqueness within each trusted dir is enforced at load time so the basename shorthand always resolves unambiguously. Cross-dir basename collisions are valid only when the relative path also matches (the overlay pattern).
 
-| Path | Kind | Discovered? |
+| Path | Kind | Reachable via |
 |---|---|---|
-| `sites/munich-prod.yaml` | `Site` | ✅ deployable |
-| `sites/base-site.yaml` | `SiteTemplate` | ✅ as inherit target only |
-| `sites/shared/usa-west.yaml` | `SiteTemplate` | ❌ reachable only via `inherits: shared/usa-west.yaml` |
-| `sites/eu/munich.yaml` | `Site` | ❌ silently ignored; move to top level |
+| `sites/munich-prod.yaml` | `Site` | `munich-prod`, internal `name:` |
+| `sites/regions/eu/munich-prod.yaml` | `Site` | `munich-prod`, `regions/eu/munich-prod`, internal `name:` |
+| `sites/base-site.yaml` | `SiteTemplate` | `inherits: base-site.yaml` only |
+| `sites/shared/usa-west.yaml` | `SiteTemplate` | `inherits: shared/usa-west.yaml` only |
+
+See [targeting.md](targeting.md) for the full identity model and CLI grammar.
 
 ## Site inheritance
 
@@ -317,55 +366,16 @@ Inherited values are overridden by child site values. Nested objects (labels, pa
 
 ## Site selection from a manifest
 
-When a manifest is deployed, Site Ops resolves the target sites through
-three mutually-exclusive precedence tiers:
+A manifest's target sites resolve from three sources: CLI `-l/--selector` (overrides everything), manifest `sites:` (explicit name list), and manifest `selector:` (label expression). A manifest with none of the three is a library or partial that requires `-l` at deploy time.
 
-1. **CLI `--selector` overrides everything.**
-   ```bash
-   siteops deploy manifests/aio-install.yaml --selector environment=dev
-   siteops deploy manifests/aio-install.yaml --selector name=munich-dev
-   ```
-   - If the selector includes `name=X` and a trusted file `X.yaml` (or
-     `X.yml`) exists, the named site is loaded directly; any load
-     error (broken inherits chain, invalid YAML) is surfaced instead of
-     silently resolving to zero sites.
-   - Otherwise the orchestrator loads all discoverable sites and keeps
-     those whose `name:` or `labels` match every `key=value` pair. This
-     path supports selecting by the site's internal `name:` field even
-     when it differs from the filename.
+```bash
+siteops deploy manifests/aio-install.yaml                           # uses manifest selector
+siteops deploy manifests/aio-install.yaml -l environment=dev        # CLI overrides manifest
+siteops deploy manifests/aio-install.yaml -l name=munich-dev        # single site
+siteops deploy manifests/aio-install.yaml -l name=a,name=b          # multi-site (name OR-combines)
+```
 
-2. **Explicit `sites:` list in the manifest.**
-   ```yaml
-   # manifests/regional-rollout.yaml
-   sites:
-     - chicago-staging
-     - seattle-prod
-   ```
-   Each entry is a filename stem; missing files raise
-   `FileNotFoundError` with the full list.
-
-3. **Manifest `selector:` (label expression).**
-   ```yaml
-   # manifests/aio-install.yaml
-   selector: "environment=dev"
-   ```
-   The orchestrator loads all discoverable sites and keeps those whose
-   labels satisfy the expression.
-
-A manifest with none of the three is rejected at parse time.
-
-### Quick decision table
-
-| I want to… | Do this |
-|---|---|
-| Add a new deployable site | Drop `my-site.yaml` at the root of `workspace/sites/` or an extras dir |
-| Share a reusable template across sites | Put it in `workspace/sites/<name>.yaml` (same dir) or `workspace/sites/shared/<name>.yaml` (subdir) and reference via `inherits:` |
-| Override a committed site at runtime without a PR | Put `my-site.yaml` in `workspace/sites.local/` (overlay merges; `inherits:` stripped) |
-| Inject a site from CI without touching the workspace | Register a dir via `SITEOPS_EXTRA_SITES_DIRS` / `--extra-sites-dir` and drop `my-site.yaml` at its root |
-| Target one specific site at the CLI | `siteops deploy <manifest> --selector name=<site-name>` |
-| Pin the manifest to a labeled cohort | Set `selector:` in the manifest |
-| Hard-code the target list for a manifest | Set `sites:` in the manifest |
-| Preview a fully-resolved site (post inherit + overlay) | `siteops -w <workspace> sites <name> --render` |
+`-l` is repeatable. Distinct keys AND-combine. Repeated `name=` values OR-combine. Any other duplicate key is an error. Path-form names (`-l name=regions/eu/munich`) work for nested site files. See [targeting.md](targeting.md) for the full grammar, the no-match diagnostic, and the validation rules.
 
 ## Scaling to a fleet
 

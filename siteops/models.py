@@ -33,6 +33,64 @@ MAX_INCLUDE_DEPTH = 8
 # is an authoring error.
 _INCLUDE_ALLOWED_KEYS = {"include", "when"}
 
+# Allowed top-level keys on a flat-shape Manifest (most common form). Any
+# other key triggers a parse-time error with a "did you mean?" hint when the
+# unknown key is close to a known one. Catches typos like `site:` (singular)
+# or `selctor:` that today silently degrade to "missing field".
+_MANIFEST_FLAT_KNOWN_KEYS = {
+    "apiVersion",
+    "kind",
+    "name",
+    "description",
+    "sites",
+    "selector",
+    "siteSelector",
+    "parallel",
+    "parameters",
+    "steps",
+}
+
+# K8s-style nested envelope. Top-level allows only the four envelope keys.
+# `metadata` carries name/description/labels. `spec` carries everything else.
+_MANIFEST_NESTED_TOP_KEYS = {"apiVersion", "kind", "metadata", "spec"}
+_MANIFEST_NESTED_METADATA_KEYS = {"name", "description", "labels"}
+_MANIFEST_NESTED_SPEC_KEYS = _MANIFEST_FLAT_KNOWN_KEYS - {"apiVersion", "kind", "name", "description"}
+
+
+def _suggest_known_key(unknown: str, known: set[str]) -> str | None:
+    """Return a 'did you mean X?' suggestion for a typo if there is a close match."""
+    import difflib
+    matches = difflib.get_close_matches(unknown, sorted(known), n=1, cutoff=0.7)
+    return matches[0] if matches else None
+
+
+def _validate_known_keys(
+    actual: dict, allowed: set[str], path: Path, context: str
+) -> None:
+    """Reject any keys in `actual` that are not in `allowed`.
+
+    Args:
+        actual: The dict whose keys to validate.
+        allowed: The closed set of permitted keys.
+        path: Source file path, used in the error message.
+        context: Where in the manifest this dict lives (e.g. "top-level",
+            "spec", "metadata"), used to disambiguate the error.
+    """
+    unknown = sorted(set(actual.keys()) - allowed)
+    if not unknown:
+        return
+    parts = []
+    for key in unknown:
+        suggestion = _suggest_known_key(key, allowed)
+        if suggestion:
+            parts.append(f"`{key}` (did you mean `{suggestion}`?)")
+        else:
+            parts.append(f"`{key}`")
+    raise ValueError(
+        f"Manifest '{path}' has unknown {context} key(s): {', '.join(parts)}. "
+        f"Allowed: {sorted(allowed)}."
+    )
+
 
 class IncludeError(ValueError):
     """Raised when a manifest `include:` directive cannot be resolved.
@@ -55,32 +113,158 @@ CONDITION_PATTERN = re.compile(
 KUBECTL_OPERATIONS = {"apply"}
 
 
-def parse_selector(selector: str | None) -> dict[str, str]:
-    """Parse a label selector string into key-value pairs.
+class NoTargetingError(ValueError):
+    """Raised when neither the manifest nor the CLI provides any targeting.
+
+    Distinct from generic `ValueError` so callers can differentiate the
+    "generic library manifest with no CLI selector" case from selector
+    parse errors. `validate()` treats this as structurally OK and skips
+    site-dependent checks. `cmd_deploy` surfaces it as a hard error.
+    """
+
+
+class SelectorParseError(ValueError):
+    """Raised when a `-l/--selector` string fails to parse.
+
+    Distinct from generic `ValueError` so `validate()` can attribute
+    the failure to selector input (and skip the redundant no-match
+    diagnostic) without substring-matching the error message.
+    """
+
+
+def parse_selector(selector: str | None) -> dict[str, list[str]]:
+    """Parse a label selector string into key to value-list pairs.
+
+    Within a single selector string, comma-separated `key=value` pairs are
+    AND-combined across distinct keys. Duplicate keys follow these rules:
+
+    - The special `name` key may repeat. Repeated values OR-combine and
+      duplicates are deduped (preserving first-seen order).
+    - Any non-name key may only appear once. Duplicate non-name keys
+      raise `SelectorParseError`. This matches kubectl, Terraform, and
+      Ansible label-selector grammars where AND across distinct keys is
+      the rule.
 
     Args:
-        selector: Comma-separated key=value pairs (e.g., 'environment=prod,region=eastus'),
-                  or None/empty string for no filtering.
+        selector: Comma-separated `key=value` pairs (e.g.,
+            `environment=prod,region=eastus`), or None/empty for no
+            filtering.
 
     Returns:
-        Dict of label key-value pairs (empty dict if selector is None/empty)
+        Dict mapping each key to a list of allowed values. Non-name keys
+        always map to a single-element list. The `name` key may map to
+        multiple values (OR-combined). Empty dict if `selector` is None
+        or empty.
+
+    Raises:
+        SelectorParseError: If a non-name key appears more than once.
 
     Example:
         >>> parse_selector('environment=prod,region=eastus')
-        {'environment': 'prod', 'region': 'eastus'}
+        {'environment': ['prod'], 'region': ['eastus']}
+        >>> parse_selector('name=a,name=b,name=a')
+        {'name': ['a', 'b']}
         >>> parse_selector(None)
         {}
     """
     if not selector:
         return {}
 
-    labels = {}
+    labels: dict[str, list[str]] = {}
     for part in selector.split(","):
         part = part.strip()
-        if "=" in part:
-            key, value = part.split("=", 1)
-            labels[key.strip()] = value.strip()
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            raise SelectorParseError(
+                f"Selector term `{part}` has empty key. Use `key=value` form."
+            )
+        if not value:
+            raise SelectorParseError(
+                f"Selector key `{key}` has empty value. Use `{key}=<value>`."
+            )
+        if key in labels:
+            if key != "name":
+                raise SelectorParseError(
+                    f"Selector key `{key}` may only appear once. Selectors "
+                    f"AND across keys, so duplicating a key would always "
+                    f"match zero sites. Only `name=` supports multiple "
+                    f"values (OR-combined)."
+                )
+            if value not in labels[key]:
+                labels[key].append(value)
+        else:
+            labels[key] = [value]
     return labels
+
+
+def _merge_selector_strings(strings: list[str] | None) -> str | None:
+    """Merge multiple selector strings into a single comma-separated string.
+
+    Used by the CLI to flatten repeated `-l/--selector` flags into a single
+    string before parsing. The grammar is associative under comma joining:
+    `parse_selector(",".join(parts))` enforces the same name-OR /
+    non-name-error rules across the merged input.
+    """
+    if not strings:
+        return None
+    merged = ",".join(s for s in strings if s)
+    return merged or None
+
+
+def _normalize_site_identifier(identifier: str) -> str:
+    """Validate and normalize a site identifier or path-form identifier.
+
+    Accepts:
+    - Bare basename (`munich-dev`)
+    - Forward-slash relative path (`regions/eu/munich-dev`)
+    - Backslash relative path (normalized to forward slashes)
+
+    Rejects (raises `ValueError`):
+    - Empty string
+    - Leading `./`
+    - Leading `/` (absolute path)
+    - Trailing `/`
+    - `..` path segments (path traversal)
+    - `.` path segments
+    - Empty path segments (e.g., `a//b`)
+
+    Returns the normalized form (forward-slash separators, no leading or
+    trailing slash).
+    """
+    if not identifier:
+        raise ValueError("Site identifier must not be empty")
+    normalized = identifier.replace("\\", "/")
+    if normalized.startswith("./"):
+        raise ValueError(
+            f"Site identifier '{identifier}' must not start with `./`. "
+            f"Use the relative form (e.g., `regions/eu/munich`)."
+        )
+    if normalized.startswith("/"):
+        raise ValueError(
+            f"Site identifier '{identifier}' must be relative (no leading `/`)."
+        )
+    if normalized.endswith("/"):
+        raise ValueError(
+            f"Site identifier '{identifier}' must not end with `/`."
+        )
+    parts = normalized.split("/")
+    if any(p == ".." for p in parts):
+        raise ValueError(
+            f"Site identifier '{identifier}' must not contain `..` segments."
+        )
+    if any(p == "." for p in parts):
+        raise ValueError(
+            f"Site identifier '{identifier}' must not contain `.` segments."
+        )
+    if any(not p for p in parts):
+        raise ValueError(
+            f"Site identifier '{identifier}' must not contain empty path segments."
+        )
+    return normalized
 
 
 def _validate_resource(data: dict[str, Any], expected_kind: str | list[str], path: Path) -> str:
@@ -238,27 +422,31 @@ class Site:
     properties: dict[str, Any] = field(default_factory=dict)
     parameters: dict[str, Any] = field(default_factory=dict)
 
-    def matches_selector(self, selector: dict[str, str]) -> bool:
+    def matches_selector(self, selector: dict[str, list[str]]) -> bool:
         """Check if site matches all selector criteria.
 
         Supports:
-        - name=<value>: Match site name exactly
-        - <label>=<value>: Match label value
+        - `name`: site name must be one of the listed values (OR-combined)
+        - any other `<label>`: site label value must equal the single
+          listed value
 
         Args:
-            selector: Dictionary of key=value pairs to match
+            selector: Dict mapping each key to a list of allowed values.
+                Non-name keys must map to a single-element list (enforced
+                by `parse_selector`).
 
         Returns:
-            True if all selector criteria match
+            True if all selector criteria match.
         """
-        for key, value in selector.items():
+        for key, values in selector.items():
             if key == "name":
-                # Special case: match site name
-                if self.name != value:
+                if self.name not in values:
                     return False
             else:
-                # Match against labels
-                if self.labels.get(key) != value:
+                # Non-name keys carry a single value (enforced upstream).
+                # Use list containment so a malformed multi-value list still
+                # produces deterministic match behavior.
+                if self.labels.get(key) not in values:
                     return False
         return True
 
@@ -574,7 +762,12 @@ class Manifest:
         sites = []
         for item in spec.get("sites", []):
             if isinstance(item, str):
-                sites.append(item)
+                try:
+                    sites.append(_normalize_site_identifier(item))
+                except ValueError as e:
+                    raise ValueError(
+                        f"Invalid site identifier in `{path}` `sites:` list: {e}"
+                    ) from e
 
         # `selector:` is the preferred manifest field. `siteSelector:` is
         # accepted for backward compatibility but logs a one-time deprecation
@@ -670,8 +863,10 @@ class Manifest:
 def _read_manifest_spec(path: Path) -> tuple[dict[str, Any], str, str]:
     """Read a manifest YAML file and return (spec, name, description).
 
-    Validates apiVersion + kind and unwraps the K8s-style `spec:` envelope
-    when present. Raises ValueError on empty files or wrong kind.
+    Validates apiVersion + kind, rejects unknown top-level keys with a
+    "did you mean?" hint, and unwraps the K8s-style `spec:` envelope when
+    present. Raises ValueError on empty files, wrong kind, or unknown
+    top-level keys.
     """
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
@@ -682,11 +877,17 @@ def _read_manifest_spec(path: Path) -> tuple[dict[str, Any], str, str]:
     _validate_resource(data, "Manifest", path)
 
     if "spec" in data:
-        metadata = data.get("metadata", {})
-        spec = data["spec"]
+        _validate_known_keys(data, _MANIFEST_NESTED_TOP_KEYS, path, "top-level")
+        metadata = data.get("metadata", {}) or {}
+        if metadata:
+            _validate_known_keys(metadata, _MANIFEST_NESTED_METADATA_KEYS, path, "metadata")
+        spec = data["spec"] or {}
+        if isinstance(spec, dict):
+            _validate_known_keys(spec, _MANIFEST_NESTED_SPEC_KEYS, path, "spec")
         name = metadata.get("name", path.stem)
         description = metadata.get("description", "")
     else:
+        _validate_known_keys(data, _MANIFEST_FLAT_KNOWN_KEYS, path, "top-level")
         spec = data
         name = data.get("name", path.stem)
         description = data.get("description", "")

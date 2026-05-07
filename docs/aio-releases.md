@@ -35,7 +35,7 @@ The `aioApiVersion` and `adrApiVersion` values route CREATE and UPDATE operation
 
 ## Pinning a site to a release
 
-Set `properties.aioRelease` on the site (or on a parent via inheritance). The value must be the stem of a YAML under `parameters/aio-releases/`.
+Set `properties.aioRelease` on the site (or on a parent via inheritance). The value must be the filename (without extension) of a YAML under `parameters/aio-releases/`.
 
 ```yaml
 # sites/munich-prod.yaml
@@ -54,7 +54,7 @@ If not specified, the site inherits whatever `base-site.yaml` declares (`"2603"`
 
 Every file in `workspaces/iot-operations/parameters/aio-releases/` is a shipped release. At time of writing:
 
-| Stem | `aioApiVersion` | `adrApiVersion` | Notes |
+| Release | `aioApiVersion` | `adrApiVersion` | Notes |
 |------|-----------------|-----------------|-------|
 | `2512` | `2025-10-01` | `2025-10-01` | |
 | `2602` | `2025-10-01` | `2025-10-01` | |
@@ -64,12 +64,12 @@ Source of truth for every pinned version number is the YAML itself. Cross-refere
 
 ## Upgrading an existing site
 
-Use `aio-upgrade.yaml` to move a site to a newer `aioRelease`. It bumps the Arc extension versions for AIO, secret-store, and (when the cluster's trust source is `SelfSigned`) cert-manager, preserving each extension's existing `configurationSettings`, `releaseTrain`, and identity.
+Use `aio-upgrade.yaml` to move a site to a newer `aioRelease`. It bumps the Arc extension versions for AIO, secret-store, and (when the site declares `deployOptions.enableCertManager: true`) cert-manager, preserving each extension's existing `configurationSettings`, `releaseTrain`, and identity.
 
 The IoT Operations instance ARM resource has no writable version property and is not mutated by this manifest. New instance child resource types introduced by future AIO releases (broker properties, dataflow profile schema changes, etc.) are out of scope and will need a future tier of upgrade manifests.
 
-```
-# 1. Bump aioRelease on the site (or its parent) to the new YAML stem.
+```bash
+# 1. Bump aioRelease on the site (or its parent) to the new YAML filename (without extension).
 # 2. Deploy the upgrade manifest:
 siteops -w workspaces/iot-operations deploy manifests/aio-upgrade.yaml -l "name=<site>"
 ```
@@ -90,8 +90,8 @@ This policy applies only to samples. Fundamentals (`templates/aio/`, `templates/
 
 ## Adding a new AIO release
 
-1. **Ship the release YAML.** Create `parameters/aio-releases/<stem>.yaml` with all eight fields (`aioVersion`, `aioTrain`, `aioApiVersion`, `adrApiVersion`, `certManagerVersion`, `certManagerTrain`, `secretStoreVersion`, `secretStoreTrain`).
-2. **If `aioApiVersion` is new**, extend the dispatch in both Bicep routers:
+1. **Ship the release YAML.** Create `parameters/aio-releases/<release>.yaml` with all eight fields (`aioVersion`, `aioTrain`, `aioApiVersion`, `adrApiVersion`, `certManagerVersion`, `certManagerTrain`, `secretStoreVersion`, `secretStoreTrain`).
+2. **If `aioApiVersion` is new**, extend the dispatch in both Bicep dispatchers:
    - `templates/aio/instance.bicep`: add to `@allowed` on `param aioApiVersion`, add a new conditional `module instance_<YYYY>` block, push the previously-newest version from `else` into an explicit equality, make the new version the `else`.
    - `templates/aio/modules/update-instance.bicep`: same pattern. The file header has a checklist.
    - Add `templates/aio/modules/instance-<YYYY-MM-DD>.bicep` and `update-instance-<YYYY-MM-DD>.bicep`. Start by copying the previous API version's modules verbatim and change only the API version strings. Diverge per-module only when the schema actually changes.
@@ -102,8 +102,8 @@ This policy applies only to samples. Fundamentals (`templates/aio/`, `templates/
 5. **Run the workspace suite**: `pytest tests/workspace/ -q`. The relevant checks are:
    - `test_version_config_api_versions_are_allowed_in_bicep`: every `aioApiVersion` must appear in both AIO dispatchers' `@allowed` lists.
    - `test_version_config_adr_api_versions_are_allowed_in_bicep`: every `adrApiVersion` must appear in the ADR dispatcher's `@allowed` list.
-   - `test_all_sites_aio_releases_have_config_files`: no site references a missing YAML stem.
-   - `TestUpdateInstanceDispatch`: every param of the update-instance router is forwarded by every caller.
+   - `test_all_sites_aio_releases_have_config_files`: no site references a missing YAML file.
+   - `TestUpdateInstanceDispatch`: every param of the update-instance dispatcher is forwarded by every caller.
 6. **Decide the default for new sites.** If the new release should be the workspace default, update `aioRelease:` in `sites/base-site.yaml`. Sites that don't override `properties.aioRelease` will then pick it up on the next deploy. If the new release is opt-in only, leave the base alone and pin specific sites individually.
 7. **Test live**: dispatch the E2E workflow including the new release in `aio-releases`:
    ```
@@ -119,7 +119,7 @@ Four layers catch release misconfigurations before they reach production:
 |-------|-------|--------------|
 | Workflow prep job | Every requested `aio-releases` entry has a matching YAML | E2E dispatch (`e2e-test.yaml`) |
 | Workspace unit tests | `@allowed` membership, all-sites coverage, base-site coverage | Every CI run |
-| Workspace unit tests | `TestUpdateInstanceDispatch`: caller-vs-router param parity | Every CI run |
+| Workspace unit tests | `TestUpdateInstanceDispatch`: caller-vs-dispatcher param parity | Every CI run |
 | Live integration | Deployed `aioExtension.version` equals YAML's `aioVersion` | E2E matrix (per cell) |
 
 ## See also

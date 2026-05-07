@@ -77,6 +77,129 @@ class TestValidation:
         errors = orchestrator.validate(manifest_path)
         assert any("No sites matched" in e for e in errors)
 
+    def test_validate_generic_manifest_passes(self, complete_workspace):
+        """A manifest with no `sites:` and no `selector:` is a valid library
+        manifest. `validate` should pass without surfacing the missing
+        targeting (deploy enforces that separately)."""
+        orchestrator = Orchestrator(complete_workspace)
+
+        manifest_data = {
+            "name": "generic",
+            "steps": [{"name": "step1", "template": "templates/test.bicep"}],
+        }
+        manifest_path = complete_workspace / "manifests" / "generic.yaml"
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            yaml.dump(manifest_data, f)
+
+        errors = orchestrator.validate(manifest_path)
+        assert errors == []
+
+    def test_validate_duplicate_non_name_selector_key_surfaces_error(self, complete_workspace):
+        """Selector parse errors (e.g. duplicate non-name key) appear in the
+        validation error list rather than being silently swallowed."""
+        orchestrator = Orchestrator(complete_workspace)
+
+        manifest_data = {
+            "name": "test",
+            "sites": ["test-site"],
+            "steps": [{"name": "step1", "template": "templates/test.bicep"}],
+        }
+        manifest_path = complete_workspace / "manifests" / "test.yaml"
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            yaml.dump(manifest_data, f)
+
+        errors = orchestrator.validate(manifest_path, selector="env=prod,env=dev")
+        assert any("may only appear once" in e for e in errors)
+
+    def test_validate_selector_parse_error_does_not_short_circuit(self, complete_workspace):
+        """A selector parse error must NOT skip the other validation
+        checks. Operator iterating on a broken manifest deserves to see
+        every issue in one pass, not fix the typo and discover the next
+        problem on re-run."""
+        orchestrator = Orchestrator(complete_workspace)
+
+        # Manifest has BOTH a selector typo AND a missing template.
+        manifest_data = {
+            "name": "multi-error",
+            "sites": ["test-site"],
+            "steps": [{"name": "step1", "template": "templates/missing.bicep"}],
+        }
+        manifest_path = complete_workspace / "manifests" / "multi.yaml"
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            yaml.dump(manifest_data, f)
+
+        errors = orchestrator.validate(manifest_path, selector="env=prod,env=dev")
+        # Both errors must surface so the operator fixes them in one pass.
+        assert any("may only appear once" in e for e in errors)
+        assert any("Template not found" in e for e in errors)
+
+    def test_validate_selector_parse_error_suppresses_no_match_diagnostic(
+        self, complete_workspace
+    ):
+        """When the selector itself fails to parse, the no-match
+        diagnostic is redundant noise. The parse error is the cause."""
+        orchestrator = Orchestrator(complete_workspace)
+
+        manifest_data = {
+            "name": "selector-typo",
+            "sites": ["test-site"],
+            "steps": [{"name": "step1", "template": "templates/test.bicep"}],
+        }
+        manifest_path = complete_workspace / "manifests" / "selector-typo.yaml"
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            yaml.dump(manifest_data, f)
+
+        errors = orchestrator.validate(manifest_path, selector="env=prod,env=dev")
+        # Parse error must surface.
+        assert any("may only appear once" in e for e in errors)
+        # The "matched no sites" diagnostic must NOT also surface.
+        assert not any("matched no sites" in e for e in errors)
+        assert not any("No sites matched" in e for e in errors)
+
+    def test_validate_non_selector_value_error_still_shows_no_match(
+        self, complete_workspace
+    ):
+        """A non-selector ValueError (e.g. overlay-rename) must NOT
+        suppress the no-match diagnostic. Only SelectorParseError
+        does."""
+        orchestrator = Orchestrator(complete_workspace)
+
+        manifest_data = {
+            "name": "no-match",
+            "siteSelector": "nonexistent=value",
+            "steps": [{"name": "step1", "template": "templates/test.bicep"}],
+        }
+        manifest_path = complete_workspace / "manifests" / "no-match-cli.yaml"
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            yaml.dump(manifest_data, f)
+
+        # CLI selector parses cleanly but matches zero sites in the
+        # workspace.
+        errors = orchestrator.validate(manifest_path, selector="environment=nope")
+        # Rich diagnostic surfaces.
+        assert any("matched no sites" in e for e in errors)
+
+    def test_validate_unresolved_site_in_manifest_returns_error_not_traceback(
+        self, complete_workspace
+    ):
+        """A manifest `sites:` entry that does not resolve to a workspace
+        file must surface as a validation error, not a `FileNotFoundError`
+        traceback. `validate` must catch `OSError` alongside `ValueError`."""
+        orchestrator = Orchestrator(complete_workspace)
+
+        manifest_data = {
+            "name": "missing-site",
+            "sites": ["does-not-exist"],
+            "steps": [{"name": "step1", "template": "templates/test.bicep"}],
+        }
+        manifest_path = complete_workspace / "manifests" / "missing-site.yaml"
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            yaml.dump(manifest_data, f)
+
+        # Must not raise.
+        errors = orchestrator.validate(manifest_path)
+        assert any("does-not-exist" in e for e in errors)
+
     def test_validate_invalid_condition(self, complete_workspace):
         orchestrator = Orchestrator(complete_workspace)
 

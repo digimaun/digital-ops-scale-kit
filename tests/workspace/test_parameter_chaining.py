@@ -191,7 +191,7 @@ class TestUpdateInstanceDispatch:
     """Ensure callers of update-instance.bicep pass every param the router declares.
 
     Adding a new param to the shared UPDATE primitive without wiring it into
-    every caller would silently omit the value at deploy time — all params
+    every caller would silently omit the value at deploy time. All params
     have defaults in the caller signature via ARM, meaning the original
     property would be wiped on PUT without any test failure. This structural
     check is cheap insurance against that class of regression.
@@ -247,18 +247,13 @@ class TestAioUpgradeChaining:
     """Structural integrity of the aio-upgrade.yaml chain.
 
     The upgrade manifest fans resolve-aio -> resolve-extensions ->
-    resolve-cert-manager -> update-extensions through per-consumer chaining
-    files (one chaining YAML per consumer step, named after the manifest +
-    consumer step). Each consumer step's required Bicep params must be
-    satisfied by either its chaining file or the version YAML
+    update-extensions through per-consumer chaining files (one chaining
+    YAML per consumer step, named after the manifest + consumer step).
+    Each consumer step's required Bicep params must be satisfied by
+    either its chaining file or the version YAML
     (parameters/aio-releases/<release>.yaml), and every chained
     `{{ steps.X.outputs.Y }}` reference must hit a real output. A break
     here would silently produce wrong PUTs at deploy time.
-
-    Per-consumer chaining files are required because resolve-extensions runs
-    before resolve-cert-manager, so a single shared chaining file would have
-    forward references when consumed by the earlier step. See
-    docs/parameter-resolution.md.
 
     Also asserts the install-side `aioExtensionName(clusterId)` deriver
     invariant: the upgrade flow MUST receive the connected cluster's full
@@ -277,11 +272,6 @@ class TestAioUpgradeChaining:
             "resolve-extensions",
             ("inputs", "aio-upgrade-resolve-extensions.yaml"),
             ("templates", "aio", "upgrade", "resolve-extensions.bicep"),
-        ),
-        (
-            "resolve-cert-manager",
-            ("inputs", "aio-upgrade-resolve-cert-manager.yaml"),
-            ("templates", "aio", "upgrade", "resolve-cert-manager.bicep"),
         ),
         (
             "update-extensions",
@@ -356,9 +346,6 @@ class TestAioUpgradeChaining:
             ),
             "resolve-extensions": self._bicep_outputs(
                 workspace / "templates" / "aio" / "upgrade" / "resolve-extensions.bicep"
-            ),
-            "resolve-cert-manager": self._bicep_outputs(
-                workspace / "templates" / "aio" / "upgrade" / "resolve-cert-manager.bicep"
             ),
         }
         for _, chaining_parts, _ in self.CONSUMERS:
@@ -605,7 +592,7 @@ class TestReleaseConfigs:
             f"@allowed lists for aioApiVersion diverge between dispatchers: {allowed_sets}"
         )
         allowed = values[0]
-        assert allowed, "No @allowed values parsed — regex or template changed"
+        assert allowed, "No @allowed values parsed (regex or template changed)"
 
         for release_file in self._get_release_files(workspace):
             with open(release_file, "r", encoding="utf-8") as f:

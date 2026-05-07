@@ -39,11 +39,7 @@ resolve-aio                          enable-secretsync
 └──────────────────────────┘         └──────────────────────────────────┘
 ```
 
-**Step 1, Resolve**: `resolve-aio.bicep` reads the existing IoT Operations instance and resolves the full infrastructure chain (instance → custom location → connected cluster) without creating or modifying any resources. It outputs everything downstream templates need.
-
-**Step 2, Enable**: `enable-secretsync.bicep` receives all resolved values via [output chaining](parameter-resolution.md#output-chaining) and provisions the secret sync resources.
-
-This pattern keeps templates portable. `enable-secretsync.bicep` never makes assumptions about naming conventions or directory layout.
+`resolve-aio.bicep` is read-only and outputs everything downstream needs. `enable-secretsync.bicep` receives those values via [output chaining](parameter-resolution.md#output-chaining) and provisions the secret sync resources. The split keeps `enable-secretsync.bicep` portable across naming conventions.
 
 ### Output chaining
 
@@ -172,11 +168,11 @@ To sync secrets as part of a manifest, add a step after enablement:
 ```
 templates/
 ├── aio/
-│   ├── resolve-aio.bicep                    # Read-only instance → CL → cluster resolution (router)
+│   ├── resolve-aio.bicep                    # Read-only instance → CL → cluster resolution (dispatcher)
 │   └── modules/
 │       ├── resolve-instance-2025-10-01.bicep  # Per-API-version instance read
 │       ├── resolve-instance-2026-03-01.bicep  # Per-API-version instance read
-│       └── update-instance.bicep            # Shared safe instance PUT (router); used by the secretsync flow
+│       └── update-instance.bicep            # Shared safe instance PUT (dispatcher) used by the secretsync flow
 ├── common/
 │   └── modules/
 │       ├── resolve-custom-location.bicep    # CL resource ID → name, namespace, hostResourceId
@@ -190,7 +186,7 @@ templates/
 
 ### Resolve modules
 
-`resolve-aio.bicep` is the entry point. It is a router on `aioApiVersion` (sourced from `parameters/aio-releases/<release>.yaml`) that dispatches the instance read to a per-API-version inner module, then chains the (version-stable) custom-location and connected-cluster lookups:
+`resolve-aio.bicep` is the entry point. It is a dispatcher on `aioApiVersion` (sourced from `parameters/aio-releases/<release>.yaml`) that dispatches the instance read to a per-API-version inner module, then chains the (version-stable) custom-location and connected-cluster lookups:
 
 | Module | Input | Outputs |
 |--------|-------|---------|
@@ -232,7 +228,7 @@ If `resolve-aio` fails with an error about a property not existing on the instan
 
 ### Role assignment conflicts
 
-Role assignments use deterministic names via `guid(keyVault.id, principalId, roleId)`. Re-running the deployment is idempotent; existing assignments are confirmed in place, not duplicated.
+Role assignments use deterministic names via `guid(keyVault.id, principalId, roleId)`. Re-running the deployment is idempotent. Existing assignments are confirmed in place, not duplicated.
 
 ### Key Vault RBAC not enabled
 

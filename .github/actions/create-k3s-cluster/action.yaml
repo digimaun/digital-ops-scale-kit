@@ -1,3 +1,5 @@
+# Used by e2e-test.yaml. Mutates the runner with systemd k3s.
+#
 # Create a single-node k3s cluster on the runner.
 #
 # Reference (not a verbatim port): Azure/azure-iot-ops-cli-extension
@@ -12,7 +14,7 @@
 # Constraint: assumes a runner with systemd (GHA-hosted ubuntu-latest does).
 
 name: Create k3s cluster
-description: Install and start a single-node k3s cluster, write kubeconfig.
+description: Used by e2e-test.yaml. Install and start a single-node k3s cluster, write kubeconfig.
 
 inputs:
   version:
@@ -50,7 +52,7 @@ runs:
         export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
         # systemd reports the unit active before the API is necessarily
-        # serving — poll for kubectl liveness, then wait for node Ready.
+        # serving. Poll for kubectl liveness, then wait for node Ready.
         MAX_ATTEMPTS=30
         SLEEP_SECONDS=10
         for attempt in $(seq 1 $MAX_ATTEMPTS); do

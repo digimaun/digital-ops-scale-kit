@@ -135,7 +135,7 @@ workspace defines its own conventions.
 properties:
   # Pinned AIO release (workspace convention). Selects which
   # `parameters/aio-releases/<release>.yaml` gets loaded.
-  aioRelease: "2603"
+  aioRelease: "2605"
 
   # Capability gates evaluated by manifest `when:` conditions
   # (workspace convention). The `enable*` prefix is a workspace style.

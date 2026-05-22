@@ -12,7 +12,7 @@
 // the PUT cannot wipe operator state.
 //
 // cert-manager is gated by `enableCertManager`: when false, no cert-manager PUT
-// is emitted. (Conditional resource declaration; the existing extension is left
+// is emitted. (Conditional resource declaration. The existing extension is left
 // untouched.)
 //
 // API version: `Microsoft.KubernetesConfiguration/extensions@2023-05-01` is fixed
@@ -38,7 +38,7 @@
 //     in resolve-extensions and forwarded as `aio.releaseNamespace` below.
 //   - secret-store: install path does NOT set `scope` (lets the RP default apply).
 //     The upgrade PUT mirrors the install by omitting `scope` entirely.
-//   - cert-manager: install path hardcodes `'cert-manager'`; the PUT below hardcodes
+//   - cert-manager: install path hardcodes `'cert-manager'`. The PUT below hardcodes
 //     the same value rather than reading from the snapshot. ARM treats
 //     `releaseNamespace` as immutable post-create, so the hardcode is functionally
 //     equivalent for scalekit-managed installs and avoids a snapshot field for a
@@ -67,7 +67,7 @@ param certManager object
 param enableCertManager bool
 
 // =====================================================================================
-// Parameters: target versions (all optional; empty = preserve resolved).
+// Parameters: target versions. All optional. Empty = preserve resolved.
 // Names mirror the keys in `parameters/aio-releases/<release>.yaml` so the release config
 // can be wired in directly via the manifest's `parameters:` list (same source the
 // install path consumes).
@@ -211,3 +211,50 @@ output secretStoreVersionApplied string = effectiveSecretStoreVersion
 
 @description('Effective version applied to the cert-manager Arc extension. Empty when enableCertManager is false.')
 output certManagerVersionApplied string = enableCertManager ? effectiveCertManagerVersion : ''
+
+@description('Post-PUT snapshot of the AIO Arc extension, mirroring `resolve-extensions.outputs.aio`. Fields reflect ARM\'s returned state after the PUT. Excludes `configurationProtectedSettings` (write-only, returned masked).')
+output aioPostUpdate object = {
+  id: aioExtensionUpdate.id
+  name: aioExtensionUpdate.name
+  extensionType: aioExtensionUpdate.properties.extensionType
+  version: aioExtensionUpdate.properties.?version ?? ''
+  releaseTrain: aioExtensionUpdate.properties.?releaseTrain ?? ''
+  configurationSettings: aioExtensionUpdate.properties.?configurationSettings ?? {}
+  identity: aioExtensionUpdate.?identity ?? { type: 'None' }
+  releaseNamespace: aioExtensionUpdate.properties.?scope.?cluster.?releaseNamespace ?? 'azure-iot-operations'
+}
+
+@description('Post-PUT snapshot of the secret store Arc extension, mirroring `resolve-extensions.outputs.secretStore`. `releaseNamespace` is omitted because the install path does not set scope.cluster.releaseNamespace and the upgrade mirrors that. Excludes `configurationProtectedSettings` (write-only, returned masked).')
+#disable-next-line outputs-should-not-contain-secrets
+output secretStorePostUpdate object = {
+  id: secretStoreExtensionUpdate.id
+  name: secretStoreExtensionUpdate.name
+  extensionType: secretStoreExtensionUpdate.properties.extensionType
+  version: secretStoreExtensionUpdate.properties.?version ?? ''
+  releaseTrain: secretStoreExtensionUpdate.properties.?releaseTrain ?? ''
+  configurationSettings: secretStoreExtensionUpdate.properties.?configurationSettings ?? {}
+  identity: secretStoreExtensionUpdate.?identity ?? { type: 'None' }
+}
+
+@description('Post-PUT snapshot of the cert-manager Arc extension, mirroring `resolve-extensions.outputs.certManager`. Populated when enableCertManager is true, otherwise zero-valued (id is empty) so consumers can skip on the same signal as resolve. Excludes `configurationProtectedSettings` (write-only, returned masked).')
+output certManagerPostUpdate object = enableCertManager
+  ? {
+      id: certManagerExtensionUpdate!.id
+      name: certManagerExtensionUpdate!.name
+      extensionType: certManagerExtensionUpdate!.properties.extensionType
+      version: certManagerExtensionUpdate!.properties.?version ?? ''
+      releaseTrain: certManagerExtensionUpdate!.properties.?releaseTrain ?? ''
+      configurationSettings: certManagerExtensionUpdate!.properties.?configurationSettings ?? {}
+      identity: certManagerExtensionUpdate!.?identity ?? { type: 'None' }
+      releaseNamespace: certManagerExtensionUpdate!.properties.?scope.?cluster.?releaseNamespace ?? 'cert-manager'
+    }
+  : {
+      id: ''
+      name: ''
+      extensionType: ''
+      version: ''
+      releaseTrain: ''
+      configurationSettings: {}
+      identity: { type: 'None' }
+      releaseNamespace: ''
+    }

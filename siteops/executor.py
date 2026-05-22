@@ -97,6 +97,16 @@ HTTPS_URL_PATTERN = re.compile(r"^https://", re.IGNORECASE)
 # Time to wait for Arc proxy to establish connection (seconds)
 ARC_PROXY_STARTUP_WAIT = int(os.environ.get("SITEOPS_ARC_PROXY_WAIT", "60"))
 
+# Retries when `az connectedk8s proxy` exits with port-in-use. Slots may
+# collide with processes outside the in-process allocator.
+ARC_PROXY_MAX_PORT_RETRIES = int(os.environ.get("SITEOPS_ARC_PROXY_MAX_PORT_RETRIES", "3"))
+
+# Matches `az connectedk8s proxy` port-in-use stderr (e.g. "ERROR: Port 47020
+# is already in use.").
+_ARC_PROXY_PORT_IN_USE_PATTERN = re.compile(
+    r"port\s+\d+\s+is\s+already\s+in\s+use", re.IGNORECASE
+)
+
 # Default timeout for Azure CLI deployments (60 minutes)
 # Azure deployments can take significant time for complex resources
 DEFAULT_AZ_TIMEOUT_SECONDS = 3600
@@ -141,7 +151,10 @@ def get_template_parameters(template_path: str) -> frozenset[str]:
     if path.suffix == ".bicep":
         az_path = shutil.which("az")
         if not az_path:
-            raise ValueError("Azure CLI (az) not found in PATH. Required for Bicep template parsing.")
+            raise ValueError(
+                "Azure CLI (`az`) not found on PATH. Install Azure CLI and ensure "
+                "`az` is available, then retry."
+            )
 
         result = subprocess.run(
             [az_path, "bicep", "build", "--file", str(path), "--stdout"],
@@ -418,51 +431,71 @@ class AzCliExecutor:
         allocated_port: int | None = None
 
         try:
-            # Allocate a unique port slot for this proxy instance
-            allocated_port = _allocate_arc_port_slot()
+            for attempt in range(ARC_PROXY_MAX_PORT_RETRIES):
+                # Allocate a unique port slot for this proxy instance
+                allocated_port = _allocate_arc_port_slot()
 
-            cmd = [
-                self.az_path,
-                "connectedk8s",
-                "proxy",
-                "-n",
-                cluster_name,
-                "-g",
-                resource_group,
-                "--subscription",
-                subscription,
-                "--port",
-                str(allocated_port),
-            ]
+                cmd = [
+                    self.az_path,
+                    "connectedk8s",
+                    "proxy",
+                    "-n",
+                    cluster_name,
+                    "-g",
+                    resource_group,
+                    "--subscription",
+                    subscription,
+                    "--port",
+                    str(allocated_port),
+                ]
 
-            logger.debug(f"Starting Arc proxy: {' '.join(cmd)}")
+                logger.debug(f"Starting Arc proxy: {' '.join(cmd)}")
 
-            # Start process with its own process group for clean termination
-            if os.name == "nt":
-                # Windows: use CREATE_NEW_PROCESS_GROUP for signal handling
-                proxy_process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
-                )
-            else:
-                # Unix: use setsid to create new process group
-                proxy_process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    preexec_fn=os.setsid,
-                )
+                # Start process with its own process group for clean termination
+                if os.name == "nt":
+                    # Windows: use CREATE_NEW_PROCESS_GROUP for signal handling
+                    proxy_process = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                    )
+                else:
+                    # Unix: use setsid to create new process group
+                    proxy_process = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        preexec_fn=os.setsid,
+                    )
 
-            logger.debug(f"Waiting {ARC_PROXY_STARTUP_WAIT}s for proxy to establish...")
-            time.sleep(ARC_PROXY_STARTUP_WAIT)
+                logger.debug(f"Waiting {ARC_PROXY_STARTUP_WAIT}s for proxy to establish...")
+                time.sleep(ARC_PROXY_STARTUP_WAIT)
 
-            # Check if proxy is still running
-            if proxy_process.poll() is not None:
+                # Check if proxy is still running
+                if proxy_process.poll() is None:
+                    break  # proxy alive
+
                 _, stderr = proxy_process.communicate(timeout=5)
+                is_port_in_use = bool(
+                    _ARC_PROXY_PORT_IN_USE_PATTERN.search(stderr or "")
+                )
+                is_last_attempt = attempt == ARC_PROXY_MAX_PORT_RETRIES - 1
+
+                if is_port_in_use and not is_last_attempt:
+                    logger.warning(
+                        f"Arc proxy port {allocated_port} (internal {allocated_port - 1}) "
+                        f"in use, retrying with next slot "
+                        f"(attempt {attempt + 1}/{ARC_PROXY_MAX_PORT_RETRIES})"
+                    )
+                    _release_arc_port_slot(allocated_port)
+                    allocated_port = None
+                    proxy_process = None
+                    continue
+
+                # Not retryable: surface stderr and bail.
                 logger.error(f"Arc proxy exited unexpectedly: {stderr}")
                 yield False
                 return
@@ -489,10 +522,15 @@ class AzCliExecutor:
                 except subprocess.TimeoutExpired:
                     logger.debug("Proxy did not terminate gracefully, forcing...")
                     proxy_process.kill()
+                    try:
+                        proxy_process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        logger.debug("Proxy did not exit after kill; reap will defer.")
                 except Exception as e:
                     logger.debug(f"Error during proxy cleanup: {e}")
                     try:
                         proxy_process.kill()
+                        proxy_process.wait(timeout=5)
                     except Exception as e:
                         logger.debug(f"Failed to kill proxy process: {e}")
 
@@ -558,24 +596,35 @@ class AzCliExecutor:
             params_path = self._write_params_file(parameters, step_name, site_name)
             args.extend(["--parameters", f"@{params_path}"])
 
-        success, stdout, stderr = self._run_az(args)
+        try:
+            success, stdout, stderr = self._run_az(args)
 
-        outputs = {}
-        if success and stdout and not self.dry_run:
-            try:
-                result = json.loads(stdout)
-                outputs = result.get("properties", {}).get("outputs", {})
-            except json.JSONDecodeError:
-                pass
+            outputs = {}
+            if success and stdout and not self.dry_run:
+                try:
+                    result = json.loads(stdout)
+                    outputs = result.get("properties", {}).get("outputs", {})
+                except json.JSONDecodeError:
+                    pass
 
-        return DeploymentResult(
-            success=success,
-            step_name=step_name,
-            site_name=site_name,
-            deployment_name=deployment_name,
-            outputs=outputs,
-            error=stderr if not success else None,
-        )
+            return DeploymentResult(
+                success=success,
+                step_name=step_name,
+                site_name=site_name,
+                deployment_name=deployment_name,
+                outputs=outputs,
+                error=stderr if not success else None,
+            )
+        finally:
+            # Clean up the per-deploy params file. Long-running CI runs would
+            # otherwise accumulate one JSON per (step, site, deploy) under
+            # `.siteops/tmp/`. Best-effort: don't mask the deploy result on
+            # cleanup errors.
+            if parameters:
+                try:
+                    params_path.unlink(missing_ok=True)
+                except OSError as e:
+                    logger.debug(f"Failed to remove params file {params_path}: {e}")
 
     def deploy_resource_group(
         self,

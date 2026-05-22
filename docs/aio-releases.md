@@ -113,6 +113,18 @@ This policy applies only to samples. Fundamentals (`templates/aio/`, `templates/
    ```
    The matrix runs each release in its own fresh RG + Arc cluster, and `test_aio_extension_version_matches_version_config` cross-checks the deployed `aioExtension.version` against the YAML.
 
+## Removing an EOL release
+
+When a release reaches end-of-life (tied to AIO's official support window), drop it from the workspace.
+
+1. **Remove the release YAML.** Delete `parameters/aio-releases/<release>.yaml`. Git history preserves the values for future reference.
+2. **Verify no site still pins the removed release.** Run `pytest tests/workspace/ -q`. `test_all_sites_aio_releases_have_config_files` fails fast on any site that references the missing YAML. Update those sites to a supported release.
+3. **Remove orphaned API-version Bicep modules.** If no remaining release uses a given `aioApiVersion` or `adrApiVersion`, the corresponding per-version modules (`instance-<YYYY-MM-DD>.bicep`, `update-instance-<YYYY-MM-DD>.bicep`, `adr-ns-<YYYY-MM-DD>.bicep`) and their `@allowed` + conditional dispatch entries can be removed. Leave them if any supported release still uses the API version.
+4. **Update sample template API pins if needed.** Samples under `samples/<name>/template.bicep` pin to the **oldest supported** API version. If removing the EOL release leaves a newer oldest-supported version, bump the pins. `test_samples_pin_to_oldest_api_version` enforces this.
+5. **Remove the release from the E2E matrix.** Update any documentation, CI workflow defaults, or release-notes recipes that named the EOL release.
+
+A site pinned to a removed release now fails at workflow prep (`aio-releases entries without a matching ... Available: [...]`) and at deploy time (validator rejects the missing YAML). The error is clear enough that no soft-deprecation flag is needed.
+
 ## Validation summary
 
 Release misconfigurations surface at four points:

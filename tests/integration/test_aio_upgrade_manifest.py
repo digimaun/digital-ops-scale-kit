@@ -12,6 +12,14 @@ from pathlib import Path
 import pytest
 
 from siteops.models import Manifest
+from tests.integration.conftest import (
+    TEST_OVERRIDE_AIO_KEY,
+    TEST_OVERRIDE_AIO_VALUE,
+    TEST_OVERRIDE_CERT_MANAGER_KEY,
+    TEST_OVERRIDE_CERT_MANAGER_VALUE,
+    TEST_OVERRIDE_SECRET_STORE_KEY,
+    TEST_OVERRIDE_SECRET_STORE_VALUE,
+)
 from tests.integration.helpers.assertions import (
     assert_output_exists,
     assert_output_starts_with,
@@ -63,7 +71,7 @@ class TestAioUpgradeResolveExtensions:
             )
 
     def test_aio_release_namespace_non_empty(self, aio_upgrade_result):
-        """Snapshot must populate releaseNamespace; empty risks destructive PUT."""
+        """Snapshot must populate releaseNamespace. Empty risks destructive PUT."""
         for name in aio_upgrade_result["sites"]:
             step = assert_step_succeeded(aio_upgrade_result, name, "resolve-extensions")
             aio = assert_output_exists(step, "aio")
@@ -89,7 +97,7 @@ class TestAioUpgradeResolveExtensions:
     def test_cert_manager_snapshot_shape(self, aio_upgrade_result):
         """resolve-extensions returns a uniform certManager snapshot whether
         the extension is installed or not. When `enableCertManager` is true
-        the snapshot is populated; when false it is the zero-valued shape."""
+        the snapshot is populated. When false it is the zero-valued shape."""
         for name in aio_upgrade_result["sites"]:
             step = assert_step_succeeded(aio_upgrade_result, name, "resolve-extensions")
             cert_manager = assert_output_exists(step, "certManager")
@@ -161,7 +169,7 @@ class TestAioUpgradeSelfConsistency:
 
     Allowlisted for upgrade-phase E2E (cross-version: install on release A,
     then upgrade to release B in a separate run). These tests must not read
-    `aio_install_result` content because the install was a separate run; the
+    `aio_install_result` content because the install was a separate run. The
     fixture is replaced by a sentinel during upgrade phase.
     """
 
@@ -242,3 +250,381 @@ class TestAioUpgradeIdempotency:
                     f"Site '{name}': {output_name} changed on re-upgrade "
                     f"({v1!r} -> {v2!r})"
                 )
+
+
+class TestAioExtensionInvariants:
+    """Upgrade PUT changes only `version` (and `releaseTrain` when the release
+    config specifies a different train). All other AIO Arc extension fields
+    equal the pre-PUT snapshot.
+
+    Diffs `resolve-extensions.outputs.aio` (pre-PUT) against
+    `update-extensions.outputs.aioPostUpdate` (post-PUT). `aioPostUpdate`
+    reflects ARM's returned state, not Bicep input values, so RP-side
+    mutations are detected.
+
+    `configurationProtectedSettings` is outside the assertable surface:
+    write-only, returned masked by ARM, not set by the scalekit install path.
+    Its preservation across an omit-on-PUT for
+    `Microsoft.KubernetesConfiguration/extensions` is not authoritatively
+    documented. Tracked as a known gap.
+    """
+
+    def test_aio_extension_id_preserved(self, aio_upgrade_result):
+        """Different id post-PUT means full-replace, not in-place patch."""
+        for name in aio_upgrade_result["sites"]:
+            resolve = assert_step_succeeded(aio_upgrade_result, name, "resolve-extensions")
+            pre = assert_output_exists(resolve, "aio")
+            update = assert_step_succeeded(aio_upgrade_result, name, "update-extensions")
+            post = assert_output_exists(update, "aioPostUpdate")
+            assert post["id"] == pre["id"], (
+                f"Site '{name}': AIO extension id changed across PUT "
+                f"({pre['id']!r} -> {post['id']!r}); full-replace, not in-place"
+            )
+
+    def test_aio_extension_name_and_type_preserved(self, aio_upgrade_result):
+        for name in aio_upgrade_result["sites"]:
+            resolve = assert_step_succeeded(aio_upgrade_result, name, "resolve-extensions")
+            pre = assert_output_exists(resolve, "aio")
+            update = assert_step_succeeded(aio_upgrade_result, name, "update-extensions")
+            post = assert_output_exists(update, "aioPostUpdate")
+            assert post["name"] == pre["name"], (
+                f"Site '{name}': AIO extension name changed "
+                f"({pre['name']!r} -> {post['name']!r})"
+            )
+            assert post["extensionType"] == pre["extensionType"], (
+                f"Site '{name}': extensionType changed "
+                f"({pre['extensionType']!r} -> {post['extensionType']!r})"
+            )
+
+    def test_aio_release_namespace_preserved(self, aio_upgrade_result):
+        """releaseNamespace change relocates the AIO workload on the cluster."""
+        for name in aio_upgrade_result["sites"]:
+            resolve = assert_step_succeeded(aio_upgrade_result, name, "resolve-extensions")
+            pre = assert_output_exists(resolve, "aio")
+            update = assert_step_succeeded(aio_upgrade_result, name, "update-extensions")
+            post = assert_output_exists(update, "aioPostUpdate")
+            assert post["releaseNamespace"] == pre["releaseNamespace"], (
+                f"Site '{name}': releaseNamespace changed "
+                f"({pre['releaseNamespace']!r} -> {post['releaseNamespace']!r}); "
+                f"upgrade would relocate the AIO workload"
+            )
+
+    def test_aio_identity_preserved(self, aio_upgrade_result):
+        """Identity change orphans the extension's role assignments."""
+        for name in aio_upgrade_result["sites"]:
+            resolve = assert_step_succeeded(aio_upgrade_result, name, "resolve-extensions")
+            pre = assert_output_exists(resolve, "aio")
+            update = assert_step_succeeded(aio_upgrade_result, name, "update-extensions")
+            post = assert_output_exists(update, "aioPostUpdate")
+            assert post["identity"] == pre["identity"], (
+                f"Site '{name}': identity changed across PUT "
+                f"({pre['identity']!r} -> {post['identity']!r})"
+            )
+
+    def test_aio_configuration_settings_preserved(self, aio_upgrade_result):
+        """configurationSettings carries operator-applied AIO config. Update
+        uses `union(existing, overrides)` which is additive-only by contract;
+        any mutation across PUT is data loss.
+        """
+        for name in aio_upgrade_result["sites"]:
+            resolve = assert_step_succeeded(aio_upgrade_result, name, "resolve-extensions")
+            pre = assert_output_exists(resolve, "aio")
+            update = assert_step_succeeded(aio_upgrade_result, name, "update-extensions")
+            post = assert_output_exists(update, "aioPostUpdate")
+            assert post["configurationSettings"] == pre["configurationSettings"], (
+                f"Site '{name}': configurationSettings mutated by upgrade. "
+                f"Pre: {pre['configurationSettings']!r}, "
+                f"Post: {post['configurationSettings']!r}"
+            )
+
+    def test_aio_release_train_preserved(self, aio_upgrade_result):
+        """releaseTrain change is allowed only when the release config bumps
+        the train. Shipped release configs (2603, 2604, 2605) all use `stable`,
+        so a mismatch here means the RP defaulted the train unexpectedly OR
+        the release config was bumped (intentional, update the test).
+        """
+        for name in aio_upgrade_result["sites"]:
+            resolve = assert_step_succeeded(aio_upgrade_result, name, "resolve-extensions")
+            pre = assert_output_exists(resolve, "aio")
+            update = assert_step_succeeded(aio_upgrade_result, name, "update-extensions")
+            post = assert_output_exists(update, "aioPostUpdate")
+            assert post["releaseTrain"] == pre["releaseTrain"], (
+                f"Site '{name}': releaseTrain changed across PUT "
+                f"({pre['releaseTrain']!r} -> {post['releaseTrain']!r})"
+            )
+
+
+# Placeholder marker for new test classes - replaced by edit below
+class TestSecretStoreExtensionInvariants:
+    """Secret-store Arc extension PUT changes only `version` (and `releaseTrain`
+    when the release config specifies a different train). All other fields
+    equal the pre-PUT snapshot.
+
+    Mirrors TestAioExtensionInvariants. Same caveats: `configurationProtectedSettings`
+    is outside the assertable surface.
+    """
+
+    def test_secret_store_extension_id_preserved(self, aio_upgrade_result):
+        for name in aio_upgrade_result["sites"]:
+            resolve = assert_step_succeeded(aio_upgrade_result, name, "resolve-extensions")
+            pre = assert_output_exists(resolve, "secretStore")
+            update = assert_step_succeeded(aio_upgrade_result, name, "update-extensions")
+            post = assert_output_exists(update, "secretStorePostUpdate")
+            assert post["id"] == pre["id"], (
+                f"Site '{name}': secret store extension id changed across PUT "
+                f"({pre['id']!r} -> {post['id']!r}); full-replace, not in-place"
+            )
+
+    def test_secret_store_name_and_type_preserved(self, aio_upgrade_result):
+        for name in aio_upgrade_result["sites"]:
+            resolve = assert_step_succeeded(aio_upgrade_result, name, "resolve-extensions")
+            pre = assert_output_exists(resolve, "secretStore")
+            update = assert_step_succeeded(aio_upgrade_result, name, "update-extensions")
+            post = assert_output_exists(update, "secretStorePostUpdate")
+            assert post["name"] == pre["name"], (
+                f"Site '{name}': secret store name changed "
+                f"({pre['name']!r} -> {post['name']!r})"
+            )
+            assert post["extensionType"] == pre["extensionType"], (
+                f"Site '{name}': secret store extensionType changed "
+                f"({pre['extensionType']!r} -> {post['extensionType']!r})"
+            )
+
+    def test_secret_store_identity_preserved(self, aio_upgrade_result):
+        """Identity change orphans the extension's Key Vault role assignments."""
+        for name in aio_upgrade_result["sites"]:
+            resolve = assert_step_succeeded(aio_upgrade_result, name, "resolve-extensions")
+            pre = assert_output_exists(resolve, "secretStore")
+            update = assert_step_succeeded(aio_upgrade_result, name, "update-extensions")
+            post = assert_output_exists(update, "secretStorePostUpdate")
+            assert post["identity"] == pre["identity"], (
+                f"Site '{name}': secret store identity changed across PUT "
+                f"({pre['identity']!r} -> {post['identity']!r})"
+            )
+
+    def test_secret_store_configuration_settings_preserved(self, aio_upgrade_result):
+        for name in aio_upgrade_result["sites"]:
+            resolve = assert_step_succeeded(aio_upgrade_result, name, "resolve-extensions")
+            pre = assert_output_exists(resolve, "secretStore")
+            update = assert_step_succeeded(aio_upgrade_result, name, "update-extensions")
+            post = assert_output_exists(update, "secretStorePostUpdate")
+            assert post["configurationSettings"] == pre["configurationSettings"], (
+                f"Site '{name}': secret store configurationSettings mutated by upgrade. "
+                f"Pre: {pre['configurationSettings']!r}, "
+                f"Post: {post['configurationSettings']!r}"
+            )
+
+    def test_secret_store_release_train_preserved(self, aio_upgrade_result):
+        for name in aio_upgrade_result["sites"]:
+            resolve = assert_step_succeeded(aio_upgrade_result, name, "resolve-extensions")
+            pre = assert_output_exists(resolve, "secretStore")
+            update = assert_step_succeeded(aio_upgrade_result, name, "update-extensions")
+            post = assert_output_exists(update, "secretStorePostUpdate")
+            assert post["releaseTrain"] == pre["releaseTrain"], (
+                f"Site '{name}': secret store releaseTrain changed across PUT "
+                f"({pre['releaseTrain']!r} -> {post['releaseTrain']!r})"
+            )
+
+
+class TestCertManagerExtensionInvariants:
+    """cert-manager Arc extension PUT changes only `version` (and `releaseTrain`
+    when the release config specifies a different train). All other fields
+    equal the pre-PUT snapshot.
+
+    Per-test skip when the site has `deployOptions.enableCertManager: false`:
+    in that mode the extension is externally managed and the upgrade PUT does
+    not run, so resolve and post-update both return the zero-valued shape.
+    """
+
+    def test_cert_manager_extension_id_preserved(self, aio_upgrade_result):
+        for name in aio_upgrade_result["sites"]:
+            resolve = assert_step_succeeded(aio_upgrade_result, name, "resolve-extensions")
+            pre = assert_output_exists(resolve, "certManager")
+            if not pre["id"]:
+                pytest.skip(f"Site '{name}': enableCertManager is false")
+            update = assert_step_succeeded(aio_upgrade_result, name, "update-extensions")
+            post = assert_output_exists(update, "certManagerPostUpdate")
+            assert post["id"] == pre["id"], (
+                f"Site '{name}': cert-manager extension id changed across PUT "
+                f"({pre['id']!r} -> {post['id']!r}); full-replace, not in-place"
+            )
+
+    def test_cert_manager_name_and_type_preserved(self, aio_upgrade_result):
+        for name in aio_upgrade_result["sites"]:
+            resolve = assert_step_succeeded(aio_upgrade_result, name, "resolve-extensions")
+            pre = assert_output_exists(resolve, "certManager")
+            if not pre["id"]:
+                pytest.skip(f"Site '{name}': enableCertManager is false")
+            update = assert_step_succeeded(aio_upgrade_result, name, "update-extensions")
+            post = assert_output_exists(update, "certManagerPostUpdate")
+            assert post["name"] == pre["name"], (
+                f"Site '{name}': cert-manager name changed "
+                f"({pre['name']!r} -> {post['name']!r})"
+            )
+            assert post["extensionType"] == pre["extensionType"], (
+                f"Site '{name}': cert-manager extensionType changed "
+                f"({pre['extensionType']!r} -> {post['extensionType']!r})"
+            )
+
+    def test_cert_manager_release_namespace_preserved(self, aio_upgrade_result):
+        for name in aio_upgrade_result["sites"]:
+            resolve = assert_step_succeeded(aio_upgrade_result, name, "resolve-extensions")
+            pre = assert_output_exists(resolve, "certManager")
+            if not pre["id"]:
+                pytest.skip(f"Site '{name}': enableCertManager is false")
+            update = assert_step_succeeded(aio_upgrade_result, name, "update-extensions")
+            post = assert_output_exists(update, "certManagerPostUpdate")
+            # cert-manager releaseNamespace is hardcoded to 'cert-manager' at both
+            # install and update sites by design (see update-extensions.bicep header).
+            assert post["releaseNamespace"] == "cert-manager", (
+                f"Site '{name}': cert-manager releaseNamespace is {post['releaseNamespace']!r}, "
+                f"expected 'cert-manager'"
+            )
+
+    def test_cert_manager_identity_preserved(self, aio_upgrade_result):
+        for name in aio_upgrade_result["sites"]:
+            resolve = assert_step_succeeded(aio_upgrade_result, name, "resolve-extensions")
+            pre = assert_output_exists(resolve, "certManager")
+            if not pre["id"]:
+                pytest.skip(f"Site '{name}': enableCertManager is false")
+            update = assert_step_succeeded(aio_upgrade_result, name, "update-extensions")
+            post = assert_output_exists(update, "certManagerPostUpdate")
+            assert post["identity"] == pre["identity"], (
+                f"Site '{name}': cert-manager identity changed across PUT "
+                f"({pre['identity']!r} -> {post['identity']!r})"
+            )
+
+    def test_cert_manager_configuration_settings_preserved(self, aio_upgrade_result):
+        for name in aio_upgrade_result["sites"]:
+            resolve = assert_step_succeeded(aio_upgrade_result, name, "resolve-extensions")
+            pre = assert_output_exists(resolve, "certManager")
+            if not pre["id"]:
+                pytest.skip(f"Site '{name}': enableCertManager is false")
+            update = assert_step_succeeded(aio_upgrade_result, name, "update-extensions")
+            post = assert_output_exists(update, "certManagerPostUpdate")
+            assert post["configurationSettings"] == pre["configurationSettings"], (
+                f"Site '{name}': cert-manager configurationSettings mutated by upgrade. "
+                f"Pre: {pre['configurationSettings']!r}, "
+                f"Post: {post['configurationSettings']!r}"
+            )
+
+    def test_cert_manager_release_train_preserved(self, aio_upgrade_result):
+        for name in aio_upgrade_result["sites"]:
+            resolve = assert_step_succeeded(aio_upgrade_result, name, "resolve-extensions")
+            pre = assert_output_exists(resolve, "certManager")
+            if not pre["id"]:
+                pytest.skip(f"Site '{name}': enableCertManager is false")
+            update = assert_step_succeeded(aio_upgrade_result, name, "update-extensions")
+            post = assert_output_exists(update, "certManagerPostUpdate")
+            assert post["releaseTrain"] == pre["releaseTrain"], (
+                f"Site '{name}': cert-manager releaseTrain changed across PUT "
+                f"({pre['releaseTrain']!r} -> {post['releaseTrain']!r})"
+            )
+
+
+class TestExtensionAdditiveOverrides:
+    """`union(existing, overrides)` in update-extensions.bicep preserves all
+    pre-PUT keys AND adds override keys. Asserted per-extension.
+
+    Uses the `aio_upgrade_with_overrides_result` fixture, which deploys
+    aio-upgrade.yaml with known test override keys injected via a tmp
+    parameter file on the update-extensions step. Tests assert (a) the test
+    override key is present in post-PUT, (b) all pre-PUT keys are still
+    present in post-PUT (preservation under union).
+
+    Operator out-of-band customization (case 1: `az k8s-extension update
+    --config` between install and upgrade) is covered by the invariants
+    classes above, since out-of-band keys appear in the pre-PUT snapshot
+    and the post == pre assertion catches their preservation. This class
+    covers case 2 + 3 (the operator passes overrides via the upgrade run).
+    """
+
+    def test_aio_override_added_and_existing_preserved(self, aio_upgrade_with_overrides_result):
+        for name in aio_upgrade_with_overrides_result["sites"]:
+            resolve = assert_step_succeeded(
+                aio_upgrade_with_overrides_result, name, "resolve-extensions"
+            )
+            pre = assert_output_exists(resolve, "aio")
+            update = assert_step_succeeded(
+                aio_upgrade_with_overrides_result, name, "update-extensions"
+            )
+            post = assert_output_exists(update, "aioPostUpdate")
+
+            assert TEST_OVERRIDE_AIO_KEY in post["configurationSettings"], (
+                f"Site '{name}': override key {TEST_OVERRIDE_AIO_KEY!r} not in "
+                f"post-PUT configurationSettings: {post['configurationSettings']!r}"
+            )
+            assert (
+                post["configurationSettings"][TEST_OVERRIDE_AIO_KEY]
+                == TEST_OVERRIDE_AIO_VALUE
+            ), (
+                f"Site '{name}': override value mismatch for {TEST_OVERRIDE_AIO_KEY!r}: "
+                f"got {post['configurationSettings'][TEST_OVERRIDE_AIO_KEY]!r}, "
+                f"expected {TEST_OVERRIDE_AIO_VALUE!r}"
+            )
+            for key, value in pre["configurationSettings"].items():
+                assert key in post["configurationSettings"], (
+                    f"Site '{name}': pre-PUT key {key!r} dropped from post-PUT. "
+                    f"Pre: {pre['configurationSettings']!r}, "
+                    f"Post: {post['configurationSettings']!r}"
+                )
+                assert post["configurationSettings"][key] == value, (
+                    f"Site '{name}': pre-PUT key {key!r} value mutated "
+                    f"({value!r} -> {post['configurationSettings'][key]!r})"
+                )
+
+    def test_secret_store_override_added_and_existing_preserved(
+        self, aio_upgrade_with_overrides_result
+    ):
+        for name in aio_upgrade_with_overrides_result["sites"]:
+            resolve = assert_step_succeeded(
+                aio_upgrade_with_overrides_result, name, "resolve-extensions"
+            )
+            pre = assert_output_exists(resolve, "secretStore")
+            update = assert_step_succeeded(
+                aio_upgrade_with_overrides_result, name, "update-extensions"
+            )
+            post = assert_output_exists(update, "secretStorePostUpdate")
+
+            assert TEST_OVERRIDE_SECRET_STORE_KEY in post["configurationSettings"], (
+                f"Site '{name}': override key {TEST_OVERRIDE_SECRET_STORE_KEY!r} not "
+                f"in post-PUT: {post['configurationSettings']!r}"
+            )
+            assert (
+                post["configurationSettings"][TEST_OVERRIDE_SECRET_STORE_KEY]
+                == TEST_OVERRIDE_SECRET_STORE_VALUE
+            )
+            for key, value in pre["configurationSettings"].items():
+                assert key in post["configurationSettings"], (
+                    f"Site '{name}': pre-PUT key {key!r} dropped from post-PUT"
+                )
+                assert post["configurationSettings"][key] == value
+
+    def test_cert_manager_override_added_and_existing_preserved(
+        self, aio_upgrade_with_overrides_result
+    ):
+        for name in aio_upgrade_with_overrides_result["sites"]:
+            resolve = assert_step_succeeded(
+                aio_upgrade_with_overrides_result, name, "resolve-extensions"
+            )
+            pre = assert_output_exists(resolve, "certManager")
+            if not pre["id"]:
+                pytest.skip(f"Site '{name}': enableCertManager is false")
+            update = assert_step_succeeded(
+                aio_upgrade_with_overrides_result, name, "update-extensions"
+            )
+            post = assert_output_exists(update, "certManagerPostUpdate")
+
+            assert TEST_OVERRIDE_CERT_MANAGER_KEY in post["configurationSettings"], (
+                f"Site '{name}': override key {TEST_OVERRIDE_CERT_MANAGER_KEY!r} not "
+                f"in post-PUT: {post['configurationSettings']!r}"
+            )
+            assert (
+                post["configurationSettings"][TEST_OVERRIDE_CERT_MANAGER_KEY]
+                == TEST_OVERRIDE_CERT_MANAGER_VALUE
+            )
+            for key, value in pre["configurationSettings"].items():
+                assert key in post["configurationSettings"], (
+                    f"Site '{name}': pre-PUT key {key!r} dropped from post-PUT"
+                )
+                assert post["configurationSettings"][key] == value

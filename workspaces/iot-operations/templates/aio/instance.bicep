@@ -226,6 +226,7 @@ var activeResources = aioApiVersion == '2025-10-01'
 /*                          Deployment Outputs                               */
 /*****************************************************************************/
 
+@description('AIO Arc extension snapshot (name, id, version, releaseTrain, trust config, identity principal id).')
 output aioExtension object = {
   name: activeResources.aioExtensionName
   id: activeResources.aioExtensionId
@@ -237,6 +238,7 @@ output aioExtension object = {
   identityPrincipalId: activeResources.aioExtensionPrincipalId
 }
 
+@description('AIO instance snapshot (instance name, broker name, broker listener, broker authentication, broker settings).')
 output aio object = {
   name: activeResources.instanceName
   broker: {
@@ -247,9 +249,11 @@ output aio object = {
   }
 }
 
+@description('Custom Location resource id and name. Custom Location is the boundary for AIO-instance-scoped child resources.')
 output customLocation object = {
   id: activeResources.customLocationId
   name: activeResources.customLocationName
 }
 
+@description('Azure region of the connected cluster hosting this AIO instance.')
 output location string = clusterLocation

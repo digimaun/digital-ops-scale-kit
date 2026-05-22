@@ -39,6 +39,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 from siteops.models import Manifest
 from siteops.orchestrator import Orchestrator
@@ -63,6 +64,10 @@ _UPGRADE_PHASE_ALLOWED_CLASSES = frozenset({
     "TestAioUpgradeResolveExtensions",
     "TestAioUpgradeSelfConsistency",
     "TestAioUpgradeIdempotency",
+    "TestAioExtensionInvariants",
+    "TestSecretStoreExtensionInvariants",
+    "TestCertManagerExtensionInvariants",
+    "TestExtensionAdditiveOverrides",
 })
 
 
@@ -282,6 +287,85 @@ def aio_upgrade_result(
         manifest=manifest,
         sites=sites,
     )
+
+
+# Test override keys injected by aio_upgrade_with_overrides_result. Exposed at
+# module scope so TestExtensionAdditiveOverrides can assert against them
+# without re-declaring values.
+TEST_OVERRIDE_AIO_KEY = "siteopsTestOverrideAio"
+TEST_OVERRIDE_AIO_VALUE = "siteops-test-aio-value"
+TEST_OVERRIDE_SECRET_STORE_KEY = "siteopsTestOverrideSecretStore"
+TEST_OVERRIDE_SECRET_STORE_VALUE = "siteops-test-secretstore-value"
+TEST_OVERRIDE_CERT_MANAGER_KEY = "siteopsTestOverrideCertManager"
+TEST_OVERRIDE_CERT_MANAGER_VALUE = "siteops-test-certmanager-value"
+
+
+@pytest.fixture(scope="session")
+def aio_upgrade_with_overrides_result(
+    orchestrator: Orchestrator,
+    selector: str | None,
+    aio_install_result: dict,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> dict:
+    """Deploy aio-upgrade.yaml with non-empty `configurationOverrides` on every
+    extension. Exercises the `union(existing, overrides)` additive path in
+    update-extensions.bicep so tests can assert pre-PUT keys are preserved
+    AND override keys are added.
+
+    Implementation: write a tmp parameter file with known override keys, load
+    aio-upgrade.yaml, append the tmp file to update-extensions' parameter
+    chain. No production manifest mutation, no fixture-manifest duplication.
+
+    Independent of aio_upgrade_result so test ordering does not matter. Both
+    fixtures use additive `union()` semantics, so cross-test contamination on
+    the shared cluster is safe.
+    """
+    overrides_dir = tmp_path_factory.mktemp("siteops-aio-upgrade-test-overrides")
+    overrides_path = overrides_dir / "extension-overrides.yaml"
+    overrides_path.write_text(
+        yaml.safe_dump(
+            {
+                "aioConfigurationOverrides": {
+                    TEST_OVERRIDE_AIO_KEY: TEST_OVERRIDE_AIO_VALUE,
+                },
+                "secretStoreConfigurationOverrides": {
+                    TEST_OVERRIDE_SECRET_STORE_KEY: TEST_OVERRIDE_SECRET_STORE_VALUE,
+                },
+                "certManagerConfigurationOverrides": {
+                    TEST_OVERRIDE_CERT_MANAGER_KEY: TEST_OVERRIDE_CERT_MANAGER_VALUE,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manifest_path = WORKSPACE_PATH / "manifests" / "aio-upgrade.yaml"
+    manifest, sites = _resolve_or_fail(orchestrator, manifest_path, selector)
+
+    # Append the tmp overrides file to update-extensions' parameter list.
+    # Absolute path bypasses workspace-relative resolution.
+    injected = False
+    for step in manifest.steps:
+        if step.name == "update-extensions":
+            step.parameters.append(str(overrides_path))
+            injected = True
+            break
+    if not injected:
+        raise RuntimeError(
+            "aio_upgrade_with_overrides_result: aio-upgrade.yaml has no "
+            "step named 'update-extensions' to inject overrides into. "
+            "Manifest structure changed; update the fixture."
+        )
+
+    result = orchestrator.deploy(
+        manifest_path=manifest_path,
+        manifest=manifest,
+        sites=sites,
+    )
+    assert result["summary"]["failed"] == 0, (
+        f"aio-upgrade-with-overrides deployment failed: {result}"
+    )
+    return result
 
 
 @pytest.fixture(scope="session")

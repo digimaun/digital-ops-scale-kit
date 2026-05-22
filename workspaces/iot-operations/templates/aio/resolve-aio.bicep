@@ -34,7 +34,7 @@
 @description('Name of the existing IoT Operations instance.')
 param aioInstanceName string
 
-@description('IoT Operations API version for the instance read. Sourced from parameters/aio-releases/<release>.yaml; pin must match the version the site is currently on.')
+@description('IoT Operations API version for the instance read. Sourced from parameters/aio-releases/<release>.yaml. The pin must match the version the site is currently on.')
 @allowed([
   '2025-10-01'
   '2026-03-01'
@@ -164,7 +164,7 @@ output schemaRegistryResourceId string = activeInstance.schemaRegistryResourceId
 @description('ADR namespace resource ID.')
 output adrNamespaceResourceId string = activeInstance.adrNamespaceResourceId
 
-@description('ADR namespace name (parsed from resource ID; empty if instance has no ADR namespace bound).')
+@description('ADR namespace name (parsed from resource ID, empty if instance has no ADR namespace bound).')
 output adrNamespaceName string = empty(activeInstance.adrNamespaceResourceId) ? '' : last(split(activeInstance.adrNamespaceResourceId, '/'))
 
 @description('Instance features map.')

@@ -611,7 +611,7 @@ class TestCmdDeploy:
 
         assert exit_code == 1
         captured = capsys.readouterr()
-        assert "declares no `sites:` or `selector:`" in captured.err
+        assert "has no targeting" in captured.err
 
     def test_deploy_duplicate_non_name_selector_key_errors(self, complete_workspace, capsys):
         """Duplicate non-name selector key surfaces as exit 1 with clear error."""

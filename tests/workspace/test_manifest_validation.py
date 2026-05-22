@@ -121,3 +121,40 @@ class TestManifestValidation:
                         f"files must be partials with the `_` prefix"
                     )
         assert offenders == [], "Partial-prefix violations:\n" + "\n".join(offenders)
+
+    def test_every_partial_is_composed_somewhere(self, workspace):
+        """Every leaf partial (`_*.yaml`) must be `include:`-d by at least one
+        other manifest. A partial with no consumers is dead code.
+
+        Detection: collect every `_*.yaml` file across `manifests/` and
+        `samples/<name>/`, then collect every `include:` target referenced
+        anywhere. Assert each partial appears in the referenced set.
+
+        Why: partials are never deployed standalone (their `_` prefix marks
+        them as composable fragments only). An orphaned partial silently
+        accumulates and tests / refactors keep updating it without anyone
+        noticing it's unreferenced.
+        """
+        all_partials: set[Path] = set()
+        all_includes: set[Path] = set()
+        for manifest_path in _all_manifest_files(workspace):
+            if manifest_path.name.startswith("_"):
+                all_partials.add(manifest_path.resolve())
+            with open(manifest_path, "r", encoding="utf-8") as fh:
+                raw = yaml.safe_load(fh)
+            if not raw:
+                continue
+            for step in raw.get("steps", []) or []:
+                if not isinstance(step, dict):
+                    continue
+                target = step.get("include")
+                if not target:
+                    continue
+                resolved = (manifest_path.parent / target).resolve()
+                all_includes.add(resolved)
+
+        orphans = sorted(p.relative_to(workspace) for p in all_partials - all_includes)
+        assert not orphans, (
+            "Orphaned partials (no manifest composes them):\n"
+            + "\n".join(f"  {p}" for p in orphans)
+        )

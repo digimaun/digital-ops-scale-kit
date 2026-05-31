@@ -744,6 +744,26 @@ class TestArcProxyPortInUseRetry:
         with _arc_port_lock:
             _allocated_arc_port_slots.clear()
 
+    @pytest.fixture(autouse=True)
+    def _block_real_signal_to_runner(self):
+        """Block the executor's cleanup branch from issuing real OS signals
+        when `proxy_process` is a MagicMock.
+
+        `_arc_proxy`'s `finally` block runs the Unix cleanup path when
+        `proxy_process.poll() is None`. With a MagicMock subprocess
+        `mock.pid` is itself a MagicMock whose `__int__` coerces to 1, so an
+        unpatched `os.killpg(os.getpgid(mock.pid), SIGTERM)` resolves to
+        `os.killpg(getpgid(1), SIGTERM)`. On a GitHub-hosted Linux runner
+        PID 1's process group includes the runner agent, so that SIGTERM
+        terminates the runner and the job ends with
+        `##[error]The operation was canceled` instead of a test failure.
+        `create=True` keeps the patches valid on Windows test hosts where
+        `os.killpg` and `os.getpgid` are not defined on the os module.
+        """
+        with patch("siteops.executor.os.killpg", create=True), \
+             patch("siteops.executor.os.getpgid", create=True):
+            yield
+
     def _make_popen_factory(self, sequence):
         """Build a subprocess.Popen replacement that yields a sequence of
         configured mock processes. Each entry is a dict like

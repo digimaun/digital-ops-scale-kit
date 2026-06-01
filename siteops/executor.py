@@ -19,7 +19,9 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -94,8 +96,22 @@ _allocated_arc_port_slots: set[int] = set()
 # URL pattern - only HTTPS allowed for security
 HTTPS_URL_PATTERN = re.compile(r"^https://", re.IGNORECASE)
 
-# Time to wait for Arc proxy to establish connection (seconds)
-ARC_PROXY_STARTUP_WAIT = int(os.environ.get("SITEOPS_ARC_PROXY_WAIT", "60"))
+# Upper bound for `_probe_arc_proxy_ready`. Default 180s covers
+# observed worst-case proxy startup of ~120s on constrained infra,
+# with headroom. Fast environments return in 3-10s. Override via
+# `SITEOPS_ARC_PROXY_WAIT`.
+ARC_PROXY_STARTUP_WAIT = int(os.environ.get("SITEOPS_ARC_PROXY_WAIT", "180"))
+
+# TCP bind happens microseconds after the proxy is usable, so poll
+# fast. Kubectl readiness is gated on API server response time, so
+# faster polling adds no value.
+_ARC_PROXY_PROBE_TCP_INTERVAL_S = 0.2
+_ARC_PROXY_PROBE_READINESS_INTERVAL_S = 0.5
+
+# Reserved window for the kubectl readiness phase so a late TCP bind
+# still gets time to confirm the tunnel. Capped at half the total
+# budget so very short timeouts allocate to both phases.
+_ARC_PROXY_PROBE_READINESS_MIN_BUDGET_S = 10.0
 
 # Retries when `az connectedk8s proxy` exits with port-in-use. Slots may
 # collide with processes outside the in-process allocator.
@@ -242,6 +258,145 @@ def _release_arc_port_slot(port: int) -> None:
         logger.debug(f"Released Arc proxy slot {slot} (port {port})")
 
 
+def _compute_probe_phase_budget(total_budget: float) -> tuple[float, float]:
+    """Split the total probe budget into per-phase deadlines (relative).
+
+    Returns `(tcp_budget, total_budget)`, where the kubectl readiness phase
+    runs until the total budget elapses. The TCP phase exits earlier to
+    reserve `_ARC_PROXY_PROBE_READINESS_MIN_BUDGET_S` for readiness, capped
+    at half the total so a small user-supplied timeout still allocates
+    time to both phases. The readiness phase therefore always has at least
+    `min(total_budget / 2, _ARC_PROXY_PROBE_READINESS_MIN_BUDGET_S)` seconds.
+
+    Pure function so the split math can be unit-tested without timing.
+    """
+    readiness_budget = min(total_budget / 2.0, _ARC_PROXY_PROBE_READINESS_MIN_BUDGET_S)
+    return total_budget - readiness_budget, total_budget
+
+
+def _probe_arc_proxy_ready(
+    proxy_process: subprocess.Popen,
+    port: int,
+    timeout_s: int | None = None,
+    kubectl_path: str | None = None,
+    kubeconfig_path: str | None = None,
+) -> bool:
+    """Active readiness probe for the Arc proxy.
+
+    Two phases. First, TCP bind detection: poll `127.0.0.1:port` until it
+    accepts a connection. Second, kubectl readiness: poll
+    `kubectl get --raw /version` until it succeeds. The kubectl phase
+    proves connectivity through the tunnel and that the proxy-written
+    kubeconfig context is usable. It does not exercise resource RBAC,
+    so a positive signal means apply can reach the API server but a
+    later 401 or 403 on a write call is still possible.
+
+    The total budget is split so the kubectl phase always has at least
+    `_ARC_PROXY_PROBE_READINESS_MIN_BUDGET_S` seconds (capped at half the
+    total when the user-supplied timeout is small). A TCP bind that
+    succeeds right before the overall deadline still gets a real chance
+    to confirm the tunnel.
+
+    Bails early if the proxy process dies (`poll()` returns non-None) so
+    the caller can read stderr and retry on port-in-use.
+
+    Args:
+        proxy_process: Running `az connectedk8s proxy` subprocess.
+        port: Local port the proxy is bound to (`--port` argument).
+        timeout_s: Upper bound for the probe in seconds.
+            Defaults to `ARC_PROXY_STARTUP_WAIT`.
+        kubectl_path: Path to the kubectl binary. When None, resolved via
+            `shutil.which("kubectl")`. Pass an explicit path from the
+            caller to avoid a second PATH lookup.
+        kubeconfig_path: Path to the kubeconfig file the proxy writes
+            (`--file` argument to `az connectedk8s proxy`). Passed to
+            kubectl as `--kubeconfig=<path>` so the probe targets this
+            specific proxy rather than the ambient `current-context`.
+            None falls back to the default kubeconfig discovery.
+
+    Returns:
+        True if the proxy became responsive within the deadline.
+        False if the deadline elapsed, or the proxy died, or kubectl was
+        not available.
+    """
+    total_budget = timeout_s if timeout_s is not None else ARC_PROXY_STARTUP_WAIT
+    start = time.monotonic()
+    tcp_budget, readiness_total = _compute_probe_phase_budget(total_budget)
+    tcp_deadline = start + tcp_budget
+    deadline = start + readiness_total
+
+    # Phase 1: TCP bind detection.
+    bound = False
+    while time.monotonic() < tcp_deadline:
+        if proxy_process.poll() is not None:
+            return False
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                bound = True
+                break
+        except (ConnectionRefusedError, OSError):
+            time.sleep(_ARC_PROXY_PROBE_TCP_INTERVAL_S)
+    if not bound:
+        logger.debug(f"Arc proxy TCP bind probe timed out on port {port}")
+        return False
+
+    # Phase 2: kubectl readiness. Mirrors the engine path the orchestrator
+    # runs for `apply`, so a positive signal here means apply will reach
+    # the API server through the tunnel.
+    if kubectl_path is None:
+        kubectl_path = shutil.which("kubectl")
+    if kubectl_path is None:
+        logger.error(
+            "Arc proxy readiness probe cannot run: kubectl not found in "
+            "PATH. Install kubectl from "
+            "https://kubernetes.io/docs/tasks/tools/."
+        )
+        return False
+
+    cmd = [kubectl_path]
+    if kubeconfig_path is not None:
+        cmd.append(f"--kubeconfig={kubeconfig_path}")
+    cmd.extend(["get", "--raw=/version", "--request-timeout=5s"])
+
+    last_observation = "no kubectl invocation yet"
+    while time.monotonic() < deadline:
+        if proxy_process.poll() is not None:
+            return False
+        # Clamp the subprocess timeout to the remaining budget so a single
+        # hung kubectl call cannot overrun the readiness deadline by 10s.
+        # Floor at 1s so the call always gets a real attempt.
+        remaining = deadline - time.monotonic()
+        run_timeout = max(1.0, min(10.0, remaining))
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=run_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            last_observation = f"kubectl invocation timed out at {run_timeout:.1f}s"
+            time.sleep(_ARC_PROXY_PROBE_READINESS_INTERVAL_S)
+            continue
+        if result.returncode == 0:
+            return True
+        stderr_text = (result.stderr or "").strip()
+        stdout_text = (result.stdout or "").strip()
+        detail = stderr_text or stdout_text or "(no output)"
+        first_line = detail.splitlines()[0]
+        last_observation = (
+            f"argv={cmd!r} exit={result.returncode} detail={first_line[:200]!r}"
+        )
+        time.sleep(_ARC_PROXY_PROBE_READINESS_INTERVAL_S)
+
+    logger.error(
+        f"Arc proxy kubectl readiness probe timed out on port {port}. "
+        f"Last observation: {last_observation}"
+    )
+    return False
+
+
 @dataclass
 class DeploymentResult:
     """Result of a Bicep/ARM deployment operation.
@@ -356,12 +511,21 @@ class AzCliExecutor:
         except Exception as e:
             return False, "", f"Failed to execute az command: {e}"
 
-    def _run_kubectl(self, args: list[str], timeout: int = DEFAULT_KUBECTL_TIMEOUT_SECONDS) -> tuple[bool, str, str]:
+    def _run_kubectl(
+        self,
+        args: list[str],
+        timeout: int = DEFAULT_KUBECTL_TIMEOUT_SECONDS,
+        kubeconfig: str | None = None,
+    ) -> tuple[bool, str, str]:
         """Run a kubectl command.
 
         Args:
             args: Command arguments (without 'kubectl' prefix)
             timeout: Command timeout in seconds (default: 10 minutes)
+            kubeconfig: When set, pass `--kubeconfig=<value>` to kubectl so
+                the call targets a specific kubeconfig file rather than
+                the ambient `current-context`. Used by `_arc_proxy` to
+                pin kubectl to the per-proxy kubeconfig.
 
         Returns:
             Tuple of (success, stdout, stderr)
@@ -369,7 +533,10 @@ class AzCliExecutor:
         if not self.kubectl_path:
             return False, "", "kubectl not found in PATH. Install from https://kubernetes.io/docs/tasks/tools/"
 
-        cmd = [self.kubectl_path] + args
+        cmd = [self.kubectl_path]
+        if kubeconfig is not None:
+            cmd.append(f"--kubeconfig={kubeconfig}")
+        cmd.extend(args)
         cmd_str = " ".join(cmd)
 
         if self.dry_run:
@@ -392,14 +559,15 @@ class AzCliExecutor:
         cluster_name: str,
         resource_group: str,
         subscription: str,
-    ) -> Generator[bool, None, None]:
+    ) -> Generator[str | None, None, None]:
         """Context manager for Arc-connected cluster proxy.
 
         Starts `az connectedk8s proxy` in the background, waits for it to
         establish, and ensures cleanup on exit (even on exceptions).
 
-        Uses unique port slots for each proxy to support parallel deployments.
-        Each slot uses --port N where internal port becomes N-1.
+        Allocates a per-proxy kubeconfig file (`--file` argument to az) and
+        a unique local port so parallel deploys targeting different Arc
+        clusters do not race the ambient `~/.kube/config` current-context.
 
         Args:
             cluster_name: Name of the Arc-connected cluster
@@ -407,28 +575,39 @@ class AzCliExecutor:
             subscription: Azure subscription ID
 
         Yields:
-            True if proxy started successfully, False otherwise
+            Path to the per-proxy kubeconfig file when the proxy started
+            successfully, or None when it failed. Pass the path to
+            `_run_kubectl(..., kubeconfig=<path>)` so the call targets
+            this proxy rather than the ambient context.
 
         Example:
-            with self._arc_proxy("my-cluster", "my-rg", "sub-id") as ready:
-                if ready:
-                    self._run_kubectl(["apply", "-f", "config.yaml"])
+            with self._arc_proxy("my-cluster", "my-rg", "sub-id") as kubeconfig:
+                if kubeconfig is not None:
+                    self._run_kubectl(["apply", "-f", "config.yaml"], kubeconfig=kubeconfig)
         """
         if self.dry_run:
             logger.info(
                 f"[DRY-RUN] az connectedk8s proxy -n {cluster_name} "
                 f"-g {resource_group} --subscription {subscription}"
             )
-            yield True
+            yield "dry-run-kubeconfig"
             return
 
         if not self.az_path:
             logger.error("Azure CLI not found - cannot start Arc proxy")
-            yield False
+            yield None
             return
 
         proxy_process: subprocess.Popen | None = None
         allocated_port: int | None = None
+        # Per-proxy kubeconfig so parallel proxies do not race the
+        # ambient current-context in `~/.kube/config`. Created with
+        # `mkstemp` for an atomic, unique file. The fd is closed
+        # immediately. az populates the file when the proxy starts.
+        kubeconfig_fd, kubeconfig_path = tempfile.mkstemp(
+            prefix="siteops-arc-proxy-", suffix=".kubeconfig"
+        )
+        os.close(kubeconfig_fd)
 
         try:
             for attempt in range(ARC_PROXY_MAX_PORT_RETRIES):
@@ -447,6 +626,8 @@ class AzCliExecutor:
                     subscription,
                     "--port",
                     str(allocated_port),
+                    "--file",
+                    kubeconfig_path,
                 ]
 
                 logger.debug(f"Starting Arc proxy: {' '.join(cmd)}")
@@ -471,12 +652,41 @@ class AzCliExecutor:
                         preexec_fn=os.setsid,
                     )
 
-                logger.debug(f"Waiting {ARC_PROXY_STARTUP_WAIT}s for proxy to establish...")
-                time.sleep(ARC_PROXY_STARTUP_WAIT)
+                # Active readiness probe. Bails early if the proxy process dies.
+                logger.debug(
+                    f"Probing Arc proxy readiness on port {allocated_port} "
+                    f"(deadline {ARC_PROXY_STARTUP_WAIT}s)..."
+                )
+                ready = _probe_arc_proxy_ready(
+                    proxy_process,
+                    allocated_port,
+                    kubectl_path=self.kubectl_path,
+                    kubeconfig_path=kubeconfig_path,
+                )
+                if ready:
+                    break  # proxy responsive
 
-                # Check if proxy is still running
+                # Probe did not become ready. Determine cause.
                 if proxy_process.poll() is None:
-                    break  # proxy alive
+                    # Port bound but tunnel never responded within deadline.
+                    # Not a port-in-use case (proxy is still running), so no
+                    # retry. Terminate and surface a clear diagnostic.
+                    logger.error(
+                        f"Arc proxy on port {allocated_port} bound but did not "
+                        f"become responsive within {ARC_PROXY_STARTUP_WAIT}s. "
+                        f"Check upstream cluster reachability and az identity."
+                    )
+                    try:
+                        if os.name == "nt":
+                            proxy_process.send_signal(signal.CTRL_BREAK_EVENT)
+                        else:
+                            os.killpg(os.getpgid(proxy_process.pid), signal.SIGTERM)
+                        proxy_process.wait(timeout=5)
+                    except (subprocess.TimeoutExpired, ProcessLookupError, OSError):
+                        # Best-effort terminate. Finally block handles full cleanup.
+                        pass
+                    yield None
+                    return
 
                 _, stderr = proxy_process.communicate(timeout=5)
                 is_port_in_use = bool(
@@ -497,15 +707,15 @@ class AzCliExecutor:
 
                 # Not retryable: surface stderr and bail.
                 logger.error(f"Arc proxy exited unexpectedly: {stderr}")
-                yield False
+                yield None
                 return
 
             logger.debug("Arc proxy established successfully")
-            yield True
+            yield kubeconfig_path
 
         except Exception as e:
             logger.error(f"Failed to start Arc proxy: {e}")
-            yield False
+            yield None
 
         finally:
             if proxy_process is not None and proxy_process.poll() is None:
@@ -537,6 +747,17 @@ class AzCliExecutor:
             # Release the allocated port slot
             if allocated_port is not None:
                 _release_arc_port_slot(allocated_port)
+
+            # Best-effort remove the per-proxy kubeconfig. The file may
+            # already be gone (test teardown, manual cleanup), so swallow
+            # FileNotFoundError. Other errors are logged at debug because
+            # the file is in the OS temp dir and a stale copy is harmless.
+            try:
+                os.unlink(kubeconfig_path)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                logger.debug(f"Failed to remove per-proxy kubeconfig {kubeconfig_path}: {e}")
 
     def _write_params_file(self, parameters: dict[str, Any], step_name: str, site_name: str) -> Path:
         """Write parameters to a temp file in ARM parameter format.
@@ -796,8 +1017,8 @@ class AzCliExecutor:
                 error="kubectl not found in PATH",
             )
 
-        with self._arc_proxy(cluster_name, resource_group, subscription) as proxy_ready:
-            if not proxy_ready:
+        with self._arc_proxy(cluster_name, resource_group, subscription) as arc_kubeconfig:
+            if arc_kubeconfig is None:
                 return KubectlResult(
                     success=False,
                     step_name=step_name,
@@ -809,7 +1030,7 @@ class AzCliExecutor:
             for f in resolved_files:
                 args.extend(["-f", f])
 
-            success, stdout, stderr = self._run_kubectl(args)
+            success, stdout, stderr = self._run_kubectl(args, kubeconfig=arc_kubeconfig)
 
             if success and stdout:
                 logger.debug(f"kubectl output:\n{stdout}")

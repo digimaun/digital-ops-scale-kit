@@ -21,7 +21,8 @@
 //   produces opaque ARM errors when an entry is missing, and cert-manager is
 //   outside the custom-location boundary so a CL-scoped lookup would not cover
 //   it uniformly. Direct lookups through the shared name deriver give equivalent
-//   authority with simpler Bicep and clearer "resource not found" diagnostics.
+//   authority without the duplicated predicate and surface "resource not found"
+//   diagnostics from ARM directly.
 // -------------------------------------------------------------------------------------
 
 import {
@@ -95,7 +96,7 @@ output secretStore object = {
   identity: secretStoreExtension.?identity ?? { type: 'None' }
 }
 
-@description('cert-manager Arc extension snapshot. Populated when enableCertManager is true; otherwise zero-valued with the canonical name and type so update-extensions can consume a uniform shape.')
+@description('cert-manager Arc extension snapshot. Populated when enableCertManager is true. Otherwise zero-valued with the canonical name and type so update-extensions can consume a uniform shape.')
 output certManager object = enableCertManager
   ? {
       id: certManagerExtension!.id

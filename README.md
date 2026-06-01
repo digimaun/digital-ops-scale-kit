@@ -1,6 +1,6 @@
 # Digital Operations Scale Kit
 
-**Fleet-scale Azure infrastructure deployment, simplified.**
+**Fleet-scale Azure infrastructure deployment.**
 
 > [!NOTE]
 > This project is under active development. If you're an Azure IoT Operations customer or interested in fleet-scale deployment, reach out at <azureiotoperationslicensinghelp@microsoft.com>.

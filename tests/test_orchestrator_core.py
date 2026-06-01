@@ -366,7 +366,7 @@ class TestResolveSites:
         manifest = Manifest(name="generic", description="", sites=[], steps=[])
 
         import pytest
-        with pytest.raises(ValueError, match="declares no `sites:` or `selector:`"):
+        with pytest.raises(ValueError, match="has no targeting"):
             orchestrator.resolve_sites(manifest)
 
     def test_generic_manifest_with_cli_selector_resolves(self, multi_site_workspace):

@@ -24,7 +24,7 @@ output customLocationResourceId string = instance.extendedLocation.name
 @description('Instance location.')
 output instanceLocation string = instance.location
 
-@description('Instance tags. ARM does not expose tags on existing resource references in all cases; defaults to empty.')
+@description('Instance tags. ARM does not expose tags on existing resource references in all cases. Defaults to empty.')
 output instanceTags object = instance.?tags ?? {}
 
 @description('Instance identity type.')

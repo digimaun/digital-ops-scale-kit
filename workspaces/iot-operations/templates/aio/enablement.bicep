@@ -108,10 +108,12 @@ resource secretStoreExtension 'Microsoft.KubernetesConfiguration/extensions@2023
 /*                          Deployment Outputs                               */
 /*****************************************************************************/
 
+@description('Cluster extension ids managed by AIO enablement. Consumed by the Custom Location resource to establish the boundary.')
 output clExtensionIds string[] = [
   secretStoreExtension.id
 ]
 
+@description('Enabled extension snapshots. `certManager` fields are null when scalekit does not own cert-manager on this cluster.')
 output extensions object = {
   certManager: {
     name: certManagerExtension.?name

@@ -2492,10 +2492,8 @@ class Orchestrator:
         # targeting to the manifest or pass it on the CLI.
         if not cli_selector and not manifest.sites and not manifest.site_selector:
             raise NoTargetingError(
-                f"Manifest '{manifest.name}' declares no `sites:` or `selector:`, "
-                f"and no `-l/--selector` was provided on the CLI. Either add "
-                f"targeting to the manifest, or pass `-l <key>=<value>` to "
-                f"choose sites at deploy time."
+                f"Manifest '{manifest.name}' has no targeting. "
+                f"Add `sites:` or `selector:` to the manifest, or pass `-l <key>=<value>` on the CLI."
             )
 
         # CLI selector requires loading all sites for filtering
@@ -2516,7 +2514,7 @@ class Orchestrator:
                 names = ", ".join(missing)
                 raise FileNotFoundError(
                     f"Site files not found for manifest '{manifest.name}': {names}. "
-                    f"Check that matching YAML files exist in the sites/ directory."
+                    f"Create those site YAML files under `sites/`, or fix the site names listed in the manifest."
                 )
             return sites
 

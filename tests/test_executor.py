@@ -17,6 +17,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from siteops.executor import (
+    _ARC_PROXY_PORT_IN_USE_PATTERN,
+    ARC_PROXY_MAX_PORT_RETRIES,
     ARC_PROXY_MAX_SLOTS,
     ARC_PROXY_PORT_BASE,
     ARC_PROXY_PORT_SPACING,
@@ -725,6 +727,126 @@ class TestArcProxyPortAllocation:
     def test_release_invalid_port_is_safe(self):
         # Releasing a port that was never allocated should not raise
         _release_arc_port_slot(99999)  # Should not raise
+
+
+class TestArcProxyPortInUseRetry:
+    """Tests for `_arc_proxy` retry when `az connectedk8s proxy` exits with
+    "Port X is already in use". The allocated slot may collide with a process
+    outside the in-process allocator (stale proxy, unrelated tenant); the
+    fix retries with the next slot up to `ARC_PROXY_MAX_PORT_RETRIES`.
+    """
+
+    def setup_method(self):
+        with _arc_port_lock:
+            _allocated_arc_port_slots.clear()
+
+    def teardown_method(self):
+        with _arc_port_lock:
+            _allocated_arc_port_slots.clear()
+
+    @pytest.fixture(autouse=True)
+    def _block_real_signal_to_runner(self):
+        """Block the executor's cleanup branch from issuing real OS signals
+        when `proxy_process` is a MagicMock.
+
+        `_arc_proxy`'s `finally` block runs the Unix cleanup path when
+        `proxy_process.poll() is None`. With a MagicMock subprocess
+        `mock.pid` is itself a MagicMock whose `__int__` coerces to 1, so an
+        unpatched `os.killpg(os.getpgid(mock.pid), SIGTERM)` resolves to
+        `os.killpg(getpgid(1), SIGTERM)`. On a GitHub-hosted Linux runner
+        PID 1's process group includes the runner agent, so that SIGTERM
+        terminates the runner and the job ends with
+        `##[error]The operation was canceled` instead of a test failure.
+        `create=True` keeps the patches valid on Windows test hosts where
+        `os.killpg` and `os.getpgid` are not defined on the os module.
+        """
+        with patch("siteops.executor.os.killpg", create=True), \
+             patch("siteops.executor.os.getpgid", create=True):
+            yield
+
+    def _make_popen_factory(self, sequence):
+        """Build a subprocess.Popen replacement that yields a sequence of
+        configured mock processes. Each entry is a dict like
+        `{"poll": None | <exit code>, "stderr": "...stderr..."}`.
+        `poll=None` means the process is still running.
+        """
+        mocks = []
+        for entry in sequence:
+            m = MagicMock()
+            m.poll.return_value = entry["poll"]
+            m.communicate.return_value = ("", entry.get("stderr", ""))
+            mocks.append(m)
+        return MagicMock(side_effect=mocks)
+
+    def _executor(self):
+        from pathlib import Path
+        ex = AzCliExecutor(workspace=Path("/tmp/ws"), dry_run=False)
+        ex._az_path = "/usr/bin/az"  # bypass lazy lookup
+        return ex
+
+    def test_port_in_use_pattern_matches_cli_error(self):
+        assert _ARC_PROXY_PORT_IN_USE_PATTERN.search("ERROR: Port 47020 is already in use.")
+        assert _ARC_PROXY_PORT_IN_USE_PATTERN.search("port 47010 is already in use")
+        assert not _ARC_PROXY_PORT_IN_USE_PATTERN.search("ERROR: Some other failure")
+
+    def test_retry_succeeds_on_second_attempt(self):
+        """Port-in-use on first try, alive on second. Yields True after retry."""
+        executor = self._executor()
+        popen = self._make_popen_factory([
+            {"poll": 1, "stderr": "ERROR: Port 47020 is already in use."},
+            {"poll": None},
+        ])
+        with patch("siteops.executor.subprocess.Popen", popen), \
+             patch("siteops.executor.time.sleep"), \
+             patch("siteops.executor.ARC_PROXY_STARTUP_WAIT", 0):
+            with executor._arc_proxy("cluster", "rg", "sub") as ready:
+                assert ready is True
+        # Two Popen calls (one per attempt)
+        assert popen.call_count == 2
+
+    def test_no_retry_on_non_port_error(self):
+        """Non-port-in-use error: yield False immediately, no retry."""
+        executor = self._executor()
+        popen = self._make_popen_factory([
+            {"poll": 1, "stderr": "ERROR: Authentication failed."},
+            {"poll": None},  # would succeed if retry happened, but it should not
+        ])
+        with patch("siteops.executor.subprocess.Popen", popen), \
+             patch("siteops.executor.time.sleep"), \
+             patch("siteops.executor.ARC_PROXY_STARTUP_WAIT", 0):
+            with executor._arc_proxy("cluster", "rg", "sub") as ready:
+                assert ready is False
+        assert popen.call_count == 1
+
+    def test_all_attempts_port_in_use_yields_false(self):
+        """Every attempt hits port-in-use. After MAX_PORT_RETRIES, yield False."""
+        executor = self._executor()
+        popen = self._make_popen_factory([
+            {"poll": 1, "stderr": "ERROR: Port 47020 is already in use."},
+        ] * ARC_PROXY_MAX_PORT_RETRIES)
+        with patch("siteops.executor.subprocess.Popen", popen), \
+             patch("siteops.executor.time.sleep"), \
+             patch("siteops.executor.ARC_PROXY_STARTUP_WAIT", 0):
+            with executor._arc_proxy("cluster", "rg", "sub") as ready:
+                assert ready is False
+        assert popen.call_count == ARC_PROXY_MAX_PORT_RETRIES
+
+    def test_retry_releases_failed_slots(self):
+        """Each failed retry must release its slot so subsequent allocations
+        do not exhaust the slot pool unnecessarily."""
+        executor = self._executor()
+        popen = self._make_popen_factory([
+            {"poll": 1, "stderr": "ERROR: Port 47020 is already in use."},
+            {"poll": 1, "stderr": "ERROR: Port 47030 is already in use."},
+            {"poll": None},
+        ])
+        with patch("siteops.executor.subprocess.Popen", popen), \
+             patch("siteops.executor.time.sleep"), \
+             patch("siteops.executor.ARC_PROXY_STARTUP_WAIT", 0):
+            with executor._arc_proxy("cluster", "rg", "sub") as ready:
+                assert ready is True
+        # After exit, the successful slot is released too. No slots held.
+        assert len(_allocated_arc_port_slots) == 0
 
 
 class TestGetTemplateParameters:

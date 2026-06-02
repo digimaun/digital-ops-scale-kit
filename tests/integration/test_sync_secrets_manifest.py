@@ -55,7 +55,55 @@ SAMPLE_SECRETS = [
         "kubernetesSecretKey": "token",
         "value": "secretsync-sample-value-b",
     },
+    # Multi-key group: the three entries below materialize into one
+    # Kubernetes Secret `secretsync-sample-db-credentials` with three keys.
+    {
+        "secretName": "secretsync-sample-db-host",
+        "kubernetesSecretName": "secretsync-sample-db-credentials",
+        "kubernetesSecretKey": "host",
+        "value": "secretsync-sample-db-host-value",
+    },
+    {
+        "secretName": "secretsync-sample-db-username",
+        "kubernetesSecretName": "secretsync-sample-db-credentials",
+        "kubernetesSecretKey": "username",
+        "value": "secretsync-sample-db-username-value",
+    },
+    {
+        "secretName": "secretsync-sample-db-password",
+        "kubernetesSecretName": "secretsync-sample-db-credentials",
+        "kubernetesSecretKey": "password",
+        "value": "secretsync-sample-db-password-value",
+    },
+    # Second multi-key group. The `host` key intentionally collides with
+    # db-credentials's `host` so any bug that bled entries across groups
+    # would land the wrong value on one of the two `host` keys.
+    {
+        "secretName": "secretsync-sample-mqtt-host",
+        "kubernetesSecretName": "secretsync-sample-mqtt-credentials",
+        "kubernetesSecretKey": "host",
+        "value": "secretsync-sample-mqtt-host-value",
+    },
+    {
+        "secretName": "secretsync-sample-mqtt-port",
+        "kubernetesSecretName": "secretsync-sample-mqtt-credentials",
+        "kubernetesSecretKey": "port",
+        "value": "1883",
+    },
 ]
+
+# Distinct Kubernetes Secret names the sample materializes, computed
+# from SAMPLE_SECRETS so this stays accurate when entries change.
+SAMPLE_K8S_SECRET_NAMES = sorted({s["kubernetesSecretName"] for s in SAMPLE_SECRETS})
+
+# Multi-key groups: each entry maps a Kubernetes Secret name to the keys
+# it must contain. `TestMultiKeySecrets` asserts grouping produces one
+# Secret per name with all expected keys, and that same-named keys
+# across groups stay isolated to their own Secret resource.
+SAMPLE_MULTI_KEY_SECRETS = {
+    "secretsync-sample-db-credentials": {"host", "username", "password"},
+    "secretsync-sample-mqtt-credentials": {"host", "port"},
+}
 
 
 class TestSyncSecretsDeployment:
@@ -86,6 +134,7 @@ class TestSyncSecretsArmOutputs:
             step = assert_step_succeeded(sync_secret_result, name, "sync-secrets")
             assert_output_exists(step, "materializedSecrets")
             assert_output_exists(step, "secretCount")
+            assert_output_exists(step, "kubernetesSecretCount")
 
     def test_secret_count_matches_sample(self, sync_secret_result):
         for name in sync_secret_result["sites"]:
@@ -93,6 +142,18 @@ class TestSyncSecretsArmOutputs:
             count = assert_output_exists(step, "secretCount")
             assert count == len(SAMPLE_SECRETS), (
                 f"Expected {len(SAMPLE_SECRETS)} secrets, got {count}"
+            )
+
+    def test_kubernetes_secret_count_matches_distinct_names(self, sync_secret_result):
+        """`kubernetesSecretCount` equals the number of distinct K8s Secret
+        names across all entries, not the entry count. Detects a regression
+        in the grouping logic that would emit one SecretSync per entry."""
+        for name in sync_secret_result["sites"]:
+            step = assert_step_succeeded(sync_secret_result, name, "sync-secrets")
+            count = assert_output_exists(step, "kubernetesSecretCount")
+            assert count == len(SAMPLE_K8S_SECRET_NAMES), (
+                f"Expected {len(SAMPLE_K8S_SECRET_NAMES)} distinct Kubernetes "
+                f"Secret names ({sorted(SAMPLE_K8S_SECRET_NAMES)}), got {count}"
             )
 
     def test_materialized_secrets_match_sample(self, sync_secret_result):
@@ -230,6 +291,101 @@ class TestSyncSecretsMaterialize:
                     context=(
                         f"Site='{site_name}' Secret='{k8s_name}' Key='{k8s_key}'"
                     ),
+                )
+
+
+class TestMultiKeySecrets:
+    """Multiple `secrets:` entries sharing a `kubernetesSecretName`
+    materialize into one multi-key Kubernetes Secret, with one key per
+    entry. The Bicep groups by that name and emits one SecretSync ARM
+    resource with N `objectSecretMapping` entries.
+    """
+
+    def test_grouped_entries_produce_one_secret_with_all_keys(
+        self, sync_secret_result, aio_namespace, kubectl_available
+    ):
+        """For each multi-key Secret in the sample, assert exactly one
+        Kubernetes Secret resource exists with all the expected keys
+        present and each carrying the correct value."""
+        expected_by_name = {s["secretName"]: s for s in SAMPLE_SECRETS}
+        for site_name in sync_secret_result["sites"]:
+            assert_step_succeeded(sync_secret_result, site_name, "sync-secrets")
+            secretsync_step = assert_step_succeeded(
+                sync_secret_result, site_name, "secretsync"
+            )
+            spc_name = assert_output_exists(secretsync_step, "spcResourceName")
+            for k8s_name, expected_keys in SAMPLE_MULTI_KEY_SECRETS.items():
+                # Wait for the K8s Secret to materialize with one of the
+                # expected keys. Subsequent keys are asserted from the
+                # same single Secret payload.
+                first_key = sorted(expected_keys)[0]
+                try:
+                    secret = wait_for_secret(
+                        k8s_name,
+                        aio_namespace,
+                        expected_key=first_key,
+                        timeout=600,
+                        interval=10,
+                    )
+                except TimeoutError as e:
+                    diagnostic = dump_secretsync_status(
+                        k8s_name, spc_name, aio_namespace
+                    )
+                    pytest.fail(f"{e}\n\n{diagnostic}")
+                actual_keys = set(secret.get("data", {}))
+                assert expected_keys.issubset(actual_keys), (
+                    f"Site '{site_name}' Secret '{k8s_name}': expected keys "
+                    f"{sorted(expected_keys)} but Secret has {sorted(actual_keys)}. "
+                    f"A missing key means grouping did not materialize all "
+                    f"entries sharing this kubernetesSecretName into one "
+                    f"multi-key Secret."
+                )
+                # Validate per-key values. Any input entry whose
+                # kubernetesSecretName equals k8s_name contributes one key.
+                grouped_entries = [
+                    s for s in SAMPLE_SECRETS
+                    if s["kubernetesSecretName"] == k8s_name
+                ]
+                for entry in grouped_entries:
+                    k8s_key = entry["kubernetesSecretKey"]
+                    encoded = secret["data"].get(k8s_key)
+                    assert encoded is not None, (
+                        f"Site '{site_name}' Secret '{k8s_name}' missing "
+                        f"key '{k8s_key}' (sourced from KV "
+                        f"'{entry['secretName']}')"
+                    )
+                    actual = base64.b64decode(encoded).decode("utf-8")
+                    expected_value = expected_by_name[entry["secretName"]]["value"]
+                    assert_secret_value_equals(
+                        actual,
+                        expected_value,
+                        context=(
+                            f"Site='{site_name}' Secret='{k8s_name}' "
+                            f"Key='{k8s_key}' (multi-key)"
+                        ),
+                    )
+
+    def test_grouped_entries_share_secret_sync_name(self, sync_secret_result):
+        """`materializedSecrets` output reports the same `secretSyncName`
+        for every entry that targets a shared `kubernetesSecretName`. The
+        downstream contract is that one SecretSync ARM resource backs the
+        whole multi-key Secret."""
+        for site_name in sync_secret_result["sites"]:
+            step = assert_step_succeeded(
+                sync_secret_result, site_name, "sync-secrets"
+            )
+            materialized = assert_output_exists(step, "materializedSecrets")
+            by_k8s_name: dict[str, set[str]] = {}
+            for entry in materialized:
+                by_k8s_name.setdefault(
+                    entry["kubernetesSecretName"], set()
+                ).add(entry["secretSyncName"])
+            for k8s_name, secret_sync_names in by_k8s_name.items():
+                assert secret_sync_names == {k8s_name}, (
+                    f"Site '{site_name}' kubernetesSecretName='{k8s_name}' "
+                    f"reported {len(secret_sync_names)} distinct "
+                    f"secretSyncName values {sorted(secret_sync_names)}. "
+                    f"Expected exactly one matching the kubernetesSecretName."
                 )
 
 

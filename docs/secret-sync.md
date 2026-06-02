@@ -131,7 +131,7 @@ az deployment group create -g <rg> \
      secretValues='{"my-secret":"<value>"}'
 ```
 
-The template treats the `secrets` array as the desired state. Each deploy PUTs the SPC with the union of all entries' object names and creates one SecretSync per entry.
+The template treats the `secrets` array as the desired state. Each deploy PUTs the SPC with the union of all entries' object names and creates one SecretSync per distinct `kubernetesSecretName` (defaulting to `secretName`). Entries that share a `kubernetesSecretName` are grouped into one multi-key Kubernetes Secret. See [Multi-key Secrets](#multi-key-secrets) below.
 
 ### Parameters
 
@@ -150,10 +150,38 @@ Per-entry fields in `secrets`:
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `secretName` | Yes | | Key Vault secret name (must be unique within the array) |
-| `kubernetesSecretName` | No | `secretName` | Kubernetes Secret name when the consuming workload expects a different name |
-| `kubernetesSecretKey` | No | `secretName` | Key inside the Kubernetes Secret |
+| `secretName` | Yes | | Key Vault secret name. Must be unique within the array. |
+| `kubernetesSecretName` | No | `secretName` | Kubernetes Secret name. Multiple entries that set the same value are grouped into one multi-key Secret. |
+| `kubernetesSecretKey` | No | `secretName` | Key inside the Kubernetes Secret. Must be unique within a group of entries that share a `kubernetesSecretName`. |
 | `createInKv` | No | `true` | Set `false` to sync a secret already present in the Key Vault |
+
+### Multi-key Secrets
+
+Workloads often consume related credentials as a single multi-key Kubernetes Secret (e.g., a `database-credentials` Secret with `host`, `username`, and `password` keys). Express this by setting the same `kubernetesSecretName` on each entry and a distinct `kubernetesSecretKey`:
+
+```yaml
+secrets:
+  - secretName: my-db-host-kv
+    kubernetesSecretName: database-credentials
+    kubernetesSecretKey: host
+  - secretName: my-db-username-kv
+    kubernetesSecretName: database-credentials
+    kubernetesSecretKey: username
+  - secretName: my-db-password-kv
+    kubernetesSecretName: database-credentials
+    kubernetesSecretKey: password
+```
+
+This produces:
+
+- Three Key Vault secrets (`my-db-host-kv`, `my-db-username-kv`, `my-db-password-kv`)
+- One SecretSync ARM resource named `database-credentials` with three `objectSecretMapping` entries
+- One Kubernetes Secret `database-credentials` on the cluster with three keys (`host`, `username`, `password`)
+
+Constraints:
+
+- Each `secretName` must be unique across the array. Each entry corresponds to one Key Vault secret.
+- Within a group of entries sharing a `kubernetesSecretName`, each `kubernetesSecretKey` must also be unique. Like any duplicate-key situation in YAML, two entries claiming the same `(kubernetesSecretName, kubernetesSecretKey)` pair both write to the same Kubernetes Secret slot and the cluster-side reconcile order decides which value wins.
 
 ### Security model
 

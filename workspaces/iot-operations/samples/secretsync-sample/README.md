@@ -6,7 +6,7 @@ Reference sample that synchronizes a set of Key Vault secrets to Kubernetes Secr
 
 1. **resolve-aio**: reads instance and custom-location names from the existing AIO instance.
 2. **secretsync** (`enable-secretsync`): provisions the secretsync infrastructure on the resource group: a user-assigned managed identity, a Key Vault, role assignments, a federated identity credential, and the default Secret Provider Class. Updates the AIO instance to point at the new SPC as its default.
-3. **sync-secrets** (`sync-secrets.bicep`): writes the configured Key Vault secrets, updates the default SPC's `properties.objects` to include every entry, and creates one SecretSync ARM resource per entry.
+3. **sync-secrets** (`sync-secrets.bicep`): writes the configured Key Vault secrets, updates the default SPC's `properties.objects` to include every entry, and creates one SecretSync ARM resource per distinct `kubernetesSecretName`. Entries that share a `kubernetesSecretName` are grouped into one multi-key Kubernetes Secret.
 
 The cluster-side SecretSync controller resolves each SecretSync, exchanges its OIDC token for an Azure AD token via the federated identity credential, reads the Key Vault secret using the managed identity, and writes the value into a Kubernetes Secret on the cluster. Materialized Secrets are consumable by AIO workloads in the AIO namespace.
 
@@ -17,29 +17,50 @@ The cluster-side SecretSync controller resolves each SecretSync, exchanges its O
 
 ## Configure before deploying
 
-The sync-secrets template treats the `secrets` array as the desired state. Each deploy PUTs the SPC with the union of all entries and creates one SecretSync per entry. Edit `parameters/inputs/sync-secrets.yaml` (or override in a `sites.local/` overlay) to declare the secrets you want synced and supply their values.
+The sync-secrets template treats the `secrets` array as the desired state. Each deploy PUTs the SPC with the union of all entries and emits one SecretSync per distinct `kubernetesSecretName`. Edit `parameters/inputs/sync-secrets.yaml` (or override in a `sites.local/` overlay) to declare the secrets you want synced and supply their values.
 
 ```yaml
 # parameters/inputs/sync-secrets.yaml (or sites.local/ overlay)
 secrets:
+  # Single-key Secret: one Key Vault secret -> one Kubernetes Secret with one key.
   - secretName: db-password
+
+  # Renamed Kubernetes Secret + renamed key: one Key Vault secret ->
+  # Kubernetes Secret `my-app-credentials` with one key `key`.
   - secretName: api-key
     kubernetesSecretName: my-app-credentials
     kubernetesSecretKey: key
+
+  # Bring-your-own Key Vault secret: skip the Key Vault write, sync only.
   - secretName: license-token
-    createInKv: false  # already in the Key Vault, sync only
+    createInKv: false
+
+  # Multi-key Secret: three Key Vault secrets grouped into one Kubernetes
+  # Secret `database-credentials` with keys `host`, `username`, `password`.
+  - secretName: my-db-host-kv
+    kubernetesSecretName: database-credentials
+    kubernetesSecretKey: host
+  - secretName: my-db-username-kv
+    kubernetesSecretName: database-credentials
+    kubernetesSecretKey: username
+  - secretName: my-db-password-kv
+    kubernetesSecretName: database-credentials
+    kubernetesSecretKey: password
 
 secretValues:
   db-password: "{{ env.DB_PASSWORD }}"
   api-key: "{{ env.API_KEY }}"
   # license-token omitted because createInKv is false
+  my-db-host-kv: "{{ env.DB_HOST }}"
+  my-db-username-kv: "{{ env.DB_USERNAME }}"
+  my-db-password-kv: "{{ env.DB_PASSWORD }}"
 ```
 
 Per-entry fields:
 
 - **`secretName`** (required): the Key Vault secret name. Also the default Kubernetes Secret name and key. Must be unique within the array.
-- **`kubernetesSecretName`** (optional): override when the consuming workload expects a different Kubernetes Secret name.
-- **`kubernetesSecretKey`** (optional): override when the consuming workload expects a different key inside the Secret.
+- **`kubernetesSecretName`** (optional): override when the consuming workload expects a different Kubernetes Secret name. Multiple entries that set the same value are grouped into one multi-key Secret.
+- **`kubernetesSecretKey`** (optional): override when the consuming workload expects a different key inside the Secret. Must be unique within a group of entries that share a `kubernetesSecretName`.
 - **`createInKv`** (optional, default `true`): set `false` to sync a secret that already exists in the Key Vault. Skip the corresponding entry in `secretValues`.
 
 Supply `secretValues` via a `sites.local/` overlay or a CI/CD secret store. Do not commit real values to source control.

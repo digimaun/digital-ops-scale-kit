@@ -192,6 +192,30 @@ throw "az CLI install reported success but `az` is still not on PATH. Check $log
 }
 Write-Log "az CLI installed: $((& az version --output tsv --query '\"azure-cli\"' 2>$null) -join ' ')"
 }
+function Write-BootstrapStateTag {
+param(
+[Parameter(Mandatory)] $config,
+[Parameter(Mandatory)] [string]$Value
+)
+if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+Write-Log "Skipping bootstrap-state tag write: az CLI not installed."
+return
+}
+$sub  = $config.subscription
+$rg   = $config.resourceGroup
+$name = $env:COMPUTERNAME
+if (-not $sub -or -not $rg -or -not $name) {
+Write-Log "Skipping bootstrap-state tag write: missing subscription / resourceGroup / COMPUTERNAME."
+return
+}
+$arcId = "/subscriptions/$sub/resourceGroups/$rg/providers/Microsoft.HybridCompute/machines/$name"
+$tagOut = & az tag update --resource-id $arcId --operation merge --tags "siteops.bootstrap.state=$Value" --only-show-errors 2>&1
+if ($LASTEXITCODE -ne 0) {
+Write-Log "WARNING: tag write failed on $arcId (exit $LASTEXITCODE): $tagOut. See README Prerequisites for the required Microsoft.Resources/tags/write grant."
+return
+}
+Write-Log "Wrote tag siteops.bootstrap.state=$Value on $arcId"
+}
 function Test-ClusterArcConnected {
 param([string]$ClusterName, [string]$ResourceGroup)
 try {
@@ -600,6 +624,11 @@ $cfg | ConvertTo-Json | Set-Content -Path $script:ConfigPath -Encoding UTF8
 Write-Log 'Zeroed SP password blob in config.json'
 }
 }
+try {
+Write-BootstrapStateTag -config $config -Value 'succeeded'
+} catch {
+Write-Log "WARNING: tag write helper threw: $_. Non-fatal."
+}
 Set-State -Phase 99 -Status 'succeeded'
 Write-Log 'Phase 99: complete. Bootstrap succeeded.'
 }
@@ -627,6 +656,11 @@ default { throw "Unknown phase: $($state.phase)" }
 } catch {
 Write-Log "ERROR in phase ${startPhase}: $_"
 Set-State -Phase $startPhase -Status 'failed' -ErrorText $_.ToString()
+try {
+Write-BootstrapStateTag -config $config -Value "failed-phase-$startPhase"
+} catch {
+Write-Log "WARNING: tag write helper threw on failure path: $_. Original phase error re-raised below."
+}
 throw
 }
 $newState = Get-State

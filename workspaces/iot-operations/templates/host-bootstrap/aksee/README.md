@@ -240,11 +240,40 @@ Remove-AksEdgeDeployment -Confirm:$false -ErrorAction SilentlyContinue
 | 1  | MSI install + `Install-AksEdgeHostFeatures` | Yes (Hyper-V enable) |
 | 2  | Substitute the Arc block in the rendered cluster config from runtime parameters, then create the single-node K3s cluster (AKS Edge Essentials Arc-connects the cluster as part of this step) | No |
 | 3  | Install Azure CLI if missing, authenticate (managed identity by default, service principal as fallback), enable `cluster-connect` and `custom-locations`, and (when `enableWorkloadIdentity` is requested) wire the OIDC issuer through the K3s apiserver | No |
-| 99 | Cleanup (unregister scheduled task, remove bootstrap user, remove rendered config) | No |
+| 99 | Cleanup (unregister scheduled task, remove bootstrap user, remove rendered config). Write `siteops.bootstrap.state` tag on the Arc machine. | No |
 
 Each phase is idempotent so a worker re-run from any state is safe. Phase 1 writes the next phase to `state.json` BEFORE calling `Install-AksEdgeHostFeatures` so the at-startup scheduled-task trigger resumes at Phase 2 after the reboot.
 
 Phase 3 layers AIO-specific features on top of the basic Arc-connected cluster. The reason for layering instead of doing everything in Phase 2: the inner `aksedge-config.json` schema does not recognize OIDC issuer, workload identity, or custom-locations fields. Phase 3 handles them explicitly through `az connectedk8s` commands.
+
+## Bootstrap state tag
+
+The worker writes a tag on the Arc machine resource that signals terminal bootstrap state:
+
+- `siteops.bootstrap.state=succeeded` on Phase 99 success.
+- `siteops.bootstrap.state=failed-phase-N` on any phase failure. N is the failing phase number.
+
+Downstream automation reads this tag to gate on actual bootstrap completion. A siteops `type: wait` step is the intended primary consumer. A CI script polling via `az tag list` works the same way.
+
+The worker writes the tag using the Phase 3 identity (managed identity by default, service principal as fallback). The required permission is `Microsoft.Resources/tags/write` on the Arc machine resource.
+
+- If you completed [prereq #3](#3-grant-the-arc-machine-identity-access-to-the-resource-group) with the default `Contributor` grant, no additional grant is needed.
+- If you scoped the Arc machine identity to the narrow `Kubernetes Cluster - Azure Arc Onboarding` role instead of `Contributor`, you need an additional `Tag Contributor` assignment on the Arc machine resource:
+
+```bash
+az role assignment create \
+  --assignee-object-id $ARC_PRINCIPAL_ID \
+  --assignee-principal-type ServicePrincipal \
+  --role "Tag Contributor" \
+  --scope "/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.HybridCompute/machines/<vm-name>"
+```
+
+A failed tag write does not fail the bootstrap. The cluster is still up and Arc-connected. Verify or set the tag manually:
+
+```bash
+az tag list --resource-id "/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.HybridCompute/machines/<vm-name>" \
+    --query "properties.tags" -o json
+```
 
 ## Optional flags
 
@@ -270,4 +299,4 @@ The scalekit path delivers the launcher via Bicep + Arc Run Command. For debuggi
 
 - The Bicep `spAppId` and `spPassword` are required (no managed-identity-only path for cluster creation). AKS Edge Essentials' install cmdlet hard-requires SP credentials and there is no flag to skip its own Arc-connect. Tracked upstream.
 - The bootstrap registers a Scheduled Task that runs as a dedicated local admin user the launcher creates. Hardened environments that disallow new local users would need a `LocalAdminUser` override pointing at a pre-existing account.
-- The Run Command resource returns `executionState=Succeeded` the moment the launcher returns `REGISTERED`, NOT when the worker reaches `phase=99 status=succeeded`. Pair this manifest with a status-gate Bicep step to gate downstream steps on actual bootstrap completion.
+- The Run Command resource returns `executionState=Succeeded` the moment the launcher returns `REGISTERED`, NOT when the worker reaches `phase=99 status=succeeded`. Use the [bootstrap state tag](#bootstrap-state-tag) to gate downstream pipeline steps on actual bootstrap completion.

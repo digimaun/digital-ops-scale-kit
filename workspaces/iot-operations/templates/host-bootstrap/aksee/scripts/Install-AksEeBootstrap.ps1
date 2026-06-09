@@ -454,6 +454,53 @@ function Install-AzCliIfMissing {
     Write-Log "az CLI installed: $((& az version --output tsv --query '\"azure-cli\"' 2>$null) -join ' ')"
 }
 
+function Write-BootstrapStateTag {
+    # Idempotent tag write on this Arc machine resource. Phase 99 calls
+    # with 'succeeded'. The per-phase catch calls with 'failed-phase-N'.
+    # A siteops `type: wait` step polls this tag to gate downstream
+    # pipeline steps on actual bootstrap completion.
+    #
+    # Safe to call before az CLI is installed or authenticated. Logs and
+    # returns without throwing. A failed tag write does not fail the
+    # bootstrap.
+    #
+    # Required permission on the Phase 3 identity (managed identity by
+    # default, service principal as fallback):
+    # `Microsoft.Resources/tags/write` on the Arc machine resource.
+    # `Contributor` covers it transitively. The narrow
+    # `Kubernetes Cluster - Azure Arc Onboarding` role does not.
+    #
+    # Assumes the Arc machine resource name equals `$env:COMPUTERNAME`
+    # (the `azcmagent connect` default). If overridden during onboarding,
+    # the tag write fails on lookup. The constructed ID is logged for
+    # manual tagging.
+    param(
+        [Parameter(Mandatory)] $config,
+        [Parameter(Mandatory)] [string]$Value
+    )
+
+    if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+        Write-Log "Skipping bootstrap-state tag write: az CLI not installed."
+        return
+    }
+
+    $sub  = $config.subscription
+    $rg   = $config.resourceGroup
+    $name = $env:COMPUTERNAME
+    if (-not $sub -or -not $rg -or -not $name) {
+        Write-Log "Skipping bootstrap-state tag write: missing subscription / resourceGroup / COMPUTERNAME."
+        return
+    }
+
+    $arcId = "/subscriptions/$sub/resourceGroups/$rg/providers/Microsoft.HybridCompute/machines/$name"
+    $tagOut = & az tag update --resource-id $arcId --operation merge --tags "siteops.bootstrap.state=$Value" --only-show-errors 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Log "WARNING: tag write failed on $arcId (exit $LASTEXITCODE): $tagOut. See README Prerequisites for the required Microsoft.Resources/tags/write grant."
+        return
+    }
+    Write-Log "Wrote tag siteops.bootstrap.state=$Value on $arcId"
+}
+
 function Test-ClusterArcConnected {
     param([string]$ClusterName, [string]$ResourceGroup)
     try {
@@ -1097,6 +1144,12 @@ function Invoke-Phase99 {
         }
     }
 
+    try {
+        Write-BootstrapStateTag -config $config -Value 'succeeded'
+    } catch {
+        Write-Log "WARNING: tag write helper threw: $_. Non-fatal."
+    }
+
     Set-State -Phase 99 -Status 'succeeded'
     Write-Log 'Phase 99: complete. Bootstrap succeeded.'
 }
@@ -1132,6 +1185,11 @@ try {
         } catch {
             Write-Log "ERROR in phase ${startPhase}: $_"
             Set-State -Phase $startPhase -Status 'failed' -ErrorText $_.ToString()
+            try {
+                Write-BootstrapStateTag -config $config -Value "failed-phase-$startPhase"
+            } catch {
+                Write-Log "WARNING: tag write helper threw on failure path: $_. Original phase error re-raised below."
+            }
             throw
         }
 

@@ -1,0 +1,39 @@
+apiVersion: siteops/v1
+kind: Manifest
+name: aio-with-aksee-bootstrap
+description: |
+  Composes the AKS Edge Essentials host bootstrap with AIO fundamentals.
+
+  TWO-STAGE TODAY. The bootstrap step returns shortly after the Connected
+  Machine Agent picks up the launcher (~90 seconds), but the cluster
+  takes 25 to 40 minutes to come up on the VM asynchronously. AIO
+  fundamentals references the cluster as an existing resource and fails
+  partway through if the cluster is not yet there.
+
+    Stage 1: `siteops deploy samples/aio-with-aksee-bootstrap/manifest.yaml`
+             dispatches the bootstrap. Expect failure partway through AIO
+             fundamentals.
+    Stage 2: re-run the same command after `state.json` on the VM shows
+             `phase=99 status=succeeded`. The bootstrap step short-
+             circuits (cluster already deployed) and AIO fundamentals
+             proceeds against the ready cluster.
+
+  Post-flatten step sequence (preview with `siteops sites --render`):
+    1. aksee-bootstrap          (Windows VM through K3s + Arc + custom locations)
+    2. global-edge-site         (gated by enableGlobalSite)
+    3. edge-site                (gated by enableEdgeSite)
+    4. schema-registry
+    5. adr-ns
+    6. aio-enablement
+    7. aio-instance
+    8. schema-registry-role
+
+# Default selector. Override at the CLI with `-l <key>=<value>`.
+selector: "environment=dev"
+
+# Max concurrent sites. 0 = unlimited, 1 = serial.
+parallel: 3
+
+steps:
+  - include: ../../templates/host-bootstrap/aksee/_partial.yaml
+  - include: ../../manifests/_aio-fundamentals.yaml

@@ -1,0 +1,16 @@
+# Parameter inputs for the aksee-bootstrap step.
+#
+# All five fields are required by `templates/host-bootstrap/aksee/template.bicep`.
+# The launcher delivers the bootstrap to the target Windows VM via Arc Run
+# Command, then the VM-side Scheduled Task drives the deployment.
+#
+# Override per-site in `sites/<site>.yaml` (committable, no secrets) or in
+# `sites.local/<site>.yaml` (gitignored, for the SP password). See
+# `templates/host-bootstrap/aksee/README.md` for the full required-field
+# walkthrough and the SP creation recipe.
+
+machineName:        "{{ site.parameters.aksee.machineName }}"
+clusterName:        "{{ site.parameters.aksee.clusterName }}"
+customLocationsOid: "{{ site.parameters.aksee.customLocationsOid }}"
+spAppId:            "{{ site.parameters.aksee.spAppId }}"
+spPassword:         "{{ site.parameters.aksee.spPassword }}"

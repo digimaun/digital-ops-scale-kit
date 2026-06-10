@@ -185,23 +185,35 @@ function Protect-StringMachine {
 }
 
 function New-RandomPassword {
-    # Generate a strong password for the local admin user. 24 chars from
-    # the printable ASCII range, biased to satisfy Windows complexity
-    # rules (upper, lower, digit, symbol).
+    # Strong 24-char password (upper, lower, digit, symbol) for the local
+    # admin user, drawn from a cryptographic RNG (GetBytes, for PS 5.1
+    # compatibility) with rejection sampling to avoid modulo bias. The
+    # credential grants local admin and can outlive the bootstrap on an
+    # early failure, so it must be unpredictable.
     $upper = 'ABCDEFGHJKLMNPQRSTUVWXYZ'
     $lower = 'abcdefghijkmnpqrstuvwxyz'
     $digit = '23456789'
     $symbol = '!@#$%^&*()-_=+'
-    $all = ($upper + $lower + $digit + $symbol).ToCharArray()
-    $required = @(
-        (Get-Random -InputObject $upper.ToCharArray()),
-        (Get-Random -InputObject $lower.ToCharArray()),
-        (Get-Random -InputObject $digit.ToCharArray()),
-        (Get-Random -InputObject $symbol.ToCharArray())
-    )
-    $rest = 1..20 | ForEach-Object { Get-Random -InputObject $all }
-    $chars = $required + $rest | Sort-Object { Get-Random }
-    return -join $chars
+    $all = $upper + $lower + $digit + $symbol
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        # Uniform 0..max-1 for any alphabet under 256. Single-byte rejection
+        # sampling: reject the top partial block so the result is unbiased.
+        $idx = {
+            param([int]$max)
+            $b = New-Object 'byte[]' 1; $cap = 256 - (256 % $max)
+            do { $rng.GetBytes($b) } while ($b[0] -ge $cap)
+            $b[0] % $max
+        }
+        $chars = @($upper[(& $idx $upper.Length)], $lower[(& $idx $lower.Length)], $digit[(& $idx $digit.Length)], $symbol[(& $idx $symbol.Length)])
+        for ($i = 0; $i -lt 20; $i++) { $chars += $all[(& $idx $all.Length)] }
+        # Cryptographic Fisher-Yates shuffle so the required classes are not
+        # pinned to the first positions.
+        for ($i = $chars.Count - 1; $i -gt 0; $i--) { $j = & $idx ($i + 1); $t = $chars[$i]; $chars[$i] = $chars[$j]; $chars[$j] = $t }
+        return -join $chars
+    } finally {
+        $rng.Dispose()
+    }
 }
 
 function Set-StrictAcl {

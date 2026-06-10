@@ -279,15 +279,19 @@ function Wait-ArcClusterReady {
             $cluster = $json | ConvertFrom-Json
             $obj = if ($cluster.PSObject.Properties.Name -contains 'properties') { $cluster.properties } else { $cluster }
             $connStatus = $obj.connectivityStatus
+            # StrictMode throws on an absent property rather than returning
+            # $null, so guard the leaf. The issuer URL and agentState are
+            # commonly absent in the window between enabling the issuer and
+            # Arc finishing provisioning, which is what -WaitForIssuerUrl
+            # polls through.
             $issuerUrl = $null
-            if ($obj.PSObject.Properties.Name -contains 'oidcIssuerProfile' -and $null -ne $obj.oidcIssuerProfile) {
+            if ($obj.PSObject.Properties.Name -contains 'oidcIssuerProfile' -and $null -ne $obj.oidcIssuerProfile -and
+                $obj.oidcIssuerProfile.PSObject.Properties.Name -contains 'issuerUrl') {
                 $issuerUrl = $obj.oidcIssuerProfile.issuerUrl
             }
-            # StrictMode-safe reads: arcAgentProfile.agentState and
-            # securityProfile.workloadIdentity.enabled may be absent on a
-            # response taken before reconciliation, so guard every hop.
             $agentState = $null
-            if ($obj.PSObject.Properties.Name -contains 'arcAgentProfile' -and $null -ne $obj.arcAgentProfile) {
+            if ($obj.PSObject.Properties.Name -contains 'arcAgentProfile' -and $null -ne $obj.arcAgentProfile -and
+                $obj.arcAgentProfile.PSObject.Properties.Name -contains 'agentState') {
                 $agentState = $obj.arcAgentProfile.agentState
             }
             $wiEnabled = $false
@@ -550,6 +554,12 @@ function Invoke-Phase2 {
     param($config)
     Write-Log 'Phase 2: deploy single-node K3s cluster'
 
+    # Purge any leftover rendered config from a hard-killed prior run before
+    # the early-return path below. It can carry the plaintext SP secret if a
+    # forced reboot or task timeout skipped the finally block last time.
+    $renderedPath = Join-Path $ConfigDir 'aksedge-config.json'
+    Remove-Item -Path $renderedPath -Force -ErrorAction SilentlyContinue
+
     if (Test-AksEdgeDeployed) {
         Write-Log 'AKS EE deployment already present, skipping'
         Set-State -Phase 3 -Status 'running'
@@ -574,7 +584,6 @@ function Invoke-Phase2 {
         throw "AKS Edge Essentials requires a service principal to create the cluster. Re-run the launcher with -SpAppId and -SpPassword."
     }
 
-    $renderedPath = Join-Path $ConfigDir 'aksedge-config.json'
     try {
         # Populate the Arc block in the rendered config from runtime
         # parameters. AKS Edge Essentials rejects null or absent Arc

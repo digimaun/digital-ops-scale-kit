@@ -48,16 +48,22 @@ $upper = 'ABCDEFGHJKLMNPQRSTUVWXYZ'
 $lower = 'abcdefghijkmnpqrstuvwxyz'
 $digit = '23456789'
 $symbol = '!@#$%^&*()-_=+'
-$all = ($upper + $lower + $digit + $symbol).ToCharArray()
-$required = @(
-(Get-Random -InputObject $upper.ToCharArray()),
-(Get-Random -InputObject $lower.ToCharArray()),
-(Get-Random -InputObject $digit.ToCharArray()),
-(Get-Random -InputObject $symbol.ToCharArray())
-)
-$rest = 1..20 | ForEach-Object { Get-Random -InputObject $all }
-$chars = $required + $rest | Sort-Object { Get-Random }
+$all = $upper + $lower + $digit + $symbol
+$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+try {
+$idx = {
+param([int]$max)
+$b = New-Object 'byte[]' 1; $cap = 256 - (256 % $max)
+do { $rng.GetBytes($b) } while ($b[0] -ge $cap)
+$b[0] % $max
+}
+$chars = @($upper[(& $idx $upper.Length)], $lower[(& $idx $lower.Length)], $digit[(& $idx $digit.Length)], $symbol[(& $idx $symbol.Length)])
+for ($i = 0; $i -lt 20; $i++) { $chars += $all[(& $idx $all.Length)] }
+for ($i = $chars.Count - 1; $i -gt 0; $i--) { $j = & $idx ($i + 1); $t = $chars[$i]; $chars[$i] = $chars[$j]; $chars[$j] = $t }
 return -join $chars
+} finally {
+$rng.Dispose()
+}
 }
 function Set-StrictAcl {
 param([string]$Path)
@@ -249,11 +255,13 @@ $cluster = $json | ConvertFrom-Json
 $obj = if ($cluster.PSObject.Properties.Name -contains 'properties') { $cluster.properties } else { $cluster }
 $connStatus = $obj.connectivityStatus
 $issuerUrl = $null
-if ($obj.PSObject.Properties.Name -contains 'oidcIssuerProfile' -and $null -ne $obj.oidcIssuerProfile) {
+if ($obj.PSObject.Properties.Name -contains 'oidcIssuerProfile' -and $null -ne $obj.oidcIssuerProfile -and
+$obj.oidcIssuerProfile.PSObject.Properties.Name -contains 'issuerUrl') {
 $issuerUrl = $obj.oidcIssuerProfile.issuerUrl
 }
 $agentState = $null
-if ($obj.PSObject.Properties.Name -contains 'arcAgentProfile' -and $null -ne $obj.arcAgentProfile) {
+if ($obj.PSObject.Properties.Name -contains 'arcAgentProfile' -and $null -ne $obj.arcAgentProfile -and
+$obj.arcAgentProfile.PSObject.Properties.Name -contains 'agentState') {
 $agentState = $obj.arcAgentProfile.agentState
 }
 $wiEnabled = $false
@@ -424,6 +432,8 @@ Write-Log 'Phase 1: complete (no reboot needed)'
 function Invoke-Phase2 {
 param($config)
 Write-Log 'Phase 2: deploy single-node K3s cluster'
+$renderedPath = Join-Path $ConfigDir 'aksedge-config.json'
+Remove-Item -Path $renderedPath -Force -ErrorAction SilentlyContinue
 if (Test-AksEdgeDeployed) {
 Write-Log 'AKS EE deployment already present, skipping'
 Set-State -Phase 3 -Status 'running'
@@ -438,7 +448,6 @@ $hasPassword = ($config.PSObject.Properties.Name -contains 'spPassword') -and $c
 if (-not ($hasAppId -and $hasPassword)) {
 throw "AKS Edge Essentials requires a service principal to create the cluster. Re-run the launcher with -SpAppId and -SpPassword."
 }
-$renderedPath = Join-Path $ConfigDir 'aksedge-config.json'
 try {
 Write-Log "Rendering AKS EE config from $script:TemplatePath"
 $cfg = Get-Content -Raw -Path $script:TemplatePath | ConvertFrom-Json

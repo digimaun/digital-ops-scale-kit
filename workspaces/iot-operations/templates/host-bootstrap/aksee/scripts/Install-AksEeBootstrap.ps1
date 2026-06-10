@@ -193,23 +193,35 @@ function Protect-StringMachine {
 }
 
 function New-RandomPassword {
-    # Generate a strong password for the local admin user. 24 chars from
-    # the printable ASCII range, biased to satisfy Windows complexity
-    # rules (upper, lower, digit, symbol).
+    # Strong 24-char password (upper, lower, digit, symbol) for the local
+    # admin user, drawn from a cryptographic RNG (GetBytes, for PS 5.1
+    # compatibility) with rejection sampling to avoid modulo bias. The
+    # credential grants local admin and can outlive the bootstrap on an
+    # early failure, so it must be unpredictable.
     $upper = 'ABCDEFGHJKLMNPQRSTUVWXYZ'
     $lower = 'abcdefghijkmnpqrstuvwxyz'
     $digit = '23456789'
     $symbol = '!@#$%^&*()-_=+'
-    $all = ($upper + $lower + $digit + $symbol).ToCharArray()
-    $required = @(
-        (Get-Random -InputObject $upper.ToCharArray()),
-        (Get-Random -InputObject $lower.ToCharArray()),
-        (Get-Random -InputObject $digit.ToCharArray()),
-        (Get-Random -InputObject $symbol.ToCharArray())
-    )
-    $rest = 1..20 | ForEach-Object { Get-Random -InputObject $all }
-    $chars = $required + $rest | Sort-Object { Get-Random }
-    return -join $chars
+    $all = $upper + $lower + $digit + $symbol
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        # Uniform 0..max-1 for any alphabet under 256. Single-byte rejection
+        # sampling: reject the top partial block so the result is unbiased.
+        $idx = {
+            param([int]$max)
+            $b = New-Object 'byte[]' 1; $cap = 256 - (256 % $max)
+            do { $rng.GetBytes($b) } while ($b[0] -ge $cap)
+            $b[0] % $max
+        }
+        $chars = @($upper[(& $idx $upper.Length)], $lower[(& $idx $lower.Length)], $digit[(& $idx $digit.Length)], $symbol[(& $idx $symbol.Length)])
+        for ($i = 0; $i -lt 20; $i++) { $chars += $all[(& $idx $all.Length)] }
+        # Cryptographic Fisher-Yates shuffle so the required classes are not
+        # pinned to the first positions.
+        for ($i = $chars.Count - 1; $i -gt 0; $i--) { $j = & $idx ($i + 1); $t = $chars[$i]; $chars[$i] = $chars[$j]; $chars[$j] = $t }
+        return -join $chars
+    } finally {
+        $rng.Dispose()
+    }
 }
 
 function Set-StrictAcl {
@@ -543,15 +555,19 @@ function Wait-ArcClusterReady {
             $cluster = $json | ConvertFrom-Json
             $obj = if ($cluster.PSObject.Properties.Name -contains 'properties') { $cluster.properties } else { $cluster }
             $connStatus = $obj.connectivityStatus
+            # StrictMode throws on an absent property rather than returning
+            # $null, so guard the leaf. The issuer URL and agentState are
+            # commonly absent in the window between enabling the issuer and
+            # Arc finishing provisioning, which is what -WaitForIssuerUrl
+            # polls through.
             $issuerUrl = $null
-            if ($obj.PSObject.Properties.Name -contains 'oidcIssuerProfile' -and $null -ne $obj.oidcIssuerProfile) {
+            if ($obj.PSObject.Properties.Name -contains 'oidcIssuerProfile' -and $null -ne $obj.oidcIssuerProfile -and
+                $obj.oidcIssuerProfile.PSObject.Properties.Name -contains 'issuerUrl') {
                 $issuerUrl = $obj.oidcIssuerProfile.issuerUrl
             }
-            # StrictMode-safe reads: arcAgentProfile.agentState and
-            # securityProfile.workloadIdentity.enabled may be absent on a
-            # response taken before reconciliation, so guard every hop.
             $agentState = $null
-            if ($obj.PSObject.Properties.Name -contains 'arcAgentProfile' -and $null -ne $obj.arcAgentProfile) {
+            if ($obj.PSObject.Properties.Name -contains 'arcAgentProfile' -and $null -ne $obj.arcAgentProfile -and
+                $obj.arcAgentProfile.PSObject.Properties.Name -contains 'agentState') {
                 $agentState = $obj.arcAgentProfile.agentState
             }
             $wiEnabled = $false
@@ -814,6 +830,12 @@ function Invoke-Phase2 {
     param($config)
     Write-Log 'Phase 2: deploy single-node K3s cluster'
 
+    # Purge any leftover rendered config from a hard-killed prior run before
+    # the early-return path below. It can carry the plaintext SP secret if a
+    # forced reboot or task timeout skipped the finally block last time.
+    $renderedPath = Join-Path $ConfigDir 'aksedge-config.json'
+    Remove-Item -Path $renderedPath -Force -ErrorAction SilentlyContinue
+
     if (Test-AksEdgeDeployed) {
         Write-Log 'AKS EE deployment already present, skipping'
         Set-State -Phase 3 -Status 'running'
@@ -838,7 +860,6 @@ function Invoke-Phase2 {
         throw "AKS Edge Essentials requires a service principal to create the cluster. Re-run the launcher with -SpAppId and -SpPassword."
     }
 
-    $renderedPath = Join-Path $ConfigDir 'aksedge-config.json'
     try {
         # Populate the Arc block in the rendered config from runtime
         # parameters. AKS Edge Essentials rejects null or absent Arc

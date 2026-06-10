@@ -412,6 +412,20 @@ class TestValidateKubectlFile:
         assert "Path traversal not allowed" in error
 
 
+def _show_result(state, outputs=None, error=None):
+    """Build a (success, stdout, stderr) tuple mimicking `az deployment ... show`."""
+    props = {"provisioningState": state}
+    if outputs is not None:
+        props["outputs"] = outputs
+    if error is not None:
+        props["error"] = error
+    return (True, json.dumps({"properties": props}), "")
+
+
+# A `--no-wait` submit returns empty stdout with returncode 0.
+_SUBMIT_OK = (True, "", "")
+
+
 class TestDeployResourceGroup:
     """Tests for resource group deployments."""
 
@@ -419,14 +433,14 @@ class TestDeployResourceGroup:
         executor = AzCliExecutor(workspace=tmp_workspace)
         monkeypatch.setattr(executor, "_az_path", "/usr/bin/az")
 
-        mock_result = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout=json.dumps({"properties": {"outputs": {"resourceId": {"type": "String", "value": "resource-123"}}}}),
-            stderr="",
-        )
-
-        with patch("subprocess.run", return_value=mock_result):
+        responses = [
+            _SUBMIT_OK,
+            _show_result(
+                "Succeeded",
+                outputs={"resourceId": {"type": "String", "value": "resource-123"}},
+            ),
+        ]
+        with patch.object(executor, "_run_az", side_effect=responses):
             result = executor.deploy_resource_group(
                 subscription="sub-123",
                 resource_group="rg-test",
@@ -440,6 +454,59 @@ class TestDeployResourceGroup:
         assert result.success is True
         assert result.outputs["resourceId"]["value"] == "resource-123"
         assert result.deployment_name == "test-deploy"
+
+    def test_deploy_resource_group_success_after_running(self, tmp_workspace, sample_bicep_template, monkeypatch):
+        executor = AzCliExecutor(workspace=tmp_workspace)
+        monkeypatch.setattr(executor, "_az_path", "/usr/bin/az")
+
+        responses = [
+            _SUBMIT_OK,
+            _show_result("Running"),
+            _show_result("Succeeded", outputs={}),
+        ]
+        with patch.object(executor, "_run_az", side_effect=responses):
+            with patch("siteops.executor.time.sleep"):
+                result = executor.deploy_resource_group(
+                    subscription="sub-123",
+                    resource_group="rg-test",
+                    template_path=sample_bicep_template,
+                    parameters={},
+                    deployment_name="test-deploy",
+                    step_name="step-1",
+                    site_name="site-1",
+                )
+
+        assert result.success is True
+        assert result.outputs == {}
+
+    def test_submit_uses_no_wait_then_show_polls(self, tmp_workspace, sample_bicep_template, monkeypatch):
+        executor = AzCliExecutor(workspace=tmp_workspace)
+        monkeypatch.setattr(executor, "_az_path", "/usr/bin/az")
+
+        calls = []
+
+        def record(args, timeout=None):
+            calls.append(args)
+            if "create" in args:
+                return _SUBMIT_OK
+            return _show_result("Succeeded", outputs={})
+
+        with patch.object(executor, "_run_az", side_effect=record):
+            result = executor.deploy_resource_group(
+                subscription="sub-123",
+                resource_group="rg-test",
+                template_path=sample_bicep_template,
+                parameters={},
+                deployment_name="test-deploy",
+                step_name="step-1",
+                site_name="site-1",
+            )
+
+        assert result.success is True
+        assert "--no-wait" in calls[0]
+        assert calls[0][:3] == ["deployment", "group", "create"]
+        assert calls[1][:3] == ["deployment", "group", "show"]
+        assert "--no-wait" not in calls[1]
 
     def test_deploy_resource_group_failure(self, tmp_workspace, sample_bicep_template, monkeypatch):
         executor = AzCliExecutor(workspace=tmp_workspace)
@@ -466,19 +533,17 @@ class TestDeployResourceGroup:
         assert result.success is False
         assert "not found" in result.error
 
-    def test_deploy_resource_group_malformed_json_output(self, tmp_workspace, sample_bicep_template, monkeypatch):
-        """Test that malformed JSON in az deployment output is handled gracefully."""
+    def test_submit_permanent_failure_fails_fast(self, tmp_workspace, sample_bicep_template, monkeypatch):
+        """A deterministic submit rejection (bad template) fails fast without polling."""
         executor = AzCliExecutor(workspace=tmp_workspace)
         monkeypatch.setattr(executor, "_az_path", "/usr/bin/az")
 
-        mock_result = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout="Deployment succeeded but output is not JSON",
-            stderr="",
-        )
+        def guard(args, timeout=None):
+            if "show" in args:
+                raise AssertionError("must not poll after a fail-fast submit error")
+            return (False, "", "InvalidTemplate: the template resource is not valid")
 
-        with patch("subprocess.run", return_value=mock_result):
+        with patch.object(executor, "_run_az", side_effect=guard):
             result = executor.deploy_resource_group(
                 subscription="sub-123",
                 resource_group="rg-test",
@@ -489,12 +554,54 @@ class TestDeployResourceGroup:
                 site_name="site-1",
             )
 
+        assert result.success is False
+        assert "InvalidTemplate" in result.error
+
+    def test_submit_transient_retries_then_polls(self, tmp_workspace, sample_bicep_template, monkeypatch):
+        executor = AzCliExecutor(workspace=tmp_workspace)
+        monkeypatch.setattr(executor, "_az_path", "/usr/bin/az")
+
+        responses = [
+            (False, "", "status code: 503 ServiceUnavailable"),
+            (False, "", "status code: 503 ServiceUnavailable"),
+            _SUBMIT_OK,
+            _show_result("Succeeded", outputs={}),
+        ]
+        with patch.object(executor, "_run_az", side_effect=responses):
+            with patch("siteops.executor.time.sleep"):
+                result = executor.deploy_resource_group(
+                    subscription="sub-123",
+                    resource_group="rg-test",
+                    template_path=sample_bicep_template,
+                    parameters={},
+                    deployment_name="test-deploy",
+                    step_name="step-1",
+                    site_name="site-1",
+                )
+
         assert result.success is True
-        assert result.outputs == {}
-        assert result.error is None
-        assert result.step_name == "step-1"
-        assert result.site_name == "site-1"
-        assert result.deployment_name == "test-deploy"
+
+    def test_submit_timeout_falls_through_to_poll(self, tmp_workspace, sample_bicep_template, monkeypatch):
+        executor = AzCliExecutor(workspace=tmp_workspace)
+        monkeypatch.setattr(executor, "_az_path", "/usr/bin/az")
+
+        responses = [
+            (False, "", "Command timed out after 300s"),
+            _show_result("Succeeded", outputs={}),
+        ]
+        with patch.object(executor, "_run_az", side_effect=responses):
+            with patch("siteops.executor.time.sleep"):
+                result = executor.deploy_resource_group(
+                    subscription="sub-123",
+                    resource_group="rg-test",
+                    template_path=sample_bicep_template,
+                    parameters={},
+                    deployment_name="test-deploy",
+                    step_name="step-1",
+                    site_name="site-1",
+                )
+
+        assert result.success is True
 
     def test_deploy_resource_group_dry_run(self, tmp_workspace, sample_bicep_template):
         executor = AzCliExecutor(workspace=tmp_workspace, dry_run=True)
@@ -513,19 +620,35 @@ class TestDeployResourceGroup:
         assert result.success is True
         mock_run.assert_not_called()
 
-    def test_deploy_resource_group_plain_text_stdout(self, tmp_workspace, sample_bicep_template, monkeypatch):
-        """Test that plain non-JSON stdout with success returncode doesn't crash."""
+    def test_failed_state_surfaces_operation_detail(self, tmp_workspace, sample_bicep_template, monkeypatch):
+        """A Failed deployment surfaces the per-operation root cause, not the shallow node."""
         executor = AzCliExecutor(workspace=tmp_workspace)
         monkeypatch.setattr(executor, "_az_path", "/usr/bin/az")
 
-        mock_result = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout="not json at all",
-            stderr="",
-        )
-
-        with patch("subprocess.run", return_value=mock_result):
+        ops = [
+            {
+                "properties": {
+                    "provisioningState": "Failed",
+                    "targetResource": {"resourceType": "Microsoft.Storage/storageAccounts"},
+                    "statusMessage": {
+                        "error": {"code": "QuotaExceeded", "message": "Storage quota exceeded"}
+                    },
+                }
+            },
+            {"properties": {"provisioningState": "Succeeded"}},
+        ]
+        responses = [
+            _SUBMIT_OK,
+            _show_result(
+                "Failed",
+                error={
+                    "code": "DeploymentFailed",
+                    "message": "At least one resource deployment operation failed.",
+                },
+            ),
+            (True, json.dumps(ops), ""),
+        ]
+        with patch.object(executor, "_run_az", side_effect=responses):
             result = executor.deploy_resource_group(
                 subscription="sub-123",
                 resource_group="rg-test",
@@ -536,22 +659,20 @@ class TestDeployResourceGroup:
                 site_name="site-1",
             )
 
-        assert result.success is True
-        assert result.outputs == {}
+        assert result.success is False
+        assert "QuotaExceeded" in result.error
+        assert "Storage quota exceeded" in result.error
 
-    def test_deploy_resource_group_truncated_json_stdout(self, tmp_workspace, sample_bicep_template, monkeypatch):
-        """Test that truncated JSON stdout with success returncode doesn't crash."""
+    def test_failed_state_falls_back_to_properties_error(self, tmp_workspace, sample_bicep_template, monkeypatch):
         executor = AzCliExecutor(workspace=tmp_workspace)
         monkeypatch.setattr(executor, "_az_path", "/usr/bin/az")
 
-        mock_result = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout='{"properties": {"outputs":',
-            stderr="",
-        )
-
-        with patch("subprocess.run", return_value=mock_result):
+        responses = [
+            _SUBMIT_OK,
+            _show_result("Failed", error={"code": "PolicyViolation", "message": "Denied by policy"}),
+            (True, json.dumps([]), ""),  # no failed operations available
+        ]
+        with patch.object(executor, "_run_az", side_effect=responses):
             result = executor.deploy_resource_group(
                 subscription="sub-123",
                 resource_group="rg-test",
@@ -562,11 +683,176 @@ class TestDeployResourceGroup:
                 site_name="site-1",
             )
 
+        assert result.success is False
+        assert "PolicyViolation" in result.error
+        assert "Denied by policy" in result.error
+
+    def test_auth_error_during_poll_does_not_fail_deploy(self, tmp_workspace, sample_bicep_template, monkeypatch):
+        """A momentary auth error while polling must not fail an in-flight deployment."""
+        executor = AzCliExecutor(workspace=tmp_workspace)
+        monkeypatch.setattr(executor, "_az_path", "/usr/bin/az")
+
+        responses = [
+            _SUBMIT_OK,
+            (False, "", "AADSTS700024: Client assertion is not within its valid time range"),
+            _show_result("Succeeded", outputs={}),
+        ]
+        with patch.object(executor, "_run_az", side_effect=responses):
+            with patch("siteops.executor.time.sleep"):
+                result = executor.deploy_resource_group(
+                    subscription="sub-123",
+                    resource_group="rg-test",
+                    template_path=sample_bicep_template,
+                    parameters={},
+                    deployment_name="test-deploy",
+                    step_name="step-1",
+                    site_name="site-1",
+                )
+
         assert result.success is True
-        assert result.outputs == {}
-        assert result.error is None
-        assert result.step_name == "step-1"
-        assert result.site_name == "site-1"
+
+    def test_unparseable_show_then_success(self, tmp_workspace, sample_bicep_template, monkeypatch):
+        executor = AzCliExecutor(workspace=tmp_workspace)
+        monkeypatch.setattr(executor, "_az_path", "/usr/bin/az")
+
+        responses = [
+            _SUBMIT_OK,
+            (True, "not json at all", ""),
+            (True, '{"properties": {"outputs":', ""),
+            _show_result("Succeeded", outputs={}),
+        ]
+        with patch.object(executor, "_run_az", side_effect=responses):
+            with patch("siteops.executor.time.sleep"):
+                result = executor.deploy_resource_group(
+                    subscription="sub-123",
+                    resource_group="rg-test",
+                    template_path=sample_bicep_template,
+                    parameters={},
+                    deployment_name="test-deploy",
+                    step_name="step-1",
+                    site_name="site-1",
+                )
+
+        assert result.success is True
+
+    def test_notfound_grace_exhausted_fails_visible(self, tmp_workspace, sample_bicep_template, monkeypatch):
+        executor = AzCliExecutor(workspace=tmp_workspace)
+        monkeypatch.setattr(executor, "_az_path", "/usr/bin/az")
+
+        responses = [
+            _SUBMIT_OK,
+            (False, "", "ResourceNotFound: deployment not found"),
+            (False, "", "ResourceNotFound: deployment not found"),
+        ]
+        clock = iter([0.0, 10.0, 10.0, 200.0])
+
+        def fake_monotonic():
+            try:
+                return next(clock)
+            except StopIteration:
+                return 200.0
+
+        with patch.object(executor, "_run_az", side_effect=responses):
+            with patch("siteops.executor.time.monotonic", side_effect=fake_monotonic):
+                with patch("siteops.executor.time.sleep"):
+                    result = executor.deploy_resource_group(
+                        subscription="sub-123",
+                        resource_group="rg-test",
+                        template_path=sample_bicep_template,
+                        parameters={},
+                        deployment_name="test-deploy",
+                        step_name="step-1",
+                        site_name="site-1",
+                    )
+
+        assert result.success is False
+        assert "never became visible" in result.error
+
+    def test_observation_grace_exhausted_does_not_claim_failure(self, tmp_workspace, sample_bicep_template, monkeypatch):
+        """Losing observability for the grace window reports indeterminate, not a deploy failure."""
+        executor = AzCliExecutor(workspace=tmp_workspace)
+        monkeypatch.setattr(executor, "_az_path", "/usr/bin/az")
+
+        responses = [
+            _SUBMIT_OK,
+            (False, "", "AADSTS700024: assertion expired"),
+            (False, "", "AADSTS700024: assertion expired"),
+        ]
+        clock = iter([0.0, 10.0, 10.0, 700.0])
+
+        def fake_monotonic():
+            try:
+                return next(clock)
+            except StopIteration:
+                return 700.0
+
+        with patch.object(executor, "_run_az", side_effect=responses):
+            with patch("siteops.executor.time.monotonic", side_effect=fake_monotonic):
+                with patch("siteops.executor.time.sleep"):
+                    result = executor.deploy_resource_group(
+                        subscription="sub-123",
+                        resource_group="rg-test",
+                        template_path=sample_bicep_template,
+                        parameters={},
+                        deployment_name="test-deploy",
+                        step_name="step-1",
+                        site_name="site-1",
+                    )
+
+        assert result.success is False
+        assert "Lost the ability to observe" in result.error
+        assert "may still be running" in result.error
+
+    def test_overall_deadline_does_not_claim_failure(self, tmp_workspace, sample_bicep_template, monkeypatch):
+        executor = AzCliExecutor(workspace=tmp_workspace)
+        monkeypatch.setattr(executor, "_az_path", "/usr/bin/az")
+
+        responses = [
+            _SUBMIT_OK,
+            _show_result("Running"),
+            _show_result("Running"),
+        ]
+        clock = iter([0.0, 1.0, 1.0, 3700.0, 3700.0])
+
+        def fake_monotonic():
+            try:
+                return next(clock)
+            except StopIteration:
+                return 3700.0
+
+        with patch.object(executor, "_run_az", side_effect=responses):
+            with patch("siteops.executor.time.monotonic", side_effect=fake_monotonic):
+                with patch("siteops.executor.time.sleep"):
+                    result = executor.deploy_resource_group(
+                        subscription="sub-123",
+                        resource_group="rg-test",
+                        template_path=sample_bicep_template,
+                        parameters={},
+                        deployment_name="test-deploy",
+                        step_name="step-1",
+                        site_name="site-1",
+                    )
+
+        assert result.success is False
+        assert "did not reach a terminal state" in result.error
+
+    def test_deploy_resource_group_az_not_found(self, tmp_workspace, sample_bicep_template, monkeypatch):
+        executor = AzCliExecutor(workspace=tmp_workspace)
+        monkeypatch.setattr(executor, "_az_path", "")  # falsy, skips shutil.which
+
+        with patch.object(executor, "_run_az", side_effect=AssertionError("must not run az when missing")):
+            result = executor.deploy_resource_group(
+                subscription="sub-123",
+                resource_group="rg-test",
+                template_path=sample_bicep_template,
+                parameters={},
+                deployment_name="test-deploy",
+                step_name="step-1",
+                site_name="site-1",
+            )
+
+        assert result.success is False
+        assert "Azure CLI (az) not found" in result.error
 
 
 class TestDeploySubscription:
@@ -576,14 +862,15 @@ class TestDeploySubscription:
         executor = AzCliExecutor(workspace=tmp_workspace)
         monkeypatch.setattr(executor, "_az_path", "/usr/bin/az")
 
-        mock_result = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout=json.dumps({"properties": {"outputs": {}}}),
-            stderr="",
-        )
+        calls = []
 
-        with patch("subprocess.run", return_value=mock_result):
+        def record(args, timeout=None):
+            calls.append(args)
+            if "create" in args:
+                return _SUBMIT_OK
+            return _show_result("Succeeded", outputs={})
+
+        with patch.object(executor, "_run_az", side_effect=record):
             result = executor.deploy_subscription(
                 subscription="sub-123",
                 location="eastus",
@@ -595,6 +882,46 @@ class TestDeploySubscription:
             )
 
         assert result.success is True
+        assert calls[0][:3] == ["deployment", "sub", "create"]
+        assert calls[1][:3] == ["deployment", "sub", "show"]
+
+    def test_deploy_subscription_failed_uses_sub_operation_list(self, tmp_workspace, sample_bicep_template, monkeypatch):
+        executor = AzCliExecutor(workspace=tmp_workspace)
+        monkeypatch.setattr(executor, "_az_path", "/usr/bin/az")
+
+        calls = []
+
+        def record(args, timeout=None):
+            calls.append(args)
+            if "create" in args:
+                return _SUBMIT_OK
+            if "operation" in args:
+                ops = [
+                    {
+                        "properties": {
+                            "provisioningState": "Failed",
+                            "statusMessage": {"error": {"code": "BadRequest", "message": "nope"}},
+                        }
+                    }
+                ]
+                return (True, json.dumps(ops), "")
+            return _show_result("Failed", error={"code": "DeploymentFailed", "message": "see operations"})
+
+        with patch.object(executor, "_run_az", side_effect=record):
+            result = executor.deploy_subscription(
+                subscription="sub-123",
+                location="eastus",
+                template_path=sample_bicep_template,
+                parameters={},
+                deployment_name="sub-deploy",
+                step_name="step-1",
+                site_name="site-1",
+            )
+
+        assert result.success is False
+        assert "BadRequest" in result.error
+        ops_call = next(c for c in calls if "operation" in c)
+        assert ops_call[:4] == ["deployment", "operation", "sub", "list"]
 
 
 class TestKubectlApply:

@@ -141,6 +141,36 @@ DEFAULT_WAIT_POLL_AZ_TIMEOUT_SECONDS = 60
 # A single successful observation resets the counter.
 WAIT_MAX_CONSECUTIVE_ERRORS = int(os.environ.get("SITEOPS_WAIT_MAX_CONSECUTIVE_ERRORS", "10"))
 
+# Async deployment submit + poll. A single blocking `az deployment ... create` is one
+# long process that captures the OIDC federated client assertion in memory at start. If
+# it crosses the access-token refresh boundary mid-call it re-uses the now-expired
+# assertion and fails (AADSTS700024) even though ARM completed the deployment. Submitting
+# with `--no-wait` and observing with short-lived `deployment ... show` calls keeps every
+# `az` process well under the ~5-minute assertion lifetime and lets the CI credential
+# refresh take effect. See plans/siteops-arm-sdk-migration.md for the long-term SDK move.
+DEFAULT_DEPLOYMENT_SUBMIT_TIMEOUT_SECONDS = 300
+DEFAULT_DEPLOYMENT_POLL_INTERVAL_SECONDS = 20
+DEFAULT_DEPLOYMENT_SUBMIT_MAX_RETRIES = 3
+
+# A returncode-0 `--no-wait` submit means ARM accepted and created the deployment
+# resource, so `show` should find it within seconds. Bound the read-after-write window so
+# a deployment that never registered (for example create and show targeting different
+# scopes) fails quickly instead of polling to the overall deadline.
+DEPLOYMENT_NOTFOUND_GRACE_SECONDS = 120
+
+# Maximum continuous wall-clock time the poller tolerates being unable to OBSERVE the
+# deployment (auth blip, throttling, 5xx, torn credential-cache read). Sized to span at
+# least two CI credential-refresh cycles so a single late or failed refresh self-heals
+# before we give up. An observation error never itself fails the deployment. Only a
+# terminal provisioningState, this grace, or the overall deadline ends the poll.
+DEPLOYMENT_OBSERVATION_GRACE_SECONDS = 600
+
+# Terminal ARM deployment provisioning states. Everything else (Accepted, Running,
+# Creating, Updating, ...) is intermediate and keeps polling. The poll fails closed: an
+# unrecognized state polls to the deadline rather than being mistaken for success.
+_DEPLOYMENT_TERMINAL_SUCCESS = frozenset({"Succeeded"})
+_DEPLOYMENT_TERMINAL_FAILURE = frozenset({"Failed", "Canceled"})
+
 # Classification patterns for `az` failures during a wait poll. Order matters:
 # resource-not-found is checked before the permanent set because a 404 message
 # can contain generic phrases. Permanent errors will never self-resolve, so they
@@ -186,6 +216,28 @@ def _classify_az_error(stderr: str) -> str:
     if _WAIT_TRANSIENT_ERROR_PATTERN.search(text):
         return "transient"
     return "unknown"
+
+
+def _format_arm_error(error_node: Any) -> str:
+    """Flatten an ARM error object (`code`/`message`/`details`) into one line.
+
+    Used to surface deployment failure detail. Falls back to a JSON dump for shapes that
+    do not match the standard ARM error envelope.
+    """
+    if not isinstance(error_node, dict):
+        return str(error_node)
+    code = error_node.get("code", "")
+    message = error_node.get("message", "")
+    parts = [part for part in (code, message) if part]
+    text = ": ".join(parts) if parts else json.dumps(error_node)
+    details = error_node.get("details")
+    if isinstance(details, list) and details and isinstance(details[0], dict):
+        detail_code = details[0].get("code", "")
+        detail_message = details[0].get("message", "")
+        detail_text = ": ".join(part for part in (detail_code, detail_message) if part)
+        if detail_text:
+            text = f"{text} ({detail_text})"
+    return text
 
 
 def _describe_condition(condition: Any) -> str:
@@ -910,57 +962,350 @@ class AzCliExecutor:
 
     def _deploy(
         self,
-        args: list[str],
+        create_args: list[str],
+        show_args: list[str],
+        ops_args: list[str],
         parameters: dict[str, Any],
         deployment_name: str,
         step_name: str,
         site_name: str,
     ) -> DeploymentResult:
-        """Execute an Azure deployment and return results.
+        """Submit an Azure deployment asynchronously and poll it to a terminal state.
+
+        The deployment is submitted with `--no-wait` and then observed with short
+        `az deployment ... show` calls. This keeps every `az` process well under the OIDC
+        federated-assertion lifetime, so a long deployment cannot fail on a stale
+        in-memory assertion (AADSTS700024) the way a single blocking `create` does.
 
         Args:
-            args: Base az deployment command arguments
-            parameters: Parameters to pass to the deployment
-            deployment_name: Name for the Azure deployment
-            step_name: Site Ops step name
-            site_name: Site Ops site name
+            create_args: Base `az deployment ... create` arguments (without `--no-wait`).
+            show_args: Matching `az deployment ... show` arguments for polling.
+            ops_args: Matching `az deployment operation ... list` arguments for failure detail.
+            parameters: Parameters to pass to the deployment.
+            deployment_name: Name for the Azure deployment.
+            step_name: Site Ops step name.
+            site_name: Site Ops site name.
 
         Returns:
-            DeploymentResult with success status and outputs
+            DeploymentResult with success status and outputs.
         """
-        if parameters:
-            params_path = self._write_params_file(parameters, step_name, site_name)
-            args.extend(["--parameters", f"@{params_path}"])
-
-        try:
-            success, stdout, stderr = self._run_az(args)
-
-            outputs = {}
-            if success and stdout and not self.dry_run:
-                try:
-                    result = json.loads(stdout)
-                    outputs = result.get("properties", {}).get("outputs", {})
-                except json.JSONDecodeError:
-                    pass
-
+        if not self.dry_run and not self.az_path:
             return DeploymentResult(
-                success=success,
+                success=False,
                 step_name=step_name,
                 site_name=site_name,
                 deployment_name=deployment_name,
-                outputs=outputs,
-                error=stderr if not success else None,
+                error="Azure CLI (az) not found in PATH. Install from https://aka.ms/installazurecli",
+            )
+
+        if parameters:
+            params_path = self._write_params_file(parameters, step_name, site_name)
+            create_args = create_args + ["--parameters", f"@{params_path}"]
+
+        try:
+            # Submit without blocking. A single long blocking `create` would re-use a
+            # stale in-memory OIDC assertion across the token-refresh boundary. Do NOT
+            # replace the show poll below with `az deployment ... wait`: that is itself a
+            # single long-lived process and reintroduces the same failure.
+            submit_args = create_args + ["--no-wait"]
+
+            if self.dry_run:
+                # Log the intended submit. Never submit or poll in dry-run.
+                self._run_az(submit_args)
+                return DeploymentResult(
+                    success=True,
+                    step_name=step_name,
+                    site_name=site_name,
+                    deployment_name=deployment_name,
+                )
+
+            proceed, early_result = self._submit_deployment(
+                submit_args, deployment_name, step_name, site_name
+            )
+            if not proceed:
+                return early_result
+
+            return self._poll_deployment(
+                show_args, ops_args, deployment_name, step_name, site_name
             )
         finally:
-            # Clean up the per-deploy params file. Long-running CI runs would
-            # otherwise accumulate one JSON per (step, site, deploy) under
-            # `.siteops/tmp/`. Best-effort: don't mask the deploy result on
-            # cleanup errors.
+            # Clean up the per-deploy params file. ARM has the parameters inline in the
+            # submit PUT by the time we poll, so `show` never needs the file. Best-effort:
+            # don't mask the deploy result on cleanup errors.
             if parameters:
                 try:
                     params_path.unlink(missing_ok=True)
                 except OSError as e:
                     logger.debug(f"Failed to remove params file {params_path}: {e}")
+
+    def _submit_deployment(
+        self,
+        submit_args: list[str],
+        deployment_name: str,
+        step_name: str,
+        site_name: str,
+    ) -> tuple[bool, DeploymentResult | None]:
+        """Submit the deployment with `--no-wait`, retrying transient submit failures.
+
+        A `--no-wait` submit makes a synchronous ARM PUT and returns once the request is
+        accepted. Bad template or parameter errors surface here and fail fast. A transient
+        network error retries (the timestamped deployment name makes the PUT idempotent).
+        A submit timeout is ambiguous because the request may have reached ARM, so it
+        falls through to polling, where the not-found grace catches a submit that never
+        registered.
+
+        Args:
+            submit_args: Full `az deployment ... create ... --no-wait` arguments.
+            deployment_name: Name for the Azure deployment.
+            step_name: Site Ops step name.
+            site_name: Site Ops site name.
+
+        Returns:
+            A tuple `(proceed_to_poll, early_result)`. When `proceed_to_poll` is True,
+            `early_result` is None and the caller polls. When False, `early_result` is a
+            terminal DeploymentResult for a fail-fast submit error.
+        """
+        last_error = ""
+        for attempt in range(1, DEFAULT_DEPLOYMENT_SUBMIT_MAX_RETRIES + 1):
+            ok, _stdout, stderr = self._run_az(
+                submit_args, timeout=DEFAULT_DEPLOYMENT_SUBMIT_TIMEOUT_SECONDS
+            )
+            if ok:
+                return True, None
+
+            last_error = stderr
+            lowered = (stderr or "").lower()
+            if "timed out" in lowered or "timeout" in lowered:
+                # Ambiguous: the PUT may have reached ARM. Poll and let the not-found
+                # grace decide.
+                logger.warning(
+                    f"Submit of '{deployment_name}' timed out. Polling in case ARM "
+                    f"accepted the request."
+                )
+                return True, None
+
+            category = _classify_az_error(stderr)
+            if category == "transient":
+                if attempt < DEFAULT_DEPLOYMENT_SUBMIT_MAX_RETRIES:
+                    time.sleep(min(DEFAULT_DEPLOYMENT_POLL_INTERVAL_SECONDS, 5 * attempt))
+                    continue
+                # Exhausted retries on a transient submit error. The PUT may still have
+                # reached ARM, so poll and let the not-found grace decide.
+                return True, None
+
+            # Permanent or unrecognized submit failure (bad template, bad parameters,
+            # auth, or an unclassified deterministic rejection). Nothing was created, so
+            # fail fast with the real error rather than polling for a phantom deployment.
+            return False, DeploymentResult(
+                success=False,
+                step_name=step_name,
+                site_name=site_name,
+                deployment_name=deployment_name,
+                error=last_error,
+            )
+
+        return True, None
+
+    def _poll_deployment(
+        self,
+        show_args: list[str],
+        ops_args: list[str],
+        deployment_name: str,
+        step_name: str,
+        site_name: str,
+    ) -> DeploymentResult:
+        """Poll a submitted deployment to a terminal state with short `show` calls.
+
+        The only authoritative outcomes are the deployment's own `provisioningState`
+        (Succeeded, or Failed/Canceled) and the overall deadline. Any failure to OBSERVE
+        the deployment (auth blip, throttling, 5xx, a torn credential-cache read, or a
+        transient not-found right after submit) never fails the deployment. It only
+        retries under a grace window, because the deployment is owned by ARM and its fate
+        is independent of our ability to read it.
+
+        Args:
+            show_args: `az deployment ... show` arguments.
+            ops_args: `az deployment operation ... list` arguments for failure detail.
+            deployment_name: Name for the Azure deployment.
+            step_name: Site Ops step name.
+            site_name: Site Ops site name.
+
+        Returns:
+            DeploymentResult. On success, `outputs` carries `properties.outputs`.
+        """
+        start = time.monotonic()
+        deadline = start + DEFAULT_AZ_TIMEOUT_SECONDS
+        last_clean_obs = start
+        ever_visible = False
+        last_obs_error: str | None = None
+        last_state: str | None = None
+        poll_count = 0
+
+        while True:
+            poll_count += 1
+            ok, stdout, stderr = self._run_az(
+                show_args, timeout=DEFAULT_WAIT_POLL_AZ_TIMEOUT_SECONDS
+            )
+
+            deployment_obj: dict[str, Any] | None = None
+            observed_state: str | None = None
+            if ok and stdout:
+                try:
+                    parsed = json.loads(stdout)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    deployment_obj = parsed
+                    state = parsed.get("properties", {}).get("provisioningState")
+                    observed_state = state if isinstance(state, str) and state else None
+
+            if observed_state is not None:
+                ever_visible = True
+                last_clean_obs = time.monotonic()
+                last_obs_error = None
+                last_state = observed_state
+
+                if observed_state in _DEPLOYMENT_TERMINAL_SUCCESS:
+                    outputs = deployment_obj.get("properties", {}).get("outputs") or {}
+                    logger.debug(
+                        f"Deployment '{deployment_name}' succeeded after {poll_count} poll(s)"
+                    )
+                    return DeploymentResult(
+                        success=True,
+                        step_name=step_name,
+                        site_name=site_name,
+                        deployment_name=deployment_name,
+                        outputs=outputs,
+                    )
+
+                if observed_state in _DEPLOYMENT_TERMINAL_FAILURE:
+                    detail = self._format_deployment_failure(deployment_obj, ops_args)
+                    return DeploymentResult(
+                        success=False,
+                        step_name=step_name,
+                        site_name=site_name,
+                        deployment_name=deployment_name,
+                        error=(
+                            f"Deployment '{deployment_name}' reached terminal state "
+                            f"'{observed_state}'. {detail}"
+                        ),
+                    )
+                # Intermediate state. Keep polling.
+            else:
+                # Could not observe a provisioningState this poll. This never fails the
+                # deployment, only bounds how long we keep trying to read it.
+                last_obs_error = (
+                    stderr or "deployment show returned no parseable provisioningState"
+                )
+                category = _classify_az_error(stderr) if stderr else "unknown"
+                now = time.monotonic()
+
+                if category == "resource_not_found" and not ever_visible:
+                    if now - start > DEPLOYMENT_NOTFOUND_GRACE_SECONDS:
+                        return DeploymentResult(
+                            success=False,
+                            step_name=step_name,
+                            site_name=site_name,
+                            deployment_name=deployment_name,
+                            error=(
+                                f"Deployment '{deployment_name}' never became visible within "
+                                f"{DEPLOYMENT_NOTFOUND_GRACE_SECONDS}s of submit. Verify the "
+                                f"create and show target the same subscription and resource "
+                                f"group. Last error: {last_obs_error}"
+                            ),
+                        )
+                    # Still within the registration window. Keep polling.
+                elif now - last_clean_obs > DEPLOYMENT_OBSERVATION_GRACE_SECONDS:
+                    return DeploymentResult(
+                        success=False,
+                        step_name=step_name,
+                        site_name=site_name,
+                        deployment_name=deployment_name,
+                        error=(
+                            f"Lost the ability to observe deployment '{deployment_name}' for "
+                            f"over {DEPLOYMENT_OBSERVATION_GRACE_SECONDS}s (last observed state: "
+                            f"{last_state or 'none'}). ARM was not canceled and may still be "
+                            f"running. Last error: {last_obs_error}"
+                        ),
+                    )
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return DeploymentResult(
+                    success=False,
+                    step_name=step_name,
+                    site_name=site_name,
+                    deployment_name=deployment_name,
+                    error=(
+                        f"Deployment '{deployment_name}' did not reach a terminal state within "
+                        f"{DEFAULT_AZ_TIMEOUT_SECONDS // 60}m (last observed state: "
+                        f"{last_state or 'none'}). ARM was not canceled and may still be in "
+                        f"progress."
+                    ),
+                )
+            time.sleep(min(DEFAULT_DEPLOYMENT_POLL_INTERVAL_SECONDS, remaining))
+
+    def _format_deployment_failure(
+        self, deployment_obj: dict[str, Any], ops_args: list[str]
+    ) -> str:
+        """Build a diagnostic for a Failed or Canceled deployment.
+
+        The deployment's own `properties.error` is usually the shallow generic node ("At
+        least one resource deployment operation failed"). The real per-resource cause
+        lives in the deployment operations, so fetch those first and fall back to the
+        top-level error only when the operations cannot be read.
+        """
+        detail = self._fetch_failed_operations(ops_args)
+        if detail:
+            return detail
+        error_node = deployment_obj.get("properties", {}).get("error")
+        if error_node:
+            return _format_arm_error(error_node)
+        return "No error detail was reported by ARM."
+
+    def _fetch_failed_operations(self, ops_args: list[str]) -> str | None:
+        """Fetch failed deployment operations and format their root-cause errors.
+
+        Returns a joined diagnostic string, or None when the operations cannot be read so
+        the caller falls back to the deployment's top-level error.
+        """
+        ok, stdout, _stderr = self._run_az(
+            ops_args, timeout=DEFAULT_WAIT_POLL_AZ_TIMEOUT_SECONDS
+        )
+        if not ok or not stdout:
+            return None
+        try:
+            operations = json.loads(stdout)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(operations, list):
+            return None
+
+        messages: list[str] = []
+        for operation in operations:
+            if not isinstance(operation, dict):
+                continue
+            props = operation.get("properties", {})
+            if props.get("provisioningState") != "Failed":
+                continue
+            status_message = props.get("statusMessage")
+            error_node = None
+            if isinstance(status_message, dict):
+                error_node = status_message.get("error", status_message)
+            target = props.get("targetResource") or {}
+            target_label = ""
+            if isinstance(target, dict):
+                target_label = target.get("resourceType") or target.get("id") or ""
+            formatted = (
+                _format_arm_error(error_node)
+                if error_node
+                else json.dumps(status_message)
+            )
+            messages.append(
+                f"{target_label}: {formatted}" if target_label else formatted
+            )
+
+        return "; ".join(messages) if messages else None
 
     def deploy_resource_group(
         self,
@@ -986,7 +1331,7 @@ class AzCliExecutor:
         Returns:
             DeploymentResult with success status and outputs
         """
-        args = [
+        create_args = [
             "deployment",
             "group",
             "create",
@@ -1001,7 +1346,36 @@ class AzCliExecutor:
             "--output",
             "json",
         ]
-        return self._deploy(args, parameters, deployment_name, step_name, site_name)
+        show_args = [
+            "deployment",
+            "group",
+            "show",
+            "--subscription",
+            subscription,
+            "--resource-group",
+            resource_group,
+            "--name",
+            deployment_name,
+            "--output",
+            "json",
+        ]
+        ops_args = [
+            "deployment",
+            "operation",
+            "group",
+            "list",
+            "--subscription",
+            subscription,
+            "--resource-group",
+            resource_group,
+            "--name",
+            deployment_name,
+            "--output",
+            "json",
+        ]
+        return self._deploy(
+            create_args, show_args, ops_args, parameters, deployment_name, step_name, site_name
+        )
 
     def deploy_subscription(
         self,
@@ -1027,7 +1401,7 @@ class AzCliExecutor:
         Returns:
             DeploymentResult with success status and outputs
         """
-        args = [
+        create_args = [
             "deployment",
             "sub",
             "create",
@@ -1042,7 +1416,32 @@ class AzCliExecutor:
             "--output",
             "json",
         ]
-        return self._deploy(args, parameters, deployment_name, step_name, site_name)
+        show_args = [
+            "deployment",
+            "sub",
+            "show",
+            "--subscription",
+            subscription,
+            "--name",
+            deployment_name,
+            "--output",
+            "json",
+        ]
+        ops_args = [
+            "deployment",
+            "operation",
+            "sub",
+            "list",
+            "--subscription",
+            subscription,
+            "--name",
+            deployment_name,
+            "--output",
+            "json",
+        ]
+        return self._deploy(
+            create_args, show_args, ops_args, parameters, deployment_name, step_name, site_name
+        )
 
     def _validate_kubectl_file(self, file_path: str) -> tuple[bool, str | None]:
         """Validate a kubectl file path or URL for security.

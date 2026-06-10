@@ -165,6 +165,59 @@ def _origin_suffix(prov: dict[str, str] | None, key: str) -> str:
     return f"  # {origin}"
 
 
+# Substrings (case-insensitive) that mark a config key as carrying a secret.
+# Values under a matching key are redacted in `siteops sites` output so a
+# secret supplied via sites.local / SITE_OVERRIDES (e.g. an SP password) does
+# not print to the terminal. Display-only: deploy still uses the real value.
+_SENSITIVE_KEY_SUBSTRINGS = (
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "credential",
+    "apikey",
+    "accountkey",
+    "accesskey",
+    "privatekey",
+    "connectionstring",
+    "sastoken",
+)
+_REDACTED = "***"
+
+
+def _is_sensitive_key(key: str) -> bool:
+    """True if a config key name indicates its value is a secret."""
+    lowered = key.lower()
+    return any(token in lowered for token in _SENSITIVE_KEY_SUBSTRINGS)
+
+
+def _redact_sensitive(value: Any, key: str | None = None) -> Any:
+    """Return a copy of `value` with secret-keyed entries replaced by `***`.
+
+    Display-only redaction for `siteops sites` and `siteops sites --render`.
+    A value is redacted when its own key matches `_is_sensitive_key`, except
+    booleans: a sensitive-looking key with a bool value is a toggle, not a
+    secret (e.g. `enableSecretSync: false`), so it is left as-is. The whole
+    subtree under a sensitive key is replaced so a nested credential object is
+    fully masked. The real value is never mutated and deploy is unaffected.
+
+    Args:
+        value: The value to redact (dict, list, or scalar).
+        key: The key this value sits under, or None at the root / in a list.
+
+    Returns:
+        A redacted deep copy.
+    """
+    if key is not None and _is_sensitive_key(key) and not isinstance(value, bool):
+        return _REDACTED
+    if isinstance(value, dict):
+        return {k: _redact_sensitive(v, k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_sensitive(item) for item in value]
+    return value
+
+
 def _print_value(
     value: Any,
     indent: int = 6,
@@ -286,9 +339,9 @@ def cmd_sites(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
             if site.labels:
                 resolved["labels"] = site.labels
             if site.parameters:
-                resolved["parameters"] = site.parameters
+                resolved["parameters"] = _redact_sensitive(site.parameters)
             if site.properties:
-                resolved["properties"] = site.properties
+                resolved["properties"] = _redact_sensitive(site.properties)
             if i > 0:
                 print("---")
             print(yaml.safe_dump(resolved, sort_keys=False, default_flow_style=False), end="")
@@ -333,11 +386,11 @@ def cmd_sites(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
 
         if site.properties:
             print("    properties:")
-            _print_value(site.properties, indent=6, prov=prov, key_prefix="properties")
+            _print_value(_redact_sensitive(site.properties), indent=6, prov=prov, key_prefix="properties")
 
         if site.parameters:
             print("    parameters:")
-            _print_value(site.parameters, indent=6, prov=prov, key_prefix="parameters")
+            _print_value(_redact_sensitive(site.parameters), indent=6, prov=prov, key_prefix="parameters")
 
         print()
 

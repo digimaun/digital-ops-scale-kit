@@ -26,9 +26,11 @@ import threading
 import time
 import uuid
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
+from fnmatch import fnmatchcase
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -129,6 +131,93 @@ DEFAULT_AZ_TIMEOUT_SECONDS = 3600
 
 # Default timeout for kubectl operations (10 minutes)
 DEFAULT_KUBECTL_TIMEOUT_SECONDS = 600
+
+# Per-poll az timeout for wait steps. Short by design: a single poll that hangs
+# should not block the whole interval. The 3600s deploy default is wrong here.
+DEFAULT_WAIT_POLL_AZ_TIMEOUT_SECONDS = 60
+
+# Circuit breaker for wait steps: abort after this many consecutive transient or
+# unknown polling errors so a broken `az`/network does not burn the full timeout.
+# A single successful observation resets the counter.
+WAIT_MAX_CONSECUTIVE_ERRORS = int(os.environ.get("SITEOPS_WAIT_MAX_CONSECUTIVE_ERRORS", "10"))
+
+# Classification patterns for `az` failures during a wait poll. Order matters:
+# resource-not-found is checked before the permanent set because a 404 message
+# can contain generic phrases. Permanent errors will never self-resolve, so they
+# fail the wait fast instead of polling for the full timeout. Transient errors
+# (throttling, 5xx, network) keep polling.
+_WAIT_RESOURCE_NOT_FOUND_PATTERN = re.compile(
+    r"ResourceNotFound|was not found|could not be found|"
+    r"status code:\s*404|\(?NotFound\)?",
+    re.IGNORECASE,
+)
+_WAIT_PERMANENT_ERROR_PATTERN = re.compile(
+    r"AuthorizationFailed|does not have authorization|\bForbidden\b|status code:\s*403|"
+    r"az login|not logged in|AADSTS|SubscriptionNotFound|InvalidResourceId|"
+    r"is not a valid resource id|InvalidAuthenticationToken|ExpiredAuthenticationToken",
+    re.IGNORECASE,
+)
+_WAIT_TRANSIENT_ERROR_PATTERN = re.compile(
+    r"timed out|timeout|TooManyRequests|status code:\s*429|status code:\s*5\d\d|"
+    r"ServerTimeout|ServiceUnavailable|connection (?:reset|aborted|refused)|"
+    r"temporarily unavailable|Gateway Time-?out",
+    re.IGNORECASE,
+)
+
+
+class WaitState(Enum):
+    """Outcome of a single wait-condition observation."""
+
+    SATISFIED = "satisfied"
+    FAILED = "failed"
+    PENDING = "pending"
+
+
+def _classify_az_error(stderr: str) -> str:
+    """Classify an `az` failure stderr for wait-step polling.
+
+    Returns one of `resource_not_found`, `permanent`, `transient`, or `unknown`.
+    """
+    text = stderr or ""
+    if _WAIT_RESOURCE_NOT_FOUND_PATTERN.search(text):
+        return "resource_not_found"
+    if _WAIT_PERMANENT_ERROR_PATTERN.search(text):
+        return "permanent"
+    if _WAIT_TRANSIENT_ERROR_PATTERN.search(text):
+        return "transient"
+    return "unknown"
+
+
+def _describe_condition(condition: Any) -> str:
+    """Human-readable one-line description of a wait condition for logs."""
+    if getattr(condition, "type", None) == "arm-tag":
+        return f"tag '{condition.tag_key}'='{condition.expected_value}' on {condition.resource_id}"
+    return f"condition type '{getattr(condition, 'type', 'unknown')}'"
+
+
+def _wait_failure_message(
+    condition: Any,
+    *,
+    reason: str,
+    last_value: str | None,
+    last_error: str | None,
+    poll_count: int,
+    elapsed_seconds: float,
+) -> str:
+    """Build a diagnostic message for a failed or timed-out wait.
+
+    Carries both the last observed value and the last underlying error so the
+    operator can diagnose in one read (the diagnostic-on-failure convention).
+    """
+    parts = [f"Wait failed ({reason}) for {_describe_condition(condition)}."]
+    if last_value is not None:
+        parts.append(f"Last observed value: {last_value!r}.")
+    else:
+        parts.append("Tag value never observed.")
+    if last_error:
+        parts.append(f"Last error: {last_error}")
+    parts.append(f"Polls: {poll_count}, elapsed: {elapsed_seconds:.0f}s.")
+    return " ".join(parts)
 
 # Arc proxy port configuration
 # Each proxy needs 2 ports: api_server_port (--port) and internal_port (api_server_port - 1)
@@ -427,6 +516,27 @@ class KubectlResult:
         step_name: Name of the step that was executed
         site_name: Name of the site
         error: Error message if operation failed
+    """
+
+    success: bool
+    step_name: str
+    site_name: str
+    error: str | None = None
+
+
+@dataclass
+class WaitResult:
+    """Result of a wait step.
+
+    A wait step is a gate. It produces no outputs. `error` carries the full
+    diagnostic (last observed value, last underlying error, poll count, elapsed)
+    when the wait fails or times out.
+
+    Attributes:
+        success: Whether the wait condition was satisfied.
+        step_name: Name of the step that was executed.
+        site_name: Name of the site.
+        error: Diagnostic message if the wait failed or timed out.
     """
 
     success: bool
@@ -788,7 +898,12 @@ class AzCliExecutor:
 
         params_path = tmp_dir / filename
 
-        with open(params_path, "w", encoding="utf-8") as f:
+        # Create 0o600: the file holds resolved parameters, which can include
+        # secrets (e.g. an SP password). os.open applies the mode at creation so
+        # there is no world-readable window. POSIX mode is advisory on Windows
+        # (ACL-based) but harmless. Deleted in the deploy's finally.
+        fd = os.open(params_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(arm_params, f, indent=2)
 
         return params_path
@@ -1041,3 +1156,205 @@ class AzCliExecutor:
                 site_name=site_name,
                 error=stderr if not success else None,
             )
+
+    @contextmanager
+    def _condition_session(self, condition: Any) -> Generator[None, None, None]:
+        """Per-condition resource that wraps the entire wait loop.
+
+        `arm-tag` polls with plain `az` calls and needs no session resource, so
+        this is a no-op. A future condition type that needs cluster access (for
+        example `kubectl-resource-ready`) would open its Arc proxy here so the
+        proxy spans every poll rather than being re-established each iteration.
+        Keeping this seam now lets new condition types plug in without changing
+        the loop signature.
+        """
+        with nullcontext():
+            yield
+
+    def _evaluate_condition(self, condition: Any, subscription: str) -> tuple[WaitState, str | None, str | None]:
+        """Take one observation of a wait condition.
+
+        Returns `(state, observed_value, error)`. `observed_value` is the value
+        seen this poll (or None). `error` is a non-fatal poll error worth
+        surfacing in the timeout diagnostic; on a PENDING state it also drives
+        the consecutive-error circuit breaker.
+
+        Dispatches by condition type. Unknown types are rejected at parse and
+        validate time; this guard is defensive.
+        """
+        if condition.type == "arm-tag":
+            return self._evaluate_arm_tag(condition, subscription)
+        raise ValueError(f"Unsupported wait condition type: {condition.type}")
+
+    def _evaluate_arm_tag(self, condition: Any, subscription: str) -> tuple[WaitState, str | None, str | None]:
+        """Take one observation of an arm-tag condition via `az resource show`."""
+        args = [
+            "resource",
+            "show",
+            "--ids",
+            condition.resource_id,
+            "--query",
+            "tags",
+            "--output",
+            "json",
+        ]
+        if subscription:
+            # Inline --subscription per call. Never `az account set`, which
+            # mutates global state and races across concurrent site threads.
+            args.extend(["--subscription", subscription])
+
+        success, stdout, stderr = self._run_az(args, timeout=DEFAULT_WAIT_POLL_AZ_TIMEOUT_SECONDS)
+
+        if success:
+            try:
+                tags = json.loads(stdout) if stdout.strip() else {}
+            except json.JSONDecodeError as e:
+                # A malformed tags payload is unexpected. Treat as a transient
+                # hiccup and keep polling, but surface it for the diagnostic.
+                return WaitState.PENDING, None, f"could not parse tags JSON: {e}"
+            if not isinstance(tags, dict):
+                tags = {}
+
+            observed = tags.get(condition.tag_key)
+            if observed is not None:
+                observed = str(observed)
+
+            # Satisfied (exact) is checked before failed (glob), so a failure
+            # glob can never override an exact success match.
+            if observed == condition.expected_value:
+                return WaitState.SATISFIED, observed, None
+            if (
+                condition.failure_pattern
+                and observed is not None
+                and fnmatchcase(observed, condition.failure_pattern)
+            ):
+                return WaitState.FAILED, observed, (
+                    f"tag reached failure value '{observed}' matching failurePattern "
+                    f"'{condition.failure_pattern}'"
+                )
+            # Tag absent or some intermediate value. Not ready yet.
+            return WaitState.PENDING, observed, None
+
+        # The `az` call failed. Classify so permanent errors fail fast instead
+        # of polling for the full timeout.
+        classification = _classify_az_error(stderr)
+        message = stderr.strip()
+        if classification == "resource_not_found":
+            return WaitState.FAILED, None, (
+                f"resource not found: {condition.resource_id}. For arm-tag the resource is "
+                f"expected to exist before the wait. Check the resourceId (subscription, resource "
+                f"group, name). az error: {message}"
+            )
+        if classification == "permanent":
+            return WaitState.FAILED, None, f"permanent error polling tags: {message}"
+        # transient or unknown: keep polling, surface for the diagnostic.
+        return WaitState.PENDING, None, message or "transient error polling tags"
+
+    def wait_for_condition(
+        self,
+        condition: Any,
+        timeout_minutes: int,
+        poll_interval_seconds: int,
+        subscription: str,
+        step_name: str,
+        site_name: str,
+    ) -> WaitResult:
+        """Poll `condition` until satisfied, failed, or the timeout elapses.
+
+        Evaluates before sleeping (an already-satisfied condition returns on the
+        first poll), uses a monotonic deadline, and clamps the final sleep so the
+        wait does not overshoot the timeout. A permanent error or a failure-glob
+        match aborts fast. A run of consecutive polling errors trips a circuit
+        breaker so a broken `az`/network does not burn the full timeout.
+
+        Args:
+            condition: The wait condition (already template-resolved).
+            timeout_minutes: Maximum minutes to wait before failing.
+            poll_interval_seconds: Seconds between observations.
+            subscription: Subscription passed inline to each `az` call.
+            step_name: Site Ops step name.
+            site_name: Site Ops site name.
+
+        Returns:
+            WaitResult. On failure, `error` carries the full diagnostic.
+        """
+        description = _describe_condition(condition)
+
+        if self.dry_run:
+            logger.info(
+                f"[DRY-RUN] would wait for {description} "
+                f"(timeout {timeout_minutes}m, poll {poll_interval_seconds}s)"
+            )
+            return WaitResult(success=True, step_name=step_name, site_name=site_name)
+
+        start = time.monotonic()
+        deadline = start + timeout_minutes * 60
+        last_value: str | None = None
+        last_error: str | None = None
+        poll_count = 0
+        consecutive_errors = 0
+
+        with self._condition_session(condition):
+            while True:
+                poll_count += 1
+                state, observed, error = self._evaluate_condition(condition, subscription)
+                if observed is not None:
+                    last_value = observed
+                if error is not None:
+                    last_error = error
+
+                if state == WaitState.SATISFIED:
+                    logger.debug(f"{description} satisfied after {poll_count} poll(s)")
+                    return WaitResult(success=True, step_name=step_name, site_name=site_name)
+
+                if state == WaitState.FAILED:
+                    return WaitResult(
+                        success=False,
+                        step_name=step_name,
+                        site_name=site_name,
+                        error=_wait_failure_message(
+                            condition,
+                            reason="condition reached a terminal failure",
+                            last_value=last_value,
+                            last_error=error or last_error,
+                            poll_count=poll_count,
+                            elapsed_seconds=time.monotonic() - start,
+                        ),
+                    )
+
+                # PENDING. Track consecutive polling errors for the breaker.
+                if error is not None:
+                    consecutive_errors += 1
+                    if consecutive_errors >= WAIT_MAX_CONSECUTIVE_ERRORS:
+                        return WaitResult(
+                            success=False,
+                            step_name=step_name,
+                            site_name=site_name,
+                            error=_wait_failure_message(
+                                condition,
+                                reason=f"{consecutive_errors} consecutive polling errors",
+                                last_value=last_value,
+                                last_error=last_error,
+                                poll_count=poll_count,
+                                elapsed_seconds=time.monotonic() - start,
+                            ),
+                        )
+                else:
+                    consecutive_errors = 0
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return WaitResult(
+                        success=False,
+                        step_name=step_name,
+                        site_name=site_name,
+                        error=_wait_failure_message(
+                            condition,
+                            reason=f"timed out after {timeout_minutes}m",
+                            last_value=last_value,
+                            last_error=last_error,
+                            poll_count=poll_count,
+                            elapsed_seconds=time.monotonic() - start,
+                        ),
+                    )
+                time.sleep(min(poll_interval_seconds, remaining))

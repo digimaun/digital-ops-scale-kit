@@ -35,7 +35,7 @@ Extended documentation for the Digital Operations Scale Kit.
 | **Partial** | A manifest authored to be `include:`-d, not deployed standalone. Filename prefixed `_` by convention. |
 | **Sample** | A deployable example in `samples/<name>/`. Two shapes are supported: bundles (manifest + partial + template + inputs) and compositions (a manifest that `include:`s leaf partials from `manifests/` and other samples). |
 | **Composition** | A sample whose `manifest.yaml` is built entirely from `include:` steps that pull in `_partial.yaml`s from `manifests/` and other samples. Has no template of its own. |
-| **Step** | A unit of work in a manifest's `steps:` list. Three shapes: Bicep deploy (`template:`), kubectl op (`type: kubectl`), include (`include:`). |
+| **Step** | A unit of work in a manifest's `steps:` list. Shapes: Bicep deploy (`template:`), kubectl op (`type: kubectl`), wait gate (`type: wait`), include (`include:`). |
 | **Scope** | A step's deployment scope: `resourceGroup` or `subscription`. |
 | **AIO release** | A versioned bundle of pinned extension versions and API versions, defined by a YAML in `parameters/aio-releases/` and selected per site via `properties.aioRelease`. |
 | **Auto-filtering** | The engine drops parameter keys that the target Bicep template does not declare. Enables shared parameter files across templates. |

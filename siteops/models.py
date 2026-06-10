@@ -16,6 +16,7 @@ Resources support K8s-style apiVersion/kind validation:
 
 import re
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
@@ -111,6 +112,12 @@ CONDITION_PATTERN = re.compile(
 
 # Supported kubectl operations (extensible for future operations like 'wait', 'delete')
 KUBECTL_OPERATIONS = {"apply"}
+
+# Supported wait-step condition types. The first is `arm-tag` (poll an Azure
+# tag on an ARM resource). The dispatch shape accommodates future condition
+# types (e.g. arm-resource-property, kubectl-resource-ready) without a manifest
+# contract change.
+VALID_WAIT_CONDITION_TYPES = {"arm-tag"}
 
 
 class NoTargetingError(ValueError):
@@ -657,8 +664,122 @@ class KubectlStep:
             )
 
 
+@dataclass(frozen=True)
+class ArmTagCondition:
+    """Wait condition that polls a tag on an ARM resource.
+
+    The condition is satisfied when the resource's `tag_key` tag reaches
+    `expected_value`. When `failure_pattern` is set, a tag value matching that
+    glob aborts the wait immediately instead of waiting for the timeout.
+
+    This is pure data. The executor owns evaluation (running `az` and
+    classifying the result), so the model layer stays free of Azure CLI
+    coupling and a future condition type plugs in without changing this class.
+
+    Attributes:
+        type: Condition discriminator. Always `arm-tag` for this class.
+        resource_id: Full ARM resource ID whose tags are polled. Supports
+            template variables and step-output references, resolved per site.
+        tag_key: Name of the tag to read.
+        expected_value: Tag value that satisfies the wait. Azure tag values are
+            strings, so this is compared as a string.
+        failure_pattern: Optional fnmatch glob. A tag value matching it aborts
+            the wait fast. Omit for a plain wait-until-expected-or-timeout.
+    """
+
+    type: str
+    resource_id: str
+    tag_key: str
+    expected_value: str
+    failure_pattern: str | None = None
+
+    def __post_init__(self) -> None:
+        for field_name, value in (
+            ("resourceId", self.resource_id),
+            ("tagKey", self.tag_key),
+            ("expectedValue", self.expected_value),
+        ):
+            if not value or not str(value).strip():
+                raise ValueError(f"arm-tag condition requires a non-empty '{field_name}'")
+
+        # A failure glob that also matches the success value would classify a
+        # satisfied wait as failed. Catch the authoring error at parse time.
+        if self.failure_pattern and fnmatchcase(str(self.expected_value), self.failure_pattern):
+            raise ValueError(
+                f"arm-tag condition expectedValue '{self.expected_value}' also matches "
+                f"failurePattern '{self.failure_pattern}'. The success value must not match the "
+                f"failure glob."
+            )
+
+
+# Union type for wait conditions. One concrete type today; the dispatch shape
+# accommodates future types without a manifest contract change.
+WaitCondition = ArmTagCondition
+
+
+@dataclass
+class WaitStep:
+    """A wait step that gates downstream steps on an Azure condition.
+
+    Blocks the per-site step sequence until `condition` is satisfied, polling
+    every `poll_interval_seconds` up to `timeout_minutes`. A gate produces no
+    outputs. A timeout or a terminal failure fails the step, which skips the
+    site's remaining steps (the standard step-failure behavior).
+
+    Attributes:
+        name: Unique name for the step.
+        condition: The wait condition (currently ArmTagCondition).
+        timeout_minutes: Maximum minutes to wait before failing the step.
+        poll_interval_seconds: Seconds between condition checks.
+        when: Optional condition expression (same syntax as other steps).
+
+    Example manifest usage:
+        ```yaml
+        - name: wait-for-bootstrap
+          type: wait
+          condition:
+            type: arm-tag
+            resourceId: "/subscriptions/{{ site.subscription }}/resourceGroups/{{ site.resourceGroup }}/providers/Microsoft.HybridCompute/machines/{{ site.parameters.aksee.machineName }}"
+            tagKey: "siteops.bootstrap.state"
+            expectedValue: "succeeded"
+            failurePattern: "failed-*"
+          timeoutMinutes: 45
+          pollIntervalSeconds: 30
+        ```
+    """
+
+    name: str
+    condition: WaitCondition
+    timeout_minutes: int = 30
+    poll_interval_seconds: int = 30
+    when: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.timeout_minutes <= 0:
+            raise ValueError(
+                f"WaitStep '{self.name}' timeoutMinutes must be positive, got {self.timeout_minutes}"
+            )
+        if self.poll_interval_seconds <= 0:
+            raise ValueError(
+                f"WaitStep '{self.name}' pollIntervalSeconds must be positive, got {self.poll_interval_seconds}"
+            )
+        if self.poll_interval_seconds > self.timeout_minutes * 60:
+            raise ValueError(
+                f"WaitStep '{self.name}' pollIntervalSeconds ({self.poll_interval_seconds}) exceeds "
+                f"timeoutMinutes ({self.timeout_minutes} = {self.timeout_minutes * 60}s). The condition "
+                f"would be checked only once."
+            )
+
+        if self.when and not CONDITION_PATTERN.fullmatch(self.when.strip()):
+            raise ValueError(
+                f"Invalid 'when' condition syntax: {self.when}. "
+                "Expected: {{ site.labels.X == 'value' }}, {{ site.properties.path == true }}, "
+                "or {{ site.properties.path }} (truthy check)"
+            )
+
+
 # Union type for manifest steps - allows type checking to distinguish step types
-ManifestStep = DeploymentStep | KubectlStep
+ManifestStep = DeploymentStep | KubectlStep | WaitStep
 
 
 @dataclass
@@ -996,6 +1117,9 @@ def _parse_inline_step(step_data: dict[str, Any], source_path: Path, index: int)
             when=step_data.get("when"),
         )
 
+    if step_type == "wait":
+        return _parse_wait_step(step_data, source_path)
+
     if "template" not in step_data:
         raise ValueError(f"Step '{step_data['name']}' missing 'template' in manifest: {source_path}")
     return DeploymentStep(
@@ -1004,6 +1128,75 @@ def _parse_inline_step(step_data: dict[str, Any], source_path: Path, index: int)
         parameters=step_data.get("parameters", []),
         scope=step_data.get("scope", "resourceGroup"),
         when=step_data.get("when"),
+    )
+
+
+def _coerce_step_int(value: Any, field_name: str, step_name: str, source_path: Path) -> int:
+    """Coerce a manifest numeric field to int with a clear error on failure."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"Step '{step_name}' (type: wait) field '{field_name}' must be an integer, got {value!r} "
+            f"in manifest: {source_path}"
+        )
+
+
+def _parse_wait_step(step_data: dict[str, Any], source_path: Path) -> "WaitStep":
+    """Parse a `type: wait` step into a WaitStep with its condition.
+
+    Dispatches on `condition.type`. Unknown condition types fail here so the
+    error surfaces at manifest-load time rather than at deploy time.
+    """
+    name = step_data["name"]
+    condition_data = step_data.get("condition")
+    if not isinstance(condition_data, dict):
+        raise ValueError(
+            f"Step '{name}' (type: wait) requires a 'condition' mapping in manifest: {source_path}"
+        )
+
+    condition_type = condition_data.get("type")
+    if not condition_type:
+        raise ValueError(
+            f"Step '{name}' (type: wait) condition requires a 'type' field in manifest: {source_path}"
+        )
+    if condition_type not in VALID_WAIT_CONDITION_TYPES:
+        raise ValueError(
+            f"Step '{name}' (type: wait) has unknown condition type '{condition_type}'. "
+            f"Supported: {', '.join(sorted(VALID_WAIT_CONDITION_TYPES))} (manifest: {source_path})"
+        )
+
+    condition = _parse_arm_tag_condition(name, condition_data, source_path)
+    return WaitStep(
+        name=name,
+        condition=condition,
+        timeout_minutes=_coerce_step_int(
+            step_data.get("timeoutMinutes", 30), "timeoutMinutes", name, source_path
+        ),
+        poll_interval_seconds=_coerce_step_int(
+            step_data.get("pollIntervalSeconds", 30), "pollIntervalSeconds", name, source_path
+        ),
+        when=step_data.get("when"),
+    )
+
+
+def _parse_arm_tag_condition(step_name: str, condition_data: dict[str, Any], source_path: Path) -> "ArmTagCondition":
+    """Parse the body of an arm-tag wait condition."""
+    for required in ("resourceId", "tagKey", "expectedValue"):
+        if required not in condition_data:
+            raise ValueError(
+                f"Step '{step_name}' arm-tag condition missing '{required}' in manifest: {source_path}"
+            )
+
+    failure_pattern = condition_data.get("failurePattern")
+    return ArmTagCondition(
+        type="arm-tag",
+        resource_id=condition_data["resourceId"],
+        tag_key=condition_data["tagKey"],
+        # Azure tag values are strings. YAML may parse `expectedValue: true` to a
+        # bool, so coerce to str for a consistent comparison.
+        expected_value=str(condition_data["expectedValue"]),
+        failure_pattern=str(failure_pattern) if failure_pattern is not None else None,
     )
 
 

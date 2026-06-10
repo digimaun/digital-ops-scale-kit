@@ -67,6 +67,9 @@ param spPassword string
 @description('URL of the AKS Edge Essentials MSI to install. Default points at the official Microsoft latest-K3s aka.ms shortcut, which currently resolves to 1.12.269.0 / K3s 1.33.5. Override with a version-pinned URL only if you have a stable hosting URL you control. Microsoft does NOT publish stable per-version aka.ms links; the version path that appears in GitHub release notes is not a real download URL.')
 param aksEdgeMsiUrl string = 'https://aka.ms/aks-edge/k3s-msi'
 
+@description('When true, Phase 3 enables the OIDC issuer and workload identity on the Arc-connected cluster and patches the K3s apiserver `service-account-issuer`. Required only when downstream AIO components use workload-identity-backed secret sync. Defaults to false.')
+param enableWorkloadIdentity bool = false
+
 @description('Timeout for the runCommand in seconds. The launcher itself returns within ~30s after registering the Scheduled Task. The actual bootstrap runs asynchronously inside the task. 600s (10 min) covers worst-case slow file IO during launcher init without leaving ARM blocked unnecessarily.')
 param runCommandTimeoutSeconds int = 600
 
@@ -110,6 +113,10 @@ resource bootstrapCommand 'Microsoft.HybridCompute/machines/runCommands@2024-11-
       { name: 'CustomLocationsOid', value: customLocationsOid }
       { name: 'SpAppId',            value: spAppId }
       { name: 'AksEdgeMsiUrl',      value: aksEdgeMsiUrl }
+      // The launcher param is [string]; string() yields 'true'/'false',
+      // which the launcher parses case-insensitively. A bool value here
+      // would be rejected by the runCommand's string-typed parameter.
+      { name: 'EnableWorkloadIdentity', value: string(enableWorkloadIdentity) }
     ]
     protectedParameters: [
       // Azure encrypts these in transit and excludes them from any output

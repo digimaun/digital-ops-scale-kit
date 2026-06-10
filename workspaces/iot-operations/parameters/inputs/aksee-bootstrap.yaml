@@ -18,3 +18,7 @@ spPassword:         "{{ site.parameters.aksee.spPassword }}"
 # Cluster + custom-location region. Tracks site.location to match AIO resources.
 targetLocation:     "{{ site.location }}"
 
+# OIDC issuer + workload identity (Phase 3). Bool from base-site deployOptions
+# (default false), same pattern as enableCertManager.
+enableWorkloadIdentity: "{{ site.properties.deployOptions.enableWorkloadIdentity }}"
+

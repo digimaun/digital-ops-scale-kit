@@ -13,7 +13,7 @@ param(
 [string]$ConfigDir         = 'C:\ProgramData\siteops\aksee-bootstrap',
 [string]$ScheduledTaskName = 'SiteOpsAksEeBootstrap',
 [string]$LocalAdminUser    = 'siteops-bootstrap',
-[switch]$EnableWorkloadIdentity,
+[string]$EnableWorkloadIdentity = 'false',
 [switch]$Force
 )
 Set-StrictMode -Version Latest
@@ -252,19 +252,32 @@ $issuerUrl = $null
 if ($obj.PSObject.Properties.Name -contains 'oidcIssuerProfile' -and $null -ne $obj.oidcIssuerProfile) {
 $issuerUrl = $obj.oidcIssuerProfile.issuerUrl
 }
-Write-Log "Arc cluster status: connectivity=$connStatus issuerUrl=$(if ($issuerUrl) { 'present' } else { '(none)' })"
+$agentState = $null
+if ($obj.PSObject.Properties.Name -contains 'arcAgentProfile' -and $null -ne $obj.arcAgentProfile) {
+$agentState = $obj.arcAgentProfile.agentState
+}
+$wiEnabled = $false
+if ($obj.PSObject.Properties.Name -contains 'securityProfile' -and $null -ne $obj.securityProfile -and
+$obj.securityProfile.PSObject.Properties.Name -contains 'workloadIdentity' -and $null -ne $obj.securityProfile.workloadIdentity) {
+$wiEnabled = [bool]$obj.securityProfile.workloadIdentity.enabled
+}
+if ($WaitForIssuerUrl) {
+Write-Log "Arc cluster status: connectivity=$connStatus agentState=$agentState issuerUrl=$(if ($issuerUrl) { 'present' } else { '(none)' }) wiEnabled=$wiEnabled"
+} else {
+Write-Log "Arc cluster status: connectivity=$connStatus"
+}
 if ($connStatus -eq 'Connected') {
 if (-not $WaitForIssuerUrl) {
 return
 }
-if (-not [string]::IsNullOrEmpty($issuerUrl)) {
+if ((-not [string]::IsNullOrEmpty($issuerUrl)) -and $agentState -eq 'Succeeded' -and $wiEnabled) {
 return $issuerUrl
 }
 }
 }
 Start-Sleep -Seconds $RetrySeconds
 }
-throw "Cluster $ClusterName did not reach $(if ($WaitForIssuerUrl) { 'connected + OIDC-issuer-provisioned' } else { 'connected' }) status within $($MaxRetries * $RetrySeconds)s"
+throw "Cluster $ClusterName did not reach $(if ($WaitForIssuerUrl) { 'connected + OIDC-issuer-provisioned + workload-identity-enabled' } else { 'connected' }) status within $($MaxRetries * $RetrySeconds)s"
 }
 function Patch-K3sApiServer {
 param([string]$IssuerUrl)
@@ -535,9 +548,6 @@ $connectArgs = @(
 '--distribution', 'aks_edge_k3s',
 '--only-show-errors'
 )
-if ($enableWi) {
-$connectArgs += @('--enable-oidc-issuer', '--enable-workload-identity')
-}
 Write-Log "Running az connectedk8s connect $cluster (5-10 minutes)"
 $connectOut = & az connectedk8s connect @connectArgs 2>&1
 if ($LASTEXITCODE -ne 0) {
@@ -545,21 +555,21 @@ throw "az connectedk8s connect failed for ${cluster}: $connectOut"
 }
 }
 if ($enableWi) {
+Write-Log 'Enabling OIDC issuer + workload identity (az connectedk8s update)'
+$wiUpdateOut = & az connectedk8s update -g $rg -n $cluster --enable-oidc-issuer --enable-workload-identity --only-show-errors 2>&1
+if ($LASTEXITCODE -ne 0) {
+throw "az connectedk8s update --enable-oidc-issuer failed for ${cluster}: $wiUpdateOut"
+}
 Write-Log 'Waiting for Arc to provision the OIDC issuer URL'
 $issuerUrl = Wait-ArcClusterReady -ClusterName $cluster -ResourceGroup $rg -WaitForIssuerUrl
 Write-Log "OIDC issuer URL: $issuerUrl"
 Patch-K3sApiServer -IssuerUrl $issuerUrl
 Wait-K3sApiServerReady
-Write-Log 'Restarting Arc agents to pick up the new OIDC issuer'
+Write-Log 'Restarting azure-arc deployments to pick up the new issuer'
 & kubectl -n azure-arc rollout restart deployment | Out-Null
-if ($LASTEXITCODE -ne 0) {
-Write-Log 'WARNING: kubectl rollout restart returned non-zero. Check azure-arc deployments manually.'
-}
-Write-Log 'Waiting for azure-arc rollout to complete'
+if ($LASTEXITCODE -ne 0) { Write-Log 'WARNING: rollout restart (azure-arc) returned non-zero.' }
 & kubectl -n azure-arc rollout status deployment --timeout=300s | Out-Null
-if ($LASTEXITCODE -ne 0) {
-Write-Log 'WARNING: kubectl rollout status returned non-zero. Some azure-arc deployments did not roll out within 300s. Subsequent enable-features may race the rollout.'
-}
+if ($LASTEXITCODE -ne 0) { Write-Log 'WARNING: rollout status (azure-arc) did not complete in 300s.' }
 } else {
 Write-Log 'Workload identity not requested. Verifying basic Arc connection only.'
 Wait-ArcClusterReady -ClusterName $cluster -ResourceGroup $rg
@@ -779,11 +789,11 @@ spPasswordEncrypted    = (-not $useMi)
 aksEdgeMsiUrl          = $AksEdgeMsiUrl
 scheduledTaskName      = $ScheduledTaskName
 localAdminUser         = $LocalAdminUser
-enableWorkloadIdentity = [bool]$EnableWorkloadIdentity
+enableWorkloadIdentity = ($EnableWorkloadIdentity -ieq 'true')
 }
 $config | ConvertTo-Json | Set-Content -Path $configPath -Encoding UTF8
 $authNote = if ($useMi) { 'managed identity' } else { 'SP password encrypted via DPAPI LocalMachine' }
-Write-Log "Wrote $configPath (auth=$authNote, WI=$([bool]$EnableWorkloadIdentity))"
+Write-Log "Wrote $configPath (auth=$authNote, WI=$($EnableWorkloadIdentity -ieq 'true'))"
 $initialState = [pscustomobject]@{
 phase       = 0
 status      = 'running'

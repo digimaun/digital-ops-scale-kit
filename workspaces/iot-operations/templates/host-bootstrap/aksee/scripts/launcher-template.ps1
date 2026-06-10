@@ -128,11 +128,11 @@ param(
     [string]$ConfigDir         = 'C:\ProgramData\siteops\aksee-bootstrap',
     [string]$ScheduledTaskName = 'SiteOpsAksEeBootstrap',
     [string]$LocalAdminUser    = 'siteops-bootstrap',
-    # Off by default to match the user's validated AIO baseline. Set
-    # $true when downstream AIO needs workload-identity-backed secret
-    # sync. Turning this on activates the riskiest Phase 3 path
-    # (apiserver patch via sed + Invoke-AksEdgeNodeCommand + k3s restart).
-    [switch]$EnableWorkloadIdentity,
+    # Off by default to match the validated AIO baseline. Set 'true' when
+    # downstream AIO needs workload-identity-backed secret sync. A string,
+    # not a switch: the Arc Run Command delivers parameters as strings, and
+    # a [bool]/[switch] would reject the 'false' the runCommand passes.
+    [string]$EnableWorkloadIdentity = 'false',
     # Refuse to re-init when state.json shows an in-flight bootstrap.
     # Pass -Force to reset state to phase=0 and re-register the task
     # (destroys progress of any concurrent run).
@@ -385,11 +385,11 @@ $config = [pscustomobject]@{
     aksEdgeMsiUrl          = $AksEdgeMsiUrl
     scheduledTaskName      = $ScheduledTaskName
     localAdminUser         = $LocalAdminUser
-    enableWorkloadIdentity = [bool]$EnableWorkloadIdentity
+    enableWorkloadIdentity = ($EnableWorkloadIdentity -ieq 'true')
 }
 $config | ConvertTo-Json | Set-Content -Path $configPath -Encoding UTF8
 $authNote = if ($useMi) { 'managed identity' } else { 'SP password encrypted via DPAPI LocalMachine' }
-Write-Log "Wrote $configPath (auth=$authNote, WI=$([bool]$EnableWorkloadIdentity))"
+Write-Log "Wrote $configPath (auth=$authNote, WI=$($EnableWorkloadIdentity -ieq 'true'))"
 
 $initialState = [pscustomobject]@{
     phase       = 0

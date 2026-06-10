@@ -283,9 +283,9 @@ az tag list --resource-id "/subscriptions/<sub>/resourceGroups/<rg>/providers/Mi
 
 | Flag | Default | Effect |
 |---|---|---|
-| `enableWorkloadIdentity` | false | When true, Phase 3 enables OIDC issuer + workload identity on the Arc connection and patches the K3s apiserver `service-account-issuer`. Required when downstream AIO components use workload-identity-backed secret sync. |
+| `enableWorkloadIdentity` | false | When true, Phase 3 enables the OIDC issuer and workload identity on the Arc connection and patches the K3s apiserver `service-account-issuer`. Required when downstream AIO components use workload-identity-backed secret sync. |
 
-This flag is not exposed via the Bicep parameter surface. Advanced operators enable it by invoking the launcher directly with `-EnableWorkloadIdentity` (see [Run directly](#run-directly-advanced) below).
+Set it per site via `deployOptions.enableWorkloadIdentity: true` (paired with `enableSecretSync`). For direct launcher invocation, pass `-EnableWorkloadIdentity true`.
 
 ## Secret handling
 

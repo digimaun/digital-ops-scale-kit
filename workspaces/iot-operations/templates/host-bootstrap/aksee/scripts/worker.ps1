@@ -262,10 +262,10 @@ function Test-ClusterArcConnected {
 
 function Wait-ArcClusterReady {
     # Poll the connectedk8s resource until connectivityStatus is Connected.
-    # When -WaitForIssuerUrl is set, also block until
-    # oidcIssuerProfile.issuerUrl is populated (the actual precondition
-    # for Patch-K3sApiServer). The official quickstart uses a 10-minute
-    # cap; we match that to tolerate slow infra.
+    # When -WaitForIssuerUrl is set, also require oidcIssuerProfile.issuerUrl,
+    # arcAgentProfile.agentState=Succeeded, and workload identity enabled.
+    # The issuer URL can appear before the agents finish rolling out, so
+    # gating on all three keeps the apiserver patch from racing the rollout.
     param(
         [string]$ClusterName,
         [string]$ResourceGroup,
@@ -283,19 +283,35 @@ function Wait-ArcClusterReady {
             if ($obj.PSObject.Properties.Name -contains 'oidcIssuerProfile' -and $null -ne $obj.oidcIssuerProfile) {
                 $issuerUrl = $obj.oidcIssuerProfile.issuerUrl
             }
-            Write-Log "Arc cluster status: connectivity=$connStatus issuerUrl=$(if ($issuerUrl) { 'present' } else { '(none)' })"
+            # StrictMode-safe reads: arcAgentProfile.agentState and
+            # securityProfile.workloadIdentity.enabled may be absent on a
+            # response taken before reconciliation, so guard every hop.
+            $agentState = $null
+            if ($obj.PSObject.Properties.Name -contains 'arcAgentProfile' -and $null -ne $obj.arcAgentProfile) {
+                $agentState = $obj.arcAgentProfile.agentState
+            }
+            $wiEnabled = $false
+            if ($obj.PSObject.Properties.Name -contains 'securityProfile' -and $null -ne $obj.securityProfile -and
+                $obj.securityProfile.PSObject.Properties.Name -contains 'workloadIdentity' -and $null -ne $obj.securityProfile.workloadIdentity) {
+                $wiEnabled = [bool]$obj.securityProfile.workloadIdentity.enabled
+            }
+            if ($WaitForIssuerUrl) {
+                Write-Log "Arc cluster status: connectivity=$connStatus agentState=$agentState issuerUrl=$(if ($issuerUrl) { 'present' } else { '(none)' }) wiEnabled=$wiEnabled"
+            } else {
+                Write-Log "Arc cluster status: connectivity=$connStatus"
+            }
             if ($connStatus -eq 'Connected') {
                 if (-not $WaitForIssuerUrl) {
                     return
                 }
-                if (-not [string]::IsNullOrEmpty($issuerUrl)) {
+                if ((-not [string]::IsNullOrEmpty($issuerUrl)) -and $agentState -eq 'Succeeded' -and $wiEnabled) {
                     return $issuerUrl
                 }
             }
         }
         Start-Sleep -Seconds $RetrySeconds
     }
-    throw "Cluster $ClusterName did not reach $(if ($WaitForIssuerUrl) { 'connected + OIDC-issuer-provisioned' } else { 'connected' }) status within $($MaxRetries * $RetrySeconds)s"
+    throw "Cluster $ClusterName did not reach $(if ($WaitForIssuerUrl) { 'connected + OIDC-issuer-provisioned + workload-identity-enabled' } else { 'connected' }) status within $($MaxRetries * $RetrySeconds)s"
 }
 
 function Patch-K3sApiServer {
@@ -665,13 +681,10 @@ function Invoke-Phase3 {
     $oid     = $config.customLocationsOid
     $appId   = $config.spAppId
 
-    # Workload identity + OIDC issuer + apiserver patch are only required
-    # when downstream AIO components need workload-identity-federated
-    # secret sync (config.enableSecretSync=true in scalekit). The user's
-    # validated baseline runs without secret-sync, so default WI=false
-    # to keep the riskiest code path opt-in. Set
-    # `enableWorkloadIdentity: true` in config.json to turn on the full
-    # AIO-secret-sync-ready path.
+    # Workload identity + OIDC issuer are only needed when downstream AIO
+    # uses workload-identity-backed secret sync. Default false keeps the
+    # riskiest path opt-in. Set enableWorkloadIdentity true in config.json
+    # to enable it.
     $enableWi = ($config.PSObject.Properties.Name -contains 'enableWorkloadIdentity') -and $config.enableWorkloadIdentity
     Write-Log "Workload identity + OIDC issuer requested: $enableWi"
 
@@ -745,10 +758,10 @@ function Invoke-Phase3 {
         $aksEdgeVersion = (Get-Module -Name AksEdge).Version.ToString()
         $tags = @('SKU=AKSEdgeEssentials', "AKSEEVersion=$aksEdgeVersion", 'ManagedBy=siteops-bootstrap')
 
-        # --distribution aks_edge_k3s tells Arc the cluster type so it
-        # serves the right config. --disable-auto-upgrade mirrors the
-        # official quickstart to keep agent versions predictable. WI +
-        # OIDC issuer flags are added only when enableWi requested it.
+        # --distribution aks_edge_k3s tells Arc the cluster type. WLIF + OIDC
+        # issuer are NOT enabled here. Phase 2 already plain-connected the
+        # cluster, so this block is skipped on the standard path. WLIF
+        # enablement is centralized in the `az connectedk8s update` below.
         $connectArgs = @(
             '-g', $rg,
             '-n', $cluster,
@@ -760,9 +773,6 @@ function Invoke-Phase3 {
             '--distribution', 'aks_edge_k3s',
             '--only-show-errors'
         )
-        if ($enableWi) {
-            $connectArgs += @('--enable-oidc-issuer', '--enable-workload-identity')
-        }
 
         Write-Log "Running az connectedk8s connect $cluster (5-10 minutes)"
         $connectOut = & az connectedk8s connect @connectArgs 2>&1
@@ -772,10 +782,21 @@ function Invoke-Phase3 {
     }
 
     if ($enableWi) {
+        # Phase 2 plain-connected the cluster and the check above skips the
+        # connect, so enable the issuer + WLIF on the existing connection.
+        # --enable-workload-identity installs the in-cluster webhook, so it
+        # needs the routable kubeconfig set above. Idempotent on repeat.
+        Write-Log 'Enabling OIDC issuer + workload identity (az connectedk8s update)'
+        $wiUpdateOut = & az connectedk8s update -g $rg -n $cluster --enable-oidc-issuer --enable-workload-identity --only-show-errors 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "az connectedk8s update --enable-oidc-issuer failed for ${cluster}: $wiUpdateOut"
+        }
+
         # Wait for Arc to provision the workload-identity agent AND
         # populate oidcIssuerProfile.issuerUrl. Issuer URL is the actual
         # precondition for Patch-K3sApiServer, so wait on that signal
-        # rather than the looser connectivityStatus.
+        # (plus agentState + wiEnabled) rather than the looser
+        # connectivityStatus.
         Write-Log 'Waiting for Arc to provision the OIDC issuer URL'
         $issuerUrl = Wait-ArcClusterReady -ClusterName $cluster -ResourceGroup $rg -WaitForIssuerUrl
         Write-Log "OIDC issuer URL: $issuerUrl"
@@ -783,22 +804,14 @@ function Invoke-Phase3 {
         Patch-K3sApiServer -IssuerUrl $issuerUrl
         Wait-K3sApiServerReady
 
-        # Restart Arc agents so they re-handshake with the patched apiserver.
-        Write-Log 'Restarting Arc agents to pick up the new OIDC issuer'
+        # Restart the Arc agents so they re-handshake with the patched
+        # apiserver. Matches the official AKS EE quickstart. Non-fatal on
+        # timeout: a partial rollout is logged, not thrown.
+        Write-Log 'Restarting azure-arc deployments to pick up the new issuer'
         & kubectl -n azure-arc rollout restart deployment | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            Write-Log 'WARNING: kubectl rollout restart returned non-zero. Check azure-arc deployments manually.'
-        }
-        # Wait for the restart to finish so subsequent az calls (which
-        # may need the Arc agents reachable) do not race the rollout.
-        Write-Log 'Waiting for azure-arc rollout to complete'
+        if ($LASTEXITCODE -ne 0) { Write-Log 'WARNING: rollout restart (azure-arc) returned non-zero.' }
         & kubectl -n azure-arc rollout status deployment --timeout=300s | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            # Non-fatal: subsequent enable-features may still succeed if a
-            # subset of agents rolled out. Log loudly so any subsequent
-            # failure can be correlated to this incomplete rollout.
-            Write-Log 'WARNING: kubectl rollout status returned non-zero. Some azure-arc deployments did not roll out within 300s. Subsequent enable-features may race the rollout.'
-        }
+        if ($LASTEXITCODE -ne 0) { Write-Log 'WARNING: rollout status (azure-arc) did not complete in 300s.' }
     } else {
         Write-Log 'Workload identity not requested. Verifying basic Arc connection only.'
         Wait-ArcClusterReady -ClusterName $cluster -ResourceGroup $rg

@@ -15,7 +15,7 @@
   "spAppId": "00000000-0000-0000-0000-000000000000",
   "spPassword": "REPLACE-ME",
 
-  "_enableWorkloadIdentityNote": "Default false matches the user's validated AIO baseline (enableSecretSync=false in scalekit). Set true when downstream AIO components need workload-identity-backed secret sync; this activates Phase 3's OIDC issuer enablement + K3s apiserver patch + Arc agent restart.",
+  "_enableWorkloadIdentityNote": "Default false matches the validated AIO baseline. Set true when downstream AIO components need workload-identity-backed secret sync. Activates Phase 3 OIDC issuer enablement, K3s apiserver patch, and Arc agent restart.",
   "enableWorkloadIdentity": false,
 
   "_scheduledTaskNameNote": "Optional. Defaults to SiteOpsAksEeBootstrap when omitted. Set explicitly if you run multiple bootstraps in parallel on the same host (unusual).",

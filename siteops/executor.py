@@ -1022,6 +1022,14 @@ class AzCliExecutor:
             proceed, early_result = self._submit_deployment(
                 submit_args, deployment_name, step_name, site_name
             )
+            # ARM holds the parameters inline in the submit PUT now, and the
+            # poll uses `show` (no params file), so delete it here rather than
+            # holding it for the full poll deadline. The finally is a backstop.
+            if parameters:
+                try:
+                    params_path.unlink(missing_ok=True)
+                except OSError as e:
+                    logger.debug(f"Failed to remove params file {params_path}: {e}")
             if not proceed:
                 return early_result
 

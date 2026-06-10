@@ -197,6 +197,10 @@ Get-WinEvent -LogName 'Microsoft-Windows-TaskScheduler/Operational' -MaxEvents 5
     Where-Object { $_.Message -like '*SiteOpsAksEeBootstrap*' }
 ```
 
+### Re-apply against an already-bootstrapped host
+
+Re-running the bootstrap against a host that already finished is a safe no-op. The launcher sees `state.json` at `status=succeeded`, leaves the cluster, scheduled task, and bootstrap user untouched, and returns `ALREADY-BOOTSTRAPPED`. In a composition the wait step then passes immediately on the existing `succeeded` tag. Pass `-Force` to the launcher (or use the clean-restart block below) to re-bootstrap from scratch.
+
 ### Re-run a failed phase (keeps existing task and user)
 
 Use when a transient failure hit a single phase (network blip, az CLI download timeout) and you want to retry the same phase without re-running the launcher.

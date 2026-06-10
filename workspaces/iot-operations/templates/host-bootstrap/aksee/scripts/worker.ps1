@@ -124,9 +124,20 @@ function Test-AksEdgeModuleInstalled {
 function Test-AksEdgeDeployed {
     # Cluster is up when the kubeconfig exists and kubectl can reach the
     # API server. Module-only check is unreliable across AKS EE versions
-    # because cmdlet names for deployment-info vary.
+    # because cmdlet names for deployment-info vary. Try the per-user
+    # kubeconfig first, then fall back to the shared copy Phase 2 writes
+    # under the config dir (which Phase 99 preserves). The fallback lets a
+    # -Force re-run detect an existing cluster even though Phase 99 removed
+    # the bootstrap user and its profile kubeconfig.
     $kubeconfig = Join-Path $env:USERPROFILE '.kube\config'
-    if (-not (Test-Path $kubeconfig)) { return $false }
+    if (-not (Test-Path $kubeconfig)) {
+        $sharedKubeconfig = Join-Path $ConfigDir 'kubeconfig'
+        if (Test-Path $sharedKubeconfig) {
+            $kubeconfig = $sharedKubeconfig
+        } else {
+            return $false
+        }
+    }
     if (-not (Get-Command kubectl -ErrorAction SilentlyContinue)) { return $false }
     try {
         $null = & kubectl --kubeconfig=$kubeconfig get nodes --request-timeout=5s 2>&1

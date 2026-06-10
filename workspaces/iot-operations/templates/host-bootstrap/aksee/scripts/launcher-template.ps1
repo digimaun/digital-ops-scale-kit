@@ -314,19 +314,26 @@ $templatePath = Join-Path $ConfigDir 'aksedge-config.template.json'
 $configPath   = Join-Path $ConfigDir 'config.json'
 $statePath    = Join-Path $ConfigDir 'state.json'
 
-# Re-init guard. If a previous bootstrap is in flight, refuse to reset
-# state and re-register the task. -Force overrides (destroys in-flight
-# progress, which is sometimes the intent during dev iteration).
+# Re-init guard. Inspect any existing state.json before resetting state and
+# re-registering the task. A bootstrap that is in flight must not be clobbered,
+# and one that already succeeded must not be re-run (re-running would reset to
+# phase 0, and Phase 99 already removed the bootstrap user, so Phase 2 would
+# collide with the existing cluster and flip the state tag to failed). -Force
+# overrides both, destroying any prior state for a deliberate re-bootstrap.
 if ((Test-Path $statePath) -and -not $Force) {
     $inFlight = $false
+    $alreadyDone = $false
     $existingPhase = $null
     $existingStatus = $null
     try {
         $existing = Get-Content -Raw -Path $statePath | ConvertFrom-Json
-        if (($existing.PSObject.Properties.Name -contains 'status') -and
-            ($existing.status -in @('running', 'pending-reboot'))) {
-            $inFlight = $true
+        if ($existing.PSObject.Properties.Name -contains 'status') {
             $existingStatus = $existing.status
+            if ($existing.status -in @('running', 'pending-reboot')) {
+                $inFlight = $true
+            } elseif ($existing.status -eq 'succeeded') {
+                $alreadyDone = $true
+            }
             if ($existing.PSObject.Properties.Name -contains 'phase') {
                 $existingPhase = $existing.phase
             }
@@ -337,6 +344,15 @@ if ((Test-Path $statePath) -and -not $Force) {
     }
     if ($inFlight) {
         throw "Bootstrap already in flight (state.json shows phase=$existingPhase status=$existingStatus). Pass -Force to reset state and re-register the task, or wait for the existing run to complete."
+    }
+    if ($alreadyDone) {
+        # Idempotent re-apply. The cluster is already bootstrapped and the
+        # state tag already reads succeeded, so the composition wait step
+        # passes without any work here. Leave state, the task, and the user
+        # untouched. -Force re-bootstraps from scratch.
+        Write-Log "Bootstrap already completed (state.json shows phase=$existingPhase status=succeeded). Nothing to do. Pass -Force to re-bootstrap from scratch."
+        Write-Output 'ALREADY-BOOTSTRAPPED'
+        return
     }
 }
 

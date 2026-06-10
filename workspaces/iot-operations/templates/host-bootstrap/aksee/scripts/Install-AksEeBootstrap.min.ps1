@@ -1,4 +1,4 @@
-# Generated minified launcher. Edit Build-Launcher.ps1 sources, not this file.
+﻿# Generated minified launcher. Edit Build-Launcher.ps1 sources, not this file.
 [CmdletBinding()]
 param(
 [Parameter(Mandatory)] [string]$ClusterName,
@@ -143,7 +143,14 @@ return $null -ne (Get-Module -ListAvailable -Name AksEdge)
 }
 function Test-AksEdgeDeployed {
 $kubeconfig = Join-Path $env:USERPROFILE '.kube\config'
-if (-not (Test-Path $kubeconfig)) { return $false }
+if (-not (Test-Path $kubeconfig)) {
+$sharedKubeconfig = Join-Path $ConfigDir 'kubeconfig'
+if (Test-Path $sharedKubeconfig) {
+$kubeconfig = $sharedKubeconfig
+} else {
+return $false
+}
+}
 if (-not (Get-Command kubectl -ErrorAction SilentlyContinue)) { return $false }
 try {
 $null = & kubectl --kubeconfig=$kubeconfig get nodes --request-timeout=5s 2>&1
@@ -718,14 +725,18 @@ $configPath   = Join-Path $ConfigDir 'config.json'
 $statePath    = Join-Path $ConfigDir 'state.json'
 if ((Test-Path $statePath) -and -not $Force) {
 $inFlight = $false
+$alreadyDone = $false
 $existingPhase = $null
 $existingStatus = $null
 try {
 $existing = Get-Content -Raw -Path $statePath | ConvertFrom-Json
-if (($existing.PSObject.Properties.Name -contains 'status') -and
-($existing.status -in @('running', 'pending-reboot'))) {
-$inFlight = $true
+if ($existing.PSObject.Properties.Name -contains 'status') {
 $existingStatus = $existing.status
+if ($existing.status -in @('running', 'pending-reboot')) {
+$inFlight = $true
+} elseif ($existing.status -eq 'succeeded') {
+$alreadyDone = $true
+}
 if ($existing.PSObject.Properties.Name -contains 'phase') {
 $existingPhase = $existing.phase
 }
@@ -735,6 +746,11 @@ Write-Log "WARNING: existing state.json could not be parsed. Re-initializing. ($
 }
 if ($inFlight) {
 throw "Bootstrap already in flight (state.json shows phase=$existingPhase status=$existingStatus). Pass -Force to reset state and re-register the task, or wait for the existing run to complete."
+}
+if ($alreadyDone) {
+Write-Log "Bootstrap already completed (state.json shows phase=$existingPhase status=succeeded). Nothing to do. Pass -Force to re-bootstrap from scratch."
+Write-Output 'ALREADY-BOOTSTRAPPED'
+return
 }
 }
 Set-Content -Path $workerPath   -Value $EmbeddedWorker   -Encoding UTF8

@@ -83,7 +83,7 @@ The launcher creates the user (or resets its password) and adds it to
 the local Administrators group.
 
 .EXAMPLE
-    # Standard happy path. SP creates the cluster (Phase 2); Phase 3
+    # Standard happy path. SP creates the cluster in Phase 2. Phase 3
     # operations use the Arc machine's managed identity by default.
     .\Install-AksEeBootstrap.ps1 `
         -ClusterName        aksee-cluster1 `
@@ -127,7 +127,7 @@ param(
     # to create the cluster in Phase 2, so both fields are part of the
     # standard happy path. Both can be omitted only when running against
     # an already-existing cluster (Phase 2 detects the cluster and skips
-    # the create; Phase 3 falls through to the machine's managed identity).
+    # the create, and Phase 3 falls through to the machine's managed identity).
     # The launcher enforces "both or neither" so the worker never sees a
     # half-populated config.
     [string]$SpAppId = '',
@@ -743,7 +743,7 @@ function Invoke-Phase1 {
         # aka.ms link redirects to a small HTML error page, which msiexec
         # then rejects with a cryptic exit 1620. Catch it here with a
         # clearer message. Two checks:
-        #   1. Size > 50MB (real AKS EE MSI is ~876MB; an HTML error blob
+        #   1. Size > 50MB (real AKS EE MSI is ~876MB, an HTML error blob
         #      is typically < 1MB).
         #   2. CFB/CDF magic bytes D0 CF 11 E0 (the file format MSI uses).
         $fileInfo = Get-Item $msiPath
@@ -796,7 +796,7 @@ function Invoke-Phase1 {
     # Treat $false from the cmdlet as a real failure (matches the
     # convention used by Azure/AKS-Edge wrapper callers). Coerce to a
     # single boolean since some module versions return pipeline output
-    # with multiple values; take the last element.
+    # with multiple values, so take the last element.
     $lastResult = @($result) | Select-Object -Last 1
     if ($lastResult -is [bool] -and -not $lastResult) {
         throw "Install-AksEdgeHostFeatures returned `$false. See AksEdge event logs and recent entries under C:\ProgramData\AksEdge for the host-feature install failure."
@@ -1339,7 +1339,7 @@ Write-Log "Bootstrapping cluster $ClusterName in $ResourceGroup ($Location)"
 #   2. Content-Type is NOT text/* (a wrong aka.ms link returns an HTML
 #      error page with Content-Type text/html, which would otherwise
 #      sail through to msiexec exit 1620).
-#   3. Content-Length is > 50MB (the real AKS EE MSI is ~876MB; an HTML
+#   3. Content-Length is > 50MB (the real AKS EE MSI is ~876MB, an HTML
 #      error blob is typically < 1MB).
 try {
     Write-Log "Pre-checking AKS EE MSI URL $AksEdgeMsiUrl"

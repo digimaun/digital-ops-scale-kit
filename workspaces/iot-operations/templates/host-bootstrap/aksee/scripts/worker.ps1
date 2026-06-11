@@ -467,7 +467,7 @@ function Invoke-Phase1 {
         # aka.ms link redirects to a small HTML error page, which msiexec
         # then rejects with a cryptic exit 1620. Catch it here with a
         # clearer message. Two checks:
-        #   1. Size > 50MB (real AKS EE MSI is ~876MB; an HTML error blob
+        #   1. Size > 50MB (real AKS EE MSI is ~876MB, an HTML error blob
         #      is typically < 1MB).
         #   2. CFB/CDF magic bytes D0 CF 11 E0 (the file format MSI uses).
         $fileInfo = Get-Item $msiPath
@@ -520,7 +520,7 @@ function Invoke-Phase1 {
     # Treat $false from the cmdlet as a real failure (matches the
     # convention used by Azure/AKS-Edge wrapper callers). Coerce to a
     # single boolean since some module versions return pipeline output
-    # with multiple values; take the last element.
+    # with multiple values, so take the last element.
     $lastResult = @($result) | Select-Object -Last 1
     if ($lastResult -is [bool] -and -not $lastResult) {
         throw "Install-AksEdgeHostFeatures returned `$false. See AksEdge event logs and recent entries under C:\ProgramData\AksEdge for the host-feature install failure."

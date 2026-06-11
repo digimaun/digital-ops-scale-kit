@@ -1,6 +1,6 @@
 # AKS Edge Essentials bootstrap scripts
 
-The PowerShell scripts the bootstrap delivers to the target Windows VM. The Bicep template at `../template.bicep` inlines the minified launcher via `loadTextContent`; the launcher embeds the worker and the AKS Edge config template as here-strings and registers a Scheduled Task that drives the worker through all phases.
+The PowerShell scripts the bootstrap delivers to the target Windows VM. The Bicep template at `../template.bicep` inlines the minified launcher via `loadTextContent`. The launcher embeds the worker and the AKS Edge config template as here-strings and registers a Scheduled Task that drives the worker through all phases.
 
 For operator usage (configure a site, deploy via siteops, monitor, verify, troubleshoot) see [`../README.md`](../README.md). This README covers the build workflow.
 
@@ -32,14 +32,14 @@ Generated Install-AksEeBootstrap.ps1 (<N> lines, parse OK)
 Generated Install-AksEeBootstrap.min.ps1 (<N> lines, <N> bytes, parse OK)
 ```
 
-The generator parse-checks both variants and exits non-zero on failure. The minified variant is what the Bicep delivers via Arc Run Command. The full variant is for operator-direct use on the VM. Do NOT hand-edit the generated files; they are overwritten on every build.
+The generator parse-checks both variants and exits non-zero on failure. The minified variant is what the Bicep delivers via Arc Run Command. The full variant is for operator-direct use on the VM. Do not hand-edit the generated files. They are overwritten on every build.
 
 ### Size constraints
 
-The minified launcher must fit under the empirical `Microsoft.HybridCompute/machines/runCommands` size boundary that the Bicep delivery hits. Microsoft does not document an explicit limit; in practice the resource provider returns HCRP413 once the script body exceeds roughly 38 KB raw (JSON encoding plus ARM envelope amplify the wire-size further). The generator warns at 36 KB to give early notice. If the minified launcher approaches the boundary, options are:
+The Bicep template inlines the minified launcher, so it must stay within the size limit for an Arc `runCommands` script body. The generator warns when the minified launcher grows large. If it approaches the limit, options are:
 
 1. Trim source comments and dead code.
-2. Switch to `scriptUri` delivery (SAS URL to a blob) which has no documented size limit. Adds a storage dependency.
+2. Switch to `scriptUri` delivery (a SAS URL to a blob), which the Arc run-command docs recommend for larger scripts and removes the inline-size limit. Adds a storage dependency.
 
 ## Direct worker invocation (local testing)
 

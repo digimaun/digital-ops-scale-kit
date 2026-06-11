@@ -9,9 +9,9 @@
 // the task, and returns `REGISTERED`. ARM sees the runCommand succeed at
 // that point. The actual bootstrap (Hyper-V enable, reboot, cluster deploy,
 // Arc-connect, all 25-40 minutes of it) happens inside the Scheduled Task
-// asynchronously. Pair this template with `runcommand-aksee-status.bicep`
-// (separate runCommand that polls state.json) to gate downstream steps on
-// bootstrap completion.
+// asynchronously. The worker writes a `siteops.bootstrap.state` tag on the
+// Arc machine when it finishes, and a siteops `type: wait` step gates
+// downstream steps on that tag (see the `aio-with-aksee-bootstrap` sample).
 //
 // Prerequisites on the target VM (one-time per VM, outside this Bicep):
 //   1. Server is Arc-connected (e.g., via `OnboardingScript.ps1`).
@@ -57,14 +57,14 @@ param tenantId string = subscription().tenantId
 @description('Tenant-wide object ID for the Custom Locations RP service principal. Use `az ad sp show --id bc313c14-388c-4e7d-a58e-70017303ee3b --query id -o tsv` to retrieve.')
 param customLocationsOid string
 
-@description('Service principal application ID. Required for the fresh-VM bootstrap this Bicep delivers: AKS Edge Essentials demands SP credentials in its install cmdlet to create the cluster, and there is no flag to skip that step. Must be paired with spPassword. The pre-existing-cluster path (worker detects the cluster and short-circuits) is available via direct launcher invocation, not through this Bicep entry point.')
+@description('Service principal application ID, paired with spPassword. The AKS Edge Essentials install cmdlet demands SP credentials to register the cluster with Arc and offers no flag to skip that, so this Bicep requires them. The pre-existing-cluster path (the worker detects the cluster and short-circuits) is reachable by invoking the launcher directly, not through this template.')
 param spAppId string
 
 @secure()
-@description('Service principal client secret. Required; pair with spAppId. Marked @secure so Azure encrypts in transit and excludes from deployment history. The launcher encrypts at rest before writing to disk on the VM. NOTE: the value is passed as a CLI argument to the launcher by the Connected Machine Agent; values with special characters can break command-line parsing. Generate or rotate the SP secret to avoid characters outside [A-Za-z0-9._-].')
+@description('Service principal client secret, paired with spAppId. Marked @secure so Azure encrypts it in transit and keeps it out of deployment history, and the launcher encrypts it at rest on the VM. The Connected Machine Agent passes it to the launcher as a CLI argument, so characters outside [A-Za-z0-9._-] can break command-line parsing. Generate or rotate the secret to stay within that set.')
 param spPassword string
 
-@description('URL of the AKS Edge Essentials MSI to install. Default points at the official Microsoft latest-K3s aka.ms shortcut, which currently resolves to 1.12.269.0 / K3s 1.33.5. Override with a version-pinned URL only if you have a stable hosting URL you control. Microsoft does NOT publish stable per-version aka.ms links; the version path that appears in GitHub release notes is not a real download URL.')
+@description('URL of the AKS Edge Essentials MSI to install. Default points at the official Microsoft latest-K3s aka.ms shortcut. Override with a version-pinned URL only if you host one yourself. Microsoft does not publish stable per-version aka.ms links, and the version path in the GitHub release notes is not a real download URL.')
 param aksEdgeMsiUrl string = 'https://aka.ms/aks-edge/k3s-msi'
 
 @description('When true, Phase 3 enables the OIDC issuer and workload identity on the Arc-connected cluster and patches the K3s apiserver `service-account-issuer`. Required only when downstream AIO components use workload-identity-backed secret sync. Defaults to false.')
@@ -83,25 +83,24 @@ resource bootstrapCommand 'Microsoft.HybridCompute/machines/runCommands@2024-11-
   location: location
   properties: {
     source: {
-      // loadTextContent inlines the launcher script body at compile time.
-      // We use the MINIFIED launcher (comments + blank lines stripped,
-      // leading whitespace removed) to stay under the empirical
-      // Microsoft.HybridCompute runCommands size boundary. Microsoft
-      // does not document an explicit limit; in practice the RP starts
-      // returning HCRP413 around 38 KB raw script body (this workstream,
-      // 2026-06-08: 37.6 KB worked, 38.8 KB rejected). JSON encoding
-      // plus ARM envelope overhead amplify the wire-size, which is what
-      // the RP actually checks. The full launcher (~53 KB raw) is
-      // always over; the minified launcher (~34 KB raw today) stays
-      // comfortably under. Long-term: switch to scriptUri delivery,
-      // which has no documented limit but adds a storage dependency.
+      // loadTextContent inlines the launcher script body at compile time. We
+      // use the MINIFIED launcher (comments, blank lines, and leading
+      // whitespace stripped) to stay under the empirical
+      // Microsoft.HybridCompute runCommands size boundary. Microsoft does not
+      // document an explicit limit. In practice the RP returns HCRP413 around
+      // 38 KB of raw script body, and JSON encoding plus ARM envelope overhead
+      // push the wire size higher, which is what the RP actually checks. The
+      // full launcher is well over the boundary, and the minified launcher
+      // stays under it, though each added feature narrows the margin. The
+      // durable fix is scriptUri delivery (a SAS blob URL), which has no
+      // documented limit but adds a storage dependency.
       script: loadTextContent('./scripts/Install-AksEeBootstrap.min.ps1')
     }
-    // asyncExecution=false makes ARM block until the script body exits.
-    // The launcher exits within ~30s (the long-running bootstrap is the
+    // asyncExecution=false makes ARM block until the script body exits. The
+    // launcher returns within ~30s. The long-running bootstrap is the
     // Scheduled Task it registers, which runs after ARM has already seen
-    // success). Sync mode gives us a clean signal that the launcher itself
-    // ran without error.
+    // success, so the runCommand result reflects only whether the launcher
+    // itself ran.
     asyncExecution: false
     timeoutInSeconds: runCommandTimeoutSeconds
     parameters: [
@@ -113,7 +112,7 @@ resource bootstrapCommand 'Microsoft.HybridCompute/machines/runCommands@2024-11-
       { name: 'CustomLocationsOid', value: customLocationsOid }
       { name: 'SpAppId',            value: spAppId }
       { name: 'AksEdgeMsiUrl',      value: aksEdgeMsiUrl }
-      // The launcher param is [string]; string() yields 'true'/'false',
+      // The launcher param is [string]. string() yields 'true' or 'false',
       // which the launcher parses case-insensitively. A bool value here
       // would be rejected by the runCommand's string-typed parameter.
       { name: 'EnableWorkloadIdentity', value: string(enableWorkloadIdentity) }
@@ -140,8 +139,8 @@ output stdout string = bootstrapCommand.properties.instanceView.output
 @description('Stderr captured from the launcher. Truncated by ARM. Typically empty on success, populated on launcher failure.')
 output errorOutput string = bootstrapCommand.properties.instanceView.error
 
-@description('Fully qualified resource ID of the Scheduled Task host (the Arc machine). Useful for chaining a downstream status-check runCommand against the same machine.')
+@description('Fully qualified resource ID of the Arc machine that hosts the bootstrap. Useful for chaining downstream steps that target the same machine, such as the wait step that polls the bootstrap-state tag.')
 output machineId string = machine.id
 
-@description('Name of the runCommand resource. Re-deploys with the same name overwrite this resource; use a different name (e.g., timestamped) to keep history.')
+@description('Name of the runCommand resource. Re-deploys with the same name overwrite this resource. Use a different name (for example timestamped) to keep history.')
 output runCommandName string = bootstrapCommand.name

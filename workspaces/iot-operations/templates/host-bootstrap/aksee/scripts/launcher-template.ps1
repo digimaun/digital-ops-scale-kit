@@ -75,7 +75,7 @@ The launcher creates the user (or resets its password) and adds it to
 the local Administrators group.
 
 .EXAMPLE
-    # Standard happy path. SP creates the cluster (Phase 2); Phase 3
+    # Standard happy path. SP creates the cluster in Phase 2. Phase 3
     # operations use the Arc machine's managed identity by default.
     .\Install-AksEeBootstrap.ps1 `
         -ClusterName        aksee-cluster1 `
@@ -119,7 +119,7 @@ param(
     # to create the cluster in Phase 2, so both fields are part of the
     # standard happy path. Both can be omitted only when running against
     # an already-existing cluster (Phase 2 detects the cluster and skips
-    # the create; Phase 3 falls through to the machine's managed identity).
+    # the create, and Phase 3 falls through to the machine's managed identity).
     # The launcher enforces "both or neither" so the worker never sees a
     # half-populated config.
     [string]$SpAppId = '',
@@ -293,7 +293,7 @@ Write-Log "Bootstrapping cluster $ClusterName in $ResourceGroup ($Location)"
 #   2. Content-Type is NOT text/* (a wrong aka.ms link returns an HTML
 #      error page with Content-Type text/html, which would otherwise
 #      sail through to msiexec exit 1620).
-#   3. Content-Length is > 50MB (the real AKS EE MSI is ~876MB; an HTML
+#   3. Content-Length is > 50MB (the real AKS EE MSI is ~876MB, an HTML
 #      error blob is typically < 1MB).
 try {
     Write-Log "Pre-checking AKS EE MSI URL $AksEdgeMsiUrl"

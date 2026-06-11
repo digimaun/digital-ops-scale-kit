@@ -1123,6 +1123,16 @@ function Invoke-Phase99 {
     param($config)
     Write-Log 'Phase 99: cleanup'
 
+    # Write the bootstrap-state tag first, while the Phase 3 az login and the
+    # SP credential are still valid. The cleanup below removes the bootstrap
+    # user (and the az token cache in its profile) and zeros the SP blob, either
+    # of which would strip the auth context this tag write depends on.
+    try {
+        Write-BootstrapStateTag -config $config -Value 'succeeded'
+    } catch {
+        Write-Log "WARNING: tag write helper threw: $_. Non-fatal."
+    }
+
     $taskName = 'SiteOpsAksEeBootstrap'
     if ($config.PSObject.Properties.Name -contains 'scheduledTaskName') {
         $taskName = $config.scheduledTaskName
@@ -1187,12 +1197,6 @@ function Invoke-Phase99 {
             $cfg | ConvertTo-Json | Set-Content -Path $script:ConfigPath -Encoding UTF8
             Write-Log 'Zeroed SP password blob in config.json'
         }
-    }
-
-    try {
-        Write-BootstrapStateTag -config $config -Value 'succeeded'
-    } catch {
-        Write-Log "WARNING: tag write helper threw: $_. Non-fatal."
     }
 
     Set-State -Phase 99 -Status 'succeeded'

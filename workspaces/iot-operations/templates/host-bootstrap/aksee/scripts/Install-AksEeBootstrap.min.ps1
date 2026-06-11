@@ -599,6 +599,11 @@ Write-Log "Phase 3: complete (cluster Arc-connected, custom-locations enabled$(i
 function Invoke-Phase99 {
 param($config)
 Write-Log 'Phase 99: cleanup'
+try {
+Write-BootstrapStateTag -config $config -Value 'succeeded'
+} catch {
+Write-Log "WARNING: tag write helper threw: $_. Non-fatal."
+}
 $taskName = 'SiteOpsAksEeBootstrap'
 if ($config.PSObject.Properties.Name -contains 'scheduledTaskName') {
 $taskName = $config.scheduledTaskName
@@ -649,11 +654,6 @@ $cfg.spPasswordEncrypted = $false
 $cfg | ConvertTo-Json | Set-Content -Path $script:ConfigPath -Encoding UTF8
 Write-Log 'Zeroed SP password blob in config.json'
 }
-}
-try {
-Write-BootstrapStateTag -config $config -Value 'succeeded'
-} catch {
-Write-Log "WARNING: tag write helper threw: $_. Non-fatal."
 }
 Set-State -Phase 99 -Status 'succeeded'
 Write-Log 'Phase 99: complete. Bootstrap succeeded.'

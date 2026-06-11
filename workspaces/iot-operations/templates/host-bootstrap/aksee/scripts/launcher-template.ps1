@@ -75,7 +75,7 @@ The launcher creates the user (or resets its password) and adds it to
 the local Administrators group.
 
 .EXAMPLE
-    # Standard happy path. SP creates the cluster (Phase 2); Phase 3
+    # Standard happy path. SP creates the cluster in Phase 2. Phase 3
     # operations use the Arc machine's managed identity by default.
     .\Install-AksEeBootstrap.ps1 `
         -ClusterName        aksee-cluster1 `
@@ -115,13 +115,11 @@ param(
     [Parameter(Mandatory)] [string]$Location,
     [Parameter(Mandatory)] [string]$TenantId,
     [Parameter(Mandatory)] [string]$CustomLocationsOid,
-    # SpAppId + SpPassword. AKS Edge Essentials requires SP credentials
-    # to create the cluster in Phase 2, so both fields are part of the
-    # standard happy path. Both can be omitted only when running against
-    # an already-existing cluster (Phase 2 detects the cluster and skips
-    # the create; Phase 3 falls through to the machine's managed identity).
-    # The launcher enforces "both or neither" so the worker never sees a
-    # half-populated config.
+    # AKS Edge Essentials requires SP credentials to create the cluster in
+    # Phase 2. Both or neither: omit both only when running against an
+    # already-existing cluster, where Phase 2 skips the create and Phase 3
+    # falls through to the machine's managed identity. The launcher rejects a
+    # half-populated SP config.
     [string]$SpAppId = '',
     [string]$SpPassword = '',
     [Parameter(Mandatory)] [string]$AksEdgeMsiUrl,
@@ -145,11 +143,9 @@ $ConfirmPreference = 'None'
 $ProgressPreference = 'SilentlyContinue'
 
 # DPAPI LocalMachine encryption (Protect-StringMachine below) uses
-# .NET Framework System.Security types that are only present under
-# Windows PowerShell 5.1 ("Desktop" edition). PowerShell 7+ ("Core")
-# has a different surface and would fail at Add-Type. Refuse to run
-# under the wrong edition rather than producing a confusing
-# Add-Type failure mid-encryption.
+# .NET Framework System.Security types present only under Windows
+# PowerShell 5.1 ("Desktop"). PowerShell 7+ ("Core") would fail at
+# Add-Type, so refuse to run under it.
 if ($PSVersionTable.PSEdition -ne 'Desktop') {
     throw "Install-AksEeBootstrap.ps1 requires Windows PowerShell 5.1 (Desktop). Detected: $($PSVersionTable.PSEdition) $($PSVersionTable.PSVersion). Re-run with 'powershell.exe -File Install-AksEeBootstrap.ps1 ...' instead of pwsh."
 }
@@ -286,15 +282,13 @@ if (-not (Test-IsAdmin)) {
 
 Write-Log "Bootstrapping cluster $ClusterName in $ResourceGroup ($Location)"
 
-# Preflight: fail fast on unreachable or wrong-content MSI URL so we do
-# not register a task that will fail Phase 1. HEAD request avoids a full
-# binary download. Validates three things:
-#   1. Status 200
-#   2. Content-Type is NOT text/* (a wrong aka.ms link returns an HTML
-#      error page with Content-Type text/html, which would otherwise
-#      sail through to msiexec exit 1620).
-#   3. Content-Length is > 50MB (the real AKS EE MSI is ~876MB; an HTML
-#      error blob is typically < 1MB).
+# Preflight: fail fast on an unreachable or wrong-content MSI URL so we
+# do not register a task that will fail Phase 1. A HEAD request avoids a
+# full binary download. Validates three things:
+#   1. Status 200.
+#   2. Content-Type is not text/* (a wrong aka.ms link returns an HTML
+#      error page that would otherwise reach msiexec as a bad installer).
+#   3. Content-Length is > 50MB (an HTML error page is well below this).
 try {
     Write-Log "Pre-checking AKS EE MSI URL $AksEdgeMsiUrl"
     $head = Invoke-WebRequest -Uri $AksEdgeMsiUrl -Method Head -UseBasicParsing -ErrorAction Stop
@@ -328,10 +322,8 @@ $statePath    = Join-Path $ConfigDir 'state.json'
 
 # Re-init guard. Inspect any existing state.json before resetting state and
 # re-registering the task. A bootstrap that is in flight must not be clobbered,
-# and one that already succeeded must not be re-run (re-running would reset to
-# phase 0, and Phase 99 already removed the bootstrap user, so Phase 2 would
-# collide with the existing cluster and flip the state tag to failed). -Force
-# overrides both, destroying any prior state for a deliberate re-bootstrap.
+# and one that already succeeded must not be re-run blindly. -Force overrides
+# both, destroying any prior state for a deliberate re-bootstrap.
 if ((Test-Path $statePath) -and -not $Force) {
     $inFlight = $false
     $alreadyDone = $false
@@ -419,7 +411,7 @@ $action = New-ScheduledTaskAction `
     -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$workerPath`" -ConfigDir `"$ConfigDir`""
 
 # at-startup trigger handles the Hyper-V reboot resume in Phase 1.
-# once-trigger ~30s out kicks off the initial run without needing a reboot.
+# once-trigger kicks off the initial run without needing a reboot.
 $startupTrigger = New-ScheduledTaskTrigger -AtStartup
 $onceTrigger    = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddSeconds(30))
 

@@ -97,27 +97,19 @@ Write-Host "Generated $outputPath ($lines lines, parse OK)"
 
 # Also emit a minified variant for Arc Run Command delivery. The
 # Microsoft.HybridCompute runCommands API enforces a size limit on the
-# `script` body. The official Microsoft docs do NOT specify a number,
-# but empirically (this workstream, 2026-06-08) the boundary sits
-# around 38 KB raw: 37.6 KB worked, 38.8 KB returned HCRP413. After
-# JSON encoding (each `\` -> `\\`, each `"` -> `\"`, each newline ->
-# `\r\n`) plus ARM envelope overhead the request body grows further,
-# which is what the RP is actually limiting. Stripping comments +
-# blank lines + leading whitespace cuts the full ~53 KB source to
-# ~34 KB. The full launcher remains for operator-direct use.
+# inline `script` body, and JSON encoding plus request overhead push the
+# wire size above the raw script size. Stripping comments, blank lines, and
+# leading whitespace keeps the minified launcher within the limit where the
+# full source would not. The full launcher remains for operator-direct use.
 #
-# Long-term scalability fix: switch to `scriptUri` (SAS URL to a
-# blob) on the runCommands resource. scriptUri has no documented
-# size limit but adds a storage account dependency to the deploy
-# chain. Tracked separately.
+# Long-term scalability fix: switch to `scriptUri` (a blob URL) on the
+# runCommands resource. It removes the inline size ceiling but adds a
+# storage account dependency to the deploy chain. Tracked separately.
 #
-# Minify each source file independently before substituting. The
-# previous "minify after rendering" approach ran a comment-strip regex
-# over here-string bodies, which silently corrupted any embedded content
-# whose line started with `#`. Per-file minification keeps the regex
-# scoped to one source at a time. The assertion below additionally
-# refuses to minify if a future edit adds a here-string to worker.ps1,
-# since that case would re-introduce the same corruption risk.
+# Minify each source file independently so the comment-strip regex never
+# traverses here-string bodies (a `#` at the start of a here-string line
+# would otherwise be stripped as a comment). The assertion below refuses
+# to minify if a future edit adds a here-string to worker.ps1.
 $minPath = Join-Path $ScriptDir 'Install-AksEeBootstrap.min.ps1'
 
 function script:Compact-PSSource {
@@ -166,5 +158,5 @@ $minBytes = (Get-Item $minPath).Length
 $minLines = (Get-Content $minPath).Count
 Write-Host ("Generated {0} ({1} lines, {2:N0} bytes, parse OK)" -f $minPath, $minLines, $minBytes)
 if ($minBytes -gt 36000) {
-    Write-Warning ("Minified launcher is {0:N0} bytes. Empirical HCRP413 boundary for Microsoft.HybridCompute runCommands sits around 38 KB raw on 2026-06-08. Slim the source or move to scriptUri delivery before this grows further." -f $minBytes)
+    Write-Warning ("Minified launcher is {0:N0} bytes and is approaching the runCommands inline-script size limit. Slim the source or move to scriptUri delivery before it grows further." -f $minBytes)
 }

@@ -8,7 +8,7 @@
   "tenantId": "00000000-0000-0000-0000-000000000000",
   "customLocationsOid": "00000000-0000-0000-0000-000000000000",
 
-  "_aksEdgeMsiUrlNote": "Official Microsoft aka.ms shortcut for the AKS Edge Essentials K3s MSI. Always points at the latest stable (currently 1.12.269.0 / K3s 1.33.5). Microsoft does NOT publish stable per-version aka.ms links; version paths that appear in GitHub release notes (e.g. AksEdge-K3s-x.y.z.msi) are NOT real download URLs and will return an HTML error page. If you need pinning, host the MSI yourself.",
+  "_aksEdgeMsiUrlNote": "Official aka.ms shortcut to the latest stable AKS Edge Essentials K3s MSI. Microsoft does not publish per-version aka.ms links, so to pin a specific version, host the MSI yourself and point this at it.",
   "aksEdgeMsiUrl": "https://aka.ms/aks-edge/k3s-msi",
 
   "_spNote": "Service principal used by AKS Edge Essentials to create the cluster (required by the install step). Needs Kubernetes Cluster - Azure Arc Onboarding (or broader Contributor) on the resource group. Leave both fields empty only when this config is used to drive the worker against an already-existing cluster, in which case Phase 3's Arc operations fall through to the machine's managed identity.",

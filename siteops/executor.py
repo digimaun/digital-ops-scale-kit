@@ -1566,14 +1566,10 @@ class AzCliExecutor:
 
     @contextmanager
     def _condition_session(self, condition: Any) -> Generator[None, None, None]:
-        """Per-condition resource that wraps the entire wait loop.
+        """Per-condition context wrapping the wait loop. No-op for `arm-tag`.
 
-        `arm-tag` polls with plain `az` calls and needs no session resource, so
-        this is a no-op. A future condition type that needs cluster access (for
-        example `kubectl-resource-ready`) would open its Arc proxy here so the
-        proxy spans every poll rather than being re-established each iteration.
-        Keeping this seam now lets new condition types plug in without changing
-        the loop signature.
+        Reserved for future condition types that need a long-lived resource
+        (for example an Arc proxy) spanning all polls.
         """
         with nullcontext():
             yield
@@ -1583,11 +1579,11 @@ class AzCliExecutor:
 
         Returns `(state, observed_value, error)`. `observed_value` is the value
         seen this poll (or None). `error` is a non-fatal poll error worth
-        surfacing in the timeout diagnostic; on a PENDING state it also drives
+        surfacing in the timeout diagnostic. On a PENDING state it also drives
         the consecutive-error circuit breaker.
 
         Dispatches by condition type. Unknown types are rejected at parse and
-        validate time; this guard is defensive.
+        validate time, so this guard is defensive.
         """
         if condition.type == "arm-tag":
             return self._evaluate_arm_tag(condition, subscription)

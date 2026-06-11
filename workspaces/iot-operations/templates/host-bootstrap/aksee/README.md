@@ -34,7 +34,7 @@ AKS Edge Essentials' install cmdlet requires a service principal to register the
 az ad sp create-for-rbac --name "aksee-bootstrap-sp" --role "Kubernetes Cluster - Azure Arc Onboarding" --scopes "/subscriptions/<sub>/resourceGroups/<rg>"
 ```
 
-Save the `appId` and `password` returned. Pin or rotate the secret to characters in `[A-Za-z0-9._-]` (the secret is passed as a CLI argument to the launcher by the Connected Machine Agent; characters outside that range can break command-line parsing).
+Save the `appId` and `password` returned. Pin or rotate the secret to characters in `[A-Za-z0-9._-]` (the secret is passed as a CLI argument to the launcher by the Connected Machine Agent, so characters outside that range can break command-line parsing).
 
 ### 3. Grant the Arc machine identity access to the resource group
 

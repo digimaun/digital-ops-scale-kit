@@ -200,7 +200,7 @@ def _redact_sensitive(value: Any, key: str | None = None) -> Any:
     booleans: a sensitive-looking key with a bool value is a toggle, not a
     secret (e.g. `enableSecretSync: false`), so it is left as-is. The whole
     subtree under a sensitive key is replaced so a nested credential object is
-    fully masked. The real value is never mutated and deploy is unaffected.
+    fully masked. The real value is never mutated.
 
     Args:
         value: The value to redact (dict, list, or scalar).

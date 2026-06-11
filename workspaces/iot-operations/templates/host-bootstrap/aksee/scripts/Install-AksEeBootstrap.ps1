@@ -83,7 +83,7 @@ The launcher creates the user (or resets its password) and adds it to
 the local Administrators group.
 
 .EXAMPLE
-    # Standard happy path. SP creates the cluster (Phase 2); Phase 3
+    # Standard happy path. SP creates the cluster in Phase 2. Phase 3
     # operations use the Arc machine's managed identity by default.
     .\Install-AksEeBootstrap.ps1 `
         -ClusterName        aksee-cluster1 `
@@ -123,13 +123,11 @@ param(
     [Parameter(Mandatory)] [string]$Location,
     [Parameter(Mandatory)] [string]$TenantId,
     [Parameter(Mandatory)] [string]$CustomLocationsOid,
-    # SpAppId + SpPassword. AKS Edge Essentials requires SP credentials
-    # to create the cluster in Phase 2, so both fields are part of the
-    # standard happy path. Both can be omitted only when running against
-    # an already-existing cluster (Phase 2 detects the cluster and skips
-    # the create; Phase 3 falls through to the machine's managed identity).
-    # The launcher enforces "both or neither" so the worker never sees a
-    # half-populated config.
+    # AKS Edge Essentials requires SP credentials to create the cluster in
+    # Phase 2. Both or neither: omit both only when running against an
+    # already-existing cluster, where Phase 2 skips the create and Phase 3
+    # falls through to the machine's managed identity. The launcher rejects a
+    # half-populated SP config.
     [string]$SpAppId = '',
     [string]$SpPassword = '',
     [Parameter(Mandatory)] [string]$AksEdgeMsiUrl,
@@ -153,11 +151,9 @@ $ConfirmPreference = 'None'
 $ProgressPreference = 'SilentlyContinue'
 
 # DPAPI LocalMachine encryption (Protect-StringMachine below) uses
-# .NET Framework System.Security types that are only present under
-# Windows PowerShell 5.1 ("Desktop" edition). PowerShell 7+ ("Core")
-# has a different surface and would fail at Add-Type. Refuse to run
-# under the wrong edition rather than producing a confusing
-# Add-Type failure mid-encryption.
+# .NET Framework System.Security types present only under Windows
+# PowerShell 5.1 ("Desktop"). PowerShell 7+ ("Core") would fail at
+# Add-Type, so refuse to run under it.
 if ($PSVersionTable.PSEdition -ne 'Desktop') {
     throw "Install-AksEeBootstrap.ps1 requires Windows PowerShell 5.1 (Desktop). Detected: $($PSVersionTable.PSEdition) $($PSVersionTable.PSVersion). Re-run with 'powershell.exe -File Install-AksEeBootstrap.ps1 ...' instead of pwsh."
 }
@@ -399,12 +395,11 @@ function Test-AksEdgeModuleInstalled {
 
 function Test-AksEdgeDeployed {
     # Cluster is up when the kubeconfig exists and kubectl can reach the
-    # API server. Module-only check is unreliable across AKS EE versions
-    # because cmdlet names for deployment-info vary. Try the per-user
-    # kubeconfig first, then fall back to the shared copy Phase 2 writes
-    # under the config dir (which Phase 99 preserves). The fallback lets a
-    # -Force re-run detect an existing cluster even though Phase 99 removed
-    # the bootstrap user and its profile kubeconfig.
+    # API server. Try the per-user kubeconfig first, then fall back to the
+    # shared copy Phase 2 writes under the config dir (which Phase 99
+    # preserves). The fallback lets a -Force re-run detect an existing
+    # cluster even though Phase 99 removed the bootstrap user and its
+    # profile kubeconfig.
     $kubeconfig = Join-Path $env:USERPROFILE '.kube\config'
     if (-not (Test-Path $kubeconfig)) {
         $sharedKubeconfig = Join-Path $ConfigDir 'kubeconfig'
@@ -478,25 +473,17 @@ function Install-AzCliIfMissing {
 }
 
 function Write-BootstrapStateTag {
-    # Idempotent tag write on this Arc machine resource. Phase 99 calls
-    # with 'succeeded'. The per-phase catch calls with 'failed-phase-N'.
-    # A siteops `type: wait` step polls this tag to gate downstream
-    # pipeline steps on actual bootstrap completion.
+    # Idempotent tag write on this Arc machine resource. Phase 99 writes
+    # 'succeeded'. The per-phase catch writes 'failed-phase-N'. A siteops
+    # `type: wait` step polls this tag to gate downstream steps on actual
+    # bootstrap completion.
     #
     # Safe to call before az CLI is installed or authenticated. Logs and
-    # returns without throwing. A failed tag write does not fail the
-    # bootstrap.
-    #
-    # Required permission on the Phase 3 identity (managed identity by
-    # default, service principal as fallback):
-    # `Microsoft.Resources/tags/write` on the Arc machine resource.
-    # `Contributor` covers it transitively. The narrow
-    # `Kubernetes Cluster - Azure Arc Onboarding` role does not.
-    #
-    # Assumes the Arc machine resource name equals `$env:COMPUTERNAME`
-    # (the `azcmagent connect` default). If overridden during onboarding,
-    # the tag write fails on lookup. The constructed ID is logged for
-    # manual tagging.
+    # returns without throwing, and a failed tag write does not fail the
+    # bootstrap. Requires `Microsoft.Resources/tags/write` on the Arc
+    # machine resource (see README "Bootstrap state tag"). Assumes the
+    # resource name equals `$env:COMPUTERNAME`. The constructed ID is
+    # logged for manual tagging.
     param(
         [Parameter(Mandatory)] $config,
         [Parameter(Mandatory)] [string]$Value
@@ -610,9 +597,8 @@ function Patch-K3sApiServer {
     Invoke-AksEdgeNodeCommand -command "sudo cp /home/aksedge-user/k3s-config.yml /var/.eflow/config/k3s/k3s-config.yml" | Out-Null
 
     # Verification: grep the patched line out and check the URL is there.
-    # Silent no-op is the failure class that motivated all of Phase 3, so
-    # we surface it explicitly rather than letting Wait-K3sApiServerReady
-    # report success on an unpatched apiserver.
+    # A silent sed no-op must fail loudly rather than letting
+    # Wait-K3sApiServerReady report success on an unpatched apiserver.
     $verify = Invoke-AksEdgeNodeCommand -command 'sudo grep service-account-issuer /var/.eflow/config/k3s/k3s-config.yml'
     if ($verify -notmatch [regex]::Escape($IssuerUrl)) {
         throw "Patch-K3sApiServer verification failed. Expected `'service-account-issuer=$IssuerUrl`' in k3s-config.yml but observed: $verify"
@@ -624,12 +610,10 @@ function Patch-K3sApiServer {
 }
 
 function Wait-K3sApiServerReady {
-    # Mirrors Wait-ApiServerReady in AksEdgeQuickStartForAio.ps1. After
-    # a k3s restart the apiserver takes 5-30 seconds to come back. Poll
-    # /readyz until "ok" or timeout. Per-call --request-timeout=2s caps
-    # each iteration so the advertised total timeout matches wall clock;
-    # default client timeout (~30s) would let 120 iterations stretch to
-    # ~1 hour without this.
+    # Mirrors Wait-ApiServerReady in AksEdgeQuickStartForAio.ps1. Poll
+    # /readyz after a k3s restart until "ok" or timeout. Per-call
+    # --request-timeout=2s caps each iteration so the total timeout
+    # matches wall clock instead of compounding the kubectl client default.
     param([int]$MaxRetries = 120)
     for ($i = 0; $i -lt $MaxRetries; $i++) {
         $ret = & kubectl get --raw='/readyz' --request-timeout=2s 2>$null
@@ -703,12 +687,11 @@ function Invoke-Phase0 {
 
     # Bootstrap the NuGet PSPackageProvider. New-AksEdgeDeployment's
     # internal Arc-connect path calls Get-PackageProvider -Name NuGet
-    # without bootstrapping, so fresh Windows installs hit a misleading
-    # "Invalid Azure Arc parameters detected" error in Phase 2 when the
-    # actual cause is the missing provider. Pre-installing here means
-    # Phase 2 finds it ready when the cmdlet asks for it. Also trust
-    # PSGallery so any module install the cmdlet triggers does not stop
-    # on the "untrusted repository" prompt.
+    # without bootstrapping it, so a fresh Windows install fails Phase 2
+    # with a misleading error whose real cause is the missing provider.
+    # Pre-install here so Phase 2 finds it ready. Also trust PSGallery so
+    # any module install the cmdlet triggers does not stop on the
+    # untrusted-repository prompt.
     Write-Log 'Bootstrapping NuGet PSPackageProvider for AKS EE Arc-connect path'
     try {
         $nuget = Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue |
@@ -740,11 +723,10 @@ function Invoke-Phase1 {
         Invoke-WebRequest -Uri $config.aksEdgeMsiUrl -OutFile $msiPath -UseBasicParsing
 
         # Validate the downloaded file BEFORE handing to msiexec. A wrong
-        # aka.ms link redirects to a small HTML error page, which msiexec
-        # then rejects with a cryptic exit 1620. Catch it here with a
-        # clearer message. Two checks:
-        #   1. Size > 50MB (real AKS EE MSI is ~876MB; an HTML error blob
-        #      is typically < 1MB).
+        # aka.ms link can redirect to an HTML error page that msiexec
+        # rejects with an uninformative error. Catch it here with a clearer
+        # message. Two checks:
+        #   1. Size > 50MB (an HTML error page is well below this).
         #   2. CFB/CDF magic bytes D0 CF 11 E0 (the file format MSI uses).
         $fileInfo = Get-Item $msiPath
         if ($fileInfo.Length -lt 50MB) {
@@ -793,20 +775,17 @@ function Invoke-Phase1 {
     $result = Install-AksEdgeHostFeatures -Force
     Write-Log "Install-AksEdgeHostFeatures returned: $result"
 
-    # Treat $false from the cmdlet as a real failure (matches the
-    # convention used by Azure/AKS-Edge wrapper callers). Coerce to a
-    # single boolean since some module versions return pipeline output
-    # with multiple values; take the last element.
+    # Treat $false from the cmdlet as a real failure. Coerce to a single
+    # boolean by taking the last element, since the cmdlet can emit
+    # multiple values into the pipeline.
     $lastResult = @($result) | Select-Object -Last 1
     if ($lastResult -is [bool] -and -not $lastResult) {
         throw "Install-AksEdgeHostFeatures returned `$false. See AksEdge event logs and recent entries under C:\ProgramData\AksEdge for the host-feature install failure."
     }
 
     # Detect pending reboot via two authoritative signals: the Hyper-V
-    # feature install state and the Component Based Servicing key. We do
-    # not rely on the cmdlet return value because its semantics vary
-    # across module versions and the cmdlet's own behavior is ambiguous
-    # about whether it auto-reboots.
+    # feature install state and the Component Based Servicing key. The
+    # cmdlet's own return value is not a reliable reboot signal.
     $hvFeature = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -ErrorAction SilentlyContinue
     $featureRestartNeeded = $false
     if ($hvFeature -and $null -ne $hvFeature.RestartNeeded) {
@@ -889,16 +868,11 @@ function Invoke-Phase2 {
         # Spawn New-AksEdgeDeployment in a fresh child PowerShell process.
         # In-place ErrorActionPreference relaxation does NOT work because the
         # AKS EE module's internal functions reset $ErrorActionPreference='Stop'
-        # in their own scope. With strict EAP propagated into the cmdlet, the
-        # cmdlet's many native-binary calls (wssdagent.exe, nodectl.exe) get
-        # their normal diagnostic stderr converted into terminating errors,
-        # killing VM creation with cryptic "Virtual machine creation failed!"
-        # and "Could not find virtual machine, removal failed" messages.
-        #
-        # A child process started with default settings (no StrictMode, default
-        # EAP=Continue) runs the cmdlet in the exact environment Microsoft tested
-        # against, matching what an operator running it interactively from a
-        # fresh admin pwsh would see.
+        # in their own scope. With strict EAP in effect, the cmdlet's native
+        # helper calls have their normal diagnostic stderr converted into
+        # terminating errors, which breaks cluster creation. A child process
+        # started with default settings (no StrictMode, default EAP=Continue)
+        # runs the cmdlet in the environment the module was tested against.
         #
         # Use -EncodedCommand for the child invocation to avoid PowerShell
         # quoting hazards across the process boundary.
@@ -1005,9 +979,7 @@ function Invoke-Phase3 {
     # create and carries into Phase 3 for consistency). Falls back to the
     # Arc machine's system-assigned managed identity when both are absent
     # (the "bring your own cluster" path where Phase 2 short-circuited
-    # because the cluster already existed). MI keeps no secret on disk,
-    # avoids DPAPI plumbing, and sidesteps the special-character-in-
-    # password parsing risk on the launcher's command line.
+    # because the cluster already existed). MI keeps no secret on disk.
     #
     # The Arc machine identity needs `Kubernetes Cluster - Azure Arc
     # Onboarding` (or broader Contributor) on the resource group for
@@ -1332,15 +1304,13 @@ if (-not (Test-IsAdmin)) {
 
 Write-Log "Bootstrapping cluster $ClusterName in $ResourceGroup ($Location)"
 
-# Preflight: fail fast on unreachable or wrong-content MSI URL so we do
-# not register a task that will fail Phase 1. HEAD request avoids a full
-# binary download. Validates three things:
-#   1. Status 200
-#   2. Content-Type is NOT text/* (a wrong aka.ms link returns an HTML
-#      error page with Content-Type text/html, which would otherwise
-#      sail through to msiexec exit 1620).
-#   3. Content-Length is > 50MB (the real AKS EE MSI is ~876MB; an HTML
-#      error blob is typically < 1MB).
+# Preflight: fail fast on an unreachable or wrong-content MSI URL so we
+# do not register a task that will fail Phase 1. A HEAD request avoids a
+# full binary download. Validates three things:
+#   1. Status 200.
+#   2. Content-Type is not text/* (a wrong aka.ms link returns an HTML
+#      error page that would otherwise reach msiexec as a bad installer).
+#   3. Content-Length is > 50MB (an HTML error page is well below this).
 try {
     Write-Log "Pre-checking AKS EE MSI URL $AksEdgeMsiUrl"
     $head = Invoke-WebRequest -Uri $AksEdgeMsiUrl -Method Head -UseBasicParsing -ErrorAction Stop
@@ -1374,10 +1344,8 @@ $statePath    = Join-Path $ConfigDir 'state.json'
 
 # Re-init guard. Inspect any existing state.json before resetting state and
 # re-registering the task. A bootstrap that is in flight must not be clobbered,
-# and one that already succeeded must not be re-run (re-running would reset to
-# phase 0, and Phase 99 already removed the bootstrap user, so Phase 2 would
-# collide with the existing cluster and flip the state tag to failed). -Force
-# overrides both, destroying any prior state for a deliberate re-bootstrap.
+# and one that already succeeded must not be re-run blindly. -Force overrides
+# both, destroying any prior state for a deliberate re-bootstrap.
 if ((Test-Path $statePath) -and -not $Force) {
     $inFlight = $false
     $alreadyDone = $false
@@ -1465,7 +1433,7 @@ $action = New-ScheduledTaskAction `
     -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$workerPath`" -ConfigDir `"$ConfigDir`""
 
 # at-startup trigger handles the Hyper-V reboot resume in Phase 1.
-# once-trigger ~30s out kicks off the initial run without needing a reboot.
+# once-trigger kicks off the initial run without needing a reboot.
 $startupTrigger = New-ScheduledTaskTrigger -AtStartup
 $onceTrigger    = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddSeconds(30))
 

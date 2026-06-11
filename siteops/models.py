@@ -672,9 +672,8 @@ class ArmTagCondition:
     `expected_value`. When `failure_pattern` is set, a tag value matching that
     glob aborts the wait immediately instead of waiting for the timeout.
 
-    This is pure data. The executor owns evaluation (running `az` and
-    classifying the result), so the model layer stays free of Azure CLI
-    coupling and a future condition type plugs in without changing this class.
+    This is pure data. Evaluation (running `az` and classifying the result)
+    lives in the executor.
 
     Attributes:
         type: Condition discriminator. Always `arm-tag` for this class.
@@ -712,8 +711,8 @@ class ArmTagCondition:
             )
 
 
-# Union type for wait conditions. One concrete type today; the dispatch shape
-# accommodates future types without a manifest contract change.
+# Union type for wait conditions. One concrete type today. Future condition
+# types join this union.
 WaitCondition = ArmTagCondition
 
 

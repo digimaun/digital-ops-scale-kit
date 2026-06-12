@@ -629,18 +629,22 @@ function Invoke-Phase2 {
             throw "New-AksEdgeDeployment exited with code $($proc.ExitCode).`nstdout tail:`n$tailOut`nstderr tail:`n$tailErr`nFull logs at $childLog and $childErrLog."
         }
 
-        $kubeconfig = Join-Path $env:USERPROFILE '.kube\config'
-        if (-not (Test-Path $kubeconfig)) {
-            throw "Kubeconfig not written at $kubeconfig after New-AksEdgeDeployment. The cluster did not come up."
+        # New-AksEdgeDeployment writes the kubeconfig to the invoking user's
+        # profile: the dedicated-admin profile, or either WoW64 systemprofile
+        # tree when the task runs as SYSTEM. Copy the first hit to the ACL-locked
+        # shared path so downstream phases and the operator use one location.
+        $kubeCandidates = @(
+            (Join-Path $env:USERPROFILE '.kube\config'),
+            (Join-Path $env:SystemRoot 'System32\config\systemprofile\.kube\config'),
+            (Join-Path $env:SystemRoot 'SysWOW64\config\systemprofile\.kube\config')
+        )
+        $kubeconfig = $kubeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+        if (-not $kubeconfig) {
+            throw "Kubeconfig not found after New-AksEdgeDeployment. Checked: $($kubeCandidates -join '; '). The cluster did not come up, or the kubeconfig landed in an unexpected location."
         }
-
-        # Copy the kubeconfig to the shared config dir so the operator can
-        # use it from their own session without needing the bootstrap user's
-        # profile. The config dir ACL restricts to Administrators + SYSTEM
-        # so the bearer token stays protected.
         $sharedKubeconfig = Join-Path $ConfigDir 'kubeconfig'
         Copy-Item -Path $kubeconfig -Destination $sharedKubeconfig -Force
-        Write-Log "Copied kubeconfig to $sharedKubeconfig for operator use"
+        Write-Log "Copied kubeconfig from $kubeconfig to $sharedKubeconfig"
 
         Set-State -Phase 3 -Status 'running'
         Write-Log 'Phase 2: complete (cluster up)'
@@ -716,6 +720,15 @@ function Invoke-Phase3 {
              -or -not ($config.PSObject.Properties.Name -contains 'spPassword' -and $config.spPassword)
     if ($useMi) {
         Write-Log 'Authenticating with Arc machine managed identity (az login --identity)'
+        # The Arc agent publishes the HIMDS endpoints as Machine-scope env vars.
+        # A fresh worker process usually inherits them, but refresh from Machine
+        # scope defensively so az login --identity can reach HIMDS as SYSTEM.
+        foreach ($name in @('IDENTITY_ENDPOINT', 'IMDS_ENDPOINT')) {
+            if (-not [Environment]::GetEnvironmentVariable($name)) {
+                $machineVal = [Environment]::GetEnvironmentVariable($name, 'Machine')
+                if ($machineVal) { Set-Item -Path "Env:$name" -Value $machineVal }
+            }
+        }
         $loginOut = & az login --identity --only-show-errors 2>&1
         if ($LASTEXITCODE -ne 0) {
             throw "az login --identity failed: $loginOut. Ensure the Arc machine identity has Contributor (or Kubernetes Cluster - Azure Arc Onboarding) on the resource group."
@@ -881,6 +894,25 @@ function Invoke-Phase99 {
         Write-Log 'Removed leftover rendered config'
     }
 
+    # SYSTEM has no user profile to remove, but New-AksEdgeDeployment still
+    # wrote a kubeconfig with a bearer token into the systemprofile tree. Purge
+    # both WoW64 variants. The retained ConfigDir\kubeconfig is the canonical
+    # copy. No-op in dedicated-admin mode.
+    foreach ($sysKube in @(
+            (Join-Path $env:SystemRoot 'System32\config\systemprofile\.kube'),
+            (Join-Path $env:SystemRoot 'SysWOW64\config\systemprofile\.kube'))) {
+        if (Test-Path $sysKube) {
+            Remove-Item -Path $sysKube -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Log "Purged systemprofile kubeconfig at $sysKube"
+        }
+    }
+    # Remove the scoped az token cache. The Phase 99 tag write above was the
+    # last az call, so the tokens are done. The retained kubeconfig is separate.
+    if ($env:AZURE_CONFIG_DIR -and (Test-Path $env:AZURE_CONFIG_DIR)) {
+        Remove-Item -Path $env:AZURE_CONFIG_DIR -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Log "Removed az token cache at $env:AZURE_CONFIG_DIR"
+    }
+
     # Zero out the encrypted SP password blob in config.json once the
     # workstream has succeeded. DPAPI-LocalMachine binds the blob to the
     # host so off-box exfiltration cannot decrypt, but leaving the
@@ -910,6 +942,11 @@ function Invoke-Phase99 {
 if (-not (Test-Path $ConfigDir)) {
     New-Item -ItemType Directory -Path $ConfigDir -Force | Out-Null
 }
+
+# Scope the az config and token cache into the ACL-locked ConfigDir. Under
+# SYSTEM the default ~/.azure lands in the shared systemprofile, readable by any
+# SYSTEM-context process. Phase 99 removes this on success.
+$env:AZURE_CONFIG_DIR = Join-Path $ConfigDir '.azure'
 
 $logPath = Join-Path $ConfigDir "worker-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
 Start-Transcript -Path $logPath -Append | Out-Null

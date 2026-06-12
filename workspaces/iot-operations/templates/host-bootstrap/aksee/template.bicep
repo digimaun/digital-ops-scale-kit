@@ -70,6 +70,9 @@ param aksEdgeMsiUrl string = 'https://aka.ms/aks-edge/k3s-msi'
 @description('When true, Phase 3 enables the OIDC issuer and workload identity on the Arc-connected cluster and patches the K3s apiserver `service-account-issuer`. Required only when downstream AIO components use workload-identity-backed secret sync. Defaults to false.')
 param enableWorkloadIdentity bool = false
 
+@description('When true, the worker Scheduled Task runs as a created local admin account with an on-box generated password instead of the built-in SYSTEM account. Leave false unless a hardened environment forbids SYSTEM-context tasks. Defaults to false.')
+param runAsDedicatedAdmin bool = false
+
 @description('Timeout in seconds for the runCommand. It bounds only the synchronous launcher, which returns quickly after registering the Scheduled Task. The bootstrap itself runs asynchronously inside that task.')
 param runCommandTimeoutSeconds int = 600
 
@@ -109,6 +112,7 @@ resource bootstrapCommand 'Microsoft.HybridCompute/machines/runCommands@2024-11-
       // which the launcher parses case-insensitively. A bool value here
       // would be rejected by the runCommand's string-typed parameter.
       { name: 'EnableWorkloadIdentity', value: string(enableWorkloadIdentity) }
+      { name: 'RunAsDedicatedAdmin',    value: string(runAsDedicatedAdmin) }
     ]
     protectedParameters: [
       // Azure encrypts these in transit and excludes them from any output

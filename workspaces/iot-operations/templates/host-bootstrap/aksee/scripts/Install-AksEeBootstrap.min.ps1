@@ -14,7 +14,8 @@ param(
 [string]$ScheduledTaskName = 'SiteOpsAksEeBootstrap',
 [string]$LocalAdminUser    = 'siteops-bootstrap',
 [string]$EnableWorkloadIdentity = 'false',
-[switch]$Force
+[switch]$Force,
+[string]$RunAsDedicatedAdmin = 'false'
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -482,13 +483,18 @@ if (Test-Path $childLog)    { $tailOut = (Get-Content $childLog    -Tail 30 -Err
 if (Test-Path $childErrLog) { $tailErr = (Get-Content $childErrLog -Tail 30 -ErrorAction SilentlyContinue) -join "`n" }
 throw "New-AksEdgeDeployment exited with code $($proc.ExitCode).`nstdout tail:`n$tailOut`nstderr tail:`n$tailErr`nFull logs at $childLog and $childErrLog."
 }
-$kubeconfig = Join-Path $env:USERPROFILE '.kube\config'
-if (-not (Test-Path $kubeconfig)) {
-throw "Kubeconfig not written at $kubeconfig after New-AksEdgeDeployment. The cluster did not come up."
+$kubeCandidates = @(
+(Join-Path $env:USERPROFILE '.kube\config'),
+(Join-Path $env:SystemRoot 'System32\config\systemprofile\.kube\config'),
+(Join-Path $env:SystemRoot 'SysWOW64\config\systemprofile\.kube\config')
+)
+$kubeconfig = $kubeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $kubeconfig) {
+throw "Kubeconfig not found after New-AksEdgeDeployment. Checked: $($kubeCandidates -join '; '). The cluster did not come up, or the kubeconfig landed in an unexpected location."
 }
 $sharedKubeconfig = Join-Path $ConfigDir 'kubeconfig'
 Copy-Item -Path $kubeconfig -Destination $sharedKubeconfig -Force
-Write-Log "Copied kubeconfig to $sharedKubeconfig for operator use"
+Write-Log "Copied kubeconfig from $kubeconfig to $sharedKubeconfig"
 Set-State -Phase 3 -Status 'running'
 Write-Log 'Phase 2: complete (cluster up)'
 } finally {
@@ -525,6 +531,12 @@ $useMi = -not ($config.PSObject.Properties.Name -contains 'spAppId' -and $config
 -or -not ($config.PSObject.Properties.Name -contains 'spPassword' -and $config.spPassword)
 if ($useMi) {
 Write-Log 'Authenticating with Arc machine managed identity (az login --identity)'
+foreach ($name in @('IDENTITY_ENDPOINT', 'IMDS_ENDPOINT')) {
+if (-not [Environment]::GetEnvironmentVariable($name)) {
+$machineVal = [Environment]::GetEnvironmentVariable($name, 'Machine')
+if ($machineVal) { Set-Item -Path "Env:$name" -Value $machineVal }
+}
+}
 $loginOut = & az login --identity --only-show-errors 2>&1
 if ($LASTEXITCODE -ne 0) {
 throw "az login --identity failed: $loginOut. Ensure the Arc machine identity has Contributor (or Kubernetes Cluster - Azure Arc Onboarding) on the resource group."
@@ -644,6 +656,18 @@ if (Test-Path $renderedPath) {
 Remove-Item -Path $renderedPath -Force -ErrorAction SilentlyContinue
 Write-Log 'Removed leftover rendered config'
 }
+foreach ($sysKube in @(
+(Join-Path $env:SystemRoot 'System32\config\systemprofile\.kube'),
+(Join-Path $env:SystemRoot 'SysWOW64\config\systemprofile\.kube'))) {
+if (Test-Path $sysKube) {
+Remove-Item -Path $sysKube -Recurse -Force -ErrorAction SilentlyContinue
+Write-Log "Purged systemprofile kubeconfig at $sysKube"
+}
+}
+if ($env:AZURE_CONFIG_DIR -and (Test-Path $env:AZURE_CONFIG_DIR)) {
+Remove-Item -Path $env:AZURE_CONFIG_DIR -Recurse -Force -ErrorAction SilentlyContinue
+Write-Log "Removed az token cache at $env:AZURE_CONFIG_DIR"
+}
 if (Test-Path $script:ConfigPath) {
 $cfg = Get-Content -Raw -Path $script:ConfigPath | ConvertFrom-Json
 if (($cfg.PSObject.Properties.Name -contains 'spPassword') -and $cfg.spPassword) {
@@ -661,6 +685,7 @@ Write-Log 'Phase 99: complete. Bootstrap succeeded.'
 if (-not (Test-Path $ConfigDir)) {
 New-Item -ItemType Directory -Path $ConfigDir -Force | Out-Null
 }
+$env:AZURE_CONFIG_DIR = Join-Path $ConfigDir '.azure'
 $logPath = Join-Path $ConfigDir "worker-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
 Start-Transcript -Path $logPath -Append | Out-Null
 try {
@@ -775,8 +800,15 @@ return
 Set-Content -Path $workerPath   -Value $EmbeddedWorker   -Encoding UTF8
 Set-Content -Path $templatePath -Value $EmbeddedTemplate -Encoding UTF8
 Write-Log "Wrote $workerPath and $templatePath"
+$runAsSystem = ($RunAsDedicatedAdmin -ine 'true')
+$adminPassword = $null
+if (-not $runAsSystem) {
 $adminPassword = New-RandomPassword
 Set-LocalAdminUser -Username $LocalAdminUser -Password $adminPassword
+Write-Log "Worker task will run as local admin $LocalAdminUser"
+} else {
+Write-Log 'Worker task will run as NT AUTHORITY\SYSTEM (no local account created)'
+}
 $encryptedSpPassword = ''
 $useMi = -not $SpAppId -and -not $SpPassword
 if ((-not $useMi) -and (-not $SpAppId -or -not $SpPassword)) {
@@ -798,6 +830,7 @@ spPasswordEncrypted    = (-not $useMi)
 aksEdgeMsiUrl          = $AksEdgeMsiUrl
 scheduledTaskName      = $ScheduledTaskName
 localAdminUser         = $LocalAdminUser
+runAsSystem            = $runAsSystem
 enableWorkloadIdentity = ($EnableWorkloadIdentity -ieq 'true')
 }
 $config | ConvertTo-Json | Set-Content -Path $configPath -Encoding UTF8
@@ -818,10 +851,17 @@ $action = New-ScheduledTaskAction `
 -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$workerPath`" -ConfigDir `"$ConfigDir`""
 $startupTrigger = New-ScheduledTaskTrigger -AtStartup
 $onceTrigger    = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddSeconds(30))
+if ($runAsSystem) {
+$principal = New-ScheduledTaskPrincipal `
+-UserId 'NT AUTHORITY\SYSTEM' `
+-LogonType ServiceAccount `
+-RunLevel Highest
+} else {
 $principal = New-ScheduledTaskPrincipal `
 -UserId "$env:COMPUTERNAME\$LocalAdminUser" `
 -LogonType Password `
 -RunLevel Highest
+}
 $settings = New-ScheduledTaskSettingsSet `
 -AllowStartIfOnBatteries `
 -DontStopIfGoingOnBatteries `
@@ -833,12 +873,19 @@ $task = New-ScheduledTask `
 -Trigger @($startupTrigger, $onceTrigger) `
 -Principal $principal `
 -Settings $settings
+if ($runAsSystem) {
+Register-ScheduledTask `
+-TaskName $ScheduledTaskName `
+-InputObject $task `
+-Force | Out-Null
+} else {
 Register-ScheduledTask `
 -TaskName $ScheduledTaskName `
 -InputObject $task `
 -User "$env:COMPUTERNAME\$LocalAdminUser" `
 -Password $adminPassword `
 -Force | Out-Null
+}
 Write-Log "Registered Scheduled Task $ScheduledTaskName"
 Start-ScheduledTask -TaskName $ScheduledTaskName
 Write-Log "Started $ScheduledTaskName"

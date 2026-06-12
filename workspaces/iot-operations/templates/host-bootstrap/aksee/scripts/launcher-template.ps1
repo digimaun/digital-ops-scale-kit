@@ -134,7 +134,13 @@ param(
     # Refuse to re-init when state.json shows an in-flight bootstrap.
     # Pass -Force to reset state to phase=0 and re-register the task
     # (destroys progress of any concurrent run).
-    [switch]$Force
+    [switch]$Force,
+    # The worker Scheduled Task runs as NT AUTHORITY\SYSTEM by default, so no
+    # local account or password is created. Set 'true' to instead create the
+    # $LocalAdminUser account with an on-box generated password and run the task
+    # as it (a hardened-environment fallback). A string, not a switch, so the
+    # Arc Run Command can deliver it (matching EnableWorkloadIdentity).
+    [string]$RunAsDedicatedAdmin = 'false'
 )
 
 Set-StrictMode -Version Latest
@@ -364,8 +370,15 @@ Set-Content -Path $workerPath   -Value $EmbeddedWorker   -Encoding UTF8
 Set-Content -Path $templatePath -Value $EmbeddedTemplate -Encoding UTF8
 Write-Log "Wrote $workerPath and $templatePath"
 
-$adminPassword = New-RandomPassword
-Set-LocalAdminUser -Username $LocalAdminUser -Password $adminPassword
+$runAsSystem = ($RunAsDedicatedAdmin -ine 'true')
+$adminPassword = $null
+if (-not $runAsSystem) {
+    $adminPassword = New-RandomPassword
+    Set-LocalAdminUser -Username $LocalAdminUser -Password $adminPassword
+    Write-Log "Worker task will run as local admin $LocalAdminUser"
+} else {
+    Write-Log 'Worker task will run as NT AUTHORITY\SYSTEM (no local account created)'
+}
 
 $encryptedSpPassword = ''
 $useMi = -not $SpAppId -and -not $SpPassword
@@ -389,6 +402,7 @@ $config = [pscustomobject]@{
     aksEdgeMsiUrl          = $AksEdgeMsiUrl
     scheduledTaskName      = $ScheduledTaskName
     localAdminUser         = $LocalAdminUser
+    runAsSystem            = $runAsSystem
     enableWorkloadIdentity = ($EnableWorkloadIdentity -ieq 'true')
 }
 $config | ConvertTo-Json | Set-Content -Path $configPath -Encoding UTF8
@@ -415,10 +429,17 @@ $action = New-ScheduledTaskAction `
 $startupTrigger = New-ScheduledTaskTrigger -AtStartup
 $onceTrigger    = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddSeconds(30))
 
-$principal = New-ScheduledTaskPrincipal `
-    -UserId "$env:COMPUTERNAME\$LocalAdminUser" `
-    -LogonType Password `
-    -RunLevel Highest
+if ($runAsSystem) {
+    $principal = New-ScheduledTaskPrincipal `
+        -UserId 'NT AUTHORITY\SYSTEM' `
+        -LogonType ServiceAccount `
+        -RunLevel Highest
+} else {
+    $principal = New-ScheduledTaskPrincipal `
+        -UserId "$env:COMPUTERNAME\$LocalAdminUser" `
+        -LogonType Password `
+        -RunLevel Highest
+}
 
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
@@ -440,12 +461,19 @@ $task = New-ScheduledTask `
     -Principal $principal `
     -Settings $settings
 
-Register-ScheduledTask `
-    -TaskName $ScheduledTaskName `
-    -InputObject $task `
-    -User "$env:COMPUTERNAME\$LocalAdminUser" `
-    -Password $adminPassword `
-    -Force | Out-Null
+if ($runAsSystem) {
+    Register-ScheduledTask `
+        -TaskName $ScheduledTaskName `
+        -InputObject $task `
+        -Force | Out-Null
+} else {
+    Register-ScheduledTask `
+        -TaskName $ScheduledTaskName `
+        -InputObject $task `
+        -User "$env:COMPUTERNAME\$LocalAdminUser" `
+        -Password $adminPassword `
+        -Force | Out-Null
+}
 Write-Log "Registered Scheduled Task $ScheduledTaskName"
 
 Start-ScheduledTask -TaskName $ScheduledTaskName

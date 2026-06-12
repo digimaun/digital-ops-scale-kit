@@ -77,6 +77,48 @@ A manifest with neither `sites:` nor `selector:` is a library or partial. It req
     - configs/local-manifest.yaml
 ```
 
+### Wait steps
+
+A wait step gates the steps that follow it on an Azure condition. It blocks the
+site's step sequence until the condition is met, then lets the remaining steps
+run. Use it when a prior step starts asynchronous work whose completion is not
+reflected in the deployment's own result. A timeout or a terminal failure fails
+the step, which skips the site's remaining steps.
+
+The first supported condition type is `arm-tag`: poll a tag on an ARM resource
+until it reaches an expected value.
+
+```yaml
+- name: wait-for-bootstrap
+  type: wait
+  condition:
+    type: arm-tag
+    resourceId: "/subscriptions/{{ site.subscription }}/resourceGroups/{{ site.resourceGroup }}/providers/Microsoft.HybridCompute/machines/{{ site.parameters.aksee.machineName }}"
+    tagKey: "siteops.bootstrap.state"
+    expectedValue: "succeeded"
+    failurePattern: "failed-*"   # optional: abort fast on a matching value
+  timeoutMinutes: 45
+  pollIntervalSeconds: 30
+```
+
+| Field | Required | Behavior |
+|-------|----------|----------|
+| `condition.type` | yes | Condition kind. Currently `arm-tag`. |
+| `condition.resourceId` | yes | Full ARM resource ID to poll. Supports template variables and `{{ steps.X.outputs.Y }}` references to prior steps. |
+| `condition.tagKey` | yes | Tag name to read. |
+| `condition.expectedValue` | yes | Tag value that satisfies the wait. Compared as a string. |
+| `condition.failurePattern` | no | An `fnmatch` glob. A tag value matching it aborts the wait immediately instead of waiting for the timeout. Omit for a plain wait-until-expected. |
+| `timeoutMinutes` | no (default 30) | Maximum minutes to wait before failing. |
+| `pollIntervalSeconds` | no (default 30) | Seconds between checks. |
+
+Behavior notes:
+
+- The deploying identity reads the tag, so it needs read access on the resource. No extra service is provisioned.
+- The wait checks the condition once before sleeping, so an already-satisfied condition returns on the first poll.
+- A permanent error (authorization failure, resource not found, malformed `resourceId`) fails the step fast rather than polling for the full timeout. Transient errors (throttling, 5xx, network) keep polling.
+- A timeout or failure message reports the last observed tag value and the last underlying error.
+- `--dry-run` never polls. It logs the intended condition and reports success.
+
 ### Include steps
 
 Splice another manifest's steps into this one's step list at the include's position:

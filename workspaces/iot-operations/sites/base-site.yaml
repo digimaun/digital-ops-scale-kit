@@ -18,6 +18,7 @@ properties:
     enableGlobalSite: false      # Subscription-scoped edge site
     enableEdgeSite: false        # RG-scoped edge site
     enableSecretSync: false
+    enableWorkloadIdentity: false # OIDC issuer + WLIF on the AKS EE host bootstrap (paired with enableSecretSync)
     enableCertManager: true      # cert-manager Arc extension on the cluster
 
 parameters:

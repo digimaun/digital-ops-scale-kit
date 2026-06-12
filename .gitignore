@@ -214,3 +214,7 @@ __marimo__/
 
 # Bicep build artifacts (compiled ARM JSON)
 **/templates/**/*.json
+# Hand-authored source JSON files under templates/ (template skeletons, example configs)
+# are intentionally tracked. The patterns above catch compiled Bicep artifacts only.
+!**/templates/**/*.template.json
+!**/templates/**/*.example.json

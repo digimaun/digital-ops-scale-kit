@@ -31,9 +31,11 @@ on:
                     - manifests/aio-install.yaml
                     - manifests/aio-upgrade.yaml
                     - manifests/secretsync.yaml
+                    - manifests/aksee-bootstrap.yaml
                     - samples/secretsync-sample/manifest.yaml
                     - samples/opc-ua-solution/manifest.yaml
                     - samples/aio-with-opc-ua/manifest.yaml
+                    - samples/aio-with-aksee-bootstrap/manifest.yaml
                 default: "manifests/aio-install.yaml"
             environment:
                 description: "Target environment"

@@ -18,6 +18,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -28,6 +29,7 @@ from siteops.executor import (
     AzCliExecutor,
     DeploymentResult,
     KubectlResult,
+    WaitResult,
     filter_parameters,
 )
 from siteops.models import (
@@ -40,6 +42,7 @@ from siteops.models import (
     ParallelConfig,
     SelectorParseError,
     Site,
+    WaitStep,
     _normalize_site_identifier,
     _validate_resource,
     parse_selector,
@@ -59,8 +62,8 @@ SITE_PROPERTIES_PATTERN = re.compile(r"\{\{\s*site\.properties\.([a-zA-Z0-9_.\[\
 # Supports nested paths like: site.parameters.brokerConfig.memoryProfile
 SITE_PARAMETERS_PATTERN = re.compile(r"\{\{\s*site\.parameters\.([a-zA-Z0-9_.\[\]]+)\s*\}\}")
 
-# Result type that can be either a deployment or kubectl result
-StepResult = DeploymentResult | KubectlResult
+# Result type that can be a deployment, kubectl, or wait result
+StepResult = DeploymentResult | KubectlResult | WaitResult
 
 # Type alias for subscription-scoped outputs: subscription_id -> step_name -> outputs
 SubscriptionOutputs = dict[str, dict[str, dict[str, Any]]]
@@ -1698,6 +1701,12 @@ class Orchestrator:
         if isinstance(step, KubectlStep):
             return None
 
+        # Wait steps gate on an external condition, not a deployment scope.
+        # They run on any site (the condition's resourceId carries the full
+        # ARM path).
+        if isinstance(step, WaitStep):
+            return None
+
         # Check scope/site level compatibility
         is_sub_level = site.is_subscription_level
         if step.scope == "subscription" and not is_sub_level:
@@ -1719,6 +1728,8 @@ class Orchestrator:
         """
         if isinstance(step, KubectlStep):
             return f"kubectl:{step.operation}"
+        if isinstance(step, WaitStep):
+            return "wait"
         return step.scope
 
     @staticmethod
@@ -1957,6 +1968,94 @@ class Orchestrator:
                 error=f"Unsupported kubectl operation: {step.operation}",
             )
 
+    def _execute_wait_step(
+        self,
+        site: Site,
+        step: WaitStep,
+        step_outputs: dict[str, dict[str, Any]],
+        subscription_outputs: SubscriptionOutputs | None = None,
+    ) -> WaitResult:
+        """Execute a wait step: resolve the condition, then poll until satisfied.
+
+        Resolves template variables and step-output references in the
+        condition's string fields (mirroring `_execute_kubectl_step`), guards
+        against an unresolved or empty resourceId/expectedValue, then hands the
+        resolved condition to the executor's poll loop.
+
+        Args:
+            site: Target site
+            step: The wait step
+            step_outputs: Outputs from previous steps (per-site)
+            subscription_outputs: Outputs from subscription-scoped steps
+
+        Returns:
+            WaitResult with success status and, on failure, a diagnostic.
+        """
+
+        def _resolve(value: str) -> str:
+            resolved = self._resolve_template_strings(value, site)
+            if step_outputs or subscription_outputs:
+                resolved = self._resolve_step_outputs(
+                    resolved, step_outputs, subscription_outputs, site.subscription
+                )
+            return str(resolved)
+
+        condition = step.condition
+
+        if condition.type == "arm-tag":
+            resolved_resource_id = _resolve(condition.resource_id)
+            resolved_expected = _resolve(condition.expected_value)
+
+            # Runtime guard: an unresolved template ({{ ... }} left intact) or an
+            # empty value would silently poll a bogus resource for the full
+            # timeout. Fail fast with a clear message instead.
+            for label, val in (
+                ("resourceId", resolved_resource_id),
+                ("expectedValue", resolved_expected),
+            ):
+                if not val.strip() or "{{" in val:
+                    return WaitResult(
+                        success=False,
+                        step_name=step.name,
+                        site_name=site.name,
+                        error=(
+                            f"Wait step '{step.name}' has an unresolved or empty {label} after "
+                            f"template resolution: {val!r}. Check the site provides the referenced "
+                            f"variables."
+                        ),
+                    )
+
+            try:
+                resolved_condition = replace(
+                    condition,
+                    resource_id=resolved_resource_id,
+                    expected_value=resolved_expected,
+                )
+            except ValueError as e:
+                return WaitResult(
+                    success=False,
+                    step_name=step.name,
+                    site_name=site.name,
+                    error=f"Wait step '{step.name}' condition invalid after resolution: {e}",
+                )
+        else:
+            # Defensive: unknown condition types are rejected at parse/validate.
+            return WaitResult(
+                success=False,
+                step_name=step.name,
+                site_name=site.name,
+                error=f"Unsupported wait condition type: {condition.type}",
+            )
+
+        return self.executor.wait_for_condition(
+            condition=resolved_condition,
+            timeout_minutes=step.timeout_minutes,
+            poll_interval_seconds=step.poll_interval_seconds,
+            subscription=site.subscription,
+            step_name=step.name,
+            site_name=site.name,
+        )
+
     def _execute_step(
         self,
         site: Site,
@@ -1981,6 +2080,8 @@ class Orchestrator:
         """
         if isinstance(step, KubectlStep):
             return self._execute_kubectl_step(site, step, step_outputs, subscription_outputs)
+        elif isinstance(step, WaitStep):
+            return self._execute_wait_step(site, step, step_outputs, subscription_outputs)
         else:
             return self._deploy_bicep_step(site, step, manifest, timestamp, step_outputs, subscription_outputs)
 
@@ -2707,6 +2808,30 @@ class Orchestrator:
                     full_path = (self.workspace / file_path).resolve()
                     if not full_path.exists():
                         errors.append(f"Kubectl file not found: {file_path} (step: {step.name})")
+            elif isinstance(step, WaitStep):
+                # Validate that step-output references in the condition point
+                # only to prior steps. A wait produces no outputs, so a self or
+                # later reference can never resolve.
+                condition = step.condition
+                condition_strings: list[str] = []
+                if condition.type == "arm-tag":
+                    condition_strings = [
+                        condition.resource_id,
+                        condition.tag_key,
+                        condition.expected_value,
+                    ]
+                for condition_string in condition_strings:
+                    for match in STEP_OUTPUT_PATTERN.finditer(condition_string):
+                        ref_step = match.group(1)
+                        if ref_step not in all_step_names:
+                            errors.append(
+                                f"Step '{step.name}' wait condition references unknown step '{ref_step}'"
+                            )
+                        elif ref_step not in prior_step_names:
+                            errors.append(
+                                f"Step '{step.name}' wait condition references step '{ref_step}' "
+                                f"which does not execute before it"
+                            )
             else:
                 template_path = (self.workspace / step.template).resolve()
 
@@ -2995,6 +3120,17 @@ class Orchestrator:
                 for j, f in enumerate(step.files):
                     prefix = "└─" if j == len(step.files) - 1 else "├─"
                     print(f"       {prefix} {f}")
+            elif isinstance(step, WaitStep):
+                condition = step.condition
+                print(f"    {i}. {step.name} (wait){condition_info}")
+                if condition.type == "arm-tag":
+                    print(f"       ├─ resource: {condition.resource_id}")
+                    print(f"       ├─ tag: {condition.tag_key} == {condition.expected_value}")
+                    if condition.failure_pattern:
+                        print(f"       ├─ failurePattern: {condition.failure_pattern}")
+                print(
+                    f"       └─ timeout {step.timeout_minutes}m, poll {step.poll_interval_seconds}s"
+                )
             else:
                 print(f"    {i}. {step.name} ({step.scope}){condition_info}")
                 print(f"       └─ {step.template}")

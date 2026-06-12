@@ -140,7 +140,7 @@ Get-Content $log.FullName -Tail 50 -Wait
 
 ## Verify
 
-On the VM after `state.json` shows `phase=99 status=succeeded`. The bootstrap writes the kubeconfig under the bootstrap user's profile (which Phase 99 removes) and copies it to the shared ACL-locked path below. Open an admin PowerShell and point `KUBECONFIG` at the shared copy:
+On the VM after `state.json` shows `phase=99 status=succeeded`. The bootstrap copies the cluster kubeconfig to the shared ACL-locked path below (the original under the task account's profile is purged in Phase 99). Open an admin PowerShell and point `KUBECONFIG` at the shared copy:
 
 ```powershell
 $env:KUBECONFIG = 'C:\ProgramData\siteops\aksee-bootstrap\kubeconfig'
@@ -199,7 +199,7 @@ Get-WinEvent -LogName 'Microsoft-Windows-TaskScheduler/Operational' -MaxEvents 5
 
 ### Re-apply against an already-bootstrapped host
 
-Re-running the bootstrap against a host that already finished is a safe no-op. The launcher sees `state.json` at `status=succeeded`, leaves the cluster, scheduled task, and bootstrap user untouched, and returns `ALREADY-BOOTSTRAPPED`. In a composition the wait step then passes immediately on the existing `succeeded` tag. Pass `-Force` to the launcher (or use the clean-restart block below) to re-bootstrap from scratch.
+Re-running the bootstrap against a host that already finished is a safe no-op. The launcher sees `state.json` at `status=succeeded`, leaves the cluster and scheduled task untouched, and returns `ALREADY-BOOTSTRAPPED`. In a composition the wait step then passes immediately on the existing `succeeded` tag. Pass `-Force` to the launcher (or use the clean-restart block below) to re-bootstrap from scratch.
 
 ### Re-run a failed phase (keeps existing task and user)
 
@@ -244,7 +244,7 @@ Remove-AksEdgeDeployment -Confirm:$false -ErrorAction SilentlyContinue
 | 1  | MSI install + `Install-AksEdgeHostFeatures` | Yes (Hyper-V enable) |
 | 2  | Substitute the Arc block in the rendered cluster config from runtime parameters, then create the single-node K3s cluster (AKS Edge Essentials Arc-connects the cluster as part of this step) | No |
 | 3  | Install Azure CLI if missing, authenticate (managed identity by default, service principal as fallback), enable `cluster-connect` and `custom-locations`, and (when `enableWorkloadIdentity` is requested) wire the OIDC issuer through the K3s apiserver | No |
-| 99 | Cleanup (unregister scheduled task, remove bootstrap user, remove rendered config). Write `siteops.bootstrap.state` tag on the Arc machine. | No |
+| 99 | Cleanup (unregister scheduled task, purge the task account's kubeconfig and az token cache, remove the rendered config, and remove the bootstrap user if one was created). Write `siteops.bootstrap.state` tag on the Arc machine. | No |
 
 Each phase is idempotent so a worker re-run from any state is safe. Phase 1 writes the next phase to `state.json` BEFORE calling `Install-AksEdgeHostFeatures` so the at-startup scheduled-task trigger resumes at Phase 2 after the reboot.
 
@@ -292,7 +292,8 @@ Set it per site via `deployOptions.enableWorkloadIdentity: true` (paired with `e
 - **In transit:** the operator passes the SP secret as a manifest parameter, ultimately delivered to the launcher as a `protectedParameter` on the Arc Run Command resource. Azure encrypts the value in transit and excludes it from instance-view output. Source from a CI Key Vault binding in production.
 - **At rest:** the launcher encrypts the SP password via Windows DPAPI (LocalMachine scope) before writing to `config.json`. The worker decrypts on read. Off-box exfiltration of `config.json` cannot decrypt because the DPAPI key is bound to the machine.
 - **ACLs:** `C:\ProgramData\siteops\aksee-bootstrap\` has inherited ACLs removed and re-granted to Administrators + SYSTEM only.
-- **Local admin user password:** generated on-box, never transmitted, written only to the Scheduled Task registration via `Register-ScheduledTask -User -Password`. The password does not persist in `config.json` or any other file the worker reads.
+- **Task identity:** by default the worker Scheduled Task runs as `NT AUTHORITY\SYSTEM`, so no local account or password is created. With `runAsDedicatedAdmin` the launcher instead creates a local admin with an on-box generated password, written only to the task registration via `Register-ScheduledTask -User -Password` and never persisted to any file the worker reads.
+- **az token cache:** Phase 3 scopes `AZURE_CONFIG_DIR` into the ACL-locked working directory so the az tokens stay behind the Administrators + SYSTEM ACL. Phase 99 removes the cache on success.
 - **Phase 2 rendered config:** the worker writes a rendered AKS Edge config to disk that carries the plaintext SP secret while the install cmdlet reads it. A `try/finally` wraps the cmdlet invocation and always deletes the rendered file after the cmdlet returns. Phase 99 zeros the SP blob in `config.json` after the bootstrap succeeds.
 
 ## Run directly (advanced)
@@ -302,5 +303,5 @@ The scalekit path delivers the launcher via Bicep + Arc Run Command. For debuggi
 ## Known limitations
 
 - The Bicep `spAppId` and `spPassword` are required (no managed-identity-only path for cluster creation). AKS Edge Essentials' install cmdlet hard-requires SP credentials and there is no flag to skip its own Arc-connect. Tracked upstream.
-- The bootstrap registers a Scheduled Task that runs as a dedicated local admin user the launcher creates. Hardened environments that disallow new local users would need a `LocalAdminUser` override pointing at a pre-existing account.
+- The worker Scheduled Task runs as `NT AUTHORITY\SYSTEM` by default, so no local account or password is created. For hardened environments that disallow SYSTEM-context tasks, the Bicep `runAsDedicatedAdmin` parameter (launcher `-RunAsDedicatedAdmin`) runs it as a launcher-created local admin instead.
 - The Run Command resource returns `executionState=Succeeded` the moment the launcher returns `REGISTERED`, NOT when the worker reaches `phase=99 status=succeeded`. Use the [bootstrap state tag](#bootstrap-state-tag) to gate downstream pipeline steps on actual bootstrap completion.

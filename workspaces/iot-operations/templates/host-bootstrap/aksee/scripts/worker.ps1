@@ -146,6 +146,14 @@ function Test-AksEdgeDeployed {
     }
 }
 
+function Get-Prop {
+    # StrictMode-safe property read. Returns $Obj.$Name when present, else
+    # $Default. Replaces the repeated PSObject.Properties.Name -contains guard.
+    param($Obj, [string]$Name, $Default = $null)
+    if ($null -ne $Obj -and $Obj.PSObject.Properties.Name -contains $Name) { return $Obj.$Name }
+    return $Default
+}
+
 function Resolve-SpPassword {
     # Returns the plaintext SP password from config. When the launcher
     # encrypts the password (production path), config.spPasswordEncrypted
@@ -153,7 +161,7 @@ function Resolve-SpPassword {
     # LocalMachine scope. For local testing without the launcher, plain
     # text in config.spPassword is also accepted.
     param($Config)
-    $isEncrypted = ($Config.PSObject.Properties.Name -contains 'spPasswordEncrypted') -and $Config.spPasswordEncrypted
+    $isEncrypted = [bool](Get-Prop $Config 'spPasswordEncrypted')
     if (-not $isEncrypted) {
         return $Config.spPassword
     }
@@ -268,28 +276,15 @@ function Wait-ArcClusterReady {
         $json = & az connectedk8s show --name $ClusterName --resource-group $ResourceGroup --output json 2>$null
         if ($LASTEXITCODE -eq 0) {
             $cluster = $json | ConvertFrom-Json
-            $obj = if ($cluster.PSObject.Properties.Name -contains 'properties') { $cluster.properties } else { $cluster }
-            $connStatus = $obj.connectivityStatus
-            # StrictMode throws on an absent property rather than returning
-            # $null, so guard the leaf. The issuer URL and agentState are
-            # commonly absent in the window between enabling the issuer and
-            # Arc finishing provisioning, which is what -WaitForIssuerUrl
-            # polls through.
-            $issuerUrl = $null
-            if ($obj.PSObject.Properties.Name -contains 'oidcIssuerProfile' -and $null -ne $obj.oidcIssuerProfile -and
-                $obj.oidcIssuerProfile.PSObject.Properties.Name -contains 'issuerUrl') {
-                $issuerUrl = $obj.oidcIssuerProfile.issuerUrl
-            }
-            $agentState = $null
-            if ($obj.PSObject.Properties.Name -contains 'arcAgentProfile' -and $null -ne $obj.arcAgentProfile -and
-                $obj.arcAgentProfile.PSObject.Properties.Name -contains 'agentState') {
-                $agentState = $obj.arcAgentProfile.agentState
-            }
-            $wiEnabled = $false
-            if ($obj.PSObject.Properties.Name -contains 'securityProfile' -and $null -ne $obj.securityProfile -and
-                $obj.securityProfile.PSObject.Properties.Name -contains 'workloadIdentity' -and $null -ne $obj.securityProfile.workloadIdentity) {
-                $wiEnabled = [bool]$obj.securityProfile.workloadIdentity.enabled
-            }
+            $obj = Get-Prop $cluster 'properties' $cluster
+            $connStatus = Get-Prop $obj 'connectivityStatus'
+            # issuerUrl and agentState are commonly absent in the window between
+            # enabling the issuer and Arc finishing provisioning, which is what
+            # -WaitForIssuerUrl polls through. Get-Prop reads each StrictMode-safe.
+            $issuerUrl  = Get-Prop (Get-Prop $obj 'oidcIssuerProfile') 'issuerUrl'
+            $agentState = Get-Prop (Get-Prop $obj 'arcAgentProfile') 'agentState'
+            $wi         = Get-Prop (Get-Prop $obj 'securityProfile') 'workloadIdentity'
+            $wiEnabled  = [bool](Get-Prop $wi 'enabled')
             if ($WaitForIssuerUrl) {
                 Write-Log "Arc cluster status: connectivity=$connStatus agentState=$agentState issuerUrl=$(if ($issuerUrl) { 'present' } else { '(none)' }) wiEnabled=$wiEnabled"
             } else {
@@ -561,8 +556,8 @@ function Invoke-Phase2 {
     # Phase 3 cannot satisfy this Phase 2 requirement. Fail fast with a
     # precise message rather than letting the operator hit a cryptic
     # 10-minute cmdlet failure mid-deploy.
-    $hasAppId    = ($config.PSObject.Properties.Name -contains 'spAppId')    -and $config.spAppId
-    $hasPassword = ($config.PSObject.Properties.Name -contains 'spPassword') -and $config.spPassword
+    $hasAppId    = [bool](Get-Prop $config 'spAppId')
+    $hasPassword = [bool](Get-Prop $config 'spPassword')
     if (-not ($hasAppId -and $hasPassword)) {
         throw "AKS Edge Essentials requires a service principal to create the cluster. Re-run the launcher with -SpAppId and -SpPassword."
     }
@@ -676,7 +671,7 @@ function Invoke-Phase3 {
     # uses workload-identity-backed secret sync. Default false keeps the
     # riskiest path opt-in. Set enableWorkloadIdentity true in config.json
     # to enable it.
-    $enableWi = ($config.PSObject.Properties.Name -contains 'enableWorkloadIdentity') -and $config.enableWorkloadIdentity
+    $enableWi = [bool](Get-Prop $config 'enableWorkloadIdentity')
     Write-Log "Workload identity + OIDC issuer requested: $enableWi"
 
     Install-AzCliIfMissing
@@ -716,8 +711,7 @@ function Invoke-Phase3 {
     # The Arc machine identity needs `Kubernetes Cluster - Azure Arc
     # Onboarding` (or broader Contributor) on the resource group for
     # connect + enable-features. One-time RBAC step per Arc machine.
-    $useMi = -not ($config.PSObject.Properties.Name -contains 'spAppId' -and $config.spAppId) `
-             -or -not ($config.PSObject.Properties.Name -contains 'spPassword' -and $config.spPassword)
+    $useMi = -not (Get-Prop $config 'spAppId') -or -not (Get-Prop $config 'spPassword')
     if ($useMi) {
         Write-Log 'Authenticating with Arc machine managed identity (az login --identity)'
         # The Arc agent publishes the HIMDS endpoints as Machine-scope env vars.
@@ -846,10 +840,7 @@ function Invoke-Phase99 {
         Write-Log "WARNING: tag write helper threw: $_. Non-fatal."
     }
 
-    $taskName = 'SiteOpsAksEeBootstrap'
-    if ($config.PSObject.Properties.Name -contains 'scheduledTaskName') {
-        $taskName = $config.scheduledTaskName
-    }
+    $taskName = Get-Prop $config 'scheduledTaskName' 'SiteOpsAksEeBootstrap'
     $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     if ($null -ne $task) {
         Write-Log "Unregistering scheduled task $taskName"
@@ -864,10 +855,7 @@ function Invoke-Phase99 {
     # token. Capture the SID first so the profile-by-SID lookup works
     # after the account is gone. Also defensively remove the rendered
     # AKS EE config in case Phase 2's finally block was skipped.
-    $bootstrapUser = 'siteops-bootstrap'
-    if ($config.PSObject.Properties.Name -contains 'localAdminUser') {
-        $bootstrapUser = $config.localAdminUser
-    }
+    $bootstrapUser = Get-Prop $config 'localAdminUser' 'siteops-bootstrap'
     $user = Get-LocalUser -Name $bootstrapUser -ErrorAction SilentlyContinue
     $bootstrapSid = $null
     if ($null -ne $user) {
@@ -921,9 +909,9 @@ function Invoke-Phase99 {
     # already and the conditional below is a no-op.
     if (Test-Path $script:ConfigPath) {
         $cfg = Get-Content -Raw -Path $script:ConfigPath | ConvertFrom-Json
-        if (($cfg.PSObject.Properties.Name -contains 'spPassword') -and $cfg.spPassword) {
+        if (Get-Prop $cfg 'spPassword') {
             $cfg.spPassword = ''
-            if ($cfg.PSObject.Properties.Name -contains 'spPasswordEncrypted') {
+            if ($null -ne (Get-Prop $cfg 'spPasswordEncrypted')) {
                 $cfg.spPasswordEncrypted = $false
             }
             $cfg | ConvertTo-Json | Set-Content -Path $script:ConfigPath -Encoding UTF8

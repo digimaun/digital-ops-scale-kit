@@ -166,9 +166,14 @@ return $LASTEXITCODE -eq 0
 return $false
 }
 }
+function Get-Prop {
+param($Obj, [string]$Name, $Default = $null)
+if ($null -ne $Obj -and $Obj.PSObject.Properties.Name -contains $Name) { return $Obj.$Name }
+return $Default
+}
 function Resolve-SpPassword {
 param($Config)
-$isEncrypted = ($Config.PSObject.Properties.Name -contains 'spPasswordEncrypted') -and $Config.spPasswordEncrypted
+$isEncrypted = [bool](Get-Prop $Config 'spPasswordEncrypted')
 if (-not $isEncrypted) {
 return $Config.spPassword
 }
@@ -253,23 +258,12 @@ for ($i = 0; $i -lt $MaxRetries; $i++) {
 $json = & az connectedk8s show --name $ClusterName --resource-group $ResourceGroup --output json 2>$null
 if ($LASTEXITCODE -eq 0) {
 $cluster = $json | ConvertFrom-Json
-$obj = if ($cluster.PSObject.Properties.Name -contains 'properties') { $cluster.properties } else { $cluster }
-$connStatus = $obj.connectivityStatus
-$issuerUrl = $null
-if ($obj.PSObject.Properties.Name -contains 'oidcIssuerProfile' -and $null -ne $obj.oidcIssuerProfile -and
-$obj.oidcIssuerProfile.PSObject.Properties.Name -contains 'issuerUrl') {
-$issuerUrl = $obj.oidcIssuerProfile.issuerUrl
-}
-$agentState = $null
-if ($obj.PSObject.Properties.Name -contains 'arcAgentProfile' -and $null -ne $obj.arcAgentProfile -and
-$obj.arcAgentProfile.PSObject.Properties.Name -contains 'agentState') {
-$agentState = $obj.arcAgentProfile.agentState
-}
-$wiEnabled = $false
-if ($obj.PSObject.Properties.Name -contains 'securityProfile' -and $null -ne $obj.securityProfile -and
-$obj.securityProfile.PSObject.Properties.Name -contains 'workloadIdentity' -and $null -ne $obj.securityProfile.workloadIdentity) {
-$wiEnabled = [bool]$obj.securityProfile.workloadIdentity.enabled
-}
+$obj = Get-Prop $cluster 'properties' $cluster
+$connStatus = Get-Prop $obj 'connectivityStatus'
+$issuerUrl  = Get-Prop (Get-Prop $obj 'oidcIssuerProfile') 'issuerUrl'
+$agentState = Get-Prop (Get-Prop $obj 'arcAgentProfile') 'agentState'
+$wi         = Get-Prop (Get-Prop $obj 'securityProfile') 'workloadIdentity'
+$wiEnabled  = [bool](Get-Prop $wi 'enabled')
 if ($WaitForIssuerUrl) {
 Write-Log "Arc cluster status: connectivity=$connStatus agentState=$agentState issuerUrl=$(if ($issuerUrl) { 'present' } else { '(none)' }) wiEnabled=$wiEnabled"
 } else {
@@ -444,8 +438,8 @@ if (-not (Test-Path $script:TemplatePath)) {
 throw "Template not found at $script:TemplatePath. The launcher copies this alongside worker.ps1. For local testing, see README.md."
 }
 Import-Module AksEdge
-$hasAppId    = ($config.PSObject.Properties.Name -contains 'spAppId')    -and $config.spAppId
-$hasPassword = ($config.PSObject.Properties.Name -contains 'spPassword') -and $config.spPassword
+$hasAppId    = [bool](Get-Prop $config 'spAppId')
+$hasPassword = [bool](Get-Prop $config 'spPassword')
 if (-not ($hasAppId -and $hasPassword)) {
 throw "AKS Edge Essentials requires a service principal to create the cluster. Re-run the launcher with -SpAppId and -SpPassword."
 }
@@ -514,7 +508,7 @@ $loc     = $config.location
 $tenant  = $config.tenantId
 $oid     = $config.customLocationsOid
 $appId   = $config.spAppId
-$enableWi = ($config.PSObject.Properties.Name -contains 'enableWorkloadIdentity') -and $config.enableWorkloadIdentity
+$enableWi = [bool](Get-Prop $config 'enableWorkloadIdentity')
 Write-Log "Workload identity + OIDC issuer requested: $enableWi"
 Install-AzCliIfMissing
 $env:KUBECTL_CLIENT_PATH = "$env:ProgramFiles\AksEdge\kubectl\kubectl.exe"
@@ -527,8 +521,7 @@ Write-Log "Shared kubeconfig not found at $sharedKubeconfig. az/kubectl will fal
 }
 Write-Log 'Adding az extension: connectedk8s'
 & az extension add --name connectedk8s --upgrade --only-show-errors | Out-Null
-$useMi = -not ($config.PSObject.Properties.Name -contains 'spAppId' -and $config.spAppId) `
--or -not ($config.PSObject.Properties.Name -contains 'spPassword' -and $config.spPassword)
+$useMi = -not (Get-Prop $config 'spAppId') -or -not (Get-Prop $config 'spPassword')
 if ($useMi) {
 Write-Log 'Authenticating with Arc machine managed identity (az login --identity)'
 foreach ($name in @('IDENTITY_ENDPOINT', 'IMDS_ENDPOINT')) {
@@ -616,10 +609,7 @@ Write-BootstrapStateTag -config $config -Value 'succeeded'
 } catch {
 Write-Log "WARNING: tag write helper threw: $_. Non-fatal."
 }
-$taskName = 'SiteOpsAksEeBootstrap'
-if ($config.PSObject.Properties.Name -contains 'scheduledTaskName') {
-$taskName = $config.scheduledTaskName
-}
+$taskName = Get-Prop $config 'scheduledTaskName' 'SiteOpsAksEeBootstrap'
 $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 if ($null -ne $task) {
 Write-Log "Unregistering scheduled task $taskName"
@@ -627,10 +617,7 @@ Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
 } else {
 Write-Log "Scheduled task $taskName not found, nothing to unregister"
 }
-$bootstrapUser = 'siteops-bootstrap'
-if ($config.PSObject.Properties.Name -contains 'localAdminUser') {
-$bootstrapUser = $config.localAdminUser
-}
+$bootstrapUser = Get-Prop $config 'localAdminUser' 'siteops-bootstrap'
 $user = Get-LocalUser -Name $bootstrapUser -ErrorAction SilentlyContinue
 $bootstrapSid = $null
 if ($null -ne $user) {
@@ -670,9 +657,9 @@ Write-Log "Removed az token cache at $env:AZURE_CONFIG_DIR"
 }
 if (Test-Path $script:ConfigPath) {
 $cfg = Get-Content -Raw -Path $script:ConfigPath | ConvertFrom-Json
-if (($cfg.PSObject.Properties.Name -contains 'spPassword') -and $cfg.spPassword) {
+if (Get-Prop $cfg 'spPassword') {
 $cfg.spPassword = ''
-if ($cfg.PSObject.Properties.Name -contains 'spPasswordEncrypted') {
+if ($null -ne (Get-Prop $cfg 'spPasswordEncrypted')) {
 $cfg.spPasswordEncrypted = $false
 }
 $cfg | ConvertTo-Json | Set-Content -Path $script:ConfigPath -Encoding UTF8
@@ -851,17 +838,12 @@ $action = New-ScheduledTaskAction `
 -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$workerPath`" -ConfigDir `"$ConfigDir`""
 $startupTrigger = New-ScheduledTaskTrigger -AtStartup
 $onceTrigger    = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddSeconds(30))
-if ($runAsSystem) {
-$principal = New-ScheduledTaskPrincipal `
--UserId 'NT AUTHORITY\SYSTEM' `
--LogonType ServiceAccount `
--RunLevel Highest
+$principalArgs = if ($runAsSystem) {
+@{ UserId = 'NT AUTHORITY\SYSTEM'; LogonType = 'ServiceAccount' }
 } else {
-$principal = New-ScheduledTaskPrincipal `
--UserId "$env:COMPUTERNAME\$LocalAdminUser" `
--LogonType Password `
--RunLevel Highest
+@{ UserId = "$env:COMPUTERNAME\$LocalAdminUser"; LogonType = 'Password' }
 }
+$principal = New-ScheduledTaskPrincipal @principalArgs -RunLevel Highest
 $settings = New-ScheduledTaskSettingsSet `
 -AllowStartIfOnBatteries `
 -DontStopIfGoingOnBatteries `
@@ -873,19 +855,12 @@ $task = New-ScheduledTask `
 -Trigger @($startupTrigger, $onceTrigger) `
 -Principal $principal `
 -Settings $settings
-if ($runAsSystem) {
-Register-ScheduledTask `
--TaskName $ScheduledTaskName `
--InputObject $task `
--Force | Out-Null
-} else {
-Register-ScheduledTask `
--TaskName $ScheduledTaskName `
--InputObject $task `
--User "$env:COMPUTERNAME\$LocalAdminUser" `
--Password $adminPassword `
--Force | Out-Null
+$registerArgs = @{ TaskName = $ScheduledTaskName; InputObject = $task; Force = $true }
+if (-not $runAsSystem) {
+$registerArgs['User'] = "$env:COMPUTERNAME\$LocalAdminUser"
+$registerArgs['Password'] = $adminPassword
 }
+Register-ScheduledTask @registerArgs | Out-Null
 Write-Log "Registered Scheduled Task $ScheduledTaskName"
 Start-ScheduledTask -TaskName $ScheduledTaskName
 Write-Log "Started $ScheduledTaskName"

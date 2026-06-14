@@ -38,7 +38,7 @@ The generator parse-checks both variants and exits non-zero on failure. The mini
 
 The Bicep template inlines the minified launcher, so it must stay within the size limit for an Arc `runCommands` script body. The generator warns when the minified launcher grows large. If it approaches the limit, options are:
 
-1. Trim source comments and dead code.
+1. Reduce code. The minifier already strips comments and blank lines, so only code reductions (removing dead code, consolidating logic) shrink the delivered launcher.
 2. Switch to `scriptUri` delivery (a SAS URL to a blob), which the Arc run-command docs recommend for larger scripts and removes the inline-size limit. Adds a storage dependency.
 
 ## Direct worker invocation (local testing)

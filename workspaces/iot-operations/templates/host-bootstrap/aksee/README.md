@@ -26,19 +26,21 @@ Three entry shapes:
 
 The VM must already be Arc-onboarded as a `Microsoft.HybridCompute/machines` resource before the bootstrap runs. Use the [official onboarding flow](https://learn.microsoft.com/azure/azure-arc/servers/onboard-portal) or your existing onboarding script. The bootstrap targets the VM by its Arc machine name.
 
-### 2. Service principal with cluster Arc-onboarding rights
+### 2. Service principal (the standard-path identity)
 
-AKS Edge Essentials' install cmdlet requires a service principal to register the new cluster with Arc as part of cluster create. The SP needs `Kubernetes Cluster - Azure Arc Onboarding` (or broader Contributor) on the target resource group.
+AKS Edge Essentials' install cmdlet requires a service principal to register the new cluster with Arc during cluster create (Phase 2). On the standard path the worker also reuses this SP for the Phase 3 Arc operations and the Phase 99 state-tag write, so it needs access covering all three on the target resource group. `Contributor` works and is the simplest grant, but it is broad. To stay least-privilege, compose narrower roles instead: `Kubernetes Cluster - Azure Arc Onboarding` for the cluster registration plus `Tag Contributor` on the machine resource for the tag write (the onboarding role does not grant `Microsoft.Resources/tags/write`).
 
 ```bash
-az ad sp create-for-rbac --name "aksee-bootstrap-sp" --role "Kubernetes Cluster - Azure Arc Onboarding" --scopes "/subscriptions/<sub>/resourceGroups/<rg>"
+# Simplest: one broad Contributor grant. For least privilege, compose the
+# narrower roles described above instead.
+az ad sp create-for-rbac --name "aksee-bootstrap-sp" --role "Contributor" --scopes "/subscriptions/<sub>/resourceGroups/<rg>"
 ```
 
 Save the `appId` and `password` returned. Pin or rotate the secret to characters in `[A-Za-z0-9._-]` (the secret is passed as a CLI argument to the launcher by the Connected Machine Agent, so characters outside that range can break command-line parsing).
 
 ### 3. Grant the Arc machine identity access to the resource group
 
-The Arc machine's system-assigned identity authenticates the AIO-specific Arc operations after cluster create (`az connectedk8s enable-features`, OIDC issuer wiring when workload identity is requested). It needs the same role on the resource group.
+When no service principal is supplied (bring-your-own existing cluster, where Phase 2 short-circuits), the worker runs the Phase 3 Arc operations and the Phase 99 tag write as the Arc machine's system-assigned identity instead. Grant it `Contributor` on the resource group (or the scoped roles from prereq #2). It is unused on the standard SP path.
 
 ```bash
 ARC_PRINCIPAL_ID=$(az resource show -g <rg> -n <vm-name> --resource-type Microsoft.HybridCompute/machines --query "identity.principalId" -o tsv)
@@ -243,7 +245,7 @@ Remove-AksEdgeDeployment -Confirm:$false -ErrorAction SilentlyContinue
 | 0  | Pre-flight: admin, OS, memory, disk, nested virt | No |
 | 1  | MSI install + `Install-AksEdgeHostFeatures` | Yes (Hyper-V enable) |
 | 2  | Substitute the Arc block in the rendered cluster config from runtime parameters, then create the single-node K3s cluster (AKS Edge Essentials Arc-connects the cluster as part of this step) | No |
-| 3  | Install Azure CLI if missing, authenticate (managed identity by default, service principal as fallback), enable `cluster-connect` and `custom-locations`, and (when `enableWorkloadIdentity` is requested) wire the OIDC issuer through the K3s apiserver | No |
+| 3  | Install Azure CLI if missing, authenticate (service principal on the standard path, managed identity on the no-SP fallback), enable `cluster-connect` and `custom-locations`, and (when `enableWorkloadIdentity` is requested) wire the OIDC issuer through the K3s apiserver | No |
 | 99 | Cleanup (unregister scheduled task, purge the task account's kubeconfig and az token cache, remove the rendered config, and remove the bootstrap user if one was created). Write `siteops.bootstrap.state` tag on the Arc machine. | No |
 
 Each phase is idempotent so a worker re-run from any state is safe. Phase 1 writes the next phase to `state.json` BEFORE calling `Install-AksEdgeHostFeatures` so the at-startup scheduled-task trigger resumes at Phase 2 after the reboot.
@@ -259,10 +261,10 @@ The worker writes a tag on the Arc machine resource that signals terminal bootst
 
 Downstream automation reads this tag to gate on actual bootstrap completion. A siteops `type: wait` step is the intended primary consumer. A CI script polling via `az tag list` works the same way.
 
-The worker writes the tag using the Phase 3 identity (managed identity by default, service principal as fallback). The required permission is `Microsoft.Resources/tags/write` on the Arc machine resource.
+The worker writes the tag using the Phase 3 identity (the service principal on the standard path, the Arc machine identity on the no-SP fallback). The required permission is `Microsoft.Resources/tags/write` on the Arc machine resource.
 
-- If you completed [prereq #3](#3-grant-the-arc-machine-identity-access-to-the-resource-group) with the default `Contributor` grant, no additional grant is needed.
-- If you scoped the Arc machine identity to the narrow `Kubernetes Cluster - Azure Arc Onboarding` role instead of `Contributor`, you need an additional `Tag Contributor` assignment on the Arc machine resource:
+- If the Phase 3 identity (the SP from prereq #2, or the machine identity from [prereq #3](#3-grant-the-arc-machine-identity-access-to-the-resource-group)) has `Contributor`, no extra grant is needed.
+- If you scoped it to the narrow `Kubernetes Cluster - Azure Arc Onboarding` role instead, add a `Tag Contributor` assignment on the Arc machine resource:
 
 ```bash
 az role assignment create \

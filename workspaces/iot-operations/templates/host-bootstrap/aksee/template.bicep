@@ -4,9 +4,10 @@
 // script body locally with the supplied parameters, and reports back into
 // the resource's instanceView.
 //
-// The launcher writes the worker + AKS EE config template to disk, creates a
-// local admin user, registers a Scheduled Task running as that user, starts
-// the task, and returns `REGISTERED`. ARM sees the runCommand succeed at
+// The launcher writes the worker + AKS EE config template to disk, registers a
+// Scheduled Task that drives the worker (running as SYSTEM by default, or as a
+// created local admin when runAsDedicatedAdmin is set), starts the task, and
+// returns `REGISTERED`. ARM sees the runCommand succeed at
 // that point. The actual bootstrap (Hyper-V enable, reboot, cluster deploy,
 // Arc-connect) happens inside the Scheduled Task asynchronously. The worker
 // writes a `siteops.bootstrap.state` tag on the Arc machine when it finishes,
@@ -15,13 +16,14 @@
 //
 // Prerequisites on the target VM (one-time per VM, outside this Bicep):
 //   1. Server is Arc-connected (e.g., via `OnboardingScript.ps1`).
-//   2. SP referenced by `spAppId` has `Kubernetes Cluster - Azure Arc
-//      Onboarding` (or broader Contributor) on the target resource group.
-//      This SP is required by AKS Edge Essentials' install cmdlet to
-//      register the new cluster with Arc as part of cluster creation.
-//   3. The Arc machine's system-assigned identity has the same role.
-//      Phase 3 (Arc operations after cluster create) authenticates as the
-//      machine identity by default.
+//   2. SP referenced by `spAppId` needs resource-group access for the Phase 2
+//      cluster registration plus, on the standard path, the Phase 3 Arc
+//      operations and the Phase 99 tag write. Use `Contributor`, or
+//      `Kubernetes Cluster - Azure Arc Onboarding` plus `Tag Contributor`
+//      for least privilege.
+//   3. On the no-SP fallback (existing cluster), the Arc machine's
+//      system-assigned identity runs Phase 3 and the tag write instead.
+//      Unused on the standard path.
 //
 // Usage as a scalekit step:
 //   - name: aksee-bootstrap

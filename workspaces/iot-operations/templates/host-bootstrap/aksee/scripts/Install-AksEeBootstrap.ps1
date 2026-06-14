@@ -294,9 +294,9 @@ phases until either a reboot is pending or the bootstrap is complete.
            K3s cluster. AKS Edge Essentials Arc-connects the cluster
            during this step.
   Phase 3  Layer AIO-specific Arc features on top of the cluster:
-           install Azure CLI if missing, authenticate (managed
-           identity by default, service principal as fallback), enable
-           custom-locations and cluster-connect, and (when workload
+           install Azure CLI if missing, authenticate (service principal
+           on the standard path, managed identity on the no-SP fallback),
+           enable custom-locations and cluster-connect, and (when workload
            identity is requested) wire the OIDC issuer through the K3s
            apiserver.
   Phase 99 Cleanup (unregister scheduled task, remove bootstrap user,

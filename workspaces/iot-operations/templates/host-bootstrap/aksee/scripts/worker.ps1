@@ -751,9 +751,10 @@ function Invoke-Phase3 {
         $tags = @('SKU=AKSEdgeEssentials', "AKSEEVersion=$aksEdgeVersion", 'ManagedBy=siteops-bootstrap')
 
         # --distribution aks_edge_k3s tells Arc the cluster type. WLIF + OIDC
-        # issuer are NOT enabled here. Phase 2 already plain-connected the
-        # cluster, so this block is skipped on the standard path. WLIF
-        # enablement is centralized in the `az connectedk8s update` below.
+        # issuer are centralized in the `az connectedk8s update` below, not here.
+        # This connect runs only when Phase 2 left the cluster unregistered: the
+        # SYSTEM default does not register the connectedCluster, the dedicated-
+        # admin path does. Idempotent either way.
         $connectArgs = @(
             '-g', $rg,
             '-n', $cluster,

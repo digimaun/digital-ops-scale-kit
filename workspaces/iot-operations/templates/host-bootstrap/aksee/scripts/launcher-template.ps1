@@ -429,14 +429,19 @@ $action = New-ScheduledTaskAction `
 $startupTrigger = New-ScheduledTaskTrigger -AtStartup
 $onceTrigger    = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddSeconds(30))
 
-# Run the task as SYSTEM (no stored credential) by default, or as the created
-# local admin under -RunAsDedicatedAdmin. Only UserId and LogonType differ.
-$principalArgs = if ($runAsSystem) {
-    @{ UserId = 'NT AUTHORITY\SYSTEM'; LogonType = 'ServiceAccount' }
+# Default: run as the built-in SYSTEM service account (no credential to store).
+# -RunAsDedicatedAdmin instead runs as the created local admin (password logon).
+if ($runAsSystem) {
+    $principal = New-ScheduledTaskPrincipal `
+        -UserId 'NT AUTHORITY\SYSTEM' `
+        -LogonType ServiceAccount `
+        -RunLevel Highest
 } else {
-    @{ UserId = "$env:COMPUTERNAME\$LocalAdminUser"; LogonType = 'Password' }
+    $principal = New-ScheduledTaskPrincipal `
+        -UserId "$env:COMPUTERNAME\$LocalAdminUser" `
+        -LogonType Password `
+        -RunLevel Highest
 }
-$principal = New-ScheduledTaskPrincipal @principalArgs -RunLevel Highest
 
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
@@ -458,14 +463,19 @@ $task = New-ScheduledTask `
     -Principal $principal `
     -Settings $settings
 
-# SYSTEM (ServiceAccount) needs no credential. The dedicated-admin path passes
-# the created user and its generated password to set the task LSA secret.
-$registerArgs = @{ TaskName = $ScheduledTaskName; InputObject = $task; Force = $true }
-if (-not $runAsSystem) {
-    $registerArgs['User'] = "$env:COMPUTERNAME\$LocalAdminUser"
-    $registerArgs['Password'] = $adminPassword
+if ($runAsSystem) {
+    Register-ScheduledTask `
+        -TaskName $ScheduledTaskName `
+        -InputObject $task `
+        -Force | Out-Null
+} else {
+    Register-ScheduledTask `
+        -TaskName $ScheduledTaskName `
+        -InputObject $task `
+        -User "$env:COMPUTERNAME\$LocalAdminUser" `
+        -Password $adminPassword `
+        -Force | Out-Null
 }
-Register-ScheduledTask @registerArgs | Out-Null
 Write-Log "Registered Scheduled Task $ScheduledTaskName"
 
 Start-ScheduledTask -TaskName $ScheduledTaskName

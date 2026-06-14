@@ -838,12 +838,17 @@ $action = New-ScheduledTaskAction `
 -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$workerPath`" -ConfigDir `"$ConfigDir`""
 $startupTrigger = New-ScheduledTaskTrigger -AtStartup
 $onceTrigger    = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddSeconds(30))
-$principalArgs = if ($runAsSystem) {
-@{ UserId = 'NT AUTHORITY\SYSTEM'; LogonType = 'ServiceAccount' }
+if ($runAsSystem) {
+$principal = New-ScheduledTaskPrincipal `
+-UserId 'NT AUTHORITY\SYSTEM' `
+-LogonType ServiceAccount `
+-RunLevel Highest
 } else {
-@{ UserId = "$env:COMPUTERNAME\$LocalAdminUser"; LogonType = 'Password' }
+$principal = New-ScheduledTaskPrincipal `
+-UserId "$env:COMPUTERNAME\$LocalAdminUser" `
+-LogonType Password `
+-RunLevel Highest
 }
-$principal = New-ScheduledTaskPrincipal @principalArgs -RunLevel Highest
 $settings = New-ScheduledTaskSettingsSet `
 -AllowStartIfOnBatteries `
 -DontStopIfGoingOnBatteries `
@@ -855,12 +860,19 @@ $task = New-ScheduledTask `
 -Trigger @($startupTrigger, $onceTrigger) `
 -Principal $principal `
 -Settings $settings
-$registerArgs = @{ TaskName = $ScheduledTaskName; InputObject = $task; Force = $true }
-if (-not $runAsSystem) {
-$registerArgs['User'] = "$env:COMPUTERNAME\$LocalAdminUser"
-$registerArgs['Password'] = $adminPassword
+if ($runAsSystem) {
+Register-ScheduledTask `
+-TaskName $ScheduledTaskName `
+-InputObject $task `
+-Force | Out-Null
+} else {
+Register-ScheduledTask `
+-TaskName $ScheduledTaskName `
+-InputObject $task `
+-User "$env:COMPUTERNAME\$LocalAdminUser" `
+-Password $adminPassword `
+-Force | Out-Null
 }
-Register-ScheduledTask @registerArgs | Out-Null
 Write-Log "Registered Scheduled Task $ScheduledTaskName"
 Start-ScheduledTask -TaskName $ScheduledTaskName
 Write-Log "Started $ScheduledTaskName"

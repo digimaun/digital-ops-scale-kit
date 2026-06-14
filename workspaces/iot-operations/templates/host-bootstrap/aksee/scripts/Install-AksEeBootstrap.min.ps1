@@ -185,6 +185,16 @@ $null,
 [System.Security.Cryptography.DataProtectionScope]::LocalMachine)
 return [System.Text.Encoding]::UTF8.GetString($plainBytes)
 }
+function Assert-MicrosoftSignedFile {
+param([string]$Path)
+$sig = Get-AuthenticodeSignature -FilePath $Path
+if ($sig.Status -ne 'Valid') {
+throw "Authenticode check failed for ${Path}: status=$($sig.Status) ($($sig.StatusMessage))."
+}
+if ($sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+throw "Unexpected signer for ${Path}: $($sig.SignerCertificate.Subject). Expected O=Microsoft Corporation."
+}
+}
 function Install-AzCliIfMissing {
 if (Get-Command az -ErrorAction SilentlyContinue) {
 Write-Log 'az CLI already present, skipping install'
@@ -195,6 +205,7 @@ $msiPath = Join-Path $ConfigDir 'azurecli-installer.msi'
 $log     = Join-Path $ConfigDir 'az-msiexec.log'
 Write-Log "az CLI not on PATH. Downloading MSI from $msiUrl"
 Invoke-WebRequest -Uri $msiUrl -OutFile $msiPath -UseBasicParsing
+Assert-MicrosoftSignedFile -Path $msiPath
 Write-Log "Installing az CLI MSI via msiexec /quiet, log at $log"
 $proc = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
 '/i', $msiPath, '/quiet', '/norestart', '/L*V', $log
@@ -383,6 +394,7 @@ if ($header[0] -ne 0xD0 -or $header[1] -ne 0xCF -or $header[2] -ne 0x11 -or $hea
 $magic = '{0:X2} {1:X2} {2:X2} {3:X2}' -f $header[0],$header[1],$header[2],$header[3]
 throw "Downloaded file at $msiPath is not a valid MSI (magic bytes '$magic', expected 'D0 CF 11 E0'). The URL '$($config.aksEdgeMsiUrl)' likely returned an error page rather than the installer."
 }
+Assert-MicrosoftSignedFile -Path $msiPath
 $msiLog = Join-Path $ConfigDir 'msiexec.log'
 Write-Log "Installing MSI via msiexec /quiet /norestart, log at $msiLog"
 $proc = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(

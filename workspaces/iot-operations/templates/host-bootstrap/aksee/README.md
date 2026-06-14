@@ -296,6 +296,10 @@ Set it per site via `deployOptions.enableWorkloadIdentity: true` (paired with `e
 - **az token cache:** Phase 3 scopes `AZURE_CONFIG_DIR` into the ACL-locked working directory so the az tokens stay behind the Administrators + SYSTEM ACL. Phase 99 removes the cache on success.
 - **Phase 2 rendered config:** the worker writes a rendered AKS Edge config to disk that carries the plaintext SP secret while the install cmdlet reads it. A `try/finally` wraps the cmdlet invocation and always deletes the rendered file after the cmdlet returns. Phase 99 zeros the SP blob in `config.json` after the bootstrap succeeds.
 
+## Installer integrity
+
+The worker Authenticode-verifies each installer MSI (AKS Edge Essentials, Azure CLI) before running it. The signature must be `Valid` (signed, untampered, chain-trusted) and the signer organization must be Microsoft, so a poisoned `aka.ms` redirect to a differently-signed binary is rejected. The default revocation check reaches the CRL or OCSP endpoint over the same network used for the download, so a fully air-gapped host may report a non-`Valid` status and need a revocation exception.
+
 ## Run directly (advanced)
 
 The scalekit path delivers the launcher via Bicep + Arc Run Command. For debugging or one-off use without scalekit, the full launcher script can run directly on the VM. See `scripts/README.md` for the dev workflow.

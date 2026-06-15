@@ -5,10 +5,7 @@ param(
 [Parameter(Mandatory)] [string]$ResourceGroup,
 [Parameter(Mandatory)] [string]$Subscription,
 [Parameter(Mandatory)] [string]$Location,
-[Parameter(Mandatory)] [string]$TenantId,
 [Parameter(Mandatory)] [string]$CustomLocationsOid,
-[string]$SpAppId = '',
-[string]$SpPassword = '',
 [Parameter(Mandatory)] [string]$AksEdgeMsiUrl,
 [string]$ConfigDir         = 'C:\ProgramData\siteops\aksee-bootstrap',
 [string]$ScheduledTaskName = 'SiteOpsAksEeBootstrap',
@@ -33,16 +30,6 @@ function Test-IsAdmin {
 $id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object System.Security.Principal.WindowsPrincipal($id)
 return $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
-}
-function Protect-StringMachine {
-param([string]$Plain)
-Add-Type -AssemblyName System.Security
-$bytes = [System.Text.Encoding]::UTF8.GetBytes($Plain)
-$protected = [System.Security.Cryptography.ProtectedData]::Protect(
-$bytes,
-$null,
-[System.Security.Cryptography.DataProtectionScope]::LocalMachine)
-return [Convert]::ToBase64String($protected)
 }
 function New-RandomPassword {
 $upper = 'ABCDEFGHJKLMNPQRSTUVWXYZ'
@@ -170,20 +157,6 @@ function Get-Prop {
 param($Obj, [string]$Name, $Default = $null)
 if ($null -ne $Obj -and $Obj.PSObject.Properties.Name -contains $Name) { return $Obj.$Name }
 return $Default
-}
-function Resolve-SpPassword {
-param($Config)
-$isEncrypted = [bool](Get-Prop $Config 'spPasswordEncrypted')
-if (-not $isEncrypted) {
-return $Config.spPassword
-}
-Add-Type -AssemblyName System.Security
-$protectedBytes = [Convert]::FromBase64String($Config.spPassword)
-$plainBytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
-$protectedBytes,
-$null,
-[System.Security.Cryptography.DataProtectionScope]::LocalMachine)
-return [System.Text.Encoding]::UTF8.GetString($plainBytes)
 }
 function Assert-MicrosoftSignedFile {
 param([string]$Path)
@@ -450,23 +423,11 @@ if (-not (Test-Path $script:TemplatePath)) {
 throw "Template not found at $script:TemplatePath. The launcher copies this alongside worker.ps1. For local testing, see README.md."
 }
 Import-Module AksEdge
-$hasAppId    = [bool](Get-Prop $config 'spAppId')
-$hasPassword = [bool](Get-Prop $config 'spPassword')
-if (-not ($hasAppId -and $hasPassword)) {
-throw "AKS Edge Essentials requires a service principal to create the cluster. Re-run the launcher with -SpAppId and -SpPassword."
-}
 try {
 Write-Log "Rendering AKS EE config from $script:TemplatePath"
 $cfg = Get-Content -Raw -Path $script:TemplatePath | ConvertFrom-Json
-$cfg.Arc.ClusterName       = $config.clusterName
-$cfg.Arc.Location          = $config.location
-$cfg.Arc.ResourceGroupName = $config.resourceGroup
-$cfg.Arc.SubscriptionId    = $config.subscription
-$cfg.Arc.TenantId          = $config.tenantId
-$cfg.Arc.ClientId          = $config.spAppId
-$cfg.Arc.ClientSecret      = Resolve-SpPassword -Config $config
+$cfg.Arc.ClusterName = $config.clusterName
 $cfg | ConvertTo-Json -Depth 6 | Set-Content -Path $renderedPath -Encoding UTF8
-$cfg.Arc.ClientSecret = $null
 $cfg = $null
 Write-Log "Calling New-AksEdgeDeployment in child PowerShell (this typically takes 10-15 minutes)"
 $childScript = "Import-Module AksEdge; New-AksEdgeDeployment -JsonConfigFilePath '$renderedPath' -Confirm:`$false -Force; exit `$LASTEXITCODE"
@@ -517,9 +478,7 @@ $cluster = $config.clusterName
 $rg      = $config.resourceGroup
 $sub     = $config.subscription
 $loc     = $config.location
-$tenant  = $config.tenantId
 $oid     = $config.customLocationsOid
-$appId   = $config.spAppId
 $enableWi = [bool](Get-Prop $config 'enableWorkloadIdentity')
 Write-Log "Workload identity + OIDC issuer requested: $enableWi"
 Install-AzCliIfMissing
@@ -533,8 +492,6 @@ Write-Log "Shared kubeconfig not found at $sharedKubeconfig. az/kubectl will fal
 }
 Write-Log 'Adding az extension: connectedk8s'
 & az extension add --name connectedk8s --upgrade --only-show-errors | Out-Null
-$useMi = -not (Get-Prop $config 'spAppId') -or -not (Get-Prop $config 'spPassword')
-if ($useMi) {
 Write-Log 'Authenticating with Arc machine managed identity (az login --identity)'
 foreach ($name in @('IDENTITY_ENDPOINT', 'IMDS_ENDPOINT')) {
 if (-not [Environment]::GetEnvironmentVariable($name)) {
@@ -544,19 +501,11 @@ if ($machineVal) { Set-Item -Path "Env:$name" -Value $machineVal }
 }
 $loginOut = & az login --identity --only-show-errors 2>&1
 if ($LASTEXITCODE -ne 0) {
-throw "az login --identity failed: $loginOut. Ensure the Arc machine identity has Contributor (or Kubernetes Cluster - Azure Arc Onboarding) on the resource group."
-}
-} else {
-Write-Log "Authenticating as service principal $appId"
-$spSecret = Resolve-SpPassword -Config $config
-$loginOut = & az login --service-principal --username $appId --password $spSecret --tenant $tenant --only-show-errors 2>&1
-if ($LASTEXITCODE -ne 0) {
-throw "az login --service-principal failed for ${appId}: $loginOut"
-}
+throw "az login --identity failed: $loginOut. Ensure the Arc machine identity has Contributor on the resource group."
 }
 $accountSetOut = & az account set --subscription $sub 2>&1
 if ($LASTEXITCODE -ne 0) {
-throw "az account set --subscription $sub failed: $accountSetOut. The authenticated principal (managed identity or service principal) likely lacks access to subscription $sub."
+throw "az account set --subscription $sub failed: $accountSetOut. The Arc machine managed identity likely lacks access to subscription $sub."
 }
 if (Test-ClusterArcConnected -ClusterName $cluster -ResourceGroup $rg) {
 Write-Log "Cluster $cluster is already Arc-connected, skipping connect"
@@ -667,17 +616,6 @@ if ($env:AZURE_CONFIG_DIR -and (Test-Path $env:AZURE_CONFIG_DIR)) {
 Remove-Item -Path $env:AZURE_CONFIG_DIR -Recurse -Force -ErrorAction SilentlyContinue
 Write-Log "Removed az token cache at $env:AZURE_CONFIG_DIR"
 }
-if (Test-Path $script:ConfigPath) {
-$cfg = Get-Content -Raw -Path $script:ConfigPath | ConvertFrom-Json
-if (Get-Prop $cfg 'spPassword') {
-$cfg.spPassword = ''
-if ($null -ne (Get-Prop $cfg 'spPasswordEncrypted')) {
-$cfg.spPasswordEncrypted = $false
-}
-$cfg | ConvertTo-Json | Set-Content -Path $script:ConfigPath -Encoding UTF8
-Write-Log 'Zeroed SP password blob in config.json'
-}
-}
 Set-State -Phase 99 -Status 'succeeded'
 Write-Log 'Phase 99: complete. Bootstrap succeeded.'
 }
@@ -732,7 +670,7 @@ Stop-Transcript | Out-Null
 }
 '@
 $EmbeddedTemplate = @'
-{"_comment":"AKS Edge Essentials single-node K3s cluster config. The bootstrap substitutes the Arc block (ClusterName, Location, ResourceGroupName, SubscriptionId, TenantId, ClientId, ClientSecret) from runtime parameters before deploying, so the nulls here are placeholders. Cluster sizing (CpuCount, MemoryInMB, DataSizeInGB, LogSizeInGB) is fixed in this file. Rebuild the launcher with Build-Launcher.ps1 after editing.","SchemaVersion":"1.16","Version":"1.0","DeploymentType":"SingleMachineCluster","Init":{"ServiceIPRangeSize":10},"Arc":{"ClusterName":null,"Location":null,"ResourceGroupName":null,"SubscriptionId":null,"TenantId":null,"ClientId":null,"ClientSecret":null},"Network":{"NetworkPlugin":"flannel","Ip4AddressPrefix":null,"InternetDisabled":false,"SkipDnsCheck":false,"Proxy":{"Http":null,"Https":null,"No":"localhost,127.0.0.0/8,192.168.0.0/16,172.17.0.0/16,10.42.0.0/16,10.43.0.0/16,10.96.0.0/12,10.244.0.0/16,.svc"}},"User":{"AcceptEula":true,"AcceptOptionalTelemetry":false},"Machines":[{"LinuxNode":{"CpuCount":4,"MemoryInMB":10240,"MemoryHugePages":{"Size":null,"Count":null},"DataSizeInGB":40,"LogSizeInGB":4,"TimeoutSeconds":300,"TpmPassthrough":false}}]}
+{"_comment":"AKS Edge Essentials single-node K3s cluster config. AioDeploy builds the cluster without Arc-connecting (no service principal). The worker substitutes only Arc.ClusterName. The other Arc fields stay null. Rebuild the launcher with Build-Launcher.ps1 after editing.","SchemaVersion":"1.16","Version":"1.0","DeploymentType":"SingleMachineCluster","AioDeploy":true,"Init":{"ServiceIPRangeSize":10},"Arc":{"ClusterName":null,"Location":null,"ResourceGroupName":null,"SubscriptionId":null,"TenantId":null,"ClientId":null,"ClientSecret":null},"Network":{"NetworkPlugin":"flannel","Ip4AddressPrefix":null,"InternetDisabled":false,"SkipDnsCheck":false,"Proxy":{"Http":null,"Https":null,"No":"localhost,127.0.0.0/8,192.168.0.0/16,172.17.0.0/16,10.42.0.0/16,10.43.0.0/16,10.96.0.0/12,10.244.0.0/16,.svc"}},"User":{"AcceptEula":true,"AcceptOptionalTelemetry":false},"Machines":[{"LinuxNode":{"CpuCount":4,"MemoryInMB":10240,"MemoryHugePages":{"Size":null,"Count":null},"DataSizeInGB":40,"LogSizeInGB":4,"TimeoutSeconds":300,"TpmPassthrough":false}}]}
 '@
 if (-not (Test-IsAdmin)) {
 throw 'Install-AksEeBootstrap.ps1 must run as Administrator.'
@@ -808,24 +746,12 @@ Write-Log "Worker task will run as local admin $LocalAdminUser"
 } else {
 Write-Log 'Worker task will run as NT AUTHORITY\SYSTEM (no local account created)'
 }
-$encryptedSpPassword = ''
-$useMi = -not $SpAppId -and -not $SpPassword
-if ((-not $useMi) -and (-not $SpAppId -or -not $SpPassword)) {
-throw "SpAppId and SpPassword must be provided together (SP auth) or both omitted (MI auth)."
-}
-if (-not $useMi) {
-$encryptedSpPassword = Protect-StringMachine -Plain $SpPassword
-}
 $config = [pscustomobject]@{
 clusterName            = $ClusterName
 resourceGroup          = $ResourceGroup
 subscription           = $Subscription
 location               = $Location
-tenantId               = $TenantId
 customLocationsOid     = $CustomLocationsOid
-spAppId                = $SpAppId
-spPassword             = $encryptedSpPassword
-spPasswordEncrypted    = (-not $useMi)
 aksEdgeMsiUrl          = $AksEdgeMsiUrl
 scheduledTaskName      = $ScheduledTaskName
 localAdminUser         = $LocalAdminUser
@@ -833,8 +759,7 @@ runAsSystem            = $runAsSystem
 enableWorkloadIdentity = ($EnableWorkloadIdentity -ieq 'true')
 }
 $config | ConvertTo-Json | Set-Content -Path $configPath -Encoding UTF8
-$authNote = if ($useMi) { 'managed identity' } else { 'SP password encrypted via DPAPI LocalMachine' }
-Write-Log "Wrote $configPath (auth=$authNote, WI=$($EnableWorkloadIdentity -ieq 'true'))"
+Write-Log "Wrote $configPath (auth=managed identity, WI=$($EnableWorkloadIdentity -ieq 'true'))"
 $initialState = [pscustomobject]@{
 phase       = 0
 status      = 'running'

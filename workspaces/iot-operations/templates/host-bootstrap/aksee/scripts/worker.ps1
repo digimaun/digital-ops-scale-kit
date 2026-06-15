@@ -11,16 +11,14 @@ phases until either a reboot is pending or the bootstrap is complete.
   Phase 0  Pre-flight verification (admin, OS, memory, disk, nested virt).
   Phase 1  Install AKS Edge Essentials MSI, then Install-AksEdgeHostFeatures
            (may reboot when enabling Hyper-V).
-  Phase 2  Render the AKS Edge Essentials config (Arc block values
-           come from runtime parameters) and create the single-node
-           K3s cluster. AKS Edge Essentials Arc-connects the cluster
-           during this step.
+  Phase 2  Render the AKS Edge Essentials config (AioDeploy cluster-only,
+           no service principal) and create the single-node K3s cluster.
+           Arc-connect happens in Phase 3.
   Phase 3  Layer AIO-specific Arc features on top of the cluster:
-           install Azure CLI if missing, authenticate (service principal
-           on the standard path, managed identity on the no-SP fallback),
-           enable custom-locations and cluster-connect, and (when workload
-           identity is requested) wire the OIDC issuer through the K3s
-           apiserver.
+           install Azure CLI if missing, authenticate with the Arc machine
+           managed identity, Arc-connect the cluster, enable custom-locations
+           and cluster-connect, and (when workload identity is requested)
+           wire the OIDC issuer through the K3s apiserver.
   Phase 99 Cleanup (unregister scheduled task, remove bootstrap user,
            write final state).
 
@@ -152,26 +150,6 @@ function Get-Prop {
     param($Obj, [string]$Name, $Default = $null)
     if ($null -ne $Obj -and $Obj.PSObject.Properties.Name -contains $Name) { return $Obj.$Name }
     return $Default
-}
-
-function Resolve-SpPassword {
-    # Returns the plaintext SP password from config. When the launcher
-    # encrypts the password (production path), config.spPasswordEncrypted
-    # is $true and config.spPassword is a base64 DPAPI blob bound to the
-    # LocalMachine scope. For local testing without the launcher, plain
-    # text in config.spPassword is also accepted.
-    param($Config)
-    $isEncrypted = [bool](Get-Prop $Config 'spPasswordEncrypted')
-    if (-not $isEncrypted) {
-        return $Config.spPassword
-    }
-    Add-Type -AssemblyName System.Security
-    $protectedBytes = [Convert]::FromBase64String($Config.spPassword)
-    $plainBytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
-        $protectedBytes,
-        $null,
-        [System.Security.Cryptography.DataProtectionScope]::LocalMachine)
-    return [System.Text.Encoding]::UTF8.GetString($plainBytes)
 }
 
 function Assert-MicrosoftSignedFile {
@@ -548,9 +526,8 @@ function Invoke-Phase2 {
     param($config)
     Write-Log 'Phase 2: deploy single-node K3s cluster'
 
-    # Purge any leftover rendered config from a hard-killed prior run before
-    # the early-return path below. It can carry the plaintext SP secret if a
-    # forced reboot or task timeout skipped the finally block last time.
+    # Remove any leftover rendered config from a hard-killed prior run before
+    # the early-return path below, so a stale file does not linger.
     $renderedPath = Join-Path $ConfigDir 'aksedge-config.json'
     Remove-Item -Path $renderedPath -Force -ErrorAction SilentlyContinue
 
@@ -566,42 +543,17 @@ function Invoke-Phase2 {
 
     Import-Module AksEdge
 
-    # AKS Edge Essentials' New-AksEdgeDeployment hard-requires populated
-    # service principal credentials in the Arc block to create the cluster.
-    # There is no flag to skip its own Arc-connect. Managed identity in
-    # Phase 3 cannot satisfy this Phase 2 requirement. Fail fast with a
-    # precise message rather than letting the operator hit a cryptic
-    # 10-minute cmdlet failure mid-deploy.
-    $hasAppId    = [bool](Get-Prop $config 'spAppId')
-    $hasPassword = [bool](Get-Prop $config 'spPassword')
-    if (-not ($hasAppId -and $hasPassword)) {
-        throw "AKS Edge Essentials requires a service principal to create the cluster. Re-run the launcher with -SpAppId and -SpPassword."
-    }
-
     try {
-        # Populate the Arc block in the rendered config from runtime
-        # parameters. AKS Edge Essentials rejects null or absent Arc
-        # values at schema-validate time, so the template ships nulls
-        # purely as placeholders.
-        #
-        # AKS Edge Essentials Arc-connects the cluster as part of cluster
-        # creation. Phase 3 detects the already-connected cluster and
-        # layers AIO-specific features on top (custom-locations always,
-        # OIDC issuer when workload identity is enabled).
+        # Render the AKS EE config for an AioDeploy cluster-only deploy. The
+        # AioDeploy flag (in the template) makes New-AksEdgeDeployment build
+        # the cluster without Arc-connecting, so no service principal is
+        # needed here. Only the Arc ClusterName is substituted from runtime
+        # parameters. Phase 3 Arc-connects the cluster with the Arc machine
+        # managed identity.
         Write-Log "Rendering AKS EE config from $script:TemplatePath"
         $cfg = Get-Content -Raw -Path $script:TemplatePath | ConvertFrom-Json
-        $cfg.Arc.ClusterName       = $config.clusterName
-        $cfg.Arc.Location          = $config.location
-        $cfg.Arc.ResourceGroupName = $config.resourceGroup
-        $cfg.Arc.SubscriptionId    = $config.subscription
-        $cfg.Arc.TenantId          = $config.tenantId
-        $cfg.Arc.ClientId          = $config.spAppId
-        $cfg.Arc.ClientSecret      = Resolve-SpPassword -Config $config
+        $cfg.Arc.ClusterName = $config.clusterName
         $cfg | ConvertTo-Json -Depth 6 | Set-Content -Path $renderedPath -Encoding UTF8
-        # Drop the in-memory plaintext as soon as the file is written. The
-        # rendered file on disk is protected by the $ConfigDir ACL
-        # (Administrators + SYSTEM only) and removed in the finally block.
-        $cfg.Arc.ClientSecret = $null
         $cfg = $null
 
         # Spawn New-AksEdgeDeployment in a fresh child PowerShell process.
@@ -660,10 +612,7 @@ function Invoke-Phase2 {
         Set-State -Phase 3 -Status 'running'
         Write-Log 'Phase 2: complete (cluster up)'
     } finally {
-        # Always remove the rendered config. It contains the plaintext SP
-        # secret in the Arc block. Phase 99's belt-and-suspenders cleanup
-        # catches anything we miss here, but a mid-Phase-2 failure must
-        # not leave the secret on disk longer than necessary.
+        # Always remove the rendered config, a per-run artifact.
         if (Test-Path $renderedPath) {
             Write-Log "Removing rendered config at $renderedPath"
             Remove-Item -Path $renderedPath -Force -ErrorAction SilentlyContinue
@@ -679,9 +628,7 @@ function Invoke-Phase3 {
     $rg      = $config.resourceGroup
     $sub     = $config.subscription
     $loc     = $config.location
-    $tenant  = $config.tenantId
     $oid     = $config.customLocationsOid
-    $appId   = $config.spAppId
 
     # Workload identity + OIDC issuer are only needed when downstream AIO
     # uses workload-identity-backed secret sync. Default false keeps the
@@ -717,46 +664,33 @@ function Invoke-Phase3 {
     Write-Log 'Adding az extension: connectedk8s'
     & az extension add --name connectedk8s --upgrade --only-show-errors | Out-Null
 
-    # Authenticate. Picks SP when both spAppId and spPassword are present
-    # (the standard happy path where SP was supplied for Phase 2's cluster
-    # create and carries into Phase 3 for consistency). Falls back to the
-    # Arc machine's system-assigned managed identity when both are absent
-    # (the "bring your own cluster" path where Phase 2 short-circuited
-    # because the cluster already existed). MI keeps no secret on disk.
-    #
-    # The Arc machine identity needs `Kubernetes Cluster - Azure Arc
-    # Onboarding` (or broader Contributor) on the resource group for
-    # connect + enable-features. One-time RBAC step per Arc machine.
-    $useMi = -not (Get-Prop $config 'spAppId') -or -not (Get-Prop $config 'spPassword')
-    if ($useMi) {
-        Write-Log 'Authenticating with Arc machine managed identity (az login --identity)'
-        # The Arc agent publishes the HIMDS endpoints as Machine-scope env vars.
-        # A fresh worker process usually inherits them, but refresh from Machine
-        # scope defensively so az login --identity can reach HIMDS as SYSTEM.
-        foreach ($name in @('IDENTITY_ENDPOINT', 'IMDS_ENDPOINT')) {
-            if (-not [Environment]::GetEnvironmentVariable($name)) {
-                $machineVal = [Environment]::GetEnvironmentVariable($name, 'Machine')
-                if ($machineVal) { Set-Item -Path "Env:$name" -Value $machineVal }
-            }
+    # Authenticate with the Arc machine's system-assigned managed identity.
+    # Phase 2 deploys cluster-only, so this identity is the only one the
+    # bootstrap uses for Azure: the Arc-connect below, the AIO feature
+    # enablement, and the Phase 99 state-tag write. No secret on disk. It
+    # needs Contributor on the resource group (simplest), or the scoped roles
+    # Kubernetes Cluster - Azure Arc Onboarding (connect + enable-features)
+    # plus Tag Contributor (the tag write) for least privilege.
+    Write-Log 'Authenticating with Arc machine managed identity (az login --identity)'
+    # The Arc agent publishes the HIMDS endpoints as Machine-scope env vars.
+    # A fresh worker process usually inherits them, but refresh from Machine
+    # scope defensively so az login --identity can reach HIMDS as SYSTEM.
+    foreach ($name in @('IDENTITY_ENDPOINT', 'IMDS_ENDPOINT')) {
+        if (-not [Environment]::GetEnvironmentVariable($name)) {
+            $machineVal = [Environment]::GetEnvironmentVariable($name, 'Machine')
+            if ($machineVal) { Set-Item -Path "Env:$name" -Value $machineVal }
         }
-        $loginOut = & az login --identity --only-show-errors 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw "az login --identity failed: $loginOut. Ensure the Arc machine identity has Contributor (or Kubernetes Cluster - Azure Arc Onboarding) on the resource group."
-        }
-    } else {
-        Write-Log "Authenticating as service principal $appId"
-        $spSecret = Resolve-SpPassword -Config $config
-        $loginOut = & az login --service-principal --username $appId --password $spSecret --tenant $tenant --only-show-errors 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw "az login --service-principal failed for ${appId}: $loginOut"
-        }
+    }
+    $loginOut = & az login --identity --only-show-errors 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "az login --identity failed: $loginOut. Ensure the Arc machine identity has Contributor on the resource group."
     }
     # Check exit code so a sub-access failure throws here instead of
     # producing misleading ResourceNotFound errors from subsequent
     # connectedk8s commands fired against the wrong default context.
     $accountSetOut = & az account set --subscription $sub 2>&1
     if ($LASTEXITCODE -ne 0) {
-        throw "az account set --subscription $sub failed: $accountSetOut. The authenticated principal (managed identity or service principal) likely lacks access to subscription $sub."
+        throw "az account set --subscription $sub failed: $accountSetOut. The Arc machine managed identity likely lacks access to subscription $sub."
     }
 
     if (Test-ClusterArcConnected -ClusterName $cluster -ResourceGroup $rg) {
@@ -768,9 +702,9 @@ function Invoke-Phase3 {
 
         # --distribution aks_edge_k3s tells Arc the cluster type. WLIF + OIDC
         # issuer are centralized in the `az connectedk8s update` below, not here.
-        # This connect runs only when Phase 2 left the cluster unregistered: the
-        # SYSTEM default does not register the connectedCluster, the dedicated-
-        # admin path does. Idempotent either way.
+        # Phase 2 is an AioDeploy cluster-only build (never pre-connected), so
+        # this is the primary Arc-connect. The check above skips it only on a
+        # re-entry where the cluster is already connected.
         $connectArgs = @(
             '-g', $rg,
             '-n', $cluster,
@@ -791,10 +725,10 @@ function Invoke-Phase3 {
     }
 
     if ($enableWi) {
-        # Phase 2 plain-connected the cluster and the check above skips the
-        # connect, so enable the issuer + WLIF on the existing connection.
-        # --enable-workload-identity installs the in-cluster webhook, so it
-        # needs the routable kubeconfig set above. Idempotent on repeat.
+        # The cluster is Arc-connected (by the connect above), so enable the
+        # issuer + WLIF on that connection. --enable-workload-identity installs
+        # the in-cluster webhook, so it needs the routable kubeconfig set above.
+        # Idempotent on repeat.
         Write-Log 'Enabling OIDC issuer + workload identity (az connectedk8s update)'
         $wiUpdateOut = & az connectedk8s update -g $rg -n $cluster --enable-oidc-issuer --enable-workload-identity --only-show-errors 2>&1
         if ($LASTEXITCODE -ne 0) {
@@ -847,10 +781,10 @@ function Invoke-Phase99 {
     param($config)
     Write-Log 'Phase 99: cleanup'
 
-    # Write the bootstrap-state tag first, while the Phase 3 az login and the
-    # SP credential are still valid. The cleanup below removes the bootstrap
-    # user (and the az token cache in its profile) and zeros the SP blob, either
-    # of which would strip the auth context this tag write depends on.
+    # Write the bootstrap-state tag first, while the Phase 3 az login is still
+    # valid. The cleanup below removes the az token cache (and the bootstrap
+    # user's profile under dedicated-admin), which would strip the managed-
+    # identity auth context this tag write depends on.
     try {
         Write-BootstrapStateTag -config $config -Value 'succeeded'
     } catch {
@@ -918,24 +852,6 @@ function Invoke-Phase99 {
         Write-Log "Removed az token cache at $env:AZURE_CONFIG_DIR"
     }
 
-    # Zero out the encrypted SP password blob in config.json once the
-    # workstream has succeeded. DPAPI-LocalMachine binds the blob to the
-    # host so off-box exfiltration cannot decrypt, but leaving the
-    # encrypted secret around after the bootstrap is done is unnecessary
-    # attack surface. The bring-your-own-cluster path has spPassword=''
-    # already and the conditional below is a no-op.
-    if (Test-Path $script:ConfigPath) {
-        $cfg = Get-Content -Raw -Path $script:ConfigPath | ConvertFrom-Json
-        if (Get-Prop $cfg 'spPassword') {
-            $cfg.spPassword = ''
-            if ($null -ne (Get-Prop $cfg 'spPasswordEncrypted')) {
-                $cfg.spPasswordEncrypted = $false
-            }
-            $cfg | ConvertTo-Json | Set-Content -Path $script:ConfigPath -Encoding UTF8
-            Write-Log 'Zeroed SP password blob in config.json'
-        }
-    }
-
     Set-State -Phase 99 -Status 'succeeded'
     Write-Log 'Phase 99: complete. Bootstrap succeeded.'
 }
@@ -965,6 +881,9 @@ try {
         Write-Log "Resuming at phase=$startPhase status=$($state.status)"
 
         try {
+            # Phases 0-3 are sequential work. 99 is the terminal cleanup phase.
+            # The gap leaves room to insert work phases later without renumbering
+            # cleanup or the terminal check below.
             switch ($state.phase) {
                 0  { Invoke-Phase0  -config $config }
                 1  { Invoke-Phase1  -config $config }

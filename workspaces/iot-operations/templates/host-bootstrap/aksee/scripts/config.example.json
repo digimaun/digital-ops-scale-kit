@@ -1,19 +1,16 @@
 {
-  "_comment": "Example config for worker.ps1. Copy to config.json in your ConfigDir and replace placeholder values. NEVER commit a populated config.json (it carries the service principal secret).",
+  "_comment": "Example config for worker.ps1. Copy to config.json in your ConfigDir and replace placeholder values.",
 
   "clusterName": "aksee-cluster1",
   "resourceGroup": "aksee-rg",
   "subscription": "00000000-0000-0000-0000-000000000000",
   "location": "westus2",
-  "tenantId": "00000000-0000-0000-0000-000000000000",
   "customLocationsOid": "00000000-0000-0000-0000-000000000000",
 
   "_aksEdgeMsiUrlNote": "Official aka.ms shortcut to the latest stable AKS Edge Essentials K3s MSI. Microsoft does not publish per-version aka.ms links, so to pin a specific version, host the MSI yourself and point this at it.",
   "aksEdgeMsiUrl": "https://aka.ms/aks-edge/k3s-msi",
 
-  "_spNote": "Service principal used by AKS Edge Essentials to create the cluster (required by the install step). Needs Kubernetes Cluster - Azure Arc Onboarding (or broader Contributor) on the resource group. Leave both fields empty only when this config is used to drive the worker against an already-existing cluster, in which case Phase 3's Arc operations fall through to the machine's managed identity.",
-  "spAppId": "00000000-0000-0000-0000-000000000000",
-  "spPassword": "REPLACE-ME",
+  "_authNote": "Phase 3 authenticates with the Arc machine's system-assigned managed identity (az login --identity). Grant it Contributor on the resource group, or Kubernetes Cluster - Azure Arc Onboarding plus Tag Contributor for least privilege. No service principal is used.",
 
   "_enableWorkloadIdentityNote": "Default false matches the validated AIO baseline. Set true when downstream AIO components need workload-identity-backed secret sync. Activates Phase 3 OIDC issuer enablement, K3s apiserver patch, and Arc agent restart.",
   "enableWorkloadIdentity": false,

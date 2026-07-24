@@ -242,6 +242,15 @@ class TestWorkflowSecretSyncModes:
         assert "secret-sync-mode: ${{ fromJSON(" in workflow
         assert "enable-workload-identity: ${{ matrix.secret-sync-mode" in workflow
         assert "E2E_ENABLE_SECRET_SYNC: ${{ matrix.secret-sync-mode" in workflow
+        assert "Validate Custom Locations RP object ID" in workflow
+        assert "secrets.CUSTOM_LOCATIONS_OID" in workflow
+        assert (
+            "inputs.custom-locations-oid != '' && inputs.custom-locations-oid "
+            "|| secrets.CUSTOM_LOCATIONS_OID"
+        ) in workflow
+        assert "multiple AIO releases or Secret Sync modes" in workflow
+        assert "Secret Sync requires OIDC issuer and workload identity" in workflow
+        assert "matrix axis intentionally controls all three settings" in workflow
         assert 'enabled) SYNC_SUFFIX="sync-on"' in workflow
         assert 'disabled) SYNC_SUFFIX="sync-off"' in workflow
         assert 'RESOURCE_SUFFIX="${SHORT_RUN}-${SAFE_VER}-${SYNC_SUFFIX}"' in workflow

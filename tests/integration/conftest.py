@@ -66,7 +66,6 @@ _UPGRADE_PHASE_ALLOWED_CLASSES = frozenset({
     "TestAioUpgradeSelfConsistency",
     "TestAioUpgradeIdempotency",
     "TestAioExtensionInvariants",
-    "TestSecretStoreOptionality",
     "TestSecretStoreExtensionInvariants",
     "TestCertManagerExtensionInvariants",
     "TestExtensionAdditiveOverrides",

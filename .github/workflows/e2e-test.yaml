@@ -44,7 +44,7 @@ on:
         type: string
         default: ""
       custom-locations-oid:
-        description: Custom Locations RP object ID in the tenant (see docs/e2e-testing.md).
+        description: Custom Locations RP object ID in the tenant. Empty uses the CUSTOM_LOCATIONS_OID environment secret.
         type: string
         default: ""
       skip-teardown:
@@ -141,10 +141,11 @@ jobs:
                   f"{invalid_secret_sync_modes}. Valid: ['disabled', 'enabled']."
               )
           persistent = bool(rg_in)
-          if cl_in and len(rs) > 1:
+          if cl_in and (len(rs) > 1 or len(secret_sync_modes) > 1):
               sys.exit(
-                  "cluster-name cannot be combined with a multi-release "
-                  "aio-releases matrix (each matrix cell registers its own cluster)."
+                  "cluster-name cannot be combined with a matrix that has "
+                  "multiple AIO releases or Secret Sync modes. Each matrix "
+                  "cell registers its own cluster."
               )
           # Validate upgrade-to against shipped versions. Same-version cells
           # are NOT a hard error here: a matrix like `aio-releases=2604,2605`
@@ -338,6 +339,16 @@ jobs:
           ) &
           echo "OIDC token refresh service started (PID: $!)"
 
+      - name: Validate Custom Locations RP object ID
+        shell: bash
+        env:
+          CUSTOM_LOCATIONS_OID: ${{ inputs.custom-locations-oid != '' && inputs.custom-locations-oid || secrets.CUSTOM_LOCATIONS_OID }}
+        run: |
+          if [[ -z "$CUSTOM_LOCATIONS_OID" ]]; then
+            echo "::error::Set the CUSTOM_LOCATIONS_OID environment secret or pass the custom-locations-oid workflow input."
+            exit 1
+          fi
+
       - name: Snapshot RG resources (persistent mode)
         if: env.PERSISTENT_RG == 'true'
         shell: bash
@@ -428,7 +439,9 @@ jobs:
           cluster-name: ${{ steps.names.outputs.cluster }}
           resource-group: ${{ steps.names.outputs.rg }}
           location: ${{ steps.loc.outputs.location }}
-          custom-locations-oid: ${{ inputs.custom-locations-oid }}
+          custom-locations-oid: ${{ inputs.custom-locations-oid != '' && inputs.custom-locations-oid || secrets.CUSTOM_LOCATIONS_OID }}
+          # Secret Sync requires OIDC issuer and workload identity, so one
+          # matrix axis intentionally controls all three settings.
           enable-workload-identity: ${{ matrix.secret-sync-mode == 'enabled' && 'true' || 'false' }}
 
       - name: Check for kubectl manifest steps

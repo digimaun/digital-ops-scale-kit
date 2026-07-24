@@ -52,6 +52,38 @@ class TestAioUpgradeDeployment:
                 assert_step_succeeded(aio_upgrade_result, name, step_name)
 
 
+class TestAioUpgradeOidcOptionality:
+    """resolve-aio supports connected clusters with and without OIDC."""
+
+    def test_missing_oidc_profile_returns_empty_issuer(self, aio_upgrade_result):
+        sites_without_oidc = 0
+        for name in aio_upgrade_result["sites"]:
+            step = assert_step_succeeded(aio_upgrade_result, name, "resolve-aio")
+            issuer = assert_output_exists(step, "oidcIssuerUrl")
+            if issuer:
+                continue
+            sites_without_oidc += 1
+            assert issuer == ""
+
+        if sites_without_oidc == 0:
+            pytest.skip("No selected site lacks an OIDC issuer profile")
+
+    def test_existing_oidc_profile_preserves_issuer(self, aio_upgrade_result):
+        sites_with_oidc = 0
+        for name in aio_upgrade_result["sites"]:
+            step = assert_step_succeeded(aio_upgrade_result, name, "resolve-aio")
+            issuer = assert_output_exists(step, "oidcIssuerUrl")
+            if not issuer:
+                continue
+            sites_with_oidc += 1
+            assert issuer.startswith("https://"), (
+                f"Site '{name}': unexpected OIDC issuer URL {issuer!r}"
+            )
+
+        if sites_with_oidc == 0:
+            pytest.skip("No selected site has an OIDC issuer profile")
+
+
 class TestAioUpgradeResolveExtensions:
     """Validate the snapshot outputs from resolve-extensions."""
 
@@ -66,7 +98,7 @@ class TestAioUpgradeResolveExtensions:
             # configurationSettings must be non-empty: union(empty, overrides)
             # would silently wipe operator-applied config on the upgrade PUT.
             assert aio["configurationSettings"], (
-                f"Site '{name}': aio.configurationSettings is empty; "
+                f"Site '{name}': aio.configurationSettings is empty. "
                 f"upgrade would wipe operator config"
             )
 
@@ -89,10 +121,24 @@ class TestAioUpgradeResolveExtensions:
                 assert key in secret_store, (
                     f"Site '{name}': secretStore snapshot missing '{key}'"
                 )
-            assert secret_store["configurationSettings"], (
-                f"Site '{name}': secretStore.configurationSettings is empty; "
-                f"upgrade would wipe operator config"
-            )
+            if secret_store["id"]:
+                assert secret_store["configurationSettings"], (
+                    f"Site '{name}': secretStore.configurationSettings is empty. "
+                    f"upgrade would wipe operator config"
+                )
+            else:
+                assert secret_store == {
+                    "id": "",
+                    "name": "azure-secret-store",
+                    "extensionType": "microsoft.azure.secretstore",
+                    "version": "",
+                    "releaseTrain": "",
+                    "configurationSettings": {},
+                    "identity": {"type": "None"},
+                }, (
+                    f"Site '{name}': disabled secretStore snapshot is not the "
+                    f"canonical zero-valued shape: {secret_store!r}"
+                )
 
     def test_cert_manager_snapshot_shape(self, aio_upgrade_result):
         """resolve-extensions returns a uniform certManager snapshot whether
@@ -123,11 +169,16 @@ class TestAioUpgradePreservation:
 
             assert install_id == upgrade_id, (
                 f"Site '{name}': AIO extension id changed across upgrade "
-                f"({install_id!r} -> {upgrade_id!r}); upgrade is replacing not patching"
+                f"({install_id!r} -> {upgrade_id!r}). Upgrade is replacing not patching"
             )
 
     def test_secret_store_extension_id_preserved(self, aio_install_result, aio_upgrade_result):
         for name in aio_upgrade_result["sites"]:
+            resolve_step = assert_step_succeeded(
+                aio_upgrade_result, name, "resolve-extensions"
+            )
+            if not assert_output_exists(resolve_step, "secretStore")["id"]:
+                continue
             install_step = assert_step_succeeded(aio_install_result, name, "aio-enablement")
             install_extensions = assert_output_exists(install_step, "extensions")
             install_id = install_extensions["secretStore"]["id"]
@@ -157,11 +208,23 @@ class TestAioUpgradePreservation:
 
     def test_update_extensions_outputs(self, aio_upgrade_result):
         for name in aio_upgrade_result["sites"]:
+            resolve = assert_step_succeeded(
+                aio_upgrade_result, name, "resolve-extensions"
+            )
+            secret_store_enabled = bool(
+                assert_output_exists(resolve, "secretStore")["id"]
+            )
             step = assert_step_succeeded(aio_upgrade_result, name, "update-extensions")
             assert_output_starts_with(step, "aioExtensionId", "/subscriptions/")
-            assert_output_starts_with(step, "secretStoreExtensionId", "/subscriptions/")
             assert_output_exists(step, "aioVersionApplied")
-            assert_output_exists(step, "secretStoreVersionApplied")
+            if secret_store_enabled:
+                assert_output_starts_with(
+                    step, "secretStoreExtensionId", "/subscriptions/"
+                )
+                assert assert_output_exists(step, "secretStoreVersionApplied")
+            else:
+                assert assert_output_exists(step, "secretStoreExtensionId") == ""
+                assert assert_output_exists(step, "secretStoreVersionApplied") == ""
 
 
 class TestAioUpgradeSelfConsistency:
@@ -186,7 +249,7 @@ class TestAioUpgradeSelfConsistency:
 
             assert resolved_id == applied_id, (
                 f"Site '{name}': update-extensions patched {applied_id!r} but "
-                f"resolve-extensions discovered {resolved_id!r}; upgrade is "
+                f"resolve-extensions discovered {resolved_id!r}. Upgrade is "
                 f"writing to the wrong extension"
             )
 
@@ -214,9 +277,64 @@ class TestAioUpgradeSelfConsistency:
             assert aio["configurationSettings"], (
                 f"Site '{name}': aio.configurationSettings empty in upgrade snapshot"
             )
-            assert secret_store["configurationSettings"], (
-                f"Site '{name}': secretStore.configurationSettings empty in upgrade snapshot"
+            if secret_store["id"]:
+                assert secret_store["configurationSettings"], (
+                    f"Site '{name}': secretStore.configurationSettings empty "
+                    f"in upgrade snapshot"
+                )
+
+
+class TestSecretStoreOptionality:
+    """The upgrade supports sites both with and without Secret Sync."""
+
+    def test_disabled_secret_store_is_not_resolved_or_updated(
+        self, aio_upgrade_result
+    ):
+        disabled_sites = 0
+        for name in aio_upgrade_result["sites"]:
+            resolve = assert_step_succeeded(
+                aio_upgrade_result, name, "resolve-extensions"
             )
+            pre = assert_output_exists(resolve, "secretStore")
+            if pre["id"]:
+                continue
+            disabled_sites += 1
+
+            update = assert_step_succeeded(
+                aio_upgrade_result, name, "update-extensions"
+            )
+            post = assert_output_exists(update, "secretStorePostUpdate")
+            assert post == pre
+            assert assert_output_exists(update, "secretStoreExtensionId") == ""
+            assert assert_output_exists(update, "secretStoreVersionApplied") == ""
+
+        if disabled_sites == 0:
+            pytest.skip("No selected site has enableSecretSync=false")
+
+    def test_enabled_secret_store_preserves_identity_config_and_train(
+        self, aio_upgrade_result
+    ):
+        enabled_sites = 0
+        for name in aio_upgrade_result["sites"]:
+            resolve = assert_step_succeeded(
+                aio_upgrade_result, name, "resolve-extensions"
+            )
+            pre = assert_output_exists(resolve, "secretStore")
+            if not pre["id"]:
+                continue
+            enabled_sites += 1
+
+            update = assert_step_succeeded(
+                aio_upgrade_result, name, "update-extensions"
+            )
+            post = assert_output_exists(update, "secretStorePostUpdate")
+            assert post["id"] == pre["id"]
+            assert post["identity"] == pre["identity"]
+            assert post["configurationSettings"] == pre["configurationSettings"]
+            assert post["releaseTrain"] == pre["releaseTrain"]
+
+        if enabled_sites == 0:
+            pytest.skip("No selected site has enableSecretSync=true")
 
 
 class TestAioUpgradeIdempotency:
@@ -278,7 +396,7 @@ class TestAioExtensionInvariants:
             post = assert_output_exists(update, "aioPostUpdate")
             assert post["id"] == pre["id"], (
                 f"Site '{name}': AIO extension id changed across PUT "
-                f"({pre['id']!r} -> {post['id']!r}); full-replace, not in-place"
+                f"({pre['id']!r} -> {post['id']!r}). Full-replace, not in-place"
             )
 
     def test_aio_extension_name_and_type_preserved(self, aio_upgrade_result):
@@ -305,7 +423,7 @@ class TestAioExtensionInvariants:
             post = assert_output_exists(update, "aioPostUpdate")
             assert post["releaseNamespace"] == pre["releaseNamespace"], (
                 f"Site '{name}': releaseNamespace changed "
-                f"({pre['releaseNamespace']!r} -> {post['releaseNamespace']!r}); "
+                f"({pre['releaseNamespace']!r} -> {post['releaseNamespace']!r}). "
                 f"upgrade would relocate the AIO workload"
             )
 
@@ -323,7 +441,7 @@ class TestAioExtensionInvariants:
 
     def test_aio_configuration_settings_preserved(self, aio_upgrade_result):
         """configurationSettings carries operator-applied AIO config. Update
-        uses `union(existing, overrides)` which is additive-only by contract;
+        uses `union(existing, overrides)` which is additive-only by contract.
         any mutation across PUT is data loss.
         """
         for name in aio_upgrade_result["sites"]:
@@ -354,14 +472,12 @@ class TestAioExtensionInvariants:
             )
 
 
-# Placeholder marker for new test classes - replaced by edit below
 class TestSecretStoreExtensionInvariants:
-    """Secret-store Arc extension PUT changes only `version` (and `releaseTrain`
-    when the release config specifies a different train). All other fields
-    equal the pre-PUT snapshot.
+    """An enabled secret-store PUT changes only its release version or train.
 
-    Mirrors TestAioExtensionInvariants. Same caveats: `configurationProtectedSettings`
-    is outside the assertable surface.
+    Disabled sites return the same zero-valued shape before and after the
+    skipped update. `configurationProtectedSettings` is outside the assertable
+    surface.
     """
 
     def test_secret_store_extension_id_preserved(self, aio_upgrade_result):
@@ -372,7 +488,7 @@ class TestSecretStoreExtensionInvariants:
             post = assert_output_exists(update, "secretStorePostUpdate")
             assert post["id"] == pre["id"], (
                 f"Site '{name}': secret store extension id changed across PUT "
-                f"({pre['id']!r} -> {post['id']!r}); full-replace, not in-place"
+                f"({pre['id']!r} -> {post['id']!r}). Full-replace, not in-place"
             )
 
     def test_secret_store_name_and_type_preserved(self, aio_upgrade_result):
@@ -446,7 +562,7 @@ class TestCertManagerExtensionInvariants:
             post = assert_output_exists(update, "certManagerPostUpdate")
             assert post["id"] == pre["id"], (
                 f"Site '{name}': cert-manager extension id changed across PUT "
-                f"({pre['id']!r} -> {post['id']!r}); full-replace, not in-place"
+                f"({pre['id']!r} -> {post['id']!r}). Full-replace, not in-place"
             )
 
     def test_cert_manager_name_and_type_preserved(self, aio_upgrade_result):
@@ -581,6 +697,13 @@ class TestExtensionAdditiveOverrides:
                 aio_upgrade_with_overrides_result, name, "resolve-extensions"
             )
             pre = assert_output_exists(resolve, "secretStore")
+            if not pre["id"]:
+                update = assert_step_succeeded(
+                    aio_upgrade_with_overrides_result, name, "update-extensions"
+                )
+                post = assert_output_exists(update, "secretStorePostUpdate")
+                assert post == pre
+                continue
             update = assert_step_succeeded(
                 aio_upgrade_with_overrides_result, name, "update-extensions"
             )

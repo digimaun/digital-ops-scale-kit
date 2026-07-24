@@ -1,6 +1,7 @@
 // update-extensions.bicep
 // -------------------------------------------------------------------------------------
-// Bumps Arc extension versions for AIO, secret-store, and (conditionally) cert-manager
+// Bumps Arc extension versions for AIO and the enabled optional extensions
+// (secret-store and cert-manager)
 // while preserving each extension's existing configurationSettings, releaseTrain, and
 // identity. Inputs are typically chained from `resolve-extensions.bicep` outputs.
 //
@@ -11,9 +12,10 @@
 // configurationOverrides are unioned over the existing configurationSettings so
 // the PUT cannot wipe operator state.
 //
-// cert-manager is gated by `enableCertManager`: when false, no cert-manager PUT
-// is emitted. (Conditional resource declaration. The existing extension is left
-// untouched.)
+// Optional extension PUTs are gated by their site capability flags:
+//   - `enableSecretSync: false` emits no azure-secret-store PUT.
+//   - `enableCertManager: false` emits no cert-manager PUT.
+// Disabled extensions are left untouched.
 //
 // API version: `Microsoft.KubernetesConfiguration/extensions@2023-05-01` is fixed
 // across AIO releases and is not driven by the AIO API version dispatcher. If a
@@ -59,6 +61,9 @@ param aio object
 @description('Secret store extension snapshot from resolve-extensions.outputs.secretStore.')
 #disable-next-line secure-secrets-in-params
 param secretStore object
+
+@description('Whether Secret Sync is enabled for this site. False skips the azure-secret-store PUT so deployments without that optional extension can upgrade.')
+param enableSecretSync bool
 
 @description('cert-manager extension snapshot from resolve-extensions.outputs.certManager. Ignored when enableCertManager is false.')
 param certManager object
@@ -110,8 +115,8 @@ param certManagerConfigurationOverrides object = {}
 var effectiveAioVersion = !empty(aioVersion) ? aioVersion : aio.version
 var effectiveAioTrain = !empty(aioTrain) ? aioTrain : aio.releaseTrain
 
-var effectiveSecretStoreVersion = !empty(secretStoreVersion) ? secretStoreVersion : secretStore.version
-var effectiveSecretStoreTrain = !empty(secretStoreTrain) ? secretStoreTrain : secretStore.releaseTrain
+var effectiveSecretStoreVersion = enableSecretSync ? (!empty(secretStoreVersion) ? secretStoreVersion : secretStore.version) : ''
+var effectiveSecretStoreTrain = enableSecretSync ? (!empty(secretStoreTrain) ? secretStoreTrain : secretStore.releaseTrain) : ''
 
 var effectiveCertManagerVersion = !empty(certManagerVersion) ? certManagerVersion : certManager.version
 var effectiveCertManagerTrain = !empty(certManagerTrain) ? certManagerTrain : certManager.releaseTrain
@@ -150,7 +155,7 @@ resource aioExtensionUpdate 'Microsoft.KubernetesConfiguration/extensions@2023-0
 // Secret Store Extension: PUT with target version, preserving config + identity.
 // =====================================================================================
 
-resource secretStoreExtensionUpdate 'Microsoft.KubernetesConfiguration/extensions@2023-05-01' = {
+resource secretStoreExtensionUpdate 'Microsoft.KubernetesConfiguration/extensions@2023-05-01' = if (enableSecretSync) {
   scope: cluster
   name: secretStore.name
   identity: secretStore.identity
@@ -197,8 +202,8 @@ resource certManagerExtensionUpdate 'Microsoft.KubernetesConfiguration/extension
 @description('Resource ID of the (updated) AIO Arc extension.')
 output aioExtensionId string = aioExtensionUpdate.id
 
-@description('Resource ID of the (updated) secret store Arc extension.')
-output secretStoreExtensionId string = secretStoreExtensionUpdate.id
+@description('Resource ID of the updated secret store Arc extension. Empty when enableSecretSync is false.')
+output secretStoreExtensionId string = enableSecretSync ? secretStoreExtensionUpdate!.id : ''
 
 @description('Resource ID of the (updated) cert-manager Arc extension. Empty when enableCertManager is false.')
 output certManagerExtensionId string = enableCertManager ? certManagerExtensionUpdate!.id : ''
@@ -206,7 +211,7 @@ output certManagerExtensionId string = enableCertManager ? certManagerExtensionU
 @description('Effective version applied to the AIO Arc extension.')
 output aioVersionApplied string = effectiveAioVersion
 
-@description('Effective version applied to the secret store Arc extension.')
+@description('Effective version applied to the secret store Arc extension. Empty when enableSecretSync is false.')
 output secretStoreVersionApplied string = effectiveSecretStoreVersion
 
 @description('Effective version applied to the cert-manager Arc extension. Empty when enableCertManager is false.')
@@ -224,17 +229,27 @@ output aioPostUpdate object = {
   releaseNamespace: aioExtensionUpdate.properties.?scope.?cluster.?releaseNamespace ?? 'azure-iot-operations'
 }
 
-@description('Post-PUT snapshot of the secret store Arc extension, mirroring `resolve-extensions.outputs.secretStore`. `releaseNamespace` is omitted because the install path does not set scope.cluster.releaseNamespace and the upgrade mirrors that. Excludes `configurationProtectedSettings` (write-only, returned masked).')
+@description('Post-PUT snapshot of the secret store Arc extension, mirroring `resolve-extensions.outputs.secretStore`. Populated when enableSecretSync is true, otherwise zero-valued. `releaseNamespace` is omitted because the install path does not set scope.cluster.releaseNamespace and the upgrade mirrors that. Excludes `configurationProtectedSettings` (write-only, returned masked).')
 #disable-next-line outputs-should-not-contain-secrets
-output secretStorePostUpdate object = {
-  id: secretStoreExtensionUpdate.id
-  name: secretStoreExtensionUpdate.name
-  extensionType: secretStoreExtensionUpdate.properties.extensionType
-  version: secretStoreExtensionUpdate.properties.?version ?? ''
-  releaseTrain: secretStoreExtensionUpdate.properties.?releaseTrain ?? ''
-  configurationSettings: secretStoreExtensionUpdate.properties.?configurationSettings ?? {}
-  identity: secretStoreExtensionUpdate.?identity ?? { type: 'None' }
-}
+output secretStorePostUpdate object = enableSecretSync
+  ? {
+      id: secretStoreExtensionUpdate!.id
+      name: secretStoreExtensionUpdate!.name
+      extensionType: secretStoreExtensionUpdate!.properties.extensionType
+      version: secretStoreExtensionUpdate!.properties.?version ?? ''
+      releaseTrain: secretStoreExtensionUpdate!.properties.?releaseTrain ?? ''
+      configurationSettings: secretStoreExtensionUpdate!.properties.?configurationSettings ?? {}
+      identity: secretStoreExtensionUpdate!.?identity ?? { type: 'None' }
+    }
+  : {
+      id: ''
+      name: secretStore.name
+      extensionType: secretStore.extensionType
+      version: ''
+      releaseTrain: ''
+      configurationSettings: {}
+      identity: { type: 'None' }
+    }
 
 @description('Post-PUT snapshot of the cert-manager Arc extension, mirroring `resolve-extensions.outputs.certManager`. Populated when enableCertManager is true, otherwise zero-valued (id is empty) so consumers can skip on the same signal as resolve. Excludes `configurationProtectedSettings` (write-only, returned masked).')
 output certManagerPostUpdate object = enableCertManager

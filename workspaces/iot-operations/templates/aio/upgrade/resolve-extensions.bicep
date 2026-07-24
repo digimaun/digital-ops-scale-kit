@@ -1,6 +1,6 @@
 // resolve-extensions.bicep
 // -------------------------------------------------------------------------------------
-// Resolves the AIO, azure-secret-store, and (conditionally) cert-manager Arc
+// Resolves the AIO and the optional azure-secret-store and cert-manager Arc
 // extensions on the cluster hosting the AIO instance, returning uniform
 // snapshots that update-extensions consumes.
 //
@@ -9,12 +9,11 @@
 // uses to STAMP these names. Drift between install and upgrade is structurally
 // impossible because both sides import the same authoritative deriver/constants.
 //
-// cert-manager ownership: the conditional `existing` is gated on the deploy-time
-// `enableCertManager` parameter (sourced from `site.properties.deployOptions.
-// enableCertManager`). This is the same flag that gates the install in
-// `enablement.bicep`, so the upgrade's view of cert-manager ownership matches
-// the install's. Sites that delegate cert-manager to a customer-managed install
-// pass `enableCertManager: false` and the snapshot is returned zero-valued.
+// Optional extensions: each conditional `existing` lookup is gated by the
+// corresponding site capability flag. A deployment without Secret Sync has no
+// azure-secret-store extension to read, so `enableSecretSync: false` must avoid
+// evaluating any `reference()` to it. Disabled extensions return a zero-valued
+// snapshot that update-extensions consumes without special parameter shapes.
 //
 // Why not iterate `customLocation.clusterExtensionIds` and filter by extensionType?
 //   BCP138 forces duplicating the filter predicate per extension, `filter(...)[0]`
@@ -28,6 +27,7 @@
 import {
   aioExtensionName as deriveAioExtensionName
   secretStoreExtensionName
+  secretStoreExtensionType
   certManagerExtensionName
   certManagerExtensionType
 } from '../../common/extension-names.bicep'
@@ -41,6 +41,9 @@ param connectedClusterName string
 
 @description('Full ARM resource ID of the connected cluster. Chained from resolve-aio.outputs.connectedClusterResourceId. Used to derive the AIO Arc extension name via the same uniqueString algebra the install path uses.')
 param connectedClusterResourceId string
+
+@description('Whether Secret Sync is enabled for this site. False skips the azure-secret-store lookup entirely so deployments without that optional extension can upgrade.')
+param enableSecretSync bool
 
 @description('Whether scalekit owns cert-manager on this cluster. Sourced from `site.properties.deployOptions.enableCertManager`. False skips cert-manager resolution entirely so externally-managed cert-manager installs are never read by this template.')
 param enableCertManager bool
@@ -58,7 +61,7 @@ resource aioExtension 'Microsoft.KubernetesConfiguration/extensions@2023-05-01' 
   name: deriveAioExtensionName(connectedClusterResourceId)
 }
 
-resource secretStoreExtension 'Microsoft.KubernetesConfiguration/extensions@2023-05-01' existing = {
+resource secretStoreExtension 'Microsoft.KubernetesConfiguration/extensions@2023-05-01' existing = if (enableSecretSync) {
   scope: cluster
   name: secretStoreExtensionName
 }
@@ -84,17 +87,27 @@ output aio object = {
   releaseNamespace: aioExtension.properties.?scope.?cluster.?releaseNamespace ?? 'azure-iot-operations'
 }
 
-@description('Secret store Arc extension snapshot.')
+@description('Secret store Arc extension snapshot. Populated when enableSecretSync is true. Otherwise zero-valued with the canonical name and type so update-extensions can consume a uniform shape without reading a missing extension.')
 #disable-next-line outputs-should-not-contain-secrets
-output secretStore object = {
-  id: secretStoreExtension.id
-  name: secretStoreExtension.name
-  extensionType: secretStoreExtension.properties.extensionType
-  version: secretStoreExtension.properties.?version ?? ''
-  releaseTrain: secretStoreExtension.properties.?releaseTrain ?? ''
-  configurationSettings: secretStoreExtension.properties.?configurationSettings ?? {}
-  identity: secretStoreExtension.?identity ?? { type: 'None' }
-}
+output secretStore object = enableSecretSync
+  ? {
+      id: secretStoreExtension!.id
+      name: secretStoreExtension!.name
+      extensionType: secretStoreExtension!.properties.extensionType
+      version: secretStoreExtension!.properties.?version ?? ''
+      releaseTrain: secretStoreExtension!.properties.?releaseTrain ?? ''
+      configurationSettings: secretStoreExtension!.properties.?configurationSettings ?? {}
+      identity: secretStoreExtension!.?identity ?? { type: 'None' }
+    }
+  : {
+      id: ''
+      name: secretStoreExtensionName
+      extensionType: secretStoreExtensionType
+      version: ''
+      releaseTrain: ''
+      configurationSettings: {}
+      identity: { type: 'None' }
+    }
 
 @description('cert-manager Arc extension snapshot. Populated when enableCertManager is true. Otherwise zero-valued with the canonical name and type so update-extensions can consume a uniform shape.')
 output certManager object = enableCertManager

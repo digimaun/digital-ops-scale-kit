@@ -66,7 +66,7 @@ Source of truth for every pinned version number is the YAML itself. Cross-refere
 
 ## Upgrading an existing site
 
-Use `aio-upgrade.yaml` to move a site to a newer `aioRelease`. It bumps the Arc extension versions for AIO, secret-store, and (when the site declares `deployOptions.enableCertManager: true`) cert-manager, preserving each extension's existing `configurationSettings`, `releaseTrain`, and identity.
+Use `aio-upgrade.yaml` to move a site to a newer `aioRelease`. It always bumps the AIO Arc extension. It upgrades secret-store only when the site declares `deployOptions.enableSecretSync: true`, and it upgrades cert-manager only when `deployOptions.enableCertManager: true`. Disabled optional extensions are neither resolved nor written, so they do not need to exist. Every extension that is updated preserves its existing `configurationSettings`, `releaseTrain`, and identity.
 
 The IoT Operations instance ARM resource has no writable version property and is not mutated by this manifest. New instance child resource types introduced by future AIO releases (broker properties, dataflow profile schema changes, etc.) are out of scope and will need a future tier of upgrade manifests.
 

@@ -2,9 +2,9 @@ apiVersion: siteops/v1
 kind: Manifest
 name: aio-upgrade
 description: |
-  Bump Arc extension versions for cert-manager, azure-secret-store, and AIO on
-  existing Azure IoT Operations instances, preserving each extension's existing
-  configurationSettings, releaseTrain, and identity.
+  Bump the AIO Arc extension and the optional extensions enabled on the site,
+  preserving each updated extension's configurationSettings, releaseTrain,
+  and identity.
 
   Reads target versions from parameters/aio-releases/<release>.yaml, the same
   source aio-install.yaml uses for the initial deployment. Operators select the
@@ -16,8 +16,9 @@ description: |
   cert-manager is upgraded only when the site declares
   `deployOptions.enableCertManager: true`. Sites that delegate cert-manager
   to a customer-managed install set the flag false to leave the existing
-  extension untouched. Custom or partial overrides can be applied via
-  standard parameter overrides.
+  extension untouched. The azure-secret-store extension is likewise resolved
+  and upgraded only when `deployOptions.enableSecretSync: true`. Sites without
+  Secret Sync do not need that extension to exist.
 
   Prerequisites:
     - AIO instance must be deployed and running

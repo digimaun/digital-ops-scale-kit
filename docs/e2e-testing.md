@@ -114,6 +114,17 @@ From the **Actions** tab, dispatch **E2E Tests** with the defaults to run a sing
 | `keep-cluster-alive-minutes` | `0` | Hold the runner for N min before teardown for debugging. Max 300. Nothing should be added to the persistent RG during the hold (it'll be deleted by teardown). |
 | `tests` | empty (run all) or `aio-install,secretsync` | Comma-separated allowlist of test phases to deploy and run. Valid values: `aio-install`, `secretsync`, `secretsync-sample`, `opc-ua-solution`, `aio-upgrade`. Useful for demos and focused debugging when paired with `keep-cluster-alive-minutes`. |
 | `upgrade-to` | empty or `2605` | Optional AIO release to upgrade to after install-phase tests pass. Empty skips the upgrade phase. Per-cell skip when equal to the cell's `aio-releases` value. Requires `aio-upgrade` to be in the `tests` allowlist (or `tests` empty). |
+| `secret-sync-modes` | `enabled` or `enabled,disabled` | Matrix modes for Secret Sync and workload identity. Use `enabled,disabled` with `tests=aio-upgrade` to qualify upgrade behavior with and without the optional extension and OIDC profile. |
+
+Qualify both AIO upgrade optionality paths in one dispatch:
+
+```bash
+gh workflow run e2e-test.yaml \
+  -f aio-releases=2604 \
+  -f upgrade-to=2605 \
+  -f tests=aio-upgrade \
+  -f secret-sync-modes=enabled,disabled
+```
 
 ### What `skip-teardown` leaves behind
 
@@ -134,7 +145,7 @@ Persistent teardown deletes the Arc cluster only if it was not present in the pr
 
 **Use a dedicated RG for persistent mode.** Anything added to the RG between the snapshot and teardown (by operators, automation, or a `keep-cluster-alive-minutes` hold) appears in the delta and is deleted.
 
-A JUnit XML artifact is uploaded per matrix cell (`e2e-results-<release>.xml`). When `upgrade-to` is set and the cell exercises the upgrade phase, a second artifact (`e2e-results-<release>-to-<upgrade-to>.xml`) is uploaded with the upgrade-only test results.
+A JUnit XML artifact is uploaded per matrix cell (`e2e-results-<release>-secretsync-<mode>.xml`). When `upgrade-to` is set and the cell exercises the upgrade phase, a second artifact (`e2e-results-<release>-to-<upgrade-to>-secretsync-<mode>.xml`) is uploaded with the upgrade-only test results.
 
 ## Running locally
 
@@ -150,6 +161,7 @@ Set three required env vars. Three more are auto-computed on first use.
 | `E2E_SITE_NAME` | no | `e2e-local-<unix_time>` |
 | `E2E_SUBSCRIPTION` | no | `az account show --query id -o tsv` |
 | `E2E_LOCATION` | no | `az group show -n $E2E_RESOURCE_GROUP --query location -o tsv` |
+| `E2E_ENABLE_SECRET_SYNC` | no | `true` |
 
 ### PowerShell (Windows)
 

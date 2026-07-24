@@ -242,5 +242,7 @@ class TestWorkflowSecretSyncModes:
         assert "secret-sync-mode: ${{ fromJSON(" in workflow
         assert "enable-workload-identity: ${{ matrix.secret-sync-mode" in workflow
         assert "E2E_ENABLE_SECRET_SYNC: ${{ matrix.secret-sync-mode" in workflow
-        assert "-secretsync-${SECRET_SYNC_MODE}" in workflow
+        assert 'enabled) SYNC_SUFFIX="sync-on"' in workflow
+        assert 'disabled) SYNC_SUFFIX="sync-off"' in workflow
+        assert 'RESOURCE_SUFFIX="${SHORT_RUN}-${SAFE_VER}-${SYNC_SUFFIX}"' in workflow
         assert "-ss-" not in workflow

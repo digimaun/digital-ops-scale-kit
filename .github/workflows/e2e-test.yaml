@@ -270,7 +270,8 @@ jobs:
           CL_IN: "${{ needs.prep.outputs.cluster-in }}"
           RELEASE: "${{ matrix.aio-release }}"
           SECRET_SYNC_MODE: "${{ matrix.secret-sync-mode }}"
-          RUN_SUFFIX: "${{ github.run_id }}-${{ github.run_attempt }}"
+          RUN_ID: "${{ github.run_id }}"
+          RUN_ATTEMPT: "${{ github.run_attempt }}"
         # Some AIO release strings may contain dots. Arc clusters
         # and several AIO-derived resource names reject dots, so we derive a
         # name-safe form (non-alphanumerics → `-`, trailing `-` trimmed) when
@@ -282,10 +283,17 @@ jobs:
         run: |
           set -euo pipefail
           SAFE_VER=$(printf '%s' "$RELEASE" | tr -c 'a-zA-Z0-9' '-' | sed 's/-*$//')
-          SUFFIX="${RUN_SUFFIX}-${SAFE_VER}-secretsync-${SECRET_SYNC_MODE}"
-          RG="${RG_IN:-rg-e2e-$SUFFIX}"
-          CL="${CL_IN:-e2e-$SUFFIX}"
-          SN="e2e-$SUFFIX"
+          case "$SECRET_SYNC_MODE" in
+            enabled) SYNC_SUFFIX="sync-on" ;;
+            disabled) SYNC_SUFFIX="sync-off" ;;
+            *) echo "::error::Unexpected Secret Sync mode '$SECRET_SYNC_MODE'"; exit 1 ;;
+          esac
+          LONG_SUFFIX="${RUN_ID}-${RUN_ATTEMPT}-${SAFE_VER}-secretsync-${SECRET_SYNC_MODE}"
+          SHORT_RUN="${RUN_ID: -8}-${RUN_ATTEMPT}"
+          RESOURCE_SUFFIX="${SHORT_RUN}-${SAFE_VER}-${SYNC_SUFFIX}"
+          RG="${RG_IN:-rg-e2e-$LONG_SUFFIX}"
+          CL="${CL_IN:-e2e-$RESOURCE_SUFFIX}"
+          SN="e2e-$RESOURCE_SUFFIX"
           echo "rg=$RG" >> "$GITHUB_OUTPUT"
           echo "cluster=$CL" >> "$GITHUB_OUTPUT"
           echo "site_name=$SN" >> "$GITHUB_OUTPUT"

@@ -10,7 +10,3 @@ connectedClusterResourceId: "{{ steps.resolve-aio.outputs.connectedClusterResour
 # cert-manager ownership flag from site config. False skips cert-manager
 # resolution so externally-managed cert-manager installs are never touched.
 enableCertManager: "{{ site.properties.deployOptions.enableCertManager }}"
-
-# Secret Sync is optional. False skips the azure-secret-store lookup so AIO
-# deployments that do not have that extension can still upgrade.
-enableSecretSync: "{{ site.properties.deployOptions.enableSecretSync }}"

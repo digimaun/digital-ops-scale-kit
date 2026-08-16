@@ -740,6 +740,18 @@ VERSION_CONFIG_REQUIRED_FIELDS = {
     "secretStoreTrain",
 }
 
+# Keys introduced by an API generation and carried by every generation after
+# it, mapped to the `aioApiVersion` that first requires them. API versions are
+# dates, so they compare lexicographically, and a generation added later
+# inherits the key without editing this map.
+GENERATION_SCOPED_RELEASE_KEYS: dict[str, str] = {
+    # The OPC UA connector template is an `akriConnectorTemplates` resource,
+    # which the supervisor-managed connector introduced with 2026-07-01.
+    # Earlier generations ship the statically deployed connector, which needs
+    # no template and no version naming one.
+    "opcuaConnectorVersion": "2026-07-01",
+}
+
 
 class TestReleaseConfigs:
     """Release config YAML files should be valid and consistent."""
@@ -811,6 +823,18 @@ class TestReleaseConfigs:
                     f"{release_file.name}: '{key}' is not an ARM API version: {config[key]!r}"
                 )
 
+            # A generation-scoped key is optional, but a release that declares
+            # one must give it a usable value. An empty string would deploy no
+            # connector template while every other check stayed green.
+            for key in GENERATION_SCOPED_RELEASE_KEYS:
+                if key not in config:
+                    continue
+                assert semver.match(str(config[key])), (
+                    f"{release_file.name}: '{key}' is declared but is not a "
+                    f"version: {config[key]!r}. Remove the key on a release that "
+                    f"deploys nothing for it, rather than leaving it empty."
+                )
+
             overrides = config["certManagerConfigurationOverrides"]
             assert all(isinstance(k, str) for k in overrides), (
                 f"{release_file.name}: configuration override keys must be strings"
@@ -874,15 +898,33 @@ class TestReleaseConfigs:
         If `2603.yaml` adds a key like `storageVersion` that `2512.yaml` doesn't
         have, upgrades to older targets would fail with missing required params
         (or silently use defaults). Catch divergence early.
+
+        Keys in `GENERATION_SCOPED_RELEASE_KEYS` are held to their own rule:
+        every release on or after the generation that introduced them declares
+        the key, and every older release does not.
         """
         release_files = self._get_release_files(workspace)
         assert release_files, "no aio-releases YAML files found"
         per_file: dict[str, set[str]] = {}
+        api_version: dict[str, str] = {}
         for release_file in release_files:
             with open(release_file, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
             per_file[release_file.name] = set(data.keys())
+            api_version[release_file.name] = str(data.get("aioApiVersion", ""))
 
+        for key, introduced in GENERATION_SCOPED_RELEASE_KEYS.items():
+            expected = {n for n, api in api_version.items() if api >= introduced}
+            actual = {n for n, keys in per_file.items() if key in keys}
+            assert actual == expected, (
+                f"'{key}' is declared by {sorted(actual)}, expected exactly "
+                f"{sorted(expected)}, the releases on API {introduced} or newer.\n"
+                f"Update GENERATION_SCOPED_RELEASE_KEYS if the key is no longer "
+                f"tied to that generation."
+            )
+
+        scoped = set(GENERATION_SCOPED_RELEASE_KEYS)
+        per_file = {name: keys - scoped for name, keys in per_file.items()}
         common = set.intersection(*per_file.values())
         for fname, keys in per_file.items():
             extra = keys - common

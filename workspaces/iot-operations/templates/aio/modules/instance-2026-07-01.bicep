@@ -52,6 +52,9 @@ param clusterResourceId string
 param customLocationName string
 param clExtensionIds string[]
 
+// OPC UA connector. Empty deploys no connector template.
+param opcuaConnectorVersion string = ''
+
 // =====================================================================================
 // Variables (version-specific logic owned by this module)
 // =====================================================================================
@@ -85,6 +88,21 @@ var BROKER_CONFIG = {
   persistence: brokerConfig.?persistence
   logsLevel: brokerConfig.?logsLevel ?? 'info'
 }
+
+// The connector template name is fixed here rather than left to the connectors
+// chart, which derives its own from the Helm release name and namespace. Telling
+// the chart the name ARM creates keeps the two in agreement on every connector
+// build, including those whose supervisor looks the name up exactly and does not
+// fall back to matching the prefix. Built from `instanceName` rather than the
+// instance symbol so the extension does not depend on a resource that is
+// deployed after it.
+var opcUaConnectorTemplateName = 'azureiotoperationsconnectorforopcua-${substring(uniqueString(resourceId('Microsoft.IoTOperations/instances', instanceName)), 0, 4)}'
+
+var opcUaConnectorSettings = empty(opcuaConnectorVersion)
+  ? {}
+  : {
+      'connectors.values.akriConnector.templateName': opcUaConnectorTemplateName
+    }
 
 var defaultAioConfigurationSettings = {
   AgentOperationTimeoutInMinutes: '120'
@@ -134,7 +152,14 @@ resource aioExtension 'Microsoft.KubernetesConfiguration/extensions@2023-05-01' 
         releaseNamespace: clusterNamespace
       }
     }
-    configurationSettings: union(defaultAioConfigurationSettings, aioConfigurationOverrides)
+    // The connector template name is an invariant rather than an operator
+    // choice, so it is applied after the overrides. A different name is not
+    // adopted by a connector build that reads the configured name exactly.
+    configurationSettings: union(
+      defaultAioConfigurationSettings,
+      aioConfigurationOverrides,
+      opcUaConnectorSettings
+    )
   }
 }
 
@@ -306,6 +331,47 @@ resource artifactRegistryEndpoint 'Microsoft.IoTOperations/instances/registryEnd
       method: 'Anonymous'
       anonymousSettings: {}
     }
+  }
+}
+
+// =====================================================================================
+// OPC UA connector template
+// =====================================================================================
+
+// The image is the supervisor image, which is what the connector metadata names.
+resource opcUaConnectorTemplate 'Microsoft.IoTOperations/instances/akriConnectorTemplates@2026-07-01' = if (!empty(opcuaConnectorVersion)) {
+  parent: aioInstance
+  name: opcUaConnectorTemplateName
+  extendedLocation: extendedLocation
+  properties: {
+    connectorMetadataRef: 'mcr.microsoft.com/azureiotoperations/aio-connectors/opcua-metadata:${opcuaConnectorVersion}'
+    aioMetadata: {
+      aioMinVersion: '1.2.100'
+    }
+    runtimeConfiguration: {
+      runtimeConfigurationType: 'ManagedConfiguration'
+      managedConfigurationSettings: {
+        managedConfigurationType: 'ImageConfiguration'
+        imageConfigurationSettings: {
+          registrySettings: {
+            registrySettingsType: 'ContainerRegistry'
+            containerRegistrySettings: {
+              registry: 'mcr.microsoft.com'
+            }
+          }
+          imageName: 'azureiotoperations/aio-connectors/supervisor'
+          tagDigestSettings: {
+            tagDigestType: 'Tag'
+            tag: opcuaConnectorVersion
+          }
+        }
+      }
+    }
+    deviceInboundEndpointTypes: [
+      {
+        endpointType: 'Microsoft.OpcUa'
+      }
+    ]
   }
 }
 

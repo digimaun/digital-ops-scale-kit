@@ -33,6 +33,19 @@ MODULE_ARM = re.compile(
 PARAMS_BLOCK = re.compile(r"params:\s*\{(?P<body>.*?)\n  \}", re.DOTALL)
 PARAM_PAIR = re.compile(r"^\s{4}(?P<key>\w+):\s*(?P<value>.+?)\s*$", re.MULTILINE)
 
+# Parameters only some generations declare, keyed by dispatcher file, then
+# mapped to the version that introduced them. Bicep rejects an arm forwarding a
+# parameter its module does not declare, but accepts one that omits an optional
+# parameter, so these are asserted per generation rather than compared across arms.
+GENERATION_SCOPED_FORWARDS: dict[str, dict[str, str]] = {
+    "instance.bicep": {"opcuaConnectorVersion": "2026-07-01"},
+}
+
+# Every scoped name, for excluding them from the cross-arm comparison.
+_SCOPED_FORWARD_NAMES = frozenset(
+    name for scoped in GENERATION_SCOPED_FORWARDS.values() for name in scoped
+)
+
 
 def _module_arms(source: str, param: str) -> list[re.Match]:
     """Every conditional module block routed on `param`, in file order."""
@@ -40,7 +53,11 @@ def _module_arms(source: str, param: str) -> list[re.Match]:
 
 
 def _forwarded_params(arm: re.Match) -> tuple[tuple[str, str], ...]:
-    """The key and value text each arm forwards, order-independent."""
+    """The key and value text each arm forwards, order-independent.
+
+    Generation-scoped parameters are omitted here and asserted separately, by
+    generation, in `test_generation_scoped_forwards_reach_their_arms`.
+    """
     block = PARAMS_BLOCK.search(arm.group("body"))
     if not block:
         return ()
@@ -48,6 +65,7 @@ def _forwarded_params(arm: re.Match) -> tuple[tuple[str, str], ...]:
         sorted(
             (m.group("key"), m.group("value"))
             for m in PARAM_PAIR.finditer(block.group("body"))
+            if m.group("key") not in _SCOPED_FORWARD_NAMES
         )
     )
 
@@ -275,6 +293,47 @@ class TestDispatcherArmsAgree:
                     f"different parameters than '{arms[0].group('version')}'. "
                     f"Only in the first: {missing}. Only in this one: {extra}."
                 )
+        assert failures == [], "\n".join(failures)
+
+    def test_generation_scoped_forwards_reach_their_arms(self, workspace):
+        """A scoped parameter reaches every generation that declares it.
+
+        The module parameter carries a default, so deleting the forward still
+        compiles and silently deploys nothing. Bicep catches the opposite
+        direction, an arm forwarding a parameter its module does not declare,
+        which is why only this direction is asserted here.
+        """
+        failures: list[str] = []
+        for path, param, _ in _discover_dispatchers(workspace):
+            scoped = GENERATION_SCOPED_FORWARDS.get(path.name, {})
+            if not scoped:
+                continue
+            source = path.read_text(encoding="utf-8")
+            arms = _module_arms(source, param)
+            if len(arms) < 2:
+                continue
+
+            for name, introduced in scoped.items():
+                for arm in arms:
+                    version = arm.group("version")
+                    block = PARAMS_BLOCK.search(arm.group("body"))
+                    forwarded = {
+                        m.group("key")
+                        for m in PARAM_PAIR.finditer(block.group("body") if block else "")
+                    }
+                    expected = version >= introduced
+                    if expected and name not in forwarded:
+                        failures.append(
+                            f"{path.name}: the arm for '{version}' does not forward "
+                            f"'{name}', which its module declares from "
+                            f"'{introduced}' onward. The module default would "
+                            f"silently apply instead."
+                        )
+                    if not expected and name in forwarded:
+                        failures.append(
+                            f"{path.name}: the arm for '{version}' forwards "
+                            f"'{name}', which was introduced in '{introduced}'."
+                        )
         assert failures == [], "\n".join(failures)
 
 

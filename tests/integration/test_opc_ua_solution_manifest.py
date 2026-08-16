@@ -4,6 +4,7 @@ import json
 import time
 
 import pytest
+import yaml
 
 from tests.integration.conftest import WORKSPACE_PATH
 from tests.integration.helpers.assertions import (
@@ -37,9 +38,62 @@ SIMULATOR_SERVICE_NAME = "opcplc-000000"
 
 # The oven asset / dataflow names are stamped by samples/opc-ua-solution/template.bicep.
 OVEN_ASSET_NAME = "oven"
+OVEN_DEVICE_NAME = "opc-ua-connector"
 OVEN_DATAFLOW_NAME = "opc-ua-solution-oven-dataflow"
 OVEN_MQTT_TOPIC = "azure-iot-operations/data/oven"
 EXPECTED_OVEN_DATA_KEYS = {"Temperature", "EnergyUse", "Weight"}
+
+# The name the connectors chart is told to expect, and that ARM creates the
+# template under. The supervisor reads this exact name on the build AIO 2607
+# ships, so a template under any other name is never adopted.
+OPC_UA_CONNECTOR_TEMPLATE_PREFIX = "azureiotoperationsconnectorforopcua-"
+OPC_UA_SUPERVISOR_DEPLOYMENT = "aio-opc-supervisor"
+OPC_UA_TEMPLATE_NAME_ENV = (
+    "opcuabroker_SupervisorConfiguration__AkriConnectorTemplateName"
+)
+
+
+def _configured_template_name(namespace: str) -> str:
+    """The template name the supervisor is waiting for, or empty if unreadable.
+
+    Read from the running supervisor rather than recomputed, so the assertion
+    compares what the cluster expects against what ARM created.
+    """
+    try:
+        deployment = kubectl_json(
+            ["get", "deployment", OPC_UA_SUPERVISOR_DEPLOYMENT, "-n", namespace]
+        )
+    except KubectlError:
+        return ""
+    containers = (
+        deployment.get("spec", {})
+        .get("template", {})
+        .get("spec", {})
+        .get("containers", [])
+    )
+    for container in containers:
+        for entry in container.get("env", []):
+            if entry.get("name") == OPC_UA_TEMPLATE_NAME_ENV:
+                return str(entry.get("value") or "")
+    return ""
+
+
+def _connector_version(orchestrator, site_name: str) -> str:
+    """The OPC UA connector version the site's release declares, if any.
+
+    A release that names no version deploys no connector template, so the
+    supervisor-managed data path does not apply to it. Reading the same
+    release config the deployment reads keeps the expectation and the
+    behavior on one source.
+    """
+    site = orchestrator.load_site(site_name)
+    release_key = site.properties.get("aioRelease", "")
+    config = WORKSPACE_PATH / "parameters" / "aio-releases" / f"{release_key}.yaml"
+    assert config.is_file(), (
+        f"Site '{site_name}': release '{release_key}' has no config at {config}."
+    )
+    data = yaml.safe_load(config.read_text(encoding="utf-8")) or {}
+    return str(data.get("opcuaConnectorVersion") or "")
 
 
 class TestOpcUaSolutionDeployment:
@@ -291,6 +345,79 @@ class TestOpcUaSolutionDataflowRuntime:
             )
 
 
+class TestOpcUaConnectorTemplate:
+    """The connector template the OPC UA supervisor waits for.
+
+    The supervisor creates connector pods on demand and serves no asset until
+    it adopts a template, so its absence stops the data path while every
+    deployment assertion still passes. Asserted separately from telemetry so a
+    regression here names the missing resource rather than expiring the
+    several-minute subscribe budget below.
+
+    The name is asserted against the one the running supervisor is configured
+    with, because the build AIO 2607 ships reads that name exactly. A template
+    carrying the right prefix under a different suffix is never adopted, and
+    would otherwise pass a prefix-only check while no data moved.
+
+    Scoped to the releases that declare a connector version. Older releases
+    ship the statically deployed connector and deploy no template, so the
+    telemetry assertion is what covers their data path.
+    """
+
+    def test_connector_template_present_on_cluster(
+        self, opc_ua_solution_result, aio_namespace, kubectl_available, orchestrator
+    ):
+        checked = 0
+        for name in opc_ua_solution_result["sites"]:
+            if not _connector_version(orchestrator, name):
+                continue
+            try:
+                templates = kubectl_json(
+                    [
+                        "get",
+                        "connectortemplates.akri.iotoperations.azure.com",
+                        "-n",
+                        aio_namespace,
+                    ]
+                )
+            except KubectlError as e:
+                pytest.fail(
+                    f"Site '{name}': connector templates not retrievable in "
+                    f"`{aio_namespace}`: {e}"
+                )
+            found = [
+                item.get("metadata", {}).get("name", "")
+                for item in templates.get("items", [])
+            ]
+            expected = _configured_template_name(aio_namespace)
+            if expected:
+                assert expected in found, (
+                    f"Site '{name}': the supervisor is configured to read "
+                    f"`{expected}` in `{aio_namespace}` and no template carries "
+                    f"that name. Templates present: {sorted(found)}. A template "
+                    f"under a different name is not adopted, so telemetry never "
+                    f"reaches the broker."
+                )
+            else:
+                adopted = [
+                    n for n in found if n.startswith(OPC_UA_CONNECTOR_TEMPLATE_PREFIX)
+                ]
+                assert adopted, (
+                    f"Site '{name}': no connector template named "
+                    f"`{OPC_UA_CONNECTOR_TEMPLATE_PREFIX}*` in `{aio_namespace}`. "
+                    f"Templates present: {sorted(found)}. The supervisor serves no "
+                    f"asset without one, so telemetry never reaches the broker."
+            )
+            checked += 1
+
+        if checked == 0:
+            pytest.skip(
+                "No site under test is on a release that declares "
+                "`opcuaConnectorVersion`, so none deploys a connector template. "
+                "The telemetry assertion still covers the data path."
+            )
+
+
 class TestOpcUaSolutionDataFlowing:
     """Prove data is flowing from the simulator through the AIO MQTT broker.
 
@@ -304,22 +431,15 @@ class TestOpcUaSolutionDataFlowing:
     SA_NAME = "scalekit-mqtt-test-client"
     POD_NAME = "scalekit-mqtt-test-client"
     # Wall-clock budgets. The OPC UA connector cold-start can take several
-    # minutes after the asset is created: AIO operator reconciles, connector
-    # pod schedules, connector establishes the OPC UA session, polling
-    # warms up, then the first MQTT publish lands. Empirically 2603 needs
-    # more than 180s on the first deploy. 360s for mosquitto_sub -W gives
-    # comfortable headroom. POD_TIMEOUT_SECONDS must exceed it to leave
-    # room for apk install plus pod scheduling.
+    # minutes after the asset is created: the supervisor adopts the connector
+    # template, allocates the device endpoint, the connector pod schedules,
+    # the OPC UA session establishes, polling warms up, then the first MQTT
+    # publish lands. 360s for mosquitto_sub -W gives comfortable headroom.
+    # POD_TIMEOUT_SECONDS must exceed it to leave room for apk install plus
+    # pod scheduling.
     SUBSCRIBE_WAIT_SECONDS = 360
     POD_TIMEOUT_SECONDS = 600
 
-    @pytest.mark.skip(
-        reason=(
-            "Skipped pending follow-up. Namespace-asset connector does not "
-            "launch a per-asset connector pod on AIO 2603 within the test "
-            "budget. Tracked as `opc-ua-connector-namespace-asset-launch`."
-        )
-    )
     def test_oven_telemetry_observed_on_mqtt(
         self, opc_ua_solution_result, aio_namespace, kubectl_available
     ):
@@ -352,7 +472,10 @@ class TestOpcUaSolutionDataFlowing:
                 except (RuntimeError, TimeoutError) as e:
                     logs = get_pod_logs(self.POD_NAME, aio_namespace)
                     connector_diag = dump_opc_ua_connector_status(
-                        OVEN_ASSET_NAME, OVEN_DATAFLOW_NAME, aio_namespace
+                        OVEN_ASSET_NAME,
+                        OVEN_DATAFLOW_NAME,
+                        aio_namespace,
+                        OVEN_DEVICE_NAME,
                     )
                     pytest.fail(
                         f"Site '{name}': MQTT subscriber pod did not "

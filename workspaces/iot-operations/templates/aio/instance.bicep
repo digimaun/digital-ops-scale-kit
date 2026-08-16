@@ -89,6 +89,9 @@ param aioVersion string
 @description('Release train of the AIO extension.')
 param aioTrain string = 'stable'
 
+@description('Version of the OPC UA connector to deploy a connector template for. Empty deploys no template.')
+param opcuaConnectorVersion string = ''
+
 @description('IoT Operations API version for resource deployment.')
 @allowed([
   '2025-10-01'
@@ -195,6 +198,7 @@ module resources_2026_07 './modules/instance-2026-07-01.bicep' = if (aioApiVersi
     aioConfigurationOverrides: aioConfigurationOverrides
     brokerConfig: brokerConfig
     trustConfig: trustConfig
+    opcuaConnectorVersion: opcuaConnectorVersion
   }
 }
 

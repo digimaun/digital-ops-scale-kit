@@ -26,6 +26,9 @@ description: |
   Out of scope (not yet supported):
     - New child resource types introduced by future AIO releases (instance
       properties, broker, dataflow profile, etc. are not mutated by this manifest)
+    - The OPC UA connector template. A site upgraded onto an API generation that
+      deploys one reaches the new release without it, and the OPC UA data path
+      stays idle until aio-install.yaml runs against the upgraded instance.
 
 # Max concurrent sites. 0 = unlimited, 1 = serial.
 parallel: 3

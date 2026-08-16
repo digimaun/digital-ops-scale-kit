@@ -5,6 +5,7 @@ aioVersion: "1.4.41"
 aioTrain: stable
 aioApiVersion: "2026-07-01"
 adrApiVersion: "2026-04-01"
+opcuaConnectorVersion: "1.4.8"
 certManagerVersion: "0.14.0"
 certManagerTrain: stable
 certManagerConfigurationOverrides:

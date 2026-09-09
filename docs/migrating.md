@@ -21,11 +21,71 @@ siteops -w <workspace> sites
 ```
 
 Any site missing from that listing no longer loads, and the error names it. Fix those first, since
-a site that does not load is not a site that deploys. Then dry run each manifest you deploy:
+a site that does not load is not a site that deploys. Then plan each manifest you deploy:
 
 ```bash
-siteops -w <workspace> deploy <manifest> --dry-run -l <selector>
+siteops -w <workspace> plan <manifest> -l <selector>
 ```
+
+## Current preview
+
+**Executable planning has its own command.** Use `siteops plan <manifest>` to
+validate, compile, preflight, and inspect a deployment without executing it.
+Use `siteops plan <manifest> --describe` for the faster compile-free shape.
+
+`validate --plan` remains a compatibility spelling for the describe form.
+`deploy --dry-run` remains a compatibility spelling for executable planning
+and no longer reports simulated deployment success.
+
+**Preparation uses the same validation boundary from the CLI and Python
+API.** `plan` and `deploy` validate the loaded manifest and targets before
+compilation or resource writes. Structurally invalid inputs produce an
+invalid plan rather than a partial target plan. Python callers receive
+`PlanNotExecutableError` when attempting to deploy that invalid result.
+
+Python integrations use `Orchestrator.build_plan` with
+`intent=PlanIntent.EXECUTABLE` for deployment preparation. The executor-level
+`get_template_parameters` and `filter_parameters` helpers have been removed.
+
+**Known kubectl inputs are checked during shared validation.** After site
+values resolve, local files and directories must exist inside the workspace,
+and URLs must use HTTPS. Per-site inputs are required only when the operation
+applies to that site. A conditionally skipped kubectl step does not require
+its site-selected file. A file path that depends on a prior deployment output
+remains deferred and is validated when that output resolves during execution.
+
+**Executable preparation checks required template inputs.** A non-nullable
+template parameter without a default must have a known supplied name unless
+a top-level parameter name still depends on a prior operation output.
+Nullable parameters may be omitted, including nullable types referenced
+through local ARM definitions. Explicit defaults, including `null`, also
+permit omission. Deferred names are checked against the same template schema
+after the output resolves.
+Fully resolved kubectl scalar inputs and wait conditions also use their
+runtime guards during preparation. Output-dependent values keep their runtime
+validation.
+
+Planning requires a target set, including `plan --describe` and its
+`validate --plan` compatibility spelling. To check a library manifest
+without targeting, use `validate` without `--plan`. A manifest or CLI
+selector matching no sites returns a nonzero exit code.
+
+Parameter files must contain a mapping. An empty document remains an empty
+parameter mapping. Scalar values and arrays report `must contain a mapping`
+before compilation or execution.
+
+**Verbose dry-run command previews are replaced by prepared-plan
+inspection.** `-v` controls logging and does not generate simulated Azure or
+kubectl commands. Use `plan --output json --projection local-private` to
+inspect operation and dependency metadata locally. Parameter values and exact
+value-bearing command lines are not exported by that projection.
+
+**Redacted plain plans use the publishable projection.** They show aggregate
+activity and generic diagnostics rather than individual steps, manifest
+descriptions, paths, conditions, or literal target inputs. Local plain output
+keeps its detailed view with redaction disabled. For CI artifacts, capture
+`plan --output json --projection publishable` from stdout separately from
+diagnostic stderr.
 
 ## To v1.0.0b7
 
@@ -112,7 +172,7 @@ manifest reads catalog step outputs, remove references to `endpointNames`,
 `profileNames`, `dataflowNames`, `dataflowProfileRefs`, `deviceNames`,
 `assetNames`, `assetDeviceRefs`, or `apiVersion`.
 
-Use `siteops validate <manifest> --plan` to inspect the effective composition
+Use `siteops plan <manifest> --describe` to inspect the effective composition
 before deployment. Read the deployed resources from Azure or their projected
 custom resources when verifying provider state.
 
@@ -223,7 +283,8 @@ parameter files for `{{` to the left of a colon.
 **A templated parameter name resolves, which changes deployed content.** A nested key such as
 `siteRoles: {"{{ site.name }}": {...}}` reached ARM as the literal text `{{ site.name }}` and now
 arrives as the site name. Templates are supported in a nested name. A top-level name is matched
-against the parameters the template declares, so a resolved site value will not be one of them.
+against the parameters the template declares. It is kept only when the
+resolved name is a declared parameter.
 
 **Two parameter names that resolve to the same string are rejected.** Reachable only now that names
 resolve. Rename one, since keeping either would drop the other.
@@ -231,19 +292,20 @@ resolve. Rename one, since keeping either would drop the other.
 **A mistyped template delimiter fails the step.** `{ site.x }}` and `{{ site.x }` reached ARM as
 literal text. Both now fail.
 
-**`deploy --dry-run` fails on what the real deployment would fail on.** A dry run resolves
-everything a real run resolves, apart from `{{ steps.X.outputs.Y }}` naming a step that runs earlier
-in the same manifest, which depends on outputs no dry run produces. Those still warn. An unresolved
-`{{ site.X }}` path, a mistyped delimiter, and a reference to a step that does not exist or that runs
-later all fail the dry run, so a pipeline that gates on `--dry-run` sees the same answer the
-deployment would give it.
+**Executable planning fails on what deployment preparation would fail on.**
+`siteops plan` resolves everything available before execution. A
+`{{ steps.X.outputs.Y }}` reference to an earlier operation remains a typed
+deferred value because the deployment has not produced it yet. An unresolved
+`{{ site.X }}` path, a mistyped delimiter, and a reference to an unknown or
+later step fail planning.
 
 **A parameter path that selects a file by site value must resolve to a real file.** A path such as
 `parameters/aio-releases/{{ site.properties.aioRelease }}.yaml` lets the site choose which file to
 load. When the site does not carry the property, or carries a value naming a file that is not
 there, the step deployed without those parameters and reported success. Both cases now fail the
 step. A path with no template in it is unchanged and still warns, so an optional fixed file keeps
-working.
+working when the template can use defaults. Executable preparation still
+reports a required parameter that the missing file would have supplied.
 
 ### Deployment and targeting
 
@@ -264,8 +326,8 @@ first and fix everything it names.
 
 **One subscription holds one subscription-level site.** `deploy` reports a second one rather than
 choosing between them. Subscription-scoped steps run once per subscription and their outputs feed
-every resource group site under it, so two candidates have no correct resolution. `validate`
-already reported this, and `deploy` does not run `validate`, so the check now covers both paths.
+every resource group site under it, so two candidates have no correct resolution.
+Shared preparation reports the ambiguity for both planning and deployment.
 
 ### Secret Sync
 
@@ -283,8 +345,8 @@ manifest that referenced the old path reports `Parameter file not found` and doe
 
 | Previously | Now |
 |---|---|
-| `siteops validate m.yaml -v` | `siteops validate m.yaml --plan` |
+| `siteops validate m.yaml -v` | `siteops plan m.yaml --describe` |
 | `siteops sites -v` | `siteops sites --show-sources` |
 
-`siteops deploy --dry-run` prints the plan on its own. Running `-v` where one of these flags is
-meant prints a note naming the flag.
+Use `siteops plan` for executable preflight. Running `-v` where one of these
+commands is meant prints a note naming the command.

@@ -115,26 +115,27 @@ alternative, which keeps the decision in Azure rather than on the cluster.
 1. Verify cluster is connected: `az connectedk8s show -n <cluster> -g <rg>`
 2. Enable Cluster Connect: `az connectedk8s enable-features -n <cluster> -g <rg> --features cluster-connect`
 
-### "Connection refused on port 47021"
+### "Connection refused" during Arc proxy setup
 
-**Cause**: Port conflict with another proxy instance.
+**Cause**: The Arc proxy did not become ready on its allocated local port, or
+an external process occupied the slot.
 
-**Solution**: Site Ops manages ports automatically. If running multiple instances, wait for the first to complete.
+**Solution**: Site Ops allocates separate slots for concurrent proxies and
+retries explicit port-in-use failures. If the error persists, stop stale
+manual proxy sessions or wait for the process using the port to finish, then
+retry.
 
 ## Debug commands
 
 ```bash
-# Show the deployment plan
-siteops -w workspaces/iot-operations validate manifests/aio-install.yaml --plan
+# Prepare and show the executable deployment plan
+siteops -w workspaces/iot-operations plan manifests/aio-install.yaml
 
 # Emit one publishable JSON plan document
-siteops -w workspaces/iot-operations validate manifests/aio-install.yaml --plan --output json --projection publishable
+siteops -w workspaces/iot-operations plan manifests/aio-install.yaml --output json --projection publishable
 
-# Dry run: shows the plan, and the sites and steps it would act on
-siteops -w workspaces/iot-operations deploy manifests/aio-install.yaml --dry-run
-
-# Dry run with the exact commands each step would run
-siteops -v -w workspaces/iot-operations deploy manifests/aio-install.yaml --dry-run
+# Show the faster compile-free plan shape
+siteops -w workspaces/iot-operations plan manifests/aio-install.yaml --describe
 
 # Show every value's source file (post inherit + overlay merge)
 siteops -w workspaces/iot-operations sites <name> --show-sources

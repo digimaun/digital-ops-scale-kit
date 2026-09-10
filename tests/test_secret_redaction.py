@@ -3,7 +3,7 @@
 
 """Tests for secret handling in the display layer and the params file.
 
-- `siteops sites` and `siteops sites --render` redact secret-keyed values so a
+- All `siteops sites` formats redact secret-keyed values so a
   secret supplied via sites.local / SITE_OVERRIDES does not print.
 - The deploy params file is created with owner-only permissions.
 """
@@ -17,6 +17,7 @@ import pytest
 from siteops.cli import _is_sensitive_key, _redact_sensitive, cmd_sites
 from siteops.executor import AzCliExecutor
 from siteops.orchestrator import Orchestrator
+from siteops.runtime import RuntimePaths
 
 SECRET = "S3cr3t-Sp-Value-xyz"
 
@@ -125,12 +126,13 @@ class TestSitesRedaction:
         assert SECRET not in out
         assert "spPassword: ***" in out
 
-    def test_render_redacts_secret(self, tmp_path, capsys):
+    @pytest.mark.parametrize("output", ["yaml", "json"])
+    def test_structured_output_redacts_secret(self, tmp_path, capsys, output):
         ws = tmp_path / "workspace"
         ws.mkdir()
         _write_site_with_secret(ws)
         cmd_sites(
-            Namespace(selector=None, show_sources=False, render=True, name=None),
+            Namespace(selector=None, show_sources=False, output=output, name=None),
             Orchestrator(ws),
         )
         out = capsys.readouterr().out
@@ -140,16 +142,27 @@ class TestSitesRedaction:
 
 
 class TestParamsFilePermissions:
-    def test_created_with_content(self, tmp_workspace):
-        ex = AzCliExecutor(workspace=tmp_workspace)
-        path = ex._write_params_file({"spPassword": SECRET, "clusterName": "c"}, "step", "site")
+    @pytest.fixture
+    def executor(self, tmp_workspace, tmp_path):
+        executor = AzCliExecutor(
+            workspace=tmp_workspace,
+            runtime_paths=RuntimePaths(temp_root=tmp_path / "scratch"),
+        )
+        try:
+            yield executor
+        finally:
+            executor.close()
+
+    def test_created_with_content(self, executor):
+        path = executor._write_params_file(
+            {"spPassword": SECRET, "clusterName": "c"}, "step", "site",
+        )
         assert path.exists()
         data = json.loads(path.read_text(encoding="utf-8"))
         assert data["parameters"]["spPassword"]["value"] == SECRET
         assert data["parameters"]["clusterName"]["value"] == "c"
 
-    @pytest.mark.skipif(os.name != "posix", reason="POSIX file mode; Windows uses ACLs")
-    def test_owner_only_permissions(self, tmp_workspace):
-        ex = AzCliExecutor(workspace=tmp_workspace)
-        path = ex._write_params_file({"k": "v"}, "step", "site")
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX file mode, Windows uses ACLs")
+    def test_owner_only_permissions(self, executor):
+        path = executor._write_params_file({"k": "v"}, "step", "site")
         assert (path.stat().st_mode & 0o777) == 0o600

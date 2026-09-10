@@ -102,7 +102,7 @@ subscription: "<your-subscription-id>"
 `sites.local/` is gitignored. The overlay merges into `sites/munich-dev.yaml` at load time. The base `munich-dev.yaml` already has working `resourceGroup` and `parameters.clusterName` values. Override them here only if you want different values. Verify the resolved shape before deploying:
 
 ```bash
-siteops -w workspaces/iot-operations sites munich-dev --render
+siteops -w workspaces/iot-operations sites munich-dev --output yaml
 ```
 
 For CI, see [docs/ci-cd-setup.md](docs/ci-cd-setup.md) for the `SITE_OVERRIDES` JSON shape that replaces the local overlay.
@@ -177,6 +177,9 @@ digital-ops-scale-kit/
 │   ├── models.py                 # Site, Manifest, Step dataclasses
 │   ├── orchestrator.py           # Shared validation, planning, and execution coordination
 │   ├── planning.py               # Prepared plan models, rendering, and projections
+│   ├── results.py                # Run, site, and operation outcome models
+│   ├── reporting.py              # Progress and final result rendering and projections
+│   ├── runtime.py                # Private temporary allocations outside the workspace
 │   ├── executor.py               # Azure CLI and kubectl execution
 │   └── __main__.py               # Enables `python -m siteops`
 ├── tests/                        # Test suite
@@ -199,7 +202,9 @@ digital-ops-scale-kit/
 │   ├── manifest-reference.md     # Manifest syntax, step types
 │   ├── migrating.md              # What to change when moving to a newer Scale Kit release
 │   ├── parameter-resolution.md   # Variables, output chaining
+│   ├── plan-output.md            # Deployment plan formats and projections
 │   ├── resource-catalog.md       # Declaring AIO workload resources in YAML
+│   ├── run-output.md             # Run outcomes, output, and interruption
 │   ├── secret-sync.md            # Secret sync enablement and usage
 │   ├── site-configuration.md     # Sites, inheritance, overlays
 │   ├── targeting.md              # Selector grammar, site identity, no-match diagnostic
@@ -310,12 +315,14 @@ auto-filtering, merge order, and cross-scope output chaining.
 | `siteops sites` | List sites in the workspace |
 | `siteops sites <name>` | Inspect one site (basename, relative path, or internal `name:`) |
 | `siteops sites <name> --show-sources` | Show every value with the source file it came from after inherits and overlays |
-| `siteops sites <name> --render` | Show the resolved YAML after inheritance and overlays |
+| `siteops sites <name> --output yaml` | Show the resolved YAML after inheritance and overlays |
+| `siteops sites --output json` | [Inspect private resolved sites as a JSON array](docs/site-configuration.md#inspection-output-details) |
 | `siteops validate <manifest>` | Validate manifest structure, files, and static references |
 | `siteops plan <manifest>` | Validate, compile, preflight, and show the executable deployment plan |
 | `siteops plan <manifest> --describe` | Show the compile-free plan shape |
 | `siteops plan <manifest> --output json` | Emit one structured plan document |
 | `siteops deploy <manifest>` | Execute deployment |
+| `siteops deploy <manifest> --output json` | Emit one structured run result |
 | `siteops deploy <manifest> --dry-run` | Compatibility alias for executable planning |
 
 ### Common options
@@ -329,6 +336,7 @@ auto-filtering, merge order, and cross-scope output chaining.
 
 See [docs/targeting.md](docs/targeting.md) for the selector grammar and the no-match diagnostic.
 See [docs/plan-output.md](docs/plan-output.md) for JSON projections and publication boundaries.
+See [docs/run-output.md](docs/run-output.md) for run outcomes, exit codes, and interruption behavior.
 
 ---
 

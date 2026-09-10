@@ -4,10 +4,10 @@
 """Command-line interface for Azure Site Ops.
 
 Commands:
-    deploy   - Deploy a manifest to target sites
-    plan     - Prepare and preflight a deployment plan
+    sites    - Inspect sites as plain text, YAML, or JSON
     validate - Validate manifest structure and references
-    sites    - List available sites
+    plan     - Prepare and preflight a deployment plan
+    deploy   - Deploy a manifest to target sites
 
 Global flags:
     -v/--verbose controls log verbosity only. Use `plan` to prepare a
@@ -15,11 +15,15 @@ Global flags:
 """
 
 import argparse
+import json
 import logging
 import os
+import signal
 import sys
+import threading
 from pathlib import Path
-from typing import Any
+from types import FrameType
+from typing import Any, Callable
 
 import yaml
 
@@ -30,6 +34,7 @@ from siteops.models import (
     MultipleSubscriptionSitesError,
     NoTargetingError,
     ParameterSelectionError,
+    Site,
     _merge_selector_strings,
 )
 from siteops.orchestrator import Orchestrator
@@ -44,6 +49,12 @@ from siteops.planning import (
     render_plain_plan,
     serialize_plan_json,
 )
+from siteops.reporting import (
+    TextProgressReporter,
+    render_plain_run,
+    serialize_run_json,
+)
+from siteops.results import RunResult, preparation_failure_result
 from siteops.sanitize import (
     is_redaction_enabled,
     report_parameter_selection_error,
@@ -69,7 +80,7 @@ def resolve_manifest_path(manifest: Path, workspace: Path) -> Path:
     return workspace / manifest
 
 
-def _plan_output_settings(
+def _output_settings(
     args: argparse.Namespace,
     *,
     require_plan_flag: bool = False,
@@ -100,7 +111,7 @@ def _plan_output_settings(
         and is_redaction_enabled()
     ):
         raise ValueError(
-            "local-private plan output is unavailable while output "
+            "local-private output is unavailable while output "
             "redaction is enabled. Use --projection publishable."
         )
     return json_output, projection
@@ -170,7 +181,7 @@ def cmd_plan(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
         return 1
 
     try:
-        json_output, projection = _plan_output_settings(args)
+        json_output, projection = _output_settings(args)
     except ValueError as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1
@@ -236,6 +247,51 @@ def cmd_plan(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
     return 0 if result.status is PlanStatus.PLANNED else 1
 
 
+_STOP_GUIDANCE = (
+    "Stopping after the operations already in progress finish. A call already "
+    "running waits for its own timeout, and work already accepted by Azure is "
+    "not cancelled."
+)
+
+
+def _install_stop_handler(
+    stop_requested: threading.Event,
+) -> Callable[[], None]:
+    """Ask a running deployment to stop when the terminal sends SIGINT.
+
+    The handler records the request and says what will happen. It does not
+    raise, because a raised `KeyboardInterrupt` would unwind through workers
+    that are still using scratch files and would abandon outcomes already
+    observed. A repeated interrupt repeats the same bounded expectation
+    rather than forcing an unsafe exit.
+
+    `signal.signal` only works on the main thread, so an embedded caller on
+    another thread keeps its own signal disposition and passes an explicit
+    `stop_requested` event instead. Returns the callable that restores the
+    previous disposition.
+
+    The guidance is written straight to stderr rather than through the
+    progress reporter, because taking that reporter's lock inside a signal
+    handler could deadlock the thread the signal interrupted.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return lambda: None
+
+    def request_stop(signum: int, frame: FrameType | None) -> None:
+        stop_requested.set()
+        print(_STOP_GUIDANCE, file=sys.stderr, flush=True)
+
+    try:
+        previous = signal.signal(signal.SIGINT, request_stop)
+    except (OSError, ValueError):  # pragma: no cover - host restriction
+        return lambda: None
+
+    def restore() -> None:
+        signal.signal(signal.SIGINT, previous)
+
+    return restore
+
+
 def cmd_deploy(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
     """Execute deployment."""
     manifest_path = resolve_manifest_path(args.manifest, args.workspace)
@@ -247,6 +303,14 @@ def cmd_deploy(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
         return cmd_plan(args, orchestrator)
 
     try:
+        json_output, projection = _output_settings(args)
+    except ValueError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+
+    stop_requested = threading.Event()
+    restore_signal_handler = _install_stop_handler(stop_requested)
+    try:
         print(
             "Preparing executable deployment plan...",
             file=sys.stderr,
@@ -255,6 +319,11 @@ def cmd_deploy(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
             manifest_path,
             selector=getattr(args, "selector", None),
             parallel_override=getattr(args, "parallel", None),
+            progress=TextProgressReporter(
+                sys.stderr,
+                redacted=is_redaction_enabled(),
+            ),
+            stop_requested=stop_requested,
         )
     except (CompositionError, ParameterSelectionError) as e:
         detail = (
@@ -265,6 +334,10 @@ def cmd_deploy(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
         print(f"\nError: {detail}\n", file=sys.stderr)
         return 1
     except PlanNotExecutableError as e:
+        if json_output:
+            result = preparation_failure_result(e.result)
+            _write_run_result(result, json_output=True, projection=projection)
+            return result.exit_code
         print(
             f"\nError: "
             f"{e.message(redacted=is_redaction_enabled())}\n",
@@ -279,11 +352,29 @@ def cmd_deploy(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
         )
         print(f"\nError: {detail}\n", file=sys.stderr)
         return 1
+    finally:
+        restore_signal_handler()
 
-    # Return exit code based on results
-    if result["summary"]["failed"] > 0:
-        return 1
-    return 0
+    _write_run_result(result, json_output=json_output, projection=projection)
+    return result.exit_code
+
+
+def _write_run_result(
+    result: RunResult,
+    *,
+    json_output: bool,
+    projection: PlanProjection,
+) -> None:
+    if json_output:
+        print(
+            serialize_run_json(result, projection, engine_version=__version__),
+            end="",
+        )
+    else:
+        print(
+            render_plain_run(result, redacted=is_redaction_enabled()),
+            end="",
+        )
 
 
 def _note_superseded_verbose(
@@ -316,7 +407,7 @@ def cmd_validate(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
     selector = getattr(args, "selector", None)
     show_plan = getattr(args, "plan", False)
     try:
-        json_output, projection = _plan_output_settings(
+        json_output, projection = _output_settings(
             args,
             require_plan_flag=True,
         )
@@ -400,10 +491,10 @@ def _is_sensitive_key(key: str) -> bool:
     return any(token in lowered for token in _SENSITIVE_KEY_SUBSTRINGS)
 
 
-def _redact_sensitive(value: Any, key: str | None = None) -> Any:
+def _redact_sensitive(value: Any, key: Any = None) -> Any:
     """Return a copy of `value` with secret-keyed entries replaced by `***`.
 
-    Display-only redaction for `siteops sites` and `siteops sites --render`.
+    Display-only redaction for all `siteops sites` output formats.
     A value is redacted when its own key matches `_is_sensitive_key`, except
     booleans: a sensitive-looking key with a bool value is a toggle, not a
     secret (e.g. `enableSecretSync: false`), so it is left as-is. The whole
@@ -417,7 +508,7 @@ def _redact_sensitive(value: Any, key: str | None = None) -> Any:
     Returns:
         A redacted deep copy.
     """
-    if key is not None and _is_sensitive_key(key) and not isinstance(value, bool):
+    if isinstance(key, str) and _is_sensitive_key(key) and not isinstance(value, bool):
         return _REDACTED
     if isinstance(value, dict):
         return {k: _redact_sensitive(v, k) for k, v in value.items()}
@@ -480,16 +571,55 @@ def _print_value(
         print(f"{prefix}{value}")
 
 
+def _site_document(site: Site) -> dict[str, Any]:
+    """Build the private inspection document without exporting hidden model fields."""
+    resolved: dict[str, Any] = {
+        "apiVersion": "siteops/v1",
+        "kind": "Site",
+        "name": site.name,
+        "subscription": site.subscription,
+    }
+    if site.resource_group:
+        resolved["resourceGroup"] = site.resource_group
+    resolved["location"] = site.location
+    if site.labels:
+        resolved["labels"] = site.labels
+    if site.parameters:
+        resolved["parameters"] = _redact_sensitive(site.parameters)
+    if site.properties:
+        resolved["properties"] = _redact_sensitive(site.properties)
+    return resolved
+
+
+def _require_json_mapping_keys(value: Any) -> None:
+    """Reject YAML keys that JSON would silently coerce to different identities."""
+    if isinstance(value, dict):
+        if any(not isinstance(key, str) for key in value):
+            raise ValueError("JSON object keys must be strings.")
+        for item in value.values():
+            _require_json_mapping_keys(item)
+    elif isinstance(value, list):
+        for item in value:
+            _require_json_mapping_keys(item)
+
+
 def cmd_sites(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
     """List available sites in the workspace.
 
     A bare `siteops sites` lists every site. Pass a positional `name`
     (filename without extension, or the internal `name:` field) to
-    scope to one site, equivalent to `-l name=<NAME>`. With `--render`,
-    emits the merged YAML for each matched site instead of the
-    human-readable summary, useful for confirming what an overlay or
-    extras-dir file actually changed.
+    scope to one site, equivalent to `-l name=<NAME>`. Every format uses the
+    same inheritance and overlay resolution. YAML emits one Site document
+    per match, while JSON emits one array regardless of the match count.
+    These are private inspection views with sensitive-key masking, not
+    publication projections or lossless exports.
     """
+    output_format = getattr(args, "output", "plain")
+    show_sources = getattr(args, "show_sources", False)
+    if show_sources and output_format != "plain":
+        print("Error: --show-sources requires --output plain.", file=sys.stderr)
+        return 1
+
     # Positional `name` is sugar for `-l name=<NAME>`. Combining the two
     # forms is rejected so a confusing override path cannot exist.
     name_arg = getattr(args, "name", None)
@@ -560,8 +690,9 @@ def cmd_sites(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
             )
             print(f"\n{message}\n", file=sys.stderr)
             return 1
-        print("\nNo sites found in workspace\n")
-        return 0
+        if output_format == "plain":
+            print("\nNo sites found in workspace\n")
+            return 0
 
     if orchestrator.skipped_sites:
         # A site that does not load is one the operator expected to be here.
@@ -574,33 +705,35 @@ def cmd_sites(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
         )
         return 1
 
-    if getattr(args, "render", False) is True:
-        import yaml
+    if sites and is_redaction_enabled():
+        print(
+            "Error: Site inspection output is private and unavailable while output "
+            "redaction is enabled. For an authorized private destination, set "
+            "SITEOPS_REDACT_OUTPUT=0.",
+            file=sys.stderr,
+        )
+        return 1
 
-        for i, site in enumerate(sorted(sites, key=lambda s: s.name)):
-            resolved = {
-                "apiVersion": "siteops/v1",
-                "kind": "Site",
-                "name": site.name,
-                "subscription": site.subscription,
-            }
-            # Subscription-scoped sites have no resourceGroup. Emitting ""
-            # would falsely imply RG-scoped behavior on a round-trip.
-            if site.resource_group:
-                resolved["resourceGroup"] = site.resource_group
-            resolved["location"] = site.location
-            if site.labels:
-                resolved["labels"] = site.labels
-            if site.parameters:
-                resolved["parameters"] = _redact_sensitive(site.parameters)
-            if site.properties:
-                resolved["properties"] = _redact_sensitive(site.properties)
-            if i > 0:
-                print("---")
-            print(yaml.safe_dump(resolved, sort_keys=False, default_flow_style=False), end="")
+    if output_format in {"yaml", "json"}:
+        documents = [_site_document(site) for site in sorted(sites, key=lambda s: s.name)]
+        if output_format == "json":
+            try:
+                _require_json_mapping_keys(documents)
+                serialized = json.dumps(documents, indent=2, allow_nan=False) + "\n"
+            except (TypeError, ValueError):
+                print(
+                    "Error: Resolved site values cannot be represented as JSON. "
+                    "Use --output yaml to inspect YAML values.",
+                    file=sys.stderr,
+                )
+                return 1
+        else:
+            serialized = yaml.safe_dump_all(
+                documents, sort_keys=False, default_flow_style=False,
+            )
+        print(serialized, end="")
         return 0
 
-    show_sources = getattr(args, "show_sources", False)
     _note_superseded_verbose(
         args, show_sources, "sites", "--show-sources", "the source file of each value"
     )
@@ -770,7 +903,7 @@ def main() -> None:
         epilog="""
 Examples:
   siteops -w workspaces/iot-operations sites
-  siteops -w workspaces/iot-operations sites munich-dev --render
+  siteops -w workspaces/iot-operations sites munich-dev --output yaml
   siteops -w workspaces/iot-operations validate manifests/aio-install.yaml
   siteops -w workspaces/iot-operations plan manifests/aio-install.yaml
   siteops -w workspaces/iot-operations deploy manifests/aio-install.yaml
@@ -819,7 +952,11 @@ Examples:
     p_deploy = subparsers.add_parser(
         "deploy",
         help="Deploy manifest to target sites",
-        description="Execute deployment of a manifest to one or more sites.",
+        description=(
+            "Execute deployment of a manifest to one or more sites. "
+            "Ctrl-C asks the run to stop and waits for the calls already in "
+            "progress to return or reach their own timeout."
+        ),
     )
     p_deploy.add_argument("manifest", type=Path, help="Path to manifest file")
     p_deploy.add_argument(
@@ -847,6 +984,21 @@ Examples:
         help=(
             "Max concurrent sites. Accepts a positive integer, or 'max' / "
             "'auto' / '0' for unlimited. Overrides the manifest setting."
+        ),
+    )
+    p_deploy.add_argument(
+        "--output",
+        choices=("plain", "json"),
+        default="plain",
+        help="Final result format. A dry run emits a plan instead (default: plain).",
+    )
+    p_deploy.add_argument(
+        "--projection",
+        choices=("local-private", "publishable"),
+        default=None,
+        help=(
+            "JSON projection, valid with --output json. Defaults to publishable "
+            "when output redaction is enabled, otherwise local-private."
         ),
     )
 
@@ -980,16 +1132,17 @@ Examples:
         action="store_true",
         help=(
             "Annotate every leaf with the source file the value came from "
-            "after inherits + overlay merge (default: false)."
+            "after inheritance and overlays. Plain output only (default: false)."
         ),
     )
     p_sites.add_argument(
-        "--render",
-        action="store_true",
+        "--output",
+        choices=("plain", "yaml", "json"),
+        default="plain",
         help=(
-            "Emit the merged YAML for each matched site instead of the summary. "
-            "Useful with a single-site scope to inspect resolved config "
-            "(default: false)."
+            "Private inspection format: plain display, YAML Site documents, or "
+            "a JSON array. Sensitive-key masking is not publication safety "
+            "(default: plain)."
         ),
     )
 

@@ -50,10 +50,13 @@ Error: Step 'aio-instance' references unknown step 'schema-reg' in parameters/p.
 When a site's resolved values disagree with what you expect (wrong location, missing label, an overlay in `sites.local/` or an extras dir not taking effect), preview the fully-resolved shape:
 
 ```
-siteops -w <workspace> sites <name> --render
+siteops -w <workspace> sites <name> --output yaml
 ```
 
-The output is the post-inherit + post-overlay site as a single YAML doc, with empty `resourceGroup:` omitted for subscription-scoped sites. Use it to verify which file contributed which field before re-running a deploy.
+The output is the resolved site as a single YAML document, with
+`resourceGroup` omitted for subscription-scoped sites. To see which file
+contributed each value, use `siteops -w <workspace> sites <name> --show-sources`
+with the default plain output.
 
 ## Deployment errors
 
@@ -100,9 +103,48 @@ alternative, which keeps the decision in Azure rather than on the cluster.
 
 **Solution**:
 
-1. Check Azure portal for deployment error details
-2. Fix the issue
-3. Re-run. Bicep deployments are idempotent.
+1. Inspect the failure details and affected resources.
+2. Correct the issue and review a fresh `siteops plan`.
+3. Decide whether to deploy again based on the resources' current state.
+
+The final summary reports every prepared operation, so the steps that never
+started after the failure are listed as `not-run`. A new run executes a
+fresh plan rather than resuming only unfinished operations.
+
+### Ctrl-C does not return the prompt right away
+
+**Cause**: A stop request reaches waiting code immediately, but a call already
+running in a child process is not interrupted. Site Ops waits for it rather
+than abandoning scratch files and observed outcomes.
+
+**Solution**: Wait for the call in flight. The bounds are 60 seconds for one
+deployment state read, 5 minutes for a deployment submission, and 10 minutes
+for a kubectl operation. Pressing Ctrl-C again repeats the same expectation.
+An interrupted execution prints its final result and exits `130`. Stopping
+locally does not cancel accepted Azure work, so inspect unconfirmed effects
+before deciding to deploy again.
+
+A request during preparation lets preparation finish, including any
+remaining template compilations. If preparation succeeds, no deployment
+operation starts. Preparation failures are still reported normally.
+The per-call timeouts above do not bound the whole preparation phase.
+
+### An operation reports "unknown"
+
+**Cause**: The provider's final result could not be confirmed, for example
+after lost observation or an incomplete kubectl apply.
+
+**Solution**: Inspect the affected resources before deciding to deploy
+again. For an ARM operation, local output names the unconfirmed deployment.
+Check it in the Azure portal or use the command for its scope:
+
+```bash
+az deployment group show --name <deployment> --resource-group <resource-group> --subscription <subscription>
+az deployment sub show --name <deployment> --subscription <subscription>
+```
+
+For a kubectl or wait operation, inspect its resources or condition at the
+target. See [run-output.md](run-output.md).
 
 ## Arc proxy issues
 
@@ -134,6 +176,9 @@ siteops -w workspaces/iot-operations plan manifests/aio-install.yaml
 # Emit one publishable JSON plan document
 siteops -w workspaces/iot-operations plan manifests/aio-install.yaml --output json --projection publishable
 
+# Emit one publishable JSON run result
+siteops -w workspaces/iot-operations deploy manifests/aio-install.yaml --output json --projection publishable
+
 # Show the faster compile-free plan shape
 siteops -w workspaces/iot-operations plan manifests/aio-install.yaml --describe
 
@@ -141,7 +186,7 @@ siteops -w workspaces/iot-operations plan manifests/aio-install.yaml --describe
 siteops -w workspaces/iot-operations sites <name> --show-sources
 
 # Print the fully-resolved site as YAML
-siteops -w workspaces/iot-operations sites <name> --render
+siteops -w workspaces/iot-operations sites <name> --output yaml
 
 # Check Azure CLI authentication
 az account show

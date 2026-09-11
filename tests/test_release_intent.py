@@ -385,7 +385,7 @@ def test_intent_paths_are_exact_and_portable(repository: Path, intent_path: str)
     )
     source_sha = _commit(repository, "valid record")
 
-    with pytest.raises(ReleaseIntentError, match="intent path|portable"):
+    with pytest.raises(ReleaseIntentError, match="release-file path|portable"):
         _load(repository, source_sha, intent_path)
 
 
@@ -511,7 +511,7 @@ def test_missing_notes_and_oversized_json_are_rejected(repository: Path):
     )
     _write_record(repository, raw)
     oversized_sha = _commit(repository, "oversized declaration")
-    with pytest.raises(ReleaseIntentError, match="declaration exceeds"):
+    with pytest.raises(ReleaseIntentError, match="release file exceeds"):
         _load(repository, oversized_sha)
 
 

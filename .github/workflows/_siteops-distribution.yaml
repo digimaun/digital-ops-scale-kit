@@ -785,7 +785,7 @@ jobs:
                   + os.environ["GITHUB_RUN_ATTEMPT"]
               )
               lines = [
-                  "## Site Ops distribution",
+                  "## Site Ops installer check",
                   "",
                   "Version: " + code(os.environ["PACKAGE_VERSION"]),
                   "",
@@ -812,7 +812,7 @@ jobs:
 
               lines.extend(
                   [
-                      "### Installation qualification",
+                      "### Installation checks",
                       "",
                       "| Python | Linux | Windows |",
                       "|---|---|---|",

@@ -63,7 +63,7 @@ env:
 
 jobs:
   prepare:
-    name: Read the release declaration
+    name: Read the release file
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -198,7 +198,7 @@ jobs:
       attestations: write
 
   review:
-    name: Prepare the approval preview
+    name: Prepare release summary
     needs: [prepare, distribution]
     if: >-
       always() && needs.prepare.result == 'success' &&
@@ -238,12 +238,12 @@ jobs:
                   "/attempts/" + os.environ["GITHUB_RUN_ATTEMPT"] + "/jobs?per_page=100",
               ], capture_output=True, text=True, timeout=60)
               if result.returncode:
-                  raise SystemExit("::error::GitHub could not read rehearsal CI readiness.")
+                  raise SystemExit("::error::GitHub could not read release-preview CI readiness.")
               jobs = json.loads(result.stdout).get("jobs", [])
               for name in ("Lint", "Unit Tests", "Validate Manifests"):
                   matches = [job for job in jobs if job.get("name") == name]
                   if len(matches) != 1 or matches[0].get("conclusion") != "success":
-                      raise SystemExit("::error::The CI jobs must succeed before the release rehearsal.")
+                      raise SystemExit("::error::The CI jobs must succeed before the release preview.")
               print("url=https://github.com/" + os.environ["GITHUB_REPOSITORY"] + "/actions/runs/" + os.environ["GITHUB_RUN_ID"])
               raise SystemExit(0)
           endpoint = "repos/" + os.environ["GITHUB_REPOSITORY"] + "/actions/workflows/ci.yaml/runs"
@@ -378,7 +378,7 @@ jobs:
           plan = json.loads(Path(sys.argv[1]).read_text())
           for field, path in (("sha256", sys.argv[2]), ("notesSha256", sys.argv[3])):
               if hashlib.sha256(Path(path).read_bytes()).hexdigest() != plan["intent"][field]:
-                  raise SystemExit("::error::Release intent changed. Prepare and approve a new candidate.")
+                  raise SystemExit("::error::The release file or notes changed. Prepare and review a new candidate.")
           declaration = json.loads(Path(sys.argv[2]).read_text())
           release, engine = plan["release"], plan["siteops"]
           if declaration["tag"] != release["tag"] or declaration.get("latest", False) != release["latest"]:
@@ -559,12 +559,12 @@ jobs:
           dry_run = os.environ.get("DRY_RUN") == "true"
           action = "Reuse the matching tag" if os.environ["TAG_EXISTS"] == "true" else "Create the missing tag"
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as output:
-              output.write("## Release dry run\n\n" if dry_run else "## Ready for release approval\n\n")
+              output.write("## Release preview (no publication)\n\n" if dry_run else "## Ready for release approval\n\n")
               if dry_run:
                   output.write("Preview only. No tag, GitHub Release, or approval request was created.\n\n")
               for label, value in (
                   ("Release", release["tag"]), ("Source commit", plan["source"]["commit"]),
-                  ("Declaration", plan["intent"]["path"]),
+                  ("Release file", plan["intent"]["path"]),
                   ("Stream", release["stream"]), ("Prerelease", release["prerelease"]),
                   ("Latest", release["latest"]), ("Proposed tag action" if dry_run else "Tag action", action),
                   ("Site Ops", engine["releaseTag"] or os.environ["ENGINE_VERSION"]),
@@ -575,7 +575,7 @@ jobs:
                   expected = ["3.10", "3.11", "3.12", "3.13", "3.14"]
                   if not isinstance(matrix, list) or [row.get("python") for row in matrix] != expected:
                       raise SystemExit("::error::Incomplete installation qualification summary.")
-                  output.write("\n### Installation qualification\n\n| Python | Linux | Windows |\n|---|---|---|\n")
+                  output.write("\n### Installation checks\n\n| Python | Linux | Windows |\n|---|---|---|\n")
                   allowed = {"passed", "failed", "cancelled", "skipped", "not-run", "unknown"}
                   for row in matrix:
                       if row["python"] not in ("3.10", "3.11", "3.12", "3.13", "3.14") or row["linux"] not in allowed or row["windows"] not in allowed:

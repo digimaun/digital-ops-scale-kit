@@ -227,8 +227,33 @@ def test_declared_record_events_do_not_create_a_release_on_an_ordinary_push():
     events = WORKFLOW[True]
     assert events["push"]["branches"] == ["main"]
     assert set(events["push"]["paths"]) == {"releases/**/release.json", "releases/**/notes.md"}
-    assert set(events["workflow_dispatch"]["inputs"]) == {"intent", "expected-source-sha"}
+    assert set(events["workflow_dispatch"]["inputs"]) == {"release-file", "expected-source-sha"}
+    assert WORKFLOW["name"] == "Release (approval required)"
+    assert JOBS["candidate"]["with"]["intent"] == "${{ inputs.release-file || '' }}"
+    assert JOBS["candidate"]["with"]["expected-source-sha"] == (
+        "${{ github.event_name != 'workflow_dispatch' && github.sha || inputs.expected-source-sha }}"
+    )
     assert "pull_request" not in events
+
+
+def test_operator_guide_matches_the_visible_workflow_controls():
+    guide = (ROOT / "docs" / "releasing.md").read_text(encoding="utf-8")
+    ci = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yaml").read_text())
+    for name in ci[True]["workflow_dispatch"]["inputs"]:
+        assert f"`{name}`" in guide
+    for option in ci[True]["workflow_dispatch"]["inputs"]["run-mode"]["options"]:
+        assert f"`{option}`" in guide
+    assert WORKFLOW["name"] in guide
+    assert "`release-intent`" not in guide and "`rehearsal`" not in guide
+    assert not (ROOT / ".github" / "workflows" / "siteops-distribution.yaml").exists()
+    assert ".github/release-examples/<name>/" in guide
+    assert "releases/<name>/release.json" in guide
+
+
+@pytest.mark.parametrize("expected", [SHA, "", "abc", "a" * 40])
+def test_manual_source_request_requires_the_exact_commit(runner, expected):
+    result, _, _ = runner("prepare", "Confirm the source request", extra={"EXPECTED_SHA": expected})
+    assert result.returncode == (0 if expected == SHA else 1), result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("outcome", ["success", "failure", "missing", "other-sha", "other-workflow"])
@@ -491,7 +516,7 @@ def test_release_rehearsal_cannot_reach_publishing_permissions():
     text = yaml.safe_dump(CANDIDATE_WORKFLOW)
     assert "release create" not in text and "--method POST" not in text
     ci = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yaml").read_text())
-    job = ci["jobs"]["release-rehearsal"]
+    job = ci["jobs"]["release-preview"]
     assert job["needs"] == ["lint", "test", "validate"]
     assert job["with"]["dry-run"] is True
     assert job["permissions"]["contents"] == "read"
@@ -556,7 +581,7 @@ def test_dry_run_summary_stops_at_preview_without_approval_instructions(candidat
     )
     assert result.returncode == 0, result.stdout + result.stderr
     summary = (candidate["root"].parent / "summary.md").read_text()
-    assert "## Release dry run" in summary
+    assert "## Release preview (no publication)" in summary
     assert "No tag, GitHub Release, or approval request was created." in summary
     assert "Approve and deploy" not in summary
     assert summary.count("| Python | Linux | Windows |") == 1

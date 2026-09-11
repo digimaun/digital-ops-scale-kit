@@ -1,5 +1,5 @@
 # Publication consumes the frozen candidate after required environment approval.
-name: Release
+name: Release (approval required)
 
 on:
   push:
@@ -9,8 +9,8 @@ on:
       - "releases/**/notes.md"
   workflow_dispatch:
     inputs:
-      intent:
-        description: "Committed releases/<name>/release.json to prepare"
+      release-file:
+        description: "Reviewed releases/<name>/release.json on main. This starts a real release candidate."
         required: true
         type: string
       expected-source-sha:
@@ -35,8 +35,8 @@ jobs:
     name: Prepare release candidate
     uses: ./.github/workflows/_release-candidate.yaml
     with:
-      expected-source-sha: ${{ inputs.expected-source-sha || github.sha }}
-      intent: ${{ inputs.intent || '' }}
+      expected-source-sha: ${{ github.event_name != 'workflow_dispatch' && github.sha || inputs.expected-source-sha }}
+      intent: ${{ inputs.release-file || '' }}
       before-sha: ${{ github.event.before || '' }}
       dry-run: false
     permissions:
@@ -142,7 +142,7 @@ jobs:
                   prefix + "/contents/" + path + "?ref=refs/heads/main",
               ], capture_output=True, timeout=60)
               if result.returncode or hashlib.sha256(result.stdout).hexdigest() != plan["intent"][hash_key]:
-                  raise SystemExit("::error::Release intent changed. Prepare and approve a new candidate.")
+                  raise SystemExit("::error::The release file or notes changed. Prepare and review a new candidate.")
           release, engine = plan["release"], plan["siteops"]
           if not engine["bundle"]:
               tag = urllib.parse.quote(engine["releaseTag"], safe="")

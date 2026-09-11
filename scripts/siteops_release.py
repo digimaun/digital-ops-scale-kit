@@ -126,7 +126,7 @@ def load_release_intent(
         source_sha,
         intent_path,
         _MAX_DECLARATION_BYTES,
-        "The release declaration",
+        "The release file",
     )
     notes_bytes = _read_tree_blob(
         repository_root,
@@ -143,7 +143,7 @@ def load_release_intent(
     if tag.startswith("siteops/v"):
         if "siteops" in declaration:
             raise ReleaseIntentError(
-                "A Site Ops release declaration must not contain the siteops field."
+                "A Site Ops release file must not contain the siteops field."
             )
         if latest:
             raise ReleaseIntentError("A Site Ops release cannot be marked latest.")
@@ -164,7 +164,7 @@ def load_release_intent(
         siteops = declaration.get("siteops")
         if siteops is None:
             raise ReleaseIntentError(
-                "A Scale Kit release declaration must contain the siteops field."
+                "A Scale Kit release file must contain the siteops field."
             )
         prerelease = _is_prerelease(version)
         stream = "scalekit"
@@ -264,7 +264,7 @@ def discover_release_intent(root: Path, before_sha: str, source_sha: str) -> str
 
     if len(surviving) > 1:
         raise ReleaseIntentError(
-            "More than one changed release declaration survives in the selected commit."
+            "More than one changed release file survives in the selected commit. Select one file explicitly."
         )
     return surviving[0] if surviving else None
 
@@ -410,7 +410,7 @@ def _validate_source_ref(value: str) -> str:
 def _validate_intent_path(value: str, *, allow_example: bool = False) -> str:
     if type(value) is not str or "\\" in value or len(value) > 256:
         raise ReleaseIntentError(
-            "The intent path must be releases/<name>/release.json."
+            "The release-file path must be releases/<name>/release.json."
         )
     parts = value.split("/")
     if allow_example and len(parts) == 4 and parts[:2] == [".github", "release-examples"]:
@@ -418,7 +418,7 @@ def _validate_intent_path(value: str, *, allow_example: bool = False) -> str:
         return value
     if len(parts) != 3 or parts[0] != "releases" or parts[2] != "release.json":
         raise ReleaseIntentError(
-            "The intent path must be releases/<name>/release.json."
+            "The release-file path must be releases/<name>/release.json."
         )
     name = parts[1]
     stem = name.split(".", 1)[0].upper()
@@ -545,7 +545,7 @@ def _parse_declaration(raw: bytes) -> dict[str, Any]:
         for key, value in pairs:
             if key in result:
                 raise ReleaseIntentError(
-                    f"The release declaration contains a duplicate JSON key: {key}."
+                    f"The release file contains a duplicate JSON key: {key}."
                 )
             result[key] = value
         return result
@@ -557,25 +557,25 @@ def _parse_declaration(raw: bytes) -> dict[str, Any]:
         raise
     except (UnicodeError, ValueError) as error:
         raise ReleaseIntentError(
-            "The release declaration must be valid UTF-8 JSON."
+            "The release file must be valid UTF-8 JSON."
         ) from error
     if type(document) is not dict:
-        raise ReleaseIntentError("The release declaration must be a JSON object.")
+        raise ReleaseIntentError("The release file must be a JSON object.")
     unknown = set(document) - {"tag", "siteops", "latest"}
     if unknown:
         raise ReleaseIntentError(
-            "The release declaration contains unknown fields: "
+            "The release file contains unknown fields: "
             + ", ".join(sorted(unknown))
             + "."
         )
     if "tag" not in document or type(document["tag"]) is not str:
-        raise ReleaseIntentError("The release declaration tag must be a string.")
+        raise ReleaseIntentError("The release file tag must be a string.")
     if len(document["tag"]) > 160:
-        raise ReleaseIntentError("The release declaration tag is too long.")
+        raise ReleaseIntentError("The release file tag is too long.")
     if "latest" in document and type(document["latest"]) is not bool:
-        raise ReleaseIntentError("The release declaration latest field must be a boolean.")
+        raise ReleaseIntentError("The release file latest field must be a boolean.")
     if "siteops" in document and type(document["siteops"]) is not dict:
-        raise ReleaseIntentError("The release declaration siteops field must be an object.")
+        raise ReleaseIntentError("The release file siteops field must be an object.")
     return document
 
 

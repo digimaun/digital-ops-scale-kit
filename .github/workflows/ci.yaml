@@ -31,19 +31,19 @@ on:
       - ".github/release-examples/**"
   workflow_dispatch:
     inputs:
-      rehearsal:
-        description: "Optional rehearsal. Neither option creates a tag or publishes a release."
+      run-mode:
+        description: "CI always runs. Optional installer checks and release previews never publish."
         type: choice
         required: false
-        options: [none, installation, release]
-        default: none
+        options: [ci-only, installer-check, release-preview]
+        default: ci-only
       expected-source-sha:
-        description: "Required for a rehearsal. Full expected commit of the selected branch."
+        description: "For installer-check or release-preview: full commit SHA of the selected branch."
         type: string
         required: false
         default: ""
-      release-intent:
-        description: "Release rehearsal only. Use the example or a committed releases/<name>/release.json."
+      release-file:
+        description: "Release preview only. Keep the example or choose a committed releases/<name>/release.json."
         type: string
         required: false
         default: .github/release-examples/combined-preview/release.json
@@ -52,9 +52,9 @@ permissions:
   contents: read
 
 jobs:
-  distribution-rehearsal:
-    name: Rehearse distribution
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'installation' }}
+  installer-check:
+    name: Check installer (no publication)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run-mode == 'installer-check' }}
     uses: ./.github/workflows/_siteops-distribution.yaml
     with:
       expected-source-sha: ${{ inputs.expected-source-sha }}
@@ -64,14 +64,14 @@ jobs:
       id-token: write
       attestations: write
 
-  release-rehearsal:
-    name: Rehearse release
+  release-preview:
+    name: Preview release (no publication)
     needs: [lint, test, validate]
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'release' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run-mode == 'release-preview' }}
     uses: ./.github/workflows/_release-candidate.yaml
     with:
       expected-source-sha: ${{ inputs.expected-source-sha }}
-      intent: ${{ inputs.release-intent }}
+      intent: ${{ inputs.release-file }}
       dry-run: true
     permissions:
       contents: read

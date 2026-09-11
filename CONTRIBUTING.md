@@ -104,13 +104,12 @@ Site Ops releases use the source package version. Content releases reference
 an already published engine or explicitly include an identified engine build
 during preview. Neither stream forces a version increment in the other.
 
-`_siteops-distribution.yaml` owns the shared build, signing, and installation
-qualification stages. `siteops-distribution.yaml` is a manual build-only entry.
-CI also exposes a `rehearsal` choice: `installation` exercises distribution,
-while `release` additionally prepares the read-only candidate preview. Both
-use `expected-source-sha` to assert the selected branch's commit. The release
-choice accepts a committed example without creating an active release request.
-Neither rehearsal publishes a release.
+There are two operator entry points: **CI** for checks and previews, and
+**Release (approval required)** for real publication. They share the read-only
+candidate workflow and `_siteops-distribution.yaml` build/signing machinery.
+CI offers `run-mode: ci-only`, `installer-check`, or `release-preview`. The
+latter two use `expected-source-sha`. The release preview also accepts
+`release-file`, defaulting to a committed example. No CI mode publishes.
 
 ### Produce a local bundle
 

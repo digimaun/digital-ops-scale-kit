@@ -34,7 +34,7 @@ from tests.test_distribution_installer import bundle_factory as bundle_factory
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 REUSABLE_PATH = WORKFLOWS / "_siteops-distribution.yaml"
-CALLER_PATH = WORKFLOWS / "siteops-distribution.yaml"
+CANDIDATE_PATH = WORKFLOWS / "_release-candidate.yaml"
 RELEASE_PATH = WORKFLOWS / "release.yaml"
 CI_PATH = WORKFLOWS / "ci.yaml"
 
@@ -73,7 +73,7 @@ def _document(path: Path) -> dict:
 
 
 REUSABLE = _document(REUSABLE_PATH)
-CALLER = _document(CALLER_PATH)
+CANDIDATE = _document(CANDIDATE_PATH)
 RELEASE = _document(RELEASE_PATH)
 CI = _document(CI_PATH)
 
@@ -98,25 +98,21 @@ def _all_steps(document: dict):
 
 def test_ci_rehearsal_requires_an_explicit_manual_request_and_source_commit():
     inputs = CI[ON]["workflow_dispatch"]["inputs"]
-    assert inputs["rehearsal"] == {
-        "description": "Optional rehearsal. Neither option creates a tag or publishes a release.",
-        "type": "choice",
-        "required": False,
-        "options": ["none", "installation", "release"],
-        "default": "none",
-    }
+    assert inputs["run-mode"]["type"] == "choice"
+    assert inputs["run-mode"]["options"] == ["ci-only", "installer-check", "release-preview"]
+    assert inputs["run-mode"]["default"] == "ci-only"
     assert inputs["expected-source-sha"]["type"] == "string"
     assert inputs["expected-source-sha"]["required"] is False
     assert inputs["expected-source-sha"]["default"] == ""
-    assert inputs["release-intent"]["type"] == "string"
-    assert inputs["release-intent"]["required"] is False
-    assert inputs["release-intent"]["default"] == (
+    assert inputs["release-file"]["type"] == "string"
+    assert inputs["release-file"]["required"] is False
+    assert inputs["release-file"]["default"] == (
         ".github/release-examples/combined-preview/release.json"
     )
-    job = CI["jobs"]["distribution-rehearsal"]
+    job = CI["jobs"]["installer-check"]
     assert job["if"] == (
         "${{ github.event_name == 'workflow_dispatch' && "
-        "inputs.rehearsal == 'installation' }}"
+        "inputs.run-mode == 'installer-check' }}"
     )
     assert job["uses"] == "./.github/workflows/_siteops-distribution.yaml"
     assert job["with"] == {"expected-source-sha": "${{ inputs.expected-source-sha }}"}
@@ -135,16 +131,16 @@ def test_ci_rehearsal_preserves_normal_ci_permissions_and_cannot_promote():
     for name in ("lint", "test", "validate"):
         assert CI["jobs"][name]["permissions"] == {"contents": "read"}
     assert all(job.get("permissions", {}).get("contents") != "write" for job in CI["jobs"].values())
-    assert "release.yaml" not in yaml.safe_dump(CI["jobs"]["distribution-rehearsal"])
-    release = CI["jobs"]["release-rehearsal"]
+    assert "release.yaml" not in yaml.safe_dump(CI["jobs"]["installer-check"])
+    release = CI["jobs"]["release-preview"]
     assert release["needs"] == ["lint", "test", "validate"]
     assert release["if"] == (
-        "${{ github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'release' }}"
+        "${{ github.event_name == 'workflow_dispatch' && inputs.run-mode == 'release-preview' }}"
     )
     assert release["uses"] == "./.github/workflows/_release-candidate.yaml"
     assert release["with"] == {
         "expected-source-sha": "${{ inputs.expected-source-sha }}",
-        "intent": "${{ inputs.release-intent }}",
+        "intent": "${{ inputs.release-file }}",
         "dry-run": True,
     }
     assert release["permissions"] == {
@@ -352,7 +348,7 @@ def test_staging_uploads_never_overwrite_and_fail_on_empty_input():
 
 
 def test_every_action_is_pinned_to_the_reviewed_commit():
-    for document in (REUSABLE, CALLER, RELEASE):
+    for document in (REUSABLE, CANDIDATE, RELEASE, CI):
         for step in _all_steps(document):
             reference = step.get("uses")
             if reference is None or reference.startswith("./"):
@@ -512,36 +508,16 @@ def test_the_signer_identity_confirmation_is_recorded():
 
 
 def test_distribution_never_reaches_azure_or_a_cluster():
-    for path in (REUSABLE_PATH, CALLER_PATH, RELEASE_PATH):
+    for path in (REUSABLE_PATH, CANDIDATE_PATH, RELEASE_PATH):
         text = path.read_text(encoding="utf-8")
         for command in ("az ", "kubectl", "azure/login", "AZURE_CLIENT_ID"):
             assert command not in text, path.name
 
 
-# --- The caller binds the local reusable workflow ----------------------------
-
-
-def test_caller_dispatches_the_local_reusable_workflow_only():
-    assert set(CALLER[ON]) == {"workflow_dispatch"}
-    assert set(CALLER[ON]["workflow_dispatch"]["inputs"]) == {"expected-source-sha"}
-    distribute = CALLER["jobs"]["distribute"]
-    assert distribute["uses"] == f"./{SIGNER_WORKFLOW}"
-    assert distribute["with"] == {"expected-source-sha": "${{ inputs.expected-source-sha }}"}
-    assert distribute["permissions"] == {
-        "contents": "read",
-        "actions": "read",
-        "id-token": "write",
-        "attestations": "write",
-    }
-    assert CALLER["permissions"] == {"contents": "read"}
-    assert set(CALLER["jobs"]) == {"distribute"}
-
-
 def test_reusable_owns_the_only_distribution_summary():
     assert sum(
         "GITHUB_STEP_SUMMARY" in step.get("run", "")
-        for document in (REUSABLE, CALLER)
-        for step in _all_steps(document)
+        for step in _all_steps(REUSABLE)
     ) == 1
     assert "Publish the qualification summary" not in _step_names(REUSABLE["jobs"]["qualify"])
     assert "Record the build identity" not in _step_names(REUSABLE["jobs"]["attest"])
@@ -685,7 +661,7 @@ def test_distribution_summary_reports_the_complete_success_matrix(tmp_path):
     ]
 
     summary = summary_path.read_text(encoding="utf-8")
-    assert summary.count("## Site Ops distribution") == 1
+    assert summary.count("## Site Ops installer check") == 1
     assert "Version: <code>1.0.0b1+build.42.2.gcccccccccccc</code>" in summary
     assert (
         "[Download the attested installation bundle]"
@@ -1230,7 +1206,7 @@ def test_every_run_block_parses_as_bash(tmp_path):
     blocks = []
     for name, document in (
         (REUSABLE_PATH.name, REUSABLE),
-        (CALLER_PATH.name, CALLER),
+        (CANDIDATE_PATH.name, CANDIDATE),
         (RELEASE_PATH.name, RELEASE),
     ):
         for job_id, job in document["jobs"].items():

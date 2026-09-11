@@ -98,17 +98,28 @@ def _all_steps(document: dict):
 
 def test_ci_rehearsal_requires_an_explicit_manual_request_and_source_commit():
     inputs = CI[ON]["workflow_dispatch"]["inputs"]
-    assert inputs["distribution-rehearsal"]["type"] == "boolean"
-    assert inputs["distribution-rehearsal"]["default"] is False
-    assert inputs["distribution-source-sha"]["type"] == "string"
-    assert inputs["distribution-source-sha"]["required"] is False
-    assert inputs["distribution-source-sha"]["default"] == ""
+    assert inputs["rehearsal"] == {
+        "description": "Optional rehearsal. Neither option creates a tag or publishes a release.",
+        "type": "choice",
+        "required": False,
+        "options": ["none", "installation", "release"],
+        "default": "none",
+    }
+    assert inputs["expected-source-sha"]["type"] == "string"
+    assert inputs["expected-source-sha"]["required"] is False
+    assert inputs["expected-source-sha"]["default"] == ""
+    assert inputs["release-intent"]["type"] == "string"
+    assert inputs["release-intent"]["required"] is False
+    assert inputs["release-intent"]["default"] == (
+        ".github/release-examples/combined-preview/release.json"
+    )
     job = CI["jobs"]["distribution-rehearsal"]
     assert job["if"] == (
-        "${{ github.event_name == 'workflow_dispatch' && inputs.distribution-rehearsal }}"
+        "${{ github.event_name == 'workflow_dispatch' && "
+        "inputs.rehearsal == 'installation' }}"
     )
     assert job["uses"] == "./.github/workflows/_siteops-distribution.yaml"
-    assert job["with"] == {"expected-source-sha": "${{ inputs.distribution-source-sha }}"}
+    assert job["with"] == {"expected-source-sha": "${{ inputs.expected-source-sha }}"}
     assert "steps" not in job
     assert "secrets" not in job
     assert job["permissions"] == {
@@ -125,6 +136,23 @@ def test_ci_rehearsal_preserves_normal_ci_permissions_and_cannot_promote():
         assert CI["jobs"][name]["permissions"] == {"contents": "read"}
     assert all(job.get("permissions", {}).get("contents") != "write" for job in CI["jobs"].values())
     assert "release.yaml" not in yaml.safe_dump(CI["jobs"]["distribution-rehearsal"])
+    release = CI["jobs"]["release-rehearsal"]
+    assert release["needs"] == ["lint", "test", "validate"]
+    assert release["if"] == (
+        "${{ github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'release' }}"
+    )
+    assert release["uses"] == "./.github/workflows/_release-candidate.yaml"
+    assert release["with"] == {
+        "expected-source-sha": "${{ inputs.expected-source-sha }}",
+        "intent": "${{ inputs.release-intent }}",
+        "dry-run": True,
+    }
+    assert release["permissions"] == {
+        "contents": "read",
+        "actions": "read",
+        "id-token": "write",
+        "attestations": "write",
+    }
 
 
 def _fake_tools(tmp_path: Path) -> tuple[Path, Path]:
@@ -142,6 +170,12 @@ def _fake_tools(tmp_path: Path) -> tuple[Path, Path]:
 
 if [[ "$1" == "attestation" ]]; then
   exit "${FAKE_GH_ATTESTATION_EXIT:-0}"
+fi
+if [[ "$1" == "api" ]]; then
+  if [[ -n "${FAKE_GH_API_RESPONSE:-}" ]]; then
+    cat "$FAKE_GH_API_RESPONSE"
+  fi
+  exit "${FAKE_GH_API_EXIT:-0}"
 fi
 exit 1
 """,
@@ -237,8 +271,15 @@ def test_build_checks_out_the_asserted_event_commit_without_credentials():
 
 
 def test_expected_source_sha_is_only_an_assertion():
-    assert set(REUSABLE[ON]["workflow_call"]["inputs"]) == {"expected-source-sha", "version-mode"}
+    inputs = REUSABLE[ON]["workflow_call"]["inputs"]
+    assert set(inputs) == {"expected-source-sha", "version-mode", "report-summary"}
     assert REUSABLE[ON]["workflow_call"]["inputs"]["version-mode"]["default"] == "build"
+    assert inputs["report-summary"] == {
+        "description": "Write the aggregate distribution report to the workflow summary.",
+        "required": False,
+        "type": "boolean",
+        "default": True,
+    }
     for step in _all_steps(REUSABLE):
         if "uses" in step:
             rendered = yaml.safe_dump(step)
@@ -292,6 +333,7 @@ def test_attestation_signs_the_literal_archive_with_build_provenance():
     )
     # Omitting every predicate input selects SLSA build provenance.
     assert set(subject["with"]) == {"subject-path", "show-summary"}
+    assert subject["with"]["show-summary"] is False
 
 
 def test_staging_uploads_never_overwrite_and_fail_on_empty_input():
@@ -422,11 +464,23 @@ def test_the_qualification_pipx_pin_matches_the_repository_pin():
     assert "venv" in script and "install.py" not in script
 
 
-def test_qualification_summary_reports_no_private_detail():
-    script = _script(REUSABLE["jobs"]["qualify"], "Publish the qualification summary")
-    assert "$RUNNER_OS" in script
-    assert "$owned" not in script
-    assert "$archive" not in script
+def test_distribution_summary_uses_only_fixed_outputs_and_job_conclusions():
+    summary = REUSABLE["jobs"]["summary"]
+    assert summary["needs"] == ["build", "attest", "qualify"]
+    assert summary["if"] == "always()"
+    assert summary["permissions"] == {"contents": "read", "actions": "read"}
+    report = _step(summary, "Aggregate the distribution result")
+    assert report["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert report["env"]["REPORT_SUMMARY"] == "${{ inputs.report-summary }}"
+    script = report["run"]
+    assert (
+        "actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100"
+        in script
+    )
+    assert 'cell = expected.get(job["name"].rsplit(" / ", 1)[-1])' in script
+    assert "logs/" not in script
+    assert "stdout" not in script
+    assert "stderr" not in script
     assert REUSABLE["env"]["SITEOPS_REDACT_OUTPUT"] == "1"
 
 
@@ -480,13 +534,40 @@ def test_caller_dispatches_the_local_reusable_workflow_only():
         "attestations": "write",
     }
     assert CALLER["permissions"] == {"contents": "read"}
+    assert set(CALLER["jobs"]) == {"distribute"}
 
 
-def test_caller_publishes_the_build_identity():
-    script = _script(CALLER["jobs"]["summary"], "Record the build identity")
-    for value in ("$GITHUB_RUN_ID", "$STAGING_ARTIFACT_ID", "$GITHUB_SHA", "$GITHUB_REF"):
-        assert value in script
-    assert CALLER["jobs"]["summary"]["permissions"] == {}
+def test_reusable_owns_the_only_distribution_summary():
+    assert sum(
+        "GITHUB_STEP_SUMMARY" in step.get("run", "")
+        for document in (REUSABLE, CALLER)
+        for step in _all_steps(document)
+    ) == 1
+    assert "Publish the qualification summary" not in _step_names(REUSABLE["jobs"]["qualify"])
+    assert "Record the build identity" not in _step_names(REUSABLE["jobs"]["attest"])
+
+
+def test_distribution_outputs_include_artifact_url_and_qualification_matrix():
+    outputs = REUSABLE[ON]["workflow_call"]["outputs"]
+    assert set(outputs) == {
+        "package-version",
+        "build-number",
+        "build-attempt",
+        "archive-name",
+        "archive-sha256",
+        "staging-artifact-id",
+        "staging-artifact-name",
+        "staging-artifact-url",
+        "qualification-matrix",
+    }
+    attest = REUSABLE["jobs"]["attest"]
+    assert attest["outputs"]["staging-artifact-url"] == "${{ steps.stage.outputs.artifact-url }}"
+    assert outputs["staging-artifact-url"]["value"] == (
+        "${{ jobs.attest.outputs.staging-artifact-url }}"
+    )
+    assert outputs["qualification-matrix"]["value"] == (
+        "${{ jobs.summary.outputs.qualification-matrix }}"
+    )
 
 
 # --- Verification identity stays consistent ---------------------------------
@@ -514,6 +595,281 @@ def test_the_archive_name_is_the_same_literal_everywhere():
 
 
 # --- Extracted snippets, exercised against fakes -----------------------------
+
+
+def _qualification_jobs() -> list[dict]:
+    return [
+        {
+            "name": f"Qualify bundle ({platform}, Python {python})",
+            "status": "completed",
+            "conclusion": "success",
+        }
+        for python in QUALIFIED_PYTHONS
+        for platform in QUALIFIED_PLATFORMS
+    ]
+
+
+def _run_distribution_summary(
+    tmp_path: Path,
+    jobs: list[dict],
+    *,
+    report_summary: bool = True,
+    build_result: str = "success",
+    attest_result: str = "success",
+    qualify_result: str = "success",
+):
+    _, log = _fake_tools(tmp_path)
+    response = tmp_path / "jobs.json"
+    response.write_text(json.dumps({"jobs": jobs}), encoding="utf-8")
+    output = tmp_path / "github-output.txt"
+    summary = tmp_path / "github-summary.md"
+    runner_temp = tmp_path / "runner-temp"
+    runner_temp.mkdir()
+    artifact_available = attest_result == "success"
+    result = _run_script(
+        _script(REUSABLE["jobs"]["summary"], "Aggregate the distribution result"),
+        tmp_path,
+        {
+            "FAKE_GH_LOG": _bash_path(log),
+            "FAKE_GH_API_RESPONSE": _bash_path(response),
+            "FAKE_PYTHON": _python_executable_path(),
+            "GITHUB_REPOSITORY": "example/publisher",
+            "GITHUB_RUN_ID": "42",
+            "GITHUB_RUN_ATTEMPT": "2",
+            "GITHUB_OUTPUT": _bash_path(output),
+            "GITHUB_STEP_SUMMARY": _bash_path(summary),
+            "REPORT_SUMMARY": str(report_summary).lower(),
+            "BUILD_RESULT": build_result,
+            "ATTEST_RESULT": attest_result,
+            "QUALIFY_RESULT": qualify_result,
+            "PACKAGE_VERSION": "1.0.0b1+build.42.2.gcccccccccccc",
+            "ARCHIVE_NAME_VALUE": ARCHIVE_NAME,
+            "ARCHIVE_SHA256": "d" * 64,
+            "STAGING_ARTIFACT_ID": "987" if artifact_available else "",
+            "STAGING_ARTIFACT_NAME": (
+                "siteops-install-staging-42-2" if artifact_available else ""
+            ),
+            "STAGING_ARTIFACT_URL": (
+                "https://github.com/example/publisher/actions/runs/42/artifacts/987"
+                if artifact_available
+                else ""
+            ),
+            "SOURCE_SHA": "c" * 40,
+            "SOURCE_REF": "refs/heads/main",
+            "RUNNER_TEMP": _bash_path(runner_temp),
+        },
+    )
+    encoded = None
+    if output.exists():
+        encoded = output.read_text(encoding="utf-8").split("=", 1)[1].strip()
+    return result, encoded, summary, log
+
+
+def test_distribution_summary_reports_the_complete_success_matrix(tmp_path):
+    result, encoded, summary_path, log = _run_distribution_summary(
+        tmp_path, _qualification_jobs()
+    )
+
+    expected = [
+        {"python": python, "linux": "passed", "windows": "passed"}
+        for python in QUALIFIED_PYTHONS
+    ]
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert encoded == json.dumps(expected, separators=(",", ":"))
+    assert json.loads(encoded) == expected
+    assert _invocations(log) == [
+        [
+            "api",
+            "repos/example/publisher/actions/runs/42/attempts/2/jobs?per_page=100",
+        ]
+    ]
+
+    summary = summary_path.read_text(encoding="utf-8")
+    assert summary.count("## Site Ops distribution") == 1
+    assert "Version: <code>1.0.0b1+build.42.2.gcccccccccccc</code>" in summary
+    assert (
+        "[Download the attested installation bundle]"
+        "(https://github.com/example/publisher/actions/runs/42/artifacts/987)"
+        in summary
+    )
+    for python in QUALIFIED_PYTHONS:
+        assert f"| {python} | passed | passed |" in summary
+    for value in (
+        "Source SHA",
+        "Source ref",
+        "Archive SHA-256",
+        "Run attempt",
+        "Artifact ID",
+        "Artifact name",
+    ):
+        assert value in summary
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("failed", "failed"),
+        ("missing", "not-run"),
+        ("cancelled", "cancelled"),
+        ("ambiguous", "unknown"),
+        ("partial", "unknown"),
+    ],
+)
+def test_distribution_summary_reports_nonpassing_cells_honestly(tmp_path, case, expected):
+    jobs = _qualification_jobs()
+    target = "Qualify bundle (ubuntu-24.04, Python 3.12)"
+    selected = next(job for job in jobs if job["name"] == target)
+    if case == "failed":
+        selected["conclusion"] = "failure"
+    elif case == "missing":
+        jobs.remove(selected)
+    elif case == "cancelled":
+        selected["conclusion"] = "cancelled"
+    elif case == "ambiguous":
+        jobs.append(
+            {
+                "name": "Qualify bundle (ubuntu-24.04, Python 3.12)",
+                "status": "completed",
+                "conclusion": "success",
+            }
+        )
+    else:
+        selected["status"] = "in_progress"
+        selected["conclusion"] = None
+
+    result, encoded, summary_path, _ = _run_distribution_summary(
+        tmp_path, jobs, qualify_result="failure"
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    matrix = json.loads(encoded)
+    assert matrix[2] == {"python": "3.12", "linux": expected, "windows": "passed"}
+    assert len(matrix) == len(QUALIFIED_PYTHONS)
+    summary = summary_path.read_text(encoding="utf-8")
+    assert f"| 3.12 | {expected} | passed |" in summary
+    assert "One or more qualification cells did not pass." in summary
+
+
+@pytest.mark.parametrize("prefix", ["Rehearse distribution", "Rehearse release / Candidate installation"])
+def test_distribution_summary_accepts_real_reusable_workflow_job_names(tmp_path, prefix):
+    jobs = _qualification_jobs()
+    for job in jobs:
+        job["name"] = prefix + " / " + job["name"]
+    result, encoded, _, _ = _run_distribution_summary(tmp_path, jobs)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert all(row["linux"] == row["windows"] == "passed" for row in json.loads(encoded))
+
+
+def test_distribution_summary_refuses_ambiguous_success_claim(tmp_path):
+    jobs = _qualification_jobs()
+    jobs.append(
+        {
+            "name": "Distribute / Qualify bundle (ubuntu-24.04, Python 3.10)",
+            "status": "completed",
+            "conclusion": "failure",
+        }
+    )
+
+    result, encoded, _, _ = _run_distribution_summary(tmp_path, jobs)
+
+    assert result.returncode != 0
+    assert json.loads(encoded)[0] == {
+        "python": "3.10",
+        "linux": "unknown",
+        "windows": "passed",
+    }
+
+
+@pytest.mark.parametrize(
+    ("build_result", "attest_result", "guidance"),
+    [
+        ("failure", "skipped", "Review the Build bundle job"),
+        ("success", "failure", "Review the Attest bundle job"),
+    ],
+)
+def test_distribution_summary_keeps_earlier_failure_visible(
+    tmp_path, build_result, attest_result, guidance
+):
+    result, encoded, summary_path, _ = _run_distribution_summary(
+        tmp_path,
+        [],
+        build_result=build_result,
+        attest_result=attest_result,
+        qualify_result="skipped",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(encoded) == [
+        {"python": python, "linux": "not-run", "windows": "not-run"}
+        for python in QUALIFIED_PYTHONS
+    ]
+    summary = summary_path.read_text(encoding="utf-8")
+    assert guidance in summary
+    assert "not available for download" in summary
+    assert REUSABLE["jobs"]["summary"]["if"] == "always()"
+    assert "continue-on-error" not in REUSABLE["jobs"]["summary"]
+
+
+def test_report_summary_false_suppresses_only_presentation(tmp_path):
+    summary_path = tmp_path / "github-summary.md"
+    summary_path.write_text("existing summary\n", encoding="utf-8")
+    result, encoded, returned_summary, log = _run_distribution_summary(
+        tmp_path, _qualification_jobs(), report_summary=False
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(encoded) == [
+        {"python": python, "linux": "passed", "windows": "passed"}
+        for python in QUALIFIED_PYTHONS
+    ]
+    assert returned_summary.read_text(encoding="utf-8") == "existing summary\n"
+    assert _invocations(log)
+    assert REUSABLE["jobs"]["summary"]["needs"] == ["build", "attest", "qualify"]
+    assert "if" not in REUSABLE["jobs"]["qualify"]
+
+
+def test_distribution_summary_fails_without_job_conclusions_and_publishes_nothing(tmp_path):
+    _, log = _fake_tools(tmp_path)
+    output = tmp_path / "github-output.txt"
+    summary = tmp_path / "github-summary.md"
+    runner_temp = tmp_path / "runner-temp"
+    runner_temp.mkdir()
+    result = _run_script(
+        _script(REUSABLE["jobs"]["summary"], "Aggregate the distribution result"),
+        tmp_path,
+        {
+            "FAKE_GH_LOG": _bash_path(log),
+            "FAKE_GH_API_EXIT": "1",
+            "FAKE_PYTHON": _python_executable_path(),
+            "GITHUB_REPOSITORY": "example/publisher",
+            "GITHUB_RUN_ID": "42",
+            "GITHUB_RUN_ATTEMPT": "2",
+            "GITHUB_OUTPUT": _bash_path(output),
+            "GITHUB_STEP_SUMMARY": _bash_path(summary),
+            "REPORT_SUMMARY": "true",
+            "BUILD_RESULT": "success",
+            "ATTEST_RESULT": "success",
+            "QUALIFY_RESULT": "success",
+            "PACKAGE_VERSION": "1.0.0b1",
+            "ARCHIVE_NAME_VALUE": ARCHIVE_NAME,
+            "ARCHIVE_SHA256": "d" * 64,
+            "STAGING_ARTIFACT_ID": "987",
+            "STAGING_ARTIFACT_NAME": "siteops-install-staging-42-2",
+            "STAGING_ARTIFACT_URL": (
+                "https://github.com/example/publisher/actions/runs/42/artifacts/987"
+            ),
+            "SOURCE_SHA": "c" * 40,
+            "SOURCE_REF": "refs/heads/main",
+            "RUNNER_TEMP": _bash_path(runner_temp),
+        },
+    )
+
+    assert result.returncode != 0
+    assert json.loads(output.read_text(encoding="utf-8").split("=", 1)[1]) == [
+        {"python": python, "linux": "unknown", "windows": "unknown"}
+        for python in QUALIFIED_PYTHONS
+    ]
+    assert not summary.exists()
 
 
 @pytest.mark.parametrize(

@@ -8,6 +8,38 @@ Site Ops and Scale Kit have independent version streams in the same repository.
 A content release can reference an existing engine release without rebuilding
 it or changing its version.
 
+## Rehearse without publishing
+
+In **Actions > CI > Run workflow**, select the feature branch and choose:
+
+| Input | Value |
+|---|---|
+| `rehearsal` | `release` |
+| `expected-source-sha` | The selected branch's full commit SHA |
+| `release-intent` | Keep the supplied example, or select a committed release declaration |
+
+The default example is
+`.github/release-examples/combined-preview/release.json`. It exercises the
+combined preview path using the selected source commit. Examples are accepted
+only for a dry run and never trigger publication when merged.
+
+The rehearsal runs ordinary CI, then shares the real declaration preparation,
+bundle production, attestation, qualification, and release-preview logic.
+The final summary shows one Python/platform matrix and a link to the attested
+bundle. Individual job logs remain available for diagnosis.
+
+This path needs no `siteops-release` environment. Its jobs have no repository
+content-write permission, request no publishing approval, and create no tag or
+GitHub Release. A generated dry-run plan cannot be used by the publisher.
+
+Select `installation` instead to rehearse only bundle production and
+installation. Leave `rehearsal` as `none` for normal CI, which does not use the
+other rehearsal inputs. These choices are mutually exclusive.
+
+Successful dry runs establish preparation and installation behavior. The
+approval UI and actual release upload still require a configured environment
+and an explicitly approved publication.
+
 ## Declare the release
 
 Create a new directory for each release:
@@ -155,8 +187,9 @@ deploy Azure resources or infer workload health from installation success.
 
 Configure the GitHub environment named `siteops-release` with required
 reviewers and appropriate branch restrictions before preparing a release.
-The workflow refuses to proceed without required reviewers. Choose self-review
-and administrator-bypass settings according to repository policy.
+The workflow checks this after reading an active release declaration and before
+building its bundle. Choose self-review and administrator-bypass settings
+according to repository policy.
 
 After reviewing the generated summary, an authorized reviewer uses **Review
 deployments**, selects `siteops-release`, then selects **Approve and deploy**.
@@ -195,8 +228,7 @@ Tag creation and publication are separate GitHub operations. A failure can leave
 the correct tag without a completed release. Inspect the result before retrying.
 Rebuilding creates a new candidate with its own evidence and approval.
 
-Use the CI workflow's `distribution-rehearsal` opt-in to exercise the shared
-bundle build, signing, and installation path on a feature branch before merge.
-Supply its exact commit in `distribution-source-sha`. The rehearsal creates
-signed artifacts under the running repository's identity. It does not create
-tags or publish releases.
+Rerun all jobs to prepare a fresh candidate after a preparation failure.
+Publication consumes the exact reviewed artifact IDs and hashes, rather than
+choosing a different successful build later. A failed publishing operation can
+have partial effects, so inspect its result before retrying.

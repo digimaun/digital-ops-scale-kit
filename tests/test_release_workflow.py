@@ -19,7 +19,8 @@ from tests.test_release_intent import repository as repository
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = yaml.safe_load((ROOT / ".github" / "workflows" / "release.yaml").read_text())
-JOBS = WORKFLOW["jobs"]
+CANDIDATE_WORKFLOW = yaml.safe_load((ROOT / ".github" / "workflows" / "_release-candidate.yaml").read_text())
+JOBS = {**CANDIDATE_WORKFLOW["jobs"], **WORKFLOW["jobs"]}
 SHA = "c" * 40
 REPO = "example/publisher"
 ARCHIVE = "siteops-install.zip"
@@ -45,7 +46,7 @@ def candidate(tmp_path):
     raw = json.dumps(declaration).encode()
     notes = b"## Changes\n\nReviewed release notes.\n"
     plan = {
-        "apiVersion": "siteops.release/v1", "kind": "ReleaseCandidate", "active": True,
+        "apiVersion": "siteops.release/v1", "kind": "ReleaseCandidate", "active": True, "dryRun": False,
         "source": {"repository": REPO, "commit": SHA, "ref": "refs/heads/main"},
         "intent": {
             "path": "releases/candidate/release.json", "sha256": digest(raw),
@@ -69,6 +70,8 @@ def candidate(tmp_path):
     (bundle_dir / PROOF).write_text("synthetic proof")
     (plan_dir / "release-notes.md").write_bytes(notes)
     (plan_dir / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    (directory / "release-notes").mkdir()
+    (directory / "release-notes" / "publish-notes.md").write_bytes(notes)
     responses = {}
     for revision in (SHA, "refs/heads/main"):
         for name, body in (("release.json", raw.decode()), ("notes.md", notes.decode())):
@@ -160,6 +163,8 @@ exec(compile(code, "<workflow>", "exec"), {"__name__": "__main__"})
             "GITHUB_STEP_SUMMARY": (tmp_path / "summary.md").as_posix(),
             "GITHUB_REPOSITORY": REPO, "SOURCE_SHA": candidate.get("source_sha", SHA),
             "SOURCE_REF": "refs/heads/main",
+            "DRY_RUN": "false",
+            "GITHUB_RUN_ID": "42", "GITHUB_RUN_ATTEMPT": "1",
             "RUNNER_TEMP": candidate["root"].as_posix(),
             "ARCHIVE_NAME": ARCHIVE, "ATTESTATION_SUFFIX": ".attestation.jsonl",
             "SIGNER_IDENTITY": f"https://github.com/{REPO}/.github/workflows/_siteops-distribution.yaml@refs/heads/main",
@@ -167,6 +172,9 @@ exec(compile(code, "<workflow>", "exec"), {"__name__": "__main__"})
             "OIDC_ISSUER": "https://token.actions.githubusercontent.com",
             "PREDICATE_TYPE": "https://slsa.dev/provenance/v1",
             "BUILD_ARCHIVE_SHA": digest((candidate["root"] / "release-bundle" / ARCHIVE).read_bytes()),
+            "APPROVED_PLAN_SHA": digest((candidate["root"] / "release-plan" / "plan.json").read_bytes()),
+            "APPROVED_NOTES_SHA": digest((candidate["root"] / "release-notes" / "publish-notes.md").read_bytes()),
+            "APPROVED_BUNDLE_SHA": digest((candidate["root"] / "release-bundle" / ARCHIVE).read_bytes()),
             "TAG": candidate["plan"]["release"]["tag"],
         }
         environment.update(extra or {})
@@ -190,8 +198,10 @@ def test_publication_uses_only_the_completed_candidate_and_required_approval():
     condition = " ".join(JOBS["review"]["if"].split())
     assert "needs.distribution.result == 'success'" in condition
     assert "needs.distribution.result == 'skipped'" in condition
-    assert JOBS["publish"]["needs"] == ["prepare", "distribution", "review"]
-    assert JOBS["publish"]["if"] == "always() && needs.review.result == 'success'"
+    assert JOBS["publish"]["needs"] == "candidate"
+    assert JOBS["publish"]["if"] == "needs.candidate.result == 'success' && needs.candidate.outputs.active == 'true'"
+    assert JOBS["candidate"]["uses"] == "./.github/workflows/_release-candidate.yaml"
+    assert JOBS["candidate"]["with"]["dry-run"] is False
     assert JOBS["publish"]["environment"] == "siteops-release"
     assert JOBS["publish"]["permissions"] == {
         "contents": "write", "actions": "read", "attestations": "read",
@@ -203,11 +213,12 @@ def test_publication_uses_only_the_completed_candidate_and_required_approval():
 
 def test_shared_verification_runs_again_before_any_publication_write():
     names = [item["name"] for item in JOBS["publish"]["steps"]]
-    assert names.index("Verify the pinned candidate") < names.index("Create only the approved missing tag")
+    assert names.index("Verify the approved candidate") < names.index("Create only the approved missing tag")
+    assert names.index("Verify the approved bundle") < names.index("Create only the approved missing tag")
     assert names.index("Check the publication target") < names.index("Create only the approved missing tag")
-    assert step("review", "Verify the pinned candidate") == step("publish", "Verify the pinned candidate")
+    assert step("review", "Check the publication target")["run"] == step("publish", "Check the publication target")["run"]
     assert step("review", "Download the pinned declaration")["with"]["artifact-ids"] == "${{ needs.prepare.outputs.artifact-id }}"
-    assert step("publish", "Download the qualified bundle")["with"]["artifact-ids"] == "${{ needs.distribution.outputs.staging-artifact-id }}"
+    assert step("publish", "Download the qualified bundle")["with"]["artifact-ids"] == "${{ needs.candidate.outputs.bundle-artifact-id }}"
     assert not any("checkout@" in item.get("uses", "") for name in ("review", "publish") for item in JOBS[name]["steps"])
     assert not any("scripts/" in item.get("run", "") for item in JOBS["publish"]["steps"])
 
@@ -251,6 +262,11 @@ def test_approval_preview_discloses_tag_authorization_notes_and_evidence(candida
         extra={
             "ENGINE_VERSION": "1.0.0b1+build.42", "CI_URL": "https://github.com/example/publisher/actions/runs/10",
             "BUNDLE_SHA": "a" * 64, "TAG_EXISTS": "false",
+            "MATRIX": json.dumps([
+                {"python": version, "linux": "passed", "windows": "passed"}
+                for version in ("3.10", "3.11", "3.12", "3.13", "3.14")
+            ]),
+            "ARTIFACT_URL": "https://github.com/example/publisher/actions/runs/42/artifacts/99",
         },
     )
     assert result.returncode == 0, result.stdout + result.stderr
@@ -361,15 +377,16 @@ def test_invalid_or_superseded_candidate_cannot_reach_tag_creation(candidate, ru
         plan["siteops"]["versionMode"] = "source"
     else:
         candidate["responses"][f"repos/{REPO}/contents/releases/candidate/notes.md?ref=refs/heads/main"]["raw"] = "new intent"
-    result, _, calls = runner("publish", "Verify the pinned candidate")
+    result, _, calls = runner("review", "Verify the pinned candidate")
     assert result.returncode != 0
     assert not any("--method" in call for call in calls)
 
 
-@pytest.mark.parametrize("variable", ["FAIL_ATTESTATION", "APPROVED_PLAN_SHA", "APPROVED_BUNDLE_SHA"])
+@pytest.mark.parametrize("variable", ["FAIL_ATTESTATION", "APPROVED_PLAN_SHA", "APPROVED_BUNDLE_SHA", "APPROVED_NOTES_SHA"])
 def test_authentication_and_approved_digest_drift_fail_closed(runner, variable):
     value = "1" if variable == "FAIL_ATTESTATION" else "a" * 64
-    result, _, calls = runner("publish", "Verify the pinned candidate", extra={variable: value})
+    name = "Verify the approved bundle" if variable in {"FAIL_ATTESTATION", "APPROVED_BUNDLE_SHA"} else "Verify the approved candidate"
+    result, _, calls = runner("publish", name, extra={variable: value})
     assert result.returncode != 0
     assert not any("--method" in call for call in calls)
 
@@ -401,7 +418,7 @@ def test_independent_content_uses_released_engine_without_bundle_verification(ca
     candidate["responses"][f"repos/{REPO}/releases/tags/{encoded}"]["body"]["assets"] = [
         {"name": ARCHIVE}, {"name": PROOF},
     ]
-    result, _, _ = runner("publish", "Verify the pinned candidate", extra={"APPROVED_ENGINE_REF": "e" * 40})
+    result, _, _ = runner("publish", "Verify the approved candidate", extra={"APPROVED_ENGINE_ID": "71", "APPROVED_ENGINE_REF": "e" * 40})
     assert result.returncode != 0
 
 
@@ -428,7 +445,7 @@ def test_publication_requires_real_environment_reviewers(candidate, runner, conf
         "status": 200,
         "body": {"protection_rules": [{"type": "required_reviewers", "reviewers": [{"type": "Team"}]}] if configured else []},
     }
-    result, _, _ = runner("review", "Require configured publication reviewers")
+    result, _, _ = runner("prepare", "Require configured publication reviewers")
     assert result.returncode == (0 if configured else 1), result.stdout + result.stderr
 
 
@@ -451,16 +468,99 @@ def test_notes_preview_and_publication_use_identical_rendering(candidate, runner
     assert result.returncode == 0, result.stdout + result.stderr
     notes = (candidate["root"] / "publish-notes.md").read_bytes()
     assert digest(notes) == values["sha256"]
-    result, _, _ = runner(
-        "publish", "Render the final release notes",
-        extra={"ENGINE_VERSION": "1.0.0b1+build.42.1.gcccccccccccc", "APPROVED_NOTES_SHA": values["sha256"]},
-    )
+    (candidate["root"] / "release-notes" / "publish-notes.md").write_bytes(notes)
+    result, _, _ = runner("publish", "Verify the approved candidate", extra={"APPROVED_NOTES_SHA": values["sha256"]})
     assert result.returncode == 0
+    (candidate["root"] / "release-notes" / "publish-notes.md").write_bytes(notes + b"changed")
     result, _, _ = runner(
-        "publish", "Render the final release notes",
-        extra={"ENGINE_VERSION": "different", "APPROVED_NOTES_SHA": values["sha256"]},
+        "publish", "Verify the approved candidate", extra={"APPROVED_NOTES_SHA": values["sha256"]},
     )
     assert result.returncode != 0
+
+
+def test_release_rehearsal_cannot_reach_publishing_permissions():
+    assert "publish" not in CANDIDATE_WORKFLOW["jobs"]
+    for job in CANDIDATE_WORKFLOW["jobs"].values():
+        assert job.get("permissions", {}).get("contents") != "write"
+        assert "environment" not in job
+    assert step("prepare", "Require configured publication reviewers")["if"] == "${{ !inputs.dry-run && steps.plan.outputs.active == 'true' }}"
+    names = [item["name"] for item in JOBS["prepare"]["steps"]]
+    assert names.index("Prepare the immutable declaration") < names.index("Require configured publication reviewers")
+    assert names.index("Require configured publication reviewers") < names.index("Retain the declaration and notes")
+    assert JOBS["distribution"]["with"]["report-summary"] is False
+    text = yaml.safe_dump(CANDIDATE_WORKFLOW)
+    assert "release create" not in text and "--method POST" not in text
+    ci = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yaml").read_text())
+    job = ci["jobs"]["release-rehearsal"]
+    assert job["needs"] == ["lint", "test", "validate"]
+    assert job["with"]["dry-run"] is True
+    assert job["permissions"]["contents"] == "read"
+
+
+@pytest.mark.parametrize("is_dry_run", [True, False])
+def test_example_branch_candidate_is_allowed_only_as_a_dry_run(candidate, runner, is_dry_run):
+    plan = candidate["plan"]
+    ref = "refs/heads/preview"
+    plan["dryRun"] = is_dry_run
+    plan["source"]["ref"] = ref
+    plan["intent"]["path"] = ".github/release-examples/example/release.json"
+    plan["intent"]["notesPath"] = ".github/release-examples/example/notes.md"
+    for revision in (SHA, ref):
+        for name in ("release.json", "notes.md"):
+            candidate["responses"][f"repos/{REPO}/contents/.github/release-examples/example/{name}?ref={revision}"] = dict(
+                candidate["responses"][f"repos/{REPO}/contents/releases/candidate/{name}?ref={SHA}"],
+            )
+    with zipfile.ZipFile(candidate["root"] / "release-bundle" / ARCHIVE, "w") as archive:
+        archive.writestr("bundle.json", json.dumps({
+            "apiVersion": "siteops.install/v1", "kind": "SiteOpsBundle", "source": plan["source"],
+            "build": {"number": 42, "attempt": 1},
+            "package": {"name": "siteops", "version": "1.0.0b1+build.42.1.gcccccccccccc"},
+        }))
+    extra = {"DRY_RUN": str(is_dry_run).lower(), "SOURCE_REF": ref}
+    result, _, _ = runner("review", "Verify the pinned candidate", extra=extra)
+    assert result.returncode == (0 if is_dry_run else 1), result.stdout + result.stderr
+    result, _, calls = runner("publish", "Verify the approved candidate", extra=extra)
+    assert result.returncode != 0
+    assert not any("--method" in call for call in calls)
+
+
+def test_dry_run_uses_completed_ci_jobs_without_waiting_for_its_own_run(candidate, runner):
+    candidate["responses"][f"repos/{REPO}/actions/runs/42/attempts/1/jobs?per_page=100"] = {
+        "status": 200, "body": {"jobs": [
+            {"name": name, "conclusion": "success"} for name in ("Lint", "Unit Tests", "Validate Manifests")
+        ]},
+    }
+    result, output, _ = runner("review", "Require successful CI for the candidate", extra={"DRY_RUN": "true"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert output["url"].endswith("/actions/runs/42")
+    candidate["responses"][f"repos/{REPO}/actions/runs/42/attempts/1/jobs?per_page=100"]["body"]["jobs"].pop()
+    result, _, _ = runner("review", "Require successful CI for the candidate", extra={"DRY_RUN": "true"})
+    assert result.returncode != 0
+
+
+def test_dry_run_summary_stops_at_preview_without_approval_instructions(candidate, runner):
+    candidate["plan"]["dryRun"] = True
+    runner("review", "Render the final release notes", extra={"ENGINE_VERSION": "1.0.0b1+build.42"})
+    result, _, _ = runner(
+        "review", "Show the release approval preview",
+        extra={
+            "DRY_RUN": "true", "ENGINE_VERSION": "1.0.0b1+build.42",
+            "CI_URL": "https://github.com/example/publisher/actions/runs/42",
+            "BUNDLE_SHA": "a" * 64, "TAG_EXISTS": "false",
+            "MATRIX": json.dumps([
+                {"python": version, "linux": "passed", "windows": "passed"}
+                for version in ("3.10", "3.11", "3.12", "3.13", "3.14")
+            ]),
+            "ARTIFACT_URL": "https://github.com/example/publisher/actions/runs/42/artifacts/99",
+        },
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    summary = (candidate["root"].parent / "summary.md").read_text()
+    assert "## Release dry run" in summary
+    assert "No tag, GitHub Release, or approval request was created." in summary
+    assert "Approve and deploy" not in summary
+    assert summary.count("| Python | Linux | Windows |") == 1
+    assert "Download the attested installation bundle" in summary
 
 
 @pytest.mark.parametrize("bundle", [False, True])

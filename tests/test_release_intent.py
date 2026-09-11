@@ -134,6 +134,7 @@ def test_engine_release_matches_literal_source_without_importing(repository: Pat
         "apiVersion": "siteops.release/v1",
         "kind": "ReleaseCandidate",
         "active": True,
+        "dryRun": False,
         "source": {
             "repository": REPOSITORY,
             "commit": source_sha,
@@ -189,6 +190,28 @@ def test_engine_tag_must_exactly_match_the_selected_source_literal(repository: P
 
     with pytest.raises(ReleaseIntentError, match="exactly match"):
         _load(repository, source_sha)
+
+
+def test_committed_example_requires_dry_run_and_is_never_publishable(repository: Path, tmp_path):
+    _write_source_version(repository, '__version__ = "1.0.0b1"\n')
+    example = repository / ".github" / "release-examples" / "preview"
+    example.mkdir(parents=True)
+    (example / "release.json").write_text('{"tag":"v0.0.0.dev0","siteops":{"build":true}}')
+    (example / "notes.md").write_text("Example rehearsal.\n")
+    sha = _commit(repository, "example")
+    path = ".github/release-examples/preview/release.json"
+    with pytest.raises(ReleaseIntentError):
+        _load(repository, sha, path)
+    intent = load_release_intent(repository, sha, path, REPOSITORY, SOURCE_REF, dry_run=True)
+    assert intent.to_dict()["dryRun"] is True
+    output = tmp_path / "dry-result"
+    result = _run_cli(
+        repository, "--repository", REPOSITORY, "--source-sha", sha, "--source-ref", SOURCE_REF,
+        "--intent", path, "--dry-run", "--output-dir", str(output),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads((output / "plan.json").read_text())["dryRun"] is True
+    assert discover_release_intent(repository, ZERO_SHA, sha) is None
 
 
 def test_referenced_engine_tag_has_a_bounded_length(repository: Path):
@@ -568,6 +591,7 @@ def test_inactive_plan_has_the_fixed_null_envelope(repository: Path):
         "apiVersion": "siteops.release/v1",
         "kind": "ReleaseCandidate",
         "active": False,
+        "dryRun": False,
         "source": {
             "repository": REPOSITORY,
             "commit": source_sha,

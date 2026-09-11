@@ -106,8 +106,11 @@ during preview. Neither stream forces a version increment in the other.
 
 `_siteops-distribution.yaml` owns the shared build, signing, and installation
 qualification stages. `siteops-distribution.yaml` is a manual build-only entry.
-CI also exposes an explicitly opted-in `distribution-rehearsal` for feature
-branches. Neither build-only path publishes a release.
+CI also exposes a `rehearsal` choice: `installation` exercises distribution,
+while `release` additionally prepares the read-only candidate preview. Both
+use `expected-source-sha` to assert the selected branch's commit. The release
+choice accepts a committed example without creating an active release request.
+Neither rehearsal publishes a release.
 
 ### Produce a local bundle
 

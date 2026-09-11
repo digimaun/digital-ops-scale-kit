@@ -31,6 +31,11 @@ on:
         required: false
         type: string
         default: build
+      report-summary:
+        description: "Write the aggregate distribution report to the workflow summary."
+        required: false
+        type: boolean
+        default: true
     outputs:
       package-version:
         description: "Exact package version in the qualified bundle."
@@ -53,6 +58,12 @@ on:
       staging-artifact-name:
         description: "Artifact name holding the attested archive and its detached proof."
         value: ${{ jobs.attest.outputs.staging-artifact-name }}
+      staging-artifact-url:
+        description: "Download page for the attested archive and its detached proof."
+        value: ${{ jobs.attest.outputs.staging-artifact-url }}
+      qualification-matrix:
+        description: "Compact JSON results for each supported Python, Linux, and Windows qualification cell."
+        value: ${{ jobs.summary.outputs.qualification-matrix }}
 
 env:
   ARCHIVE_NAME: siteops-install.zip
@@ -237,6 +248,7 @@ jobs:
     outputs:
       staging-artifact-id: ${{ steps.stage.outputs.artifact-id }}
       staging-artifact-name: ${{ steps.names.outputs.staging-artifact-name }}
+      staging-artifact-url: ${{ steps.stage.outputs.artifact-url }}
 
     env:
       EXPECTED_ARCHIVE_SHA256: ${{ needs.build.outputs.archive-sha256 }}
@@ -283,7 +295,7 @@ jobs:
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: ${{ runner.temp }}/siteops-subject/siteops-install.zip
-          show-summary: true
+          show-summary: false
 
       - name: Stage the attested bytes
         shell: bash
@@ -321,27 +333,6 @@ jobs:
           archive: true
           compression-level: 0
           retention-days: 30
-
-      - name: Record the build identity
-        shell: bash
-        env:
-          STAGING_ARTIFACT_ID: ${{ steps.stage.outputs.artifact-id }}
-          STAGING_ARTIFACT_NAME: ${{ steps.names.outputs.staging-artifact-name }}
-        run: |
-          set -euo pipefail
-          {
-            echo "### Site Ops distribution"
-            echo ""
-            echo "| Build identity | Value |"
-            echo "|---|---|"
-            echo "| source-run-id | \`$GITHUB_RUN_ID\` |"
-            echo "| source-run-attempt | \`$GITHUB_RUN_ATTEMPT\` |"
-            echo "| staging-artifact-id | \`$STAGING_ARTIFACT_ID\` |"
-            echo "| staging-artifact-name | \`$STAGING_ARTIFACT_NAME\` |"
-            echo "| expected-source-sha | \`$GITHUB_SHA\` |"
-            echo "| expected-source-ref | \`$GITHUB_REF\` |"
-            echo "| archive-sha256 | \`$EXPECTED_ARCHIVE_SHA256\` |"
-          } >> "$GITHUB_STEP_SUMMARY"
 
   qualify:
     name: Qualify bundle (${{ matrix.os }}, Python ${{ matrix.python }})
@@ -627,21 +618,251 @@ jobs:
           ' "$temp/siteops-verified/bundle.json" "$logs/install.json" "$logs/removal.json"
           echo "The bundle helper installed and removed the selected build."
 
-      - name: Publish the qualification summary
-        if: always()
+  summary:
+    name: Distribution summary
+    needs: [build, attest, qualify]
+    if: always()
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: read
+      actions: read
+
+    outputs:
+      qualification-matrix: ${{ steps.report.outputs.qualification-matrix }}
+
+    steps:
+      - name: Aggregate the distribution result
+        id: report
+        shell: bash
         env:
-          JOB_STATUS: ${{ job.status }}
+          GH_TOKEN: ${{ github.token }}
+          REPORT_SUMMARY: ${{ inputs.report-summary }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          ATTEST_RESULT: ${{ needs.attest.result }}
+          QUALIFY_RESULT: ${{ needs.qualify.result }}
+          PACKAGE_VERSION: ${{ needs.build.outputs.package-version }}
+          ARCHIVE_NAME_VALUE: ${{ needs.build.outputs.archive-name }}
+          ARCHIVE_SHA256: ${{ needs.build.outputs.archive-sha256 }}
+          STAGING_ARTIFACT_ID: ${{ needs.attest.outputs.staging-artifact-id }}
+          STAGING_ARTIFACT_NAME: ${{ needs.attest.outputs.staging-artifact-name }}
+          STAGING_ARTIFACT_URL: ${{ needs.attest.outputs.staging-artifact-url }}
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
-          if [[ "$JOB_STATUS" == "success" ]]; then
-            outcome="The verified bundle installed and removed Site Ops through isolated pipx state."
-          else
-            outcome="Qualification did not complete. Review the failing step."
-          fi
-          {
-            echo "### Site Ops qualification"
-            echo ""
-            echo "- Platform: $RUNNER_OS"
-            echo "- Policy: exact source repository, commit and ref, exact signer identity and digest, GitHub Actions OIDC issuer, SLSA build provenance, GitHub-hosted runner required."
-            echo "- Outcome: $outcome"
-          } >> "$GITHUB_STEP_SUMMARY"
+          umask 077
+          jobs_file="$RUNNER_TEMP/siteops-distribution-jobs.json"
+          jobs_error="$RUNNER_TEMP/siteops-distribution-jobs.err"
+          set +e
+          gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" \
+            > "$jobs_file" 2> "$jobs_error"
+          jobs_api_status=$?
+          set -e
+          export JOBS_API_STATUS="$jobs_api_status"
+
+          python3 - "$jobs_file" <<'PY'
+          import html
+          import json
+          import os
+          import sys
+
+
+          cells = [
+              (python, runner, column)
+              for python in ("3.10", "3.11", "3.12", "3.13", "3.14")
+              for runner, column in (
+                  ("ubuntu-24.04", "linux"),
+                  ("windows-2025", "windows"),
+              )
+          ]
+          pythons = list(dict.fromkeys(python for python, _, _ in cells))
+          expected = {
+              f"Qualify bundle ({runner}, Python {python})": (python, column)
+              for python, runner, column in cells
+          }
+          matches = {(python, column): [] for python, _, column in cells}
+          problem = None
+
+          if os.environ["JOBS_API_STATUS"] != "0":
+              problem = "GitHub job conclusions could not be read."
+              jobs = None
+          else:
+              try:
+                  document = json.loads(open(sys.argv[1], encoding="utf-8").read())
+                  jobs = document.get("jobs")
+                  if not isinstance(jobs, list):
+                      raise ValueError("jobs is not a list")
+              except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                  problem = "GitHub returned an invalid job response."
+                  jobs = None
+
+          if jobs is not None:
+              for job in jobs:
+                  if not isinstance(job, dict) or not isinstance(job.get("name"), str):
+                      continue
+                  cell = expected.get(job["name"].rsplit(" / ", 1)[-1])
+                  if cell is None:
+                      continue
+                  matches[cell].append(job)
+
+          conclusions = {
+              "success": "passed",
+              "failure": "failed",
+              "timed_out": "failed",
+              "startup_failure": "failed",
+              "cancelled": "cancelled",
+              "skipped": "skipped",
+          }
+
+          def cell_status(python, column):
+              if jobs is None:
+                  return "unknown"
+              candidates = matches[(python, column)]
+              if not candidates:
+                  return "not-run"
+              if len(candidates) != 1:
+                  return "unknown"
+              job = candidates[0]
+              if job.get("status") != "completed":
+                  return "unknown"
+              return conclusions.get(job.get("conclusion"), "unknown")
+
+
+          matrix = [
+              {
+                  "python": python,
+                  "linux": cell_status(python, "linux"),
+                  "windows": cell_status(python, "windows"),
+              }
+              for python in pythons
+          ]
+          encoded = json.dumps(matrix, separators=(",", ":"))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("qualification-matrix=" + encoded + "\n")
+
+          if os.environ["REPORT_SUMMARY"].lower() == "true" and problem is None:
+              build = os.environ["BUILD_RESULT"]
+              attest = os.environ["ATTEST_RESULT"]
+              qualify = os.environ["QUALIFY_RESULT"]
+              all_passed = all(
+                  row["linux"] == "passed" and row["windows"] == "passed"
+                  for row in matrix
+              )
+
+              if build != "success":
+                  outcome = (
+                      "The bundle build did not succeed. Review the Build bundle job, "
+                      "correct the failure, and rerun this workflow."
+                  )
+              elif attest != "success":
+                  outcome = (
+                      "The bundle was built, but signing did not succeed. Review the "
+                      "Attest bundle job and rerun after signing succeeds."
+                  )
+              elif qualify != "success" or not all_passed:
+                  outcome = (
+                      "One or more qualification cells did not pass. Open the corresponding "
+                      "Qualify bundle job, correct the failure, and rerun this workflow."
+                  )
+              else:
+                  outcome = (
+                      "All Linux and Windows installation checks passed. The attested "
+                      "bundle is ready for inspection."
+                  )
+
+              def code(value):
+                  return "<code>" + html.escape(value or "not available") + "</code>"
+
+
+              run_url = (
+                  "https://github.com/"
+                  + os.environ["GITHUB_REPOSITORY"]
+                  + "/actions/runs/"
+                  + os.environ["GITHUB_RUN_ID"]
+                  + "/attempts/"
+                  + os.environ["GITHUB_RUN_ATTEMPT"]
+              )
+              lines = [
+                  "## Site Ops distribution",
+                  "",
+                  "Version: " + code(os.environ["PACKAGE_VERSION"]),
+                  "",
+                  outcome + " [Review this run](" + run_url + ").",
+                  "",
+              ]
+              artifact_url = os.environ["STAGING_ARTIFACT_URL"]
+              if artifact_url:
+                  lines.extend(
+                      [
+                          "[Download the attested installation bundle]("
+                          + artifact_url
+                          + ").",
+                          "",
+                          "The Actions download contains the installation ZIP and its detached proof. "
+                          "Verify the installation ZIP before extracting it.",
+                          "",
+                      ]
+                  )
+              else:
+                  lines.extend(
+                      ["The attested installation bundle is not available for download.", ""]
+                  )
+
+              lines.extend(
+                  [
+                      "### Installation qualification",
+                      "",
+                      "| Python | Linux | Windows |",
+                      "|---|---|---|",
+                  ]
+              )
+              lines.extend(
+                  "| " + row["python"] + " | " + row["linux"] + " | " + row["windows"] + " |"
+                  for row in matrix
+              )
+              if any(
+                  status in {"not-run", "unknown"}
+                  for row in matrix
+                  for status in (row["linux"], row["windows"])
+              ):
+                  lines.extend(
+                      [
+                          "",
+                          "`not-run` means no matching qualification job was returned. "
+                          "`unknown` means the job data was incomplete or ambiguous.",
+                      ]
+                  )
+
+              lines.extend(
+                  [
+                      "",
+                      "<details>",
+                      "<summary>Source and artifact details</summary>",
+                      "",
+                      "| Detail | Value |",
+                      "|---|---|",
+                      "| Source SHA | " + code(os.environ["SOURCE_SHA"]) + " |",
+                      "| Source ref | " + code(os.environ["SOURCE_REF"]) + " |",
+                      "| Archive | " + code(os.environ["ARCHIVE_NAME_VALUE"]) + " |",
+                      "| Archive SHA-256 | " + code(os.environ["ARCHIVE_SHA256"]) + " |",
+                      "| Run attempt | " + code(os.environ["GITHUB_RUN_ATTEMPT"]) + " |",
+                      "| Artifact ID | " + code(os.environ["STAGING_ARTIFACT_ID"]) + " |",
+                      "| Artifact name | " + code(os.environ["STAGING_ARTIFACT_NAME"]) + " |",
+                      "",
+                      "</details>",
+                      "",
+                  ]
+              )
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as output:
+                  output.write("\n".join(lines))
+
+          if problem is not None:
+              print("::error::" + problem)
+              raise SystemExit(1)
+          if os.environ["QUALIFY_RESULT"] == "success" and any(
+              row["linux"] != "passed" or row["windows"] != "passed" for row in matrix
+          ):
+              raise SystemExit("::error::GitHub did not return a complete successful qualification matrix.")
+          PY

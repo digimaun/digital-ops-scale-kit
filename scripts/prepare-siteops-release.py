@@ -28,6 +28,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--source-sha", required=True)
     parser.add_argument("--source-ref", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--dry-run", action="store_true", help="Prepare a non-publishable rehearsal, allowing committed examples.")
     selection = parser.add_mutually_exclusive_group(required=True)
     selection.add_argument("--intent")
     selection.add_argument("--before-sha")
@@ -62,6 +63,8 @@ def main() -> int:
             raise ReleaseIntentError("--output-dir must be an absolute path.")
         if os.path.lexists(output_dir):
             raise ReleaseIntentError("The output directory already exists.")
+        if args.dry_run and not args.intent:
+            raise ReleaseIntentError("A dry run requires an explicit --intent.")
 
         intent_path = args.intent
         if intent_path is None:
@@ -83,6 +86,7 @@ def main() -> int:
                 intent_path,
                 args.repository,
                 args.source_ref,
+                dry_run=args.dry_run,
             )
             plan = intent.to_dict()
             notes = intent.notes

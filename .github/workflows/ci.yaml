@@ -15,6 +15,7 @@ on:
       - "releases/**/notes.md"
       - ".github/workflows/**"
       - ".github/actions/**"
+      - ".github/release-examples/**"
   pull_request:
     branches: [main]
     paths:
@@ -27,18 +28,25 @@ on:
       - "releases/**/notes.md"
       - ".github/workflows/**"
       - ".github/actions/**"
+      - ".github/release-examples/**"
   workflow_dispatch:
     inputs:
-      distribution-rehearsal:
-        description: "Also build, attest, and qualify Site Ops. Creates signed artifacts, not a release."
-        type: boolean
+      rehearsal:
+        description: "Optional rehearsal. Neither option creates a tag or publishes a release."
+        type: choice
         required: false
-        default: false
-      distribution-source-sha:
-        description: "Required for distribution rehearsal. Full expected source commit."
+        options: [none, installation, release]
+        default: none
+      expected-source-sha:
+        description: "Required for a rehearsal. Full expected commit of the selected branch."
         type: string
         required: false
         default: ""
+      release-intent:
+        description: "Release rehearsal only. Use the example or a committed releases/<name>/release.json."
+        type: string
+        required: false
+        default: .github/release-examples/combined-preview/release.json
 
 permissions:
   contents: read
@@ -46,10 +54,25 @@ permissions:
 jobs:
   distribution-rehearsal:
     name: Rehearse distribution
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.distribution-rehearsal }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'installation' }}
     uses: ./.github/workflows/_siteops-distribution.yaml
     with:
-      expected-source-sha: ${{ inputs.distribution-source-sha }}
+      expected-source-sha: ${{ inputs.expected-source-sha }}
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+
+  release-rehearsal:
+    name: Rehearse release
+    needs: [lint, test, validate]
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'release' }}
+    uses: ./.github/workflows/_release-candidate.yaml
+    with:
+      expected-source-sha: ${{ inputs.expected-source-sha }}
+      intent: ${{ inputs.release-intent }}
+      dry-run: true
     permissions:
       contents: read
       actions: read

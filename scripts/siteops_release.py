@@ -67,6 +67,7 @@ class ReleaseIntent:
     base_version: str | None
     release_tag: str | None
     notes: str
+    dry_run: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Return the stable release candidate plan."""
@@ -74,6 +75,7 @@ class ReleaseIntent:
             "apiVersion": _API_VERSION,
             "kind": _KIND,
             "active": True,
+            "dryRun": self.dry_run,
             "source": {
                 "repository": self.repository,
                 "commit": self.source_sha,
@@ -108,13 +110,15 @@ def load_release_intent(
     intent_path: str,
     repository: str,
     source_ref: str,
+    *,
+    dry_run: bool = False,
 ) -> ReleaseIntent:
     """Load and validate one release declaration from the selected commit."""
     repository_root = _repository_root(root)
     source_sha = _require_commit(repository_root, source_sha, "source SHA")
     repository = _validate_repository(repository)
     source_ref = _validate_source_ref(source_ref)
-    intent_path = _validate_intent_path(intent_path)
+    intent_path = _validate_intent_path(intent_path, allow_example=dry_run)
     notes_path = intent_path.removesuffix("release.json") + "notes.md"
 
     declaration_bytes = _read_tree_blob(
@@ -220,6 +224,7 @@ def load_release_intent(
         base_version=base_version,
         release_tag=release_tag,
         notes=notes,
+        dry_run=dry_run,
     )
 
 
@@ -279,6 +284,7 @@ def inactive_release_plan(
         "apiVersion": _API_VERSION,
         "kind": _KIND,
         "active": False,
+        "dryRun": False,
         "source": {
             "repository": repository,
             "commit": source_sha,
@@ -401,12 +407,15 @@ def _validate_source_ref(value: str) -> str:
     return value
 
 
-def _validate_intent_path(value: str) -> str:
+def _validate_intent_path(value: str, *, allow_example: bool = False) -> str:
     if type(value) is not str or "\\" in value or len(value) > 256:
         raise ReleaseIntentError(
             "The intent path must be releases/<name>/release.json."
         )
     parts = value.split("/")
+    if allow_example and len(parts) == 4 and parts[:2] == [".github", "release-examples"]:
+        _validate_intent_path("/".join(["releases", *parts[2:]]))
+        return value
     if len(parts) != 3 or parts[0] != "releases" or parts[2] != "release.json":
         raise ReleaseIntentError(
             "The intent path must be releases/<name>/release.json."

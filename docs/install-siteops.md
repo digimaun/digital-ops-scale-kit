@@ -42,8 +42,15 @@ operations you later select.
 
 Releases with an installation bundle include an **Install Site Ops** section.
 Its download links and Windows/Linux commands already identify that release.
-Use those commands instead of assembling the verification values yourself.
-The examples below explain the same verification policy.
+Those commands download both assets into a new private folder, so you can run
+them from any directory. Use them instead of assembling verification values
+yourself.
+
+### Install from manually downloaded files
+
+The steps below cover files you downloaded yourself, including an Actions
+artifact used before a release is published. Unlike the release-page commands,
+these examples assume both files are already in your current directory.
 
 1. Open the [official releases](https://github.com/Azure/digital-ops-scale-kit/releases)
    and select an explicit release.

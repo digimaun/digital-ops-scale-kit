@@ -1,6 +1,7 @@
 """Exercise the declaration-driven publisher through its actual workflow steps."""
 
 import hashlib
+import io
 import json
 import os
 import re
@@ -8,8 +9,10 @@ import shutil
 import subprocess
 import sys
 import urllib.parse
+import urllib.request
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -627,9 +630,16 @@ def test_install_notes_bind_downloads_and_commands_to_the_selected_release(candi
         assert "--deny-self-hosted-runners" in block and "--signer-repo" not in block
         assert "GH_TOKEN" not in block and "--custom-trusted-root" not in block
         assert "curl" not in block
+        for unsafe in ("SkipCertificateCheck", "AllowInsecureRedirect", "AllowUnencryptedAuthentication", "_create_unverified_context"):
+            assert unsafe not in block
+        assert downloads_url(tag) in block
         assert block.index("gh attestation verify") < block.index("install.py")
     assert "pipx 1.17.2" in notes and "GitHub CLI 2.95.0" in notes
     assert "CPython 3.10-3.14" in notes and "glibc 2.17" in notes
+
+
+def downloads_url(tag):
+    return f"https://github.com/{REPO}/releases/download/{urllib.parse.quote(tag, safe='')}/{ARCHIVE}"
 
 
 def test_content_only_install_notes_link_to_the_engine_release_without_wrong_source_commands(candidate, runner):
@@ -643,12 +653,15 @@ def test_content_only_install_notes_link_to_the_engine_release_without_wrong_sou
 
 
 @pytest.mark.parametrize(
-    ("verify_exit", "extract_exit", "install_exit", "expected"),
-    [(0, 0, 0, ["verify", "extract", "install"]),
-     (9, 0, 0, ["verify"]), (0, 7, 0, ["verify", "extract"]), (0, 0, 8, ["verify", "extract", "install"])],
+    ("download_exit", "verify_exit", "extract_exit", "install_exit", "expected"),
+    [(0, 0, 0, 0, ["download", "verify", "extract", "install"]),
+     (7, 0, 0, 0, ["download"]),
+     (0, 9, 0, 0, ["download", "verify"]),
+     (0, 0, 7, 0, ["download", "verify", "extract"]),
+     (0, 0, 0, 8, ["download", "verify", "extract", "install"])],
 )
 def test_generated_linux_install_commands_gate_extraction_and_installation(
-    candidate, runner, tmp_path, verify_exit, extract_exit, install_exit, expected,
+    candidate, runner, tmp_path, download_exit, verify_exit, extract_exit, install_exit, expected,
 ):
     block = _installation_block(_render_install_notes(candidate, runner), "bash")
     phases, arguments = tmp_path / "phases.log", tmp_path / "verify-args.log"
@@ -660,6 +673,15 @@ gh() {
 }
 mkdir() { return 0; }
 python3() {
+    if [[ "$1" == "-c" && "$2" == *mkdtemp* ]]; then
+        printf '%s\\n' "$PRIVATE_WORK"
+        return 0
+    fi
+    if [[ "$1" == "-c" ]]; then
+        printf '%s\\n' download >> "$PHASES"
+        printf '%s\\n' "${@:3}" > "$DOWNLOAD_ARGS"
+        return "$DOWNLOAD_EXIT"
+    fi
     if [[ "$*" == *zipfile* ]]; then
         printf '%s\\n' extract >> "$PHASES"
         return "$EXTRACT_EXIT"
@@ -670,27 +692,55 @@ python3() {
 """
     result = _run_script(stubs + block, tmp_path, {
         "PHASES": bash_path(phases), "VERIFY_ARGS": bash_path(arguments),
+        "PRIVATE_WORK": bash_path(tmp_path / "private download"),
+        "DOWNLOAD_ARGS": bash_path(tmp_path / "download-args.log"),
+        "DOWNLOAD_EXIT": str(download_exit),
         "VERIFY_EXIT": str(verify_exit), "EXTRACT_EXIT": str(extract_exit), "INSTALL_EXIT": str(install_exit),
     })
-    assert (result.returncode == 0) is (verify_exit == extract_exit == install_exit == 0)
+    assert (result.returncode == 0) is (download_exit == verify_exit == extract_exit == install_exit == 0)
     assert phases.read_text().splitlines() == expected
-    args = arguments.read_text().splitlines()
-    assert args[:3] == ["attestation", "verify", "./siteops-install.zip"]
-    assert args[args.index("--source-digest") + 1] == SHA
+    download_args = (tmp_path / "download-args.log").read_text().splitlines()
+    assert download_args == [
+        bash_path(tmp_path / "private download"), ARCHIVE, downloads_url("v1.0.0b8"),
+        PROOF, downloads_url("v1.0.0b8") + ".attestation.jsonl",
+    ]
+    if "verify" in expected:
+        args = arguments.read_text().splitlines()
+        assert args[:3] == ["attestation", "verify", bash_path(tmp_path / "private download" / ARCHIVE)]
+        assert args[args.index("--source-digest") + 1] == SHA
+    else:
+        assert not arguments.exists()
 
 
 @pytest.mark.skipif(not shutil.which("pwsh"), reason="PowerShell command coverage requires an installed PowerShell.")
 @pytest.mark.parametrize(
-    ("verify_exit", "extract_exit", "install_exit", "expected"),
-    [(0, 0, 0, ["verify", "extract", "install"]),
-     (9, 0, 0, ["verify"]), (0, 7, 0, ["verify", "extract"]), (0, 0, 8, ["verify", "extract", "install"])],
+    ("download_failure", "verify_exit", "extract_exit", "install_exit", "scheme", "expected"),
+    [(0, 0, 0, 0, "https", ["download", "download", "verify", "extract", "install"]),
+     (1, 0, 0, 0, "https", ["download"]), (2, 0, 0, 0, "https", ["download", "download"]),
+     (0, 9, 0, 0, "https", ["download", "download", "verify"]),
+     (0, 0, 7, 0, "https", ["download", "download", "verify", "extract"]),
+     (0, 0, 0, 8, "https", ["download", "download", "verify", "extract", "install"]),
+     (0, 0, 0, 0, "http", ["download"])],
 )
 def test_generated_powershell_install_commands_gate_extraction_and_installation(
-    candidate, runner, tmp_path, verify_exit, extract_exit, install_exit, expected,
+    candidate, runner, tmp_path, download_failure, verify_exit, extract_exit, install_exit, scheme, expected,
 ):
     block = _installation_block(_render_install_notes(candidate, runner), "powershell")
     phases, arguments = tmp_path / "phases.log", tmp_path / "verify-args.json"
     stubs = """
+$script:downloadNumber = 0
+function Invoke-WebRequest {
+    param([uri]$Uri, [string]$OutFile, [switch]$UseBasicParsing, [switch]$PassThru, [int]$TimeoutSec, [int]$MaximumRedirection)
+    Add-Content -LiteralPath $env:PHASES -Encoding utf8 -Value 'download'
+    Add-Content -LiteralPath $env:DOWNLOAD_URLS -Encoding utf8 -Value $Uri.AbsoluteUri
+    if (-not $UseBasicParsing -or -not $PassThru -or $TimeoutSec -ne 60 -or $MaximumRedirection -ne 5) {
+        throw 'Missing download safety controls'
+    }
+    $script:downloadNumber++
+    if ($env:DOWNLOAD_FAILURE -eq [string]$script:downloadNumber) { throw 'Synthetic download failure' }
+    $final = [uri]($env:RESPONSE_SCHEME + '://example.invalid/download')
+    return [pscustomobject]@{BaseResponse=[pscustomobject]@{RequestMessage=[pscustomobject]@{RequestUri=$final}}}
+}
 function gh {
     Add-Content -LiteralPath $env:PHASES -Encoding utf8 -Value 'verify'
     ConvertTo-Json -InputObject @($args) -Compress | Set-Content -LiteralPath $env:VERIFY_ARGS -Encoding utf8
@@ -709,13 +759,66 @@ function python {
         [shutil.which("pwsh"), "-NoProfile", "-NonInteractive", "-Command", stubs + block],
         cwd=tmp_path, capture_output=True, text=True, timeout=60,
         env={**os.environ, "PHASES": str(phases), "VERIFY_ARGS": str(arguments),
-             "VERIFY_EXIT": str(verify_exit), "EXTRACT_EXIT": str(extract_exit), "INSTALL_EXIT": str(install_exit)},
+             "VERIFY_EXIT": str(verify_exit), "EXTRACT_EXIT": str(extract_exit), "INSTALL_EXIT": str(install_exit),
+             "DOWNLOAD_FAILURE": str(download_failure), "DOWNLOAD_URLS": str(tmp_path / "downloads.log"),
+             "RESPONSE_SCHEME": scheme,
+             "TMP": str(tmp_path), "TEMP": str(tmp_path), "TMPDIR": str(tmp_path)},
     )
-    assert (result.returncode == 0) is (verify_exit == extract_exit == install_exit == 0), result.stdout + result.stderr
+    assert (result.returncode == 0) is (
+        download_failure == verify_exit == extract_exit == install_exit == 0 and scheme == "https"
+    ), result.stdout + result.stderr
     assert phases.read_text(encoding="utf-8-sig").splitlines() == expected
-    args = json.loads(arguments.read_text(encoding="utf-8-sig"))
-    assert args[:3] == ["attestation", "verify", ".\\siteops-install.zip"]
-    assert args[args.index("--source-digest") + 1] == SHA
+    urls = (tmp_path / "downloads.log").read_text(encoding="utf-8-sig").splitlines()
+    assert urls[0] == downloads_url("v1.0.0b8")
+    if len(urls) == 2:
+        assert urls[1] == downloads_url("v1.0.0b8") + ".attestation.jsonl"
+    if "verify" in expected:
+        args = json.loads(arguments.read_text(encoding="utf-8-sig"))
+        assert args[:2] == ["attestation", "verify"]
+        assert Path(args[2]).name == ARCHIVE
+        assert Path(args[2]).is_absolute()
+        assert Path(args[2]).parent.parent == tmp_path
+        assert args[args.index("--source-digest") + 1] == SHA
+    else:
+        assert not arguments.exists()
+
+
+def test_generated_python_downloader_uses_verified_tls_and_rejects_https_downgrades(
+    candidate, runner, tmp_path, monkeypatch,
+):
+    block = _installation_block(_render_install_notes(candidate, runner), "bash")
+    programs = re.findall(r"python3 -c '([^']*)'", block)
+    program = next(value for value in programs if "HTTPSRedirect" in value)
+    handlers = []
+    requested = []
+
+    class Response(io.BytesIO):
+        def geturl(self):
+            return "https://release-assets.githubusercontent.com/example"
+
+    def open_url(url, *, timeout):
+        assert timeout == 60
+        requested.append(url)
+        return Response(b"downloaded bytes")
+
+    def opener(handler):
+        handlers.append(handler)
+        return SimpleNamespace(open=open_url)
+
+    monkeypatch.setattr(urllib.request, "build_opener", opener)
+    work = tmp_path / "downloads"
+    work.mkdir()
+    monkeypatch.setattr(sys, "argv", [
+        "-c", str(work), ARCHIVE, downloads_url("v1.0.0b8"),
+        PROOF, downloads_url("v1.0.0b8") + ".attestation.jsonl",
+    ])
+    exec(compile(program, "<generated-download>", "exec"), {"__name__": "__main__"})
+    assert len(requested) == 2 and all(url.startswith("https://") for url in requested)
+    assert (work / ARCHIVE).read_bytes() == (work / PROOF).read_bytes() == b"downloaded bytes"
+    assert handlers[0].max_redirections == 5
+    with pytest.raises(ValueError, match="HTTPS"):
+        handlers[0].redirect_request(None, None, 302, "", {}, "http://example.invalid/file")
+    assert "SSLContext" not in program and "ssl" not in program
 
 
 @pytest.mark.parametrize(

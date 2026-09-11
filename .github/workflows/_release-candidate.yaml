@@ -468,7 +468,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 -c '
-          import hashlib, json, os, sys, urllib.parse
+          import hashlib, json, os, shlex, sys, urllib.parse
           from pathlib import Path
           root = Path(sys.argv[1])
           plan = json.loads((root / "release-plan/plan.json").read_text())
@@ -494,12 +494,10 @@ jobs:
               notes += "and GitHub CLI 2.95.0 or newer. Use Windows x64 or Linux x64 with glibc 2.17 or newer.\n\n"
               notes += "Obtain prerequisites through trusted managed channels. "
               notes += "[Installation guide](" + guide + ") covers setup, PATH, replacement, and removal.\n\n"
-              notes += "1. Download [" + archive + "](" + downloads + archive + ") and "
-              notes += "[" + proof + "](" + downloads + proof + ") into one private folder.\n"
-              notes += "2. Open your terminal in that folder and run the commands for your platform below.\n\n"
-              notes += "Use these two assets, not the generated Source code archives. "
-              notes += "Verification must succeed before the installation ZIP is extracted. "
-              notes += "Use a new extraction directory and run as your ordinary user.\n\n"
+              notes += "Run the block for your platform from any directory. It downloads both assets into a new private folder, "
+              notes += "verifies the installation ZIP, then extracts and installs it. Run as your ordinary user.\n\n"
+              notes += "Direct downloads for inspection or manual installation: [" + archive + "](" + downloads + archive + ") and "
+              notes += "[" + proof + "](" + downloads + proof + "). Use these assets, not the generated Source code archives.\n\n"
 
               identity = home + "/.github/workflows/_siteops-distribution.yaml@" + source["ref"]
               flags = [
@@ -512,10 +510,10 @@ jobs:
                   ("--predicate-type", os.environ["PREDICATE_TYPE"]),
               ]
 
-              def verify_command(prefix, continuation):
+              def verify_command(continuation):
                   lines = [
-                      "gh attestation verify " + prefix + archive + " " + continuation,
-                      "  --bundle " + prefix + proof + " " + continuation,
+                      "gh attestation verify \"$archive\" " + continuation,
+                      "  --bundle \"$proof\" " + continuation,
                   ]
                   lines += [
                       "  " + option + " \"" + value + "\" " + continuation
@@ -525,25 +523,63 @@ jobs:
 
               windows = "\n".join([
                   "$ErrorActionPreference = \"Stop\"",
-                  verify_command(".\\", "`"),
+                  "function Get-ReleaseAsset([uri]$uri, [string]$path) {",
+                  "    if ($uri.Scheme -ne \"https\") { throw \"Only HTTPS downloads are allowed.\" }",
+                  "    $response = Invoke-WebRequest -Uri $uri -OutFile $path -UseBasicParsing -PassThru -TimeoutSec 60 -MaximumRedirection 5",
+                  "    $request = $response.BaseResponse.PSObject.Properties[\"RequestMessage\"]",
+                  "    $final = if ($null -ne $request) { $request.Value.RequestUri } else { $response.BaseResponse.ResponseUri }",
+                  "    if ($final.Scheme -ne \"https\") { throw \"The download redirected outside HTTPS.\" }",
+                  "}",
+                  "$work = Join-Path ([IO.Path]::GetTempPath()) (\"siteops-install-\" + [guid]::NewGuid().ToString(\"N\"))",
+                  "New-Item -ItemType Directory -Path $work | Out-Null",
+                  "Write-Host \"Download folder: $work\"",
+                  "$archive = Join-Path $work \"" + archive + "\"",
+                  "$proof = Join-Path $work \"" + proof + "\"",
+                  "Get-ReleaseAsset \"" + downloads + archive + "\" $archive",
+                  "Get-ReleaseAsset \"" + downloads + proof + "\" $proof",
+                  verify_command("`"),
                   "if ($LASTEXITCODE -ne 0) {",
                   "    throw \"Verification failed. Do not extract or install.\"",
                   "}",
-                  "Expand-Archive -LiteralPath .\\" + archive + " -DestinationPath .\\siteops-bundle",
-                  "python -B .\\siteops-bundle\\install.py",
+                  "Expand-Archive -LiteralPath $archive -DestinationPath (Join-Path $work \"siteops-bundle\")",
+                  "python -B (Join-Path $work \"siteops-bundle\\install.py\")",
                   "if ($LASTEXITCODE -ne 0) {",
                   "    throw \"Installation did not complete. Follow the reported guidance.\"",
                   "}",
               ])
               windows = "& {\n" + "\n".join("    " + line for line in windows.splitlines()) + "\n}"
+              download_program = "\n".join([
+                  "import pathlib, shutil, sys, urllib.parse, urllib.request",
+                  "class HTTPSRedirect(urllib.request.HTTPRedirectHandler):",
+                  "    max_redirections = 5",
+                  "    def redirect_request(self, req, fp, code, msg, headers, newurl):",
+                  "        if urllib.parse.urlsplit(newurl).scheme != \"https\":",
+                  "            raise ValueError(\"Only HTTPS redirects are allowed.\")",
+                  "        return super().redirect_request(req, fp, code, msg, headers, newurl)",
+                  "opener = urllib.request.build_opener(HTTPSRedirect())",
+                  "root = pathlib.Path(sys.argv[1])",
+                  "for name, url in ((sys.argv[2], sys.argv[3]), (sys.argv[4], sys.argv[5])):",
+                  "    if urllib.parse.urlsplit(url).scheme != \"https\":",
+                  "        raise ValueError(\"Only HTTPS downloads are allowed.\")",
+                  "    with opener.open(url, timeout=60) as response, (root / name).open(\"xb\") as target:",
+                  "        if urllib.parse.urlsplit(response.geturl()).scheme != \"https\":",
+                  "            raise ValueError(\"The download redirected outside HTTPS.\")",
+                  "        shutil.copyfileobj(response, target)",
+              ])
+              temp_program = "import tempfile; print(tempfile.mkdtemp(prefix=\"siteops-install-\"))"
               linux = "\n".join([
                   "(",
                   "set -eu",
                   "umask 077",
-                  verify_command("./", "\\"),
-                  "mkdir ./siteops-bundle",
-                  "python3 -B -m zipfile -e ./" + archive + " ./siteops-bundle",
-                  "python3 -B ./siteops-bundle/install.py",
+                  "work=\"$(python3 -c " + shlex.quote(temp_program) + ")\"",
+                  "echo \"Download folder: $work\"",
+                  "archive=\"$work/" + archive + "\"",
+                  "proof=\"$work/" + proof + "\"",
+                  "python3 -c " + shlex.quote(download_program) + " \"$work\" \"" + archive + "\" \"" + downloads + archive + "\" \"" + proof + "\" \"" + downloads + proof + "\"",
+                  verify_command("\\"),
+                  "mkdir \"$work/siteops-bundle\"",
+                  "python3 -B -m zipfile -e \"$archive\" \"$work/siteops-bundle\"",
+                  "python3 -B \"$work/siteops-bundle/install.py\"",
                   ")",
               ])
               for title, language, commands in (
@@ -554,6 +590,8 @@ jobs:
                   notes += "```" + language + "\n" + commands + "\n```\n\n</details>\n\n"
               notes += "Follow any PATH guidance, then use `siteops --version` and `siteops --help`. "
               notes += "Selecting a different existing pipx build requires an explicit `--replace`.\n\n"
+              notes += "After successful installation, the printed download folder can be removed. "
+              notes += "The installer retains the files pipx needs in its separate installation-data directory.\n\n"
               notes += "Verification reads the downloaded proof locally. Trusted-root refresh may use the network. "
               notes += "Installing the CLI does not authenticate to Azure or deploy resources.\n"
           raw = notes.encode("utf-8")
@@ -704,6 +742,6 @@ jobs:
                   output.write("Next: select Review deployments, then siteops-release, then Approve and deploy.\n")
                   output.write("Approval authorizes the listed tag action at this commit and publication of these release assets.\n")
               if engine["bundle"]:
-                  output.write("\nThe release download links below become available after publication. For a preview, use the Actions download above.\n")
+                  output.write("\nThe download-and-install commands below are for the published release. To try a candidate before publication, use the Actions download above and the installation guide for manually downloaded files.\n")
               output.write("\n## Release notes\n\n" + embedded_notes((root.parent / "publish-notes.md").read_text(encoding="utf-8")) + "\n")
           ' "$RUNNER_TEMP/release-plan"

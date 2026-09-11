@@ -74,6 +74,13 @@ releases/<name>/notes.md
 Markdown release notes. The tag defines the release version. The folder name
 identifies the record, rather than providing another version setting.
 
+Write the changes and release-specific guidance in `notes.md`. The workflow
+adds **Install Site Ops** automatically: prerequisites, exact release downloads,
+and complete Windows/PowerShell and Linux/Bash verification and installation
+commands. A content-only release links to its independently published engine.
+There is no need to copy installation commands, source hashes, or download URLs
+into the authored notes.
+
 | Location | Purpose |
 |---|---|
 | `.github/release-examples/<name>/` | Safe examples accepted only by previews |
@@ -203,9 +210,14 @@ release file or notes requires a fresh candidate and approval.
 
 The approval summary shows the tag, source commit, version stream, engine
 selection, bundle digest when applicable, tag action, and final release notes.
+The summary nests the note headings beneath **Release notes**. Published notes
+retain their authored Markdown heading levels. Installation commands are
+included in the final notes before approval and remain bound to that approval.
 You may download the attested installation artifact for a hands-on trial.
 Authenticate the installation ZIP before extracting or running its contents,
 following [the installation guide](install-siteops.md).
+The generated release-asset links become available only after publication.
+For a candidate preview, use the Actions artifact download above the notes.
 
 CI and engine installation qualification are automated. For content releases,
 the reviewer must also confirm the applicable content/AIO evidence and any

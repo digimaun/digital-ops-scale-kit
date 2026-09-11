@@ -40,6 +40,11 @@ operations you later select.
 
 ## Select and authenticate a release
 
+Releases with an installation bundle include an **Install Site Ops** section.
+Its download links and Windows/Linux commands already identify that release.
+Use those commands instead of assembling the verification values yourself.
+The examples below explain the same verification policy.
+
 1. Open the [official releases](https://github.com/Azure/digital-ops-scale-kit/releases)
    and select an explicit release.
 2. Confirm its tag and full source commit in the official repository. Keep

@@ -2,7 +2,9 @@
 
 import hashlib
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 import urllib.parse
@@ -12,7 +14,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from tests.shell_helpers import write_executable
+from tests.shell_helpers import bash_path, write_executable
 from tests.test_distribution_workflows import _run_script
 from tests.test_release_intent import CLI, _commit, _write_record, _write_source_version
 from tests.test_release_intent import repository as repository
@@ -582,11 +584,175 @@ def test_dry_run_summary_stops_at_preview_without_approval_instructions(candidat
     )
     assert result.returncode == 0, result.stdout + result.stderr
     summary = (candidate["root"].parent / "summary.md").read_text()
-    assert "## Release preview (no publication)" in summary
+    assert summary.startswith("# Release preview (no publication)")
     assert "No tag, GitHub Release, or approval request was created." in summary
     assert "Approve and deploy" not in summary
     assert summary.count("| Python | Linux | Windows |") == 1
     assert "Download the attested installation bundle" in summary
+
+
+def _render_install_notes(candidate, runner):
+    result, values, _ = runner(
+        "review", "Render the final release notes",
+        extra={"ENGINE_VERSION": "1.0.0b1+build.42.1.gcccccccccccc"},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    notes = (candidate["root"] / "publish-notes.md").read_text(encoding="utf-8")
+    assert values["sha256"] == digest(notes.encode())
+    return notes
+
+
+def _installation_block(notes, language):
+    match = re.search(r"```" + language + r"\n(.*?)\n```", notes, re.DOTALL)
+    assert match is not None
+    return match[1]
+
+
+@pytest.mark.parametrize("tag", ["v1.0.0b8", "siteops/v1.1.0"])
+def test_install_notes_bind_downloads_and_commands_to_the_selected_release(candidate, runner, tag):
+    candidate["plan"]["release"]["tag"] = tag
+    candidate["plan"]["release"]["stream"] = "siteops" if tag.startswith("siteops/") else "scalekit"
+    notes = _render_install_notes(candidate, runner)
+    assert notes.count("## Install Site Ops") == 1
+    assert f"https://github.com/{REPO}/releases/download/{urllib.parse.quote(tag, safe='')}/{ARCHIVE}" in notes
+    assert f"https://github.com/{REPO}/blob/{SHA}/docs/install-siteops.md" in notes
+    for language in ("powershell", "bash"):
+        block = _installation_block(notes, language)
+        for flag, value in (
+            ("--repo", REPO), ("--source-digest", SHA), ("--signer-digest", SHA),
+            ("--source-ref", "refs/heads/main"),
+            ("--cert-identity", f"https://github.com/{REPO}/.github/workflows/_siteops-distribution.yaml@refs/heads/main"),
+        ):
+            assert f'{flag} "{value}"' in block
+        assert "--deny-self-hosted-runners" in block and "--signer-repo" not in block
+        assert "GH_TOKEN" not in block and "--custom-trusted-root" not in block
+        assert "curl" not in block
+        assert block.index("gh attestation verify") < block.index("install.py")
+    assert "pipx 1.17.2" in notes and "GitHub CLI 2.95.0" in notes
+    assert "CPython 3.10-3.14" in notes and "glibc 2.17" in notes
+
+
+def test_content_only_install_notes_link_to_the_engine_release_without_wrong_source_commands(candidate, runner):
+    candidate["plan"]["siteops"] = {
+        "bundle": False, "versionMode": None, "baseVersion": None, "releaseTag": "siteops/v1.0.0",
+    }
+    notes = _render_install_notes(candidate, runner)
+    assert f"https://github.com/{REPO}/releases/tag/siteops%2Fv1.0.0" in notes
+    assert "its own source commit" in notes
+    assert "gh attestation verify" not in notes and "releases/download/" not in notes
+
+
+@pytest.mark.parametrize(
+    ("verify_exit", "extract_exit", "install_exit", "expected"),
+    [(0, 0, 0, ["verify", "extract", "install"]),
+     (9, 0, 0, ["verify"]), (0, 7, 0, ["verify", "extract"]), (0, 0, 8, ["verify", "extract", "install"])],
+)
+def test_generated_linux_install_commands_gate_extraction_and_installation(
+    candidate, runner, tmp_path, verify_exit, extract_exit, install_exit, expected,
+):
+    block = _installation_block(_render_install_notes(candidate, runner), "bash")
+    phases, arguments = tmp_path / "phases.log", tmp_path / "verify-args.log"
+    stubs = """
+gh() {
+    printf '%s\\n' verify >> "$PHASES"
+    printf '%s\\n' "$@" > "$VERIFY_ARGS"
+    return "$VERIFY_EXIT"
+}
+mkdir() { return 0; }
+python3() {
+    if [[ "$*" == *zipfile* ]]; then
+        printf '%s\\n' extract >> "$PHASES"
+        return "$EXTRACT_EXIT"
+    fi
+    printf '%s\\n' install >> "$PHASES"
+    return "$INSTALL_EXIT"
+}
+"""
+    result = _run_script(stubs + block, tmp_path, {
+        "PHASES": bash_path(phases), "VERIFY_ARGS": bash_path(arguments),
+        "VERIFY_EXIT": str(verify_exit), "EXTRACT_EXIT": str(extract_exit), "INSTALL_EXIT": str(install_exit),
+    })
+    assert (result.returncode == 0) is (verify_exit == extract_exit == install_exit == 0)
+    assert phases.read_text().splitlines() == expected
+    args = arguments.read_text().splitlines()
+    assert args[:3] == ["attestation", "verify", "./siteops-install.zip"]
+    assert args[args.index("--source-digest") + 1] == SHA
+
+
+@pytest.mark.skipif(not shutil.which("pwsh"), reason="PowerShell command coverage requires an installed PowerShell.")
+@pytest.mark.parametrize(
+    ("verify_exit", "extract_exit", "install_exit", "expected"),
+    [(0, 0, 0, ["verify", "extract", "install"]),
+     (9, 0, 0, ["verify"]), (0, 7, 0, ["verify", "extract"]), (0, 0, 8, ["verify", "extract", "install"])],
+)
+def test_generated_powershell_install_commands_gate_extraction_and_installation(
+    candidate, runner, tmp_path, verify_exit, extract_exit, install_exit, expected,
+):
+    block = _installation_block(_render_install_notes(candidate, runner), "powershell")
+    phases, arguments = tmp_path / "phases.log", tmp_path / "verify-args.json"
+    stubs = """
+function gh {
+    Add-Content -LiteralPath $env:PHASES -Encoding utf8 -Value 'verify'
+    ConvertTo-Json -InputObject @($args) -Compress | Set-Content -LiteralPath $env:VERIFY_ARGS -Encoding utf8
+    $global:LASTEXITCODE = [int]$env:VERIFY_EXIT
+}
+function Expand-Archive {
+    Add-Content -LiteralPath $env:PHASES -Encoding utf8 -Value 'extract'
+    if ($env:EXTRACT_EXIT -ne '0') { throw 'Synthetic extraction failure' }
+}
+function python {
+    Add-Content -LiteralPath $env:PHASES -Encoding utf8 -Value 'install'
+    $global:LASTEXITCODE = [int]$env:INSTALL_EXIT
+}
+"""
+    result = subprocess.run(
+        [shutil.which("pwsh"), "-NoProfile", "-NonInteractive", "-Command", stubs + block],
+        cwd=tmp_path, capture_output=True, text=True, timeout=60,
+        env={**os.environ, "PHASES": str(phases), "VERIFY_ARGS": str(arguments),
+             "VERIFY_EXIT": str(verify_exit), "EXTRACT_EXIT": str(extract_exit), "INSTALL_EXIT": str(install_exit)},
+    )
+    assert (result.returncode == 0) is (verify_exit == extract_exit == install_exit == 0), result.stdout + result.stderr
+    assert phases.read_text(encoding="utf-8-sig").splitlines() == expected
+    args = json.loads(arguments.read_text(encoding="utf-8-sig"))
+    assert args[:3] == ["attestation", "verify", ".\\siteops-install.zip"]
+    assert args[args.index("--source-digest") + 1] == SHA
+
+
+@pytest.mark.parametrize(
+    ("authored", "expected"),
+    [
+        ("# Main title\n\n## Changes\n\nBody.\n", ["### Main title", "#### Changes"]),
+        ("## Changes\n\nBody.\n", ["### Changes"]),
+        ("Title\n=====\n\nChanges\n-------\n\nBody.\n", ["### Title", "#### Changes"]),
+        ("# Title\n\n```bash\n# Leave this comment alone\n```\n\n~~~\n# Also literal\n~~~\n", ["### Title"]),
+        ("# Title\n\n---\n---\n\n    # Indented example\n", ["### Title"]),
+    ],
+)
+def test_summary_nests_markdown_headings_without_changing_published_notes(candidate, runner, authored, expected):
+    (candidate["root"] / "release-plan" / "release-notes.md").write_text(authored, encoding="utf-8")
+    published = _render_install_notes(candidate, runner)
+    assert published.startswith(authored)
+    before = (candidate["root"] / "publish-notes.md").read_bytes()
+    result, _, _ = runner("review", "Show the release approval preview", extra={
+        "DRY_RUN": "true", "ENGINE_VERSION": "1.0.0b1+build.42",
+        "CI_URL": f"https://github.com/{REPO}/actions/runs/42",
+        "BUNDLE_SHA": "a" * 64, "TAG_EXISTS": "false",
+        "MATRIX": json.dumps([
+            {"python": version, "linux": "passed", "windows": "passed"}
+            for version in ("3.10", "3.11", "3.12", "3.13", "3.14")
+        ]),
+        "ARTIFACT_URL": f"https://github.com/{REPO}/actions/runs/42/artifacts/99",
+    })
+    assert result.returncode == 0, result.stdout + result.stderr
+    summary = (candidate["root"].parent / "summary.md").read_text()
+    assert summary.startswith("# Release preview")
+    assert "\n## Release notes\n" in summary
+    for heading in expected:
+        assert "\n" + heading + "\n" in summary
+    for literal in ("# Leave this comment alone", "# Also literal", "    # Indented example", "---\n---"):
+        if literal in authored:
+            assert literal in summary
+    assert (candidate["root"] / "publish-notes.md").read_bytes() == before
 
 
 @pytest.mark.parametrize("bundle", [False, True])

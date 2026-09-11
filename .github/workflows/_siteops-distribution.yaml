@@ -1,0 +1,647 @@
+# Reusable workflow that builds, attests, and qualifies one Site Ops installation
+# bundle. The caller repository, ref, and commit identify the source being built.
+# This workflow path and its commit identify the trusted builder.
+#
+# The build job executes repository source without signing capability. A separate
+# attestation job receives the staged bytes, executes no repository source, and
+# holds the signing permissions. Qualification verifies the same attested bytes
+# with the runner's GitHub CLI before anything is extracted.
+#
+# Callers reference this workflow locally as
+# `./.github/workflows/_siteops-distribution.yaml`, which GitHub binds to the
+# caller's own event commit. The certificate identity that qualification and
+# promotion expect is therefore
+# `https://github.com/<repository>/.github/workflows/_siteops-distribution.yaml@<source ref>`
+# with a signer digest equal to the caller's commit. One real signed qualification
+# run must confirm the emitted subject alternative name before any public release.
+# Treat a mismatch as a policy question rather than a reason to relax the exact
+# identity to a pattern.
+
+name: _Site Ops Distribution
+
+on:
+  workflow_call:
+    inputs:
+      expected-source-sha:
+        description: "Full 40 character commit the caller expects to build. Asserted against the event commit, never used to select what is checked out."
+        required: true
+        type: string
+      version-mode:
+        description: "build adds an identified build suffix. source preserves the declared package version."
+        required: false
+        type: string
+        default: build
+    outputs:
+      package-version:
+        description: "Exact package version in the qualified bundle."
+        value: ${{ jobs.build.outputs.package-version }}
+      build-number:
+        description: "Build run ID recorded in the bundle."
+        value: ${{ jobs.build.outputs.build-number }}
+      build-attempt:
+        description: "Build attempt recorded in the bundle."
+        value: ${{ jobs.build.outputs.build-attempt }}
+      archive-name:
+        description: "File name of the installation archive inside every artifact."
+        value: ${{ jobs.build.outputs.archive-name }}
+      archive-sha256:
+        description: "SHA-256 of the attested installation archive."
+        value: ${{ jobs.build.outputs.archive-sha256 }}
+      staging-artifact-id:
+        description: "Artifact ID holding the attested archive and its detached proof."
+        value: ${{ jobs.attest.outputs.staging-artifact-id }}
+      staging-artifact-name:
+        description: "Artifact name holding the attested archive and its detached proof."
+        value: ${{ jobs.attest.outputs.staging-artifact-name }}
+
+env:
+  ARCHIVE_NAME: siteops-install.zip
+  ATTESTATION_SUFFIX: .attestation.jsonl
+  OIDC_ISSUER: https://token.actions.githubusercontent.com
+  PREDICATE_TYPE: https://slsa.dev/provenance/v1
+  # Package downloads use the configured feed with no public fallback.
+  PACKAGE_INDEX_URL: https://packagefeedproxy.microsoft.io/pypi/simple/
+  PIPX_VERSION: 1.17.2
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONUNBUFFERED: "1"
+  # CI results and progress use publication-safe output.
+  SITEOPS_REDACT_OUTPUT: "1"
+  VERSION_MODE: ${{ inputs.version-mode }}
+
+jobs:
+  build:
+    name: Build bundle
+    runs-on: ubuntu-24.04
+
+    # The build job executes repository source. It holds no OIDC, attestation, or
+    # release capability.
+    permissions:
+      contents: read
+
+    outputs:
+      package-version: ${{ steps.build.outputs.package-version }}
+      build-number: ${{ steps.build.outputs.build-number }}
+      build-attempt: ${{ steps.build.outputs.build-attempt }}
+      archive-name: ${{ steps.build.outputs.archive-name }}
+      archive-sha256: ${{ steps.build.outputs.archive-sha256 }}
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+
+    env:
+      EXPECTED_SOURCE_SHA: ${{ inputs.expected-source-sha }}
+      SOURCE_SHA: ${{ github.sha }}
+      SOURCE_REF: ${{ github.ref }}
+      SOURCE_REPOSITORY: ${{ github.repository }}
+      BUILD_NUMBER: ${{ github.run_id }}
+      BUILD_ATTEMPT: ${{ github.run_attempt }}
+
+    steps:
+      - name: Assert the expected source commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::expected-source-sha must be a full 40 character lowercase commit SHA."
+            exit 1
+          fi
+          if [[ "$EXPECTED_SOURCE_SHA" != "$SOURCE_SHA" ]]; then
+            echo "::error::The dispatched ref resolves to a different commit than expected-source-sha."
+            exit 1
+          fi
+          if [[ "$VERSION_MODE" != "build" && "$VERSION_MODE" != "source" ]]; then
+            echo "::error::version-mode must be build or source."
+            exit 1
+          fi
+          echo "Building the event commit asserted by the caller."
+
+      - name: Checkout the event commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+
+      - name: Confirm the checked out tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          head="$(git rev-parse HEAD)"
+          if [[ "$head" != "$SOURCE_SHA" ]]; then
+            echo "::error::The checked out tree is not the event commit."
+            exit 1
+          fi
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "::error::The checked out tree carries uncommitted changes."
+            exit 1
+          fi
+
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Install the pinned build requirements
+        shell: bash
+        env:
+          PIP_INDEX_URL: ${{ env.PACKAGE_INDEX_URL }}
+          PIP_NO_INPUT: "1"
+          PIP_KEYRING_PROVIDER: disabled
+          PIP_CONFIG_FILE: /dev/null
+          PIP_EXTRA_INDEX_URL: ""
+        run: |
+          set -euo pipefail
+          umask 077
+          if ! python -m pip install \
+            --require-hashes \
+            --only-binary=:all: \
+            --no-cache-dir \
+            --requirement scripts/siteops-build-requirements.txt \
+            > "$RUNNER_TEMP/siteops-build-tooling.log" 2>&1; then
+            echo "::error::Pinned build tooling could not be installed from the configured feed."
+            exit 1
+          fi
+
+      - name: Build the installation bundle
+        id: build
+        shell: bash
+        env:
+          PIP_INDEX_URL: ${{ env.PACKAGE_INDEX_URL }}
+          PIP_NO_INPUT: "1"
+          PIP_KEYRING_PROVIDER: disabled
+          PIP_CONFIG_FILE: /dev/null
+          PIP_EXTRA_INDEX_URL: ""
+        run: |
+          set -euo pipefail
+          umask 077
+          staging="$RUNNER_TEMP/siteops-build"
+          rm -rf "$staging"
+          mkdir -p "$staging"
+          archive="$staging/$ARCHIVE_NAME"
+
+          python scripts/build-siteops-bundle.py \
+            --repository "$SOURCE_REPOSITORY" \
+            --source-ref "$SOURCE_REF" \
+            --expected-source-sha "$SOURCE_SHA" \
+            --build-number "$BUILD_NUMBER" \
+            --build-attempt "$BUILD_ATTEMPT" \
+            --version-mode "$VERSION_MODE" \
+            --output "$archive" \
+            --download-dependencies
+
+          shopt -s dotglob nullglob
+          produced=("$staging"/*)
+          if [[ ${#produced[@]} -ne 1 || "${produced[0]}" != "$archive" ]]; then
+            echo "::error::The build produced content other than the expected archive."
+            exit 1
+          fi
+
+          digest="$(sha256sum "$archive" | cut -d ' ' -f 1)"
+          version="$(python -c 'import json,sys,zipfile; print(json.loads(zipfile.ZipFile(sys.argv[1]).read("bundle.json"))["package"]["version"])' "$archive")"
+          {
+            echo "package-version=$version"
+            echo "build-number=$BUILD_NUMBER"
+            echo "build-attempt=$BUILD_ATTEMPT"
+            echo "archive-name=$ARCHIVE_NAME"
+            echo "archive-path=$archive"
+            echo "archive-sha256=$digest"
+          } >> "$GITHUB_OUTPUT"
+          echo "Built $ARCHIVE_NAME with digest $digest."
+
+      - name: Upload the build archive
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: siteops-install-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.build.outputs.archive-path }}
+          if-no-files-found: error
+          overwrite: false
+          include-hidden-files: false
+          archive: true
+          compression-level: 0
+          retention-days: 7
+
+  attest:
+    name: Attest bundle
+    needs: build
+    runs-on: ubuntu-24.04
+
+    # The signing job downloads staged bytes. It never checks out or executes
+    # repository source.
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+
+    outputs:
+      staging-artifact-id: ${{ steps.stage.outputs.artifact-id }}
+      staging-artifact-name: ${{ steps.names.outputs.staging-artifact-name }}
+
+    env:
+      EXPECTED_ARCHIVE_SHA256: ${{ needs.build.outputs.archive-sha256 }}
+
+    steps:
+      - name: Resolve the staging artifact name
+        id: names
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "staging-artifact-name=siteops-install-staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+
+      - name: Download the build archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/siteops-subject
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Confirm the staged payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          subject="$RUNNER_TEMP/siteops-subject"
+          archive="$subject/$ARCHIVE_NAME"
+          shopt -s dotglob nullglob
+          entries=("$subject"/*)
+          if [[ ${#entries[@]} -ne 1 || "${entries[0]}" != "$archive" ]]; then
+            echo "::error::The downloaded artifact holds content other than $ARCHIVE_NAME."
+            exit 1
+          fi
+          digest="$(sha256sum "$archive" | cut -d ' ' -f 1)"
+          if [[ "$digest" != "$EXPECTED_ARCHIVE_SHA256" ]]; then
+            echo "::error::The downloaded archive does not match the digest recorded by the build job."
+            exit 1
+          fi
+
+      - name: Attest build provenance
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/siteops-subject/siteops-install.zip
+          show-summary: true
+
+      - name: Stage the attested bytes
+        shell: bash
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          umask 077
+          subject="$RUNNER_TEMP/siteops-subject/$ARCHIVE_NAME"
+          staging="$RUNNER_TEMP/siteops-staging"
+          rm -rf "$staging"
+          mkdir -p "$staging"
+          cp "$subject" "$staging/$ARCHIVE_NAME"
+          cp "$BUNDLE_PATH" "$staging/${ARCHIVE_NAME}${ATTESTATION_SUFFIX}"
+
+          digest="$(sha256sum "$staging/$ARCHIVE_NAME" | cut -d ' ' -f 1)"
+          if [[ "$digest" != "$EXPECTED_ARCHIVE_SHA256" ]]; then
+            echo "::error::Staging altered the attested archive."
+            exit 1
+          fi
+          if [[ ! -s "$staging/${ARCHIVE_NAME}${ATTESTATION_SUFFIX}" ]]; then
+            echo "::error::The attestation bundle is empty."
+            exit 1
+          fi
+
+      - name: Upload the attested bundle
+        id: stage
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.names.outputs.staging-artifact-name }}
+          path: ${{ runner.temp }}/siteops-staging
+          if-no-files-found: error
+          overwrite: false
+          include-hidden-files: false
+          archive: true
+          compression-level: 0
+          retention-days: 30
+
+      - name: Record the build identity
+        shell: bash
+        env:
+          STAGING_ARTIFACT_ID: ${{ steps.stage.outputs.artifact-id }}
+          STAGING_ARTIFACT_NAME: ${{ steps.names.outputs.staging-artifact-name }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Site Ops distribution"
+            echo ""
+            echo "| Build identity | Value |"
+            echo "|---|---|"
+            echo "| source-run-id | \`$GITHUB_RUN_ID\` |"
+            echo "| source-run-attempt | \`$GITHUB_RUN_ATTEMPT\` |"
+            echo "| staging-artifact-id | \`$STAGING_ARTIFACT_ID\` |"
+            echo "| staging-artifact-name | \`$STAGING_ARTIFACT_NAME\` |"
+            echo "| expected-source-sha | \`$GITHUB_SHA\` |"
+            echo "| expected-source-ref | \`$GITHUB_REF\` |"
+            echo "| archive-sha256 | \`$EXPECTED_ARCHIVE_SHA256\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  qualify:
+    name: Qualify bundle (${{ matrix.os }}, Python ${{ matrix.python }})
+    needs: [build, attest]
+    runs-on: ${{ matrix.os }}
+
+    # Qualification consumes the attested bytes with the runner's own GitHub CLI.
+    # It never signs and never publishes.
+    permissions:
+      contents: read
+      actions: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      SOURCE_REPOSITORY: ${{ github.repository }}
+      SOURCE_SHA: ${{ github.sha }}
+      SOURCE_REF: ${{ github.ref }}
+      SIGNER_DIGEST: ${{ github.sha }}
+      SIGNER_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/_siteops-distribution.yaml@${{ github.ref }}
+      BUILD_NUMBER: ${{ github.run_id }}
+      BUILD_ATTEMPT: ${{ github.run_attempt }}
+
+    steps:
+      - name: Confirm the GitHub CLI verification capabilities
+        run: |
+          set -euo pipefail
+          if ! command -v gh > /dev/null 2>&1; then
+            echo "::error::The runner does not provide the GitHub CLI required for verification."
+            exit 1
+          fi
+          gh --version
+          help_text="$(gh attestation verify --help 2>&1)"
+          for flag in --bundle --repo --cert-identity --signer-digest --source-digest \
+            --source-ref --cert-oidc-issuer --predicate-type --deny-self-hosted-runners; do
+            if ! printf '%s' "$help_text" | grep -q -- "$flag"; then
+              echo "::error::The runner GitHub CLI does not support $flag, which this policy requires."
+              exit 1
+            fi
+          done
+
+      - name: Setup Python
+        id: python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Download the attested bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.attest.outputs.staging-artifact-id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/siteops-download
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Verify the bundle before extraction
+        run: |
+          set -euo pipefail
+          # The Windows runner reports a backslash temporary path.
+          temp="${RUNNER_TEMP//\\//}"
+          download="$temp/siteops-download"
+          archive="$download/$ARCHIVE_NAME"
+          bundle="${archive}${ATTESTATION_SUFFIX}"
+          if [[ ! -f "$archive" || ! -f "$bundle" ]]; then
+            echo "::error::The staged artifact does not hold the archive and its detached proof."
+            exit 1
+          fi
+
+          gh attestation verify "$archive" \
+            --bundle "$bundle" \
+            --repo "$SOURCE_REPOSITORY" \
+            --cert-identity "$SIGNER_IDENTITY" \
+            --signer-digest "$SIGNER_DIGEST" \
+            --source-digest "$SOURCE_SHA" \
+            --source-ref "$SOURCE_REF" \
+            --cert-oidc-issuer "$OIDC_ISSUER" \
+            --predicate-type "$PREDICATE_TYPE" \
+            --deny-self-hosted-runners
+
+          echo "The attested archive satisfies the exact source and signer policy."
+
+      - name: Extract the verified bundle
+        env:
+          PYTHON: ${{ steps.python.outputs.python-path }}
+        run: |
+          set -euo pipefail
+          umask 077
+          temp="${RUNNER_TEMP//\\//}"
+          archive="$temp/siteops-download/$ARCHIVE_NAME"
+          extract="$temp/siteops-verified"
+          rm -rf "$extract"
+          mkdir -p "$extract"
+          shopt -s dotglob nullglob
+          existing=("$extract"/*)
+          if [[ ${#existing[@]} -ne 0 ]]; then
+            echo "::error::The extraction directory is not empty."
+            exit 1
+          fi
+          "$PYTHON" -m zipfile -e "$archive" "$extract"
+
+      - name: Confirm the bundle describes this build
+        env:
+          PYTHON: ${{ steps.python.outputs.python-path }}
+        run: |
+          set -euo pipefail
+          temp="${RUNNER_TEMP//\\//}"
+          "$PYTHON" -c '
+          import json
+          import os
+          import sys
+
+          with open(os.path.join(sys.argv[1], "bundle.json"), encoding="utf-8") as stream:
+              document = json.load(stream)
+
+          source = document.get("source", {})
+          build = document.get("build", {})
+          package = document.get("package", {})
+          commit = os.environ["SOURCE_SHA"]
+          number = int(os.environ["BUILD_NUMBER"])
+          attempt = int(os.environ["BUILD_ATTEMPT"])
+          base = package.get("baseVersion", "")
+          mode = os.environ["VERSION_MODE"]
+          expected = base if mode == "source" else base + "+build." + str(number) + "." + str(attempt) + ".g" + commit[:12]
+
+          failures = []
+          if mode not in ("build", "source"):
+              failures.append("version mode")
+          if document.get("apiVersion") != "siteops.install/v1":
+              failures.append("apiVersion")
+          if document.get("kind") != "SiteOpsBundle":
+              failures.append("kind")
+          if source.get("repository") != os.environ["SOURCE_REPOSITORY"]:
+              failures.append("source.repository")
+          if source.get("commit") != commit:
+              failures.append("source.commit")
+          if source.get("ref") != os.environ["SOURCE_REF"]:
+              failures.append("source.ref")
+          if build.get("number") != number or build.get("attempt") != attempt:
+              failures.append("build")
+          if package.get("version") != expected:
+              failures.append("package.version")
+          if failures:
+              print("::error::The verified bundle describes a different build: " + ", ".join(failures))
+              raise SystemExit(1)
+          ' "$temp/siteops-verified"
+          echo "The verified bundle is internally consistent with this build."
+
+      - name: Install the external qualification tooling
+        env:
+          PYTHON: ${{ steps.python.outputs.python-path }}
+          PIP_INDEX_URL: ${{ env.PACKAGE_INDEX_URL }}
+          PIP_NO_INPUT: "1"
+          PIP_KEYRING_PROVIDER: disabled
+          PIP_EXTRA_INDEX_URL: ""
+        run: |
+          set -euo pipefail
+          temp="${RUNNER_TEMP//\\//}"
+          unset PYTHONPATH PYTHONHOME
+          export PIP_CONFIG_FILE="$("$PYTHON" -c 'import os; print(os.devnull)')"
+          tooling="$temp/siteops-tooling"
+          rm -rf "$tooling"
+          "$PYTHON" -m venv "$tooling"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            bin="$tooling/Scripts"
+          else
+            bin="$tooling/bin"
+          fi
+          umask 077
+          if ! "$bin/python" -m pip install --no-cache-dir --disable-pip-version-check \
+            "pipx==$PIPX_VERSION" > "$temp/siteops-qualification-tooling.log" 2>&1; then
+            echo "::error::Qualification tooling could not be installed from the configured feed."
+            exit 1
+          fi
+          "$bin/python" -c 'from importlib.metadata import version; print("pipx " + version("pipx"))'
+
+      - name: Install and remove Site Ops from the verified bundle
+        env:
+          PYTHON: ${{ steps.python.outputs.python-path }}
+        run: |
+          set -euo pipefail
+          umask 077
+          unset PYTHONPATH PYTHONHOME
+          temp="${RUNNER_TEMP//\\//}"
+          extract="$temp/siteops-verified"
+          owned="$temp/siteops-qualification"
+          rm -rf "$owned"
+          mkdir -p "$owned/logs"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            tooling_bin="$temp/siteops-tooling/Scripts"
+          else
+            tooling_bin="$temp/siteops-tooling/bin"
+          fi
+
+          # Every pipx and pip location stays inside this run, so the runner's
+          # own tools and user profile are unchanged.
+          export PIPX_HOME="$owned/pipx"
+          export PIPX_BIN_DIR="$owned/pipx-bin"
+          export PIPX_MAN_DIR="$owned/pipx-man"
+          export PIPX_COMPLETION_DIR="$owned/pipx-completions"
+          export PIPX_SHARED_LIBS="$owned/pipx-shared"
+          export PIPX_DEFAULT_PYTHON="$PYTHON"
+          export PIP_CACHE_DIR="$owned/pip-cache"
+          command_bin="$PIPX_BIN_DIR"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            command_bin="$(cygpath -u "$command_bin")"
+            tooling_bin="$(cygpath -u "$tooling_bin")"
+          fi
+          export PATH="$command_bin:$tooling_bin:$PATH"
+          cd "$owned"
+
+          run_installer() {
+            label="$1"
+            shift
+            if ! "$PYTHON" "$extract/install.py" --output json \
+              --store-dir "$owned/store" "$@" \
+              > "$owned/logs/$label.json" 2> "$owned/logs/$label.err"; then
+              echo "::error::The bundle helper reported a failure during $label."
+              exit 1
+            fi
+          }
+
+          run_installer install
+          siteops --version
+          run_installer removal --uninstall
+
+      - name: Confirm the helper result contract
+        env:
+          PYTHON: ${{ steps.python.outputs.python-path }}
+        run: |
+          set -euo pipefail
+          temp="${RUNNER_TEMP//\\//}"
+          logs="$temp/siteops-qualification/logs"
+          "$PYTHON" -c '
+          import json
+          import sys
+
+
+          def load(path):
+              with open(path, encoding="utf-8") as stream:
+                  return json.load(stream)
+
+
+          manifest = load(sys.argv[1])
+          installed = load(sys.argv[2])
+          removed = load(sys.argv[3])
+          private = ("sourceRepository", "sourceCommit", "store", "command", "pathReady")
+
+          failures = []
+          for label, document, status in (
+              ("installation", installed, "installed"),
+              ("removal", removed, "removed"),
+          ):
+              if document.get("apiVersion") != "siteops.install/v1":
+                  failures.append(label + " apiVersion")
+              if document.get("kind") != "SiteOpsInstallationResult":
+                  failures.append(label + " kind")
+              if document.get("package") != "siteops":
+                  failures.append(label + " package")
+              if document.get("status") != status:
+                  failures.append(label + " status")
+              if type(document.get("exitCode")) is not int or document["exitCode"] != 0 or document.get("interrupted") is not False:
+                  failures.append(label + " outcome")
+              if "diagnostic" in document:
+                  failures.append(label + " diagnostic")
+              if any(field in document for field in private):
+                  failures.append(label + " redaction")
+          if installed.get("version") != manifest["package"]["version"]:
+              failures.append("installed version")
+          if failures:
+              print("::error::The bundle helper reported an unsupported result: " + ", ".join(failures))
+              raise SystemExit(1)
+          ' "$temp/siteops-verified/bundle.json" "$logs/install.json" "$logs/removal.json"
+          echo "The bundle helper installed and removed the selected build."
+
+      - name: Publish the qualification summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          if [[ "$JOB_STATUS" == "success" ]]; then
+            outcome="The verified bundle installed and removed Site Ops through isolated pipx state."
+          else
+            outcome="Qualification did not complete. Review the failing step."
+          fi
+          {
+            echo "### Site Ops qualification"
+            echo ""
+            echo "- Platform: $RUNNER_OS"
+            echo "- Policy: exact source repository, commit and ref, exact signer identity and digest, GitHub Actions OIDC issuer, SLSA build provenance, GitHub-hosted runner required."
+            echo "- Outcome: $outcome"
+          } >> "$GITHUB_STEP_SUMMARY"

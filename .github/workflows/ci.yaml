@@ -11,6 +11,8 @@ on:
       - "tests/**"
       - "scripts/**"
       - "pyproject.toml"
+      - "releases/**/release.json"
+      - "releases/**/notes.md"
       - ".github/workflows/**"
       - ".github/actions/**"
   pull_request:
@@ -21,14 +23,39 @@ on:
       - "tests/**"
       - "scripts/**"
       - "pyproject.toml"
+      - "releases/**/release.json"
+      - "releases/**/notes.md"
       - ".github/workflows/**"
       - ".github/actions/**"
   workflow_dispatch:
+    inputs:
+      distribution-rehearsal:
+        description: "Also build, attest, and qualify Site Ops. Creates signed artifacts, not a release."
+        type: boolean
+        required: false
+        default: false
+      distribution-source-sha:
+        description: "Required for distribution rehearsal. Full expected source commit."
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
 
 jobs:
+  distribution-rehearsal:
+    name: Rehearse distribution
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.distribution-rehearsal }}
+    uses: ./.github/workflows/_siteops-distribution.yaml
+    with:
+      expected-source-sha: ${{ inputs.distribution-source-sha }}
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+
   lint:
     name: Lint
     runs-on: ubuntu-latest

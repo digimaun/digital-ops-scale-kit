@@ -1,0 +1,68 @@
+# Produces one attested and qualified Site Ops installation bundle from an exact
+# commit. Dispatch it on the ref you intend to distribute and pass that ref's
+# commit as `expected-source-sha`. The value is asserted against the event
+# commit, so it selects nothing and can only stop a build of the wrong revision.
+#
+# Release declarations prepare their own candidate through release.yaml.
+
+name: Site Ops Distribution
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected-source-sha:
+        description: "Full 40 character commit this ref is expected to resolve to"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  distribute:
+    name: Distribute
+    uses: ./.github/workflows/_siteops-distribution.yaml
+    with:
+      expected-source-sha: ${{ inputs.expected-source-sha }}
+    # The called workflow scopes each job further. The build job keeps
+    # `contents: read` alone, and only the attestation job signs.
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+
+  summary:
+    name: Build identity
+    needs: distribute
+    runs-on: ubuntu-24.04
+
+    permissions: {}
+
+    steps:
+      - name: Record the build identity
+        shell: bash
+        env:
+          STAGING_ARTIFACT_ID: ${{ needs.distribute.outputs.staging-artifact-id }}
+          STAGING_ARTIFACT_NAME: ${{ needs.distribute.outputs.staging-artifact-name }}
+          ARCHIVE_NAME: ${{ needs.distribute.outputs.archive-name }}
+          ARCHIVE_SHA256: ${{ needs.distribute.outputs.archive-sha256 }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Site Ops distribution"
+            echo ""
+            echo "This build is available for inspection and installation qualification."
+            echo "A release declaration prepares its own candidate and requires publication approval."
+            echo ""
+            echo "| Build identity | Value |"
+            echo "|---|---|"
+            echo "| source-run-id | \`$GITHUB_RUN_ID\` |"
+            echo "| source-run-attempt | \`$GITHUB_RUN_ATTEMPT\` |"
+            echo "| staging-artifact-id | \`$STAGING_ARTIFACT_ID\` |"
+            echo "| staging-artifact-name | \`$STAGING_ARTIFACT_NAME\` |"
+            echo "| expected-source-sha | \`$GITHUB_SHA\` |"
+            echo "| expected-source-ref | \`$GITHUB_REF\` |"
+            echo "| archive | \`$ARCHIVE_NAME\` |"
+            echo "| archive-sha256 | \`$ARCHIVE_SHA256\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -109,6 +109,10 @@ For CI, see [docs/ci-cd-setup.md](docs/ci-cd-setup.md) for the `SITE_OVERRIDES` 
 
 ## Quick start
 
+To install only the CLI without cloning, use an identified
+[Site Ops release bundle](docs/install-siteops.md). Workspace content and
+deployment prerequisites are separate from that installation.
+
 ### Option 1: Run locally
 
 ```bash

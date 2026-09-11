@@ -466,6 +466,7 @@ def test_tag_and_release_target_conditions(candidate, runner, state):
 
 @pytest.mark.parametrize("configured", [False, True])
 def test_publication_requires_real_environment_reviewers(candidate, runner, configured):
+    assert JOBS["prepare"]["permissions"] == {"contents": "read", "actions": "read"}
     candidate["responses"][f"repos/{REPO}/environments/siteops-release"] = {
         "status": 200,
         "body": {"protection_rules": [{"type": "required_reviewers", "reviewers": [{"type": "Team"}]}] if configured else []},

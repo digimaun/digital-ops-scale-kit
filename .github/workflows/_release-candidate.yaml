@@ -67,6 +67,7 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+      actions: read
     outputs:
       active: ${{ steps.plan.outputs.active }}
       tag: ${{ steps.plan.outputs.tag }}

@@ -473,14 +473,89 @@ jobs:
           root = Path(sys.argv[1])
           plan = json.loads((root / "release-plan/plan.json").read_text())
           notes = (root / "release-plan/release-notes.md").read_text(encoding="utf-8").rstrip() + "\n"
-          if plan["release"]["stream"] == "scalekit":
-              engine = plan["siteops"]
-              if engine["bundle"]:
-                  notes += "\nSite Ops build: `" + os.environ["ENGINE_VERSION"] + "`.\n"
-              else:
-                  tag = engine["releaseTag"]
-                  url = "https://github.com/" + os.environ["GITHUB_REPOSITORY"] + "/releases/tag/" + urllib.parse.quote(tag, safe="")
-                  notes += "\nSite Ops release: [" + tag + "](" + url + ").\n"
+          source, engine = plan["source"], plan["siteops"]
+          repository = source["repository"]
+          home = "https://github.com/" + repository
+          notes += "\n## Install Site Ops\n\n"
+          if not engine["bundle"]:
+              tag = engine["releaseTag"]
+              url = home + "/releases/tag/" + urllib.parse.quote(tag, safe="")
+              notes += "Use [" + tag + "](" + url + ") and its installation instructions. "
+              notes += "The engine release has its own source commit and installation assets.\n"
+          else:
+              version = os.environ["ENGINE_VERSION"]
+              archive = os.environ["ARCHIVE_NAME"]
+              proof = archive + os.environ["ATTESTATION_SUFFIX"]
+              downloads = home + "/releases/download/" + urllib.parse.quote(plan["release"]["tag"], safe="") + "/"
+              guide = home + "/blob/" + source["commit"] + "/docs/install-siteops.md"
+              notes += "Package version: `" + version + "`.\n\n"
+              notes += "Expected publisher: `" + repository + "`.\n\n"
+              notes += "**Prerequisites:** standard 64-bit CPython 3.10-3.14, pipx 1.17.2 or a compatible newer 1.x release, "
+              notes += "and GitHub CLI 2.95.0 or newer. Use Windows x64 or Linux x64 with glibc 2.17 or newer.\n\n"
+              notes += "Obtain prerequisites through trusted managed channels. "
+              notes += "[Installation guide](" + guide + ") covers setup, PATH, replacement, and removal.\n\n"
+              notes += "1. Download [" + archive + "](" + downloads + archive + ") and "
+              notes += "[" + proof + "](" + downloads + proof + ") into one private folder.\n"
+              notes += "2. Open your terminal in that folder and run the commands for your platform below.\n\n"
+              notes += "Use these two assets, not the generated Source code archives. "
+              notes += "Verification must succeed before the installation ZIP is extracted. "
+              notes += "Use a new extraction directory and run as your ordinary user.\n\n"
+
+              identity = home + "/.github/workflows/_siteops-distribution.yaml@" + source["ref"]
+              flags = [
+                  ("--repo", repository),
+                  ("--cert-identity", identity),
+                  ("--source-digest", source["commit"]),
+                  ("--signer-digest", source["commit"]),
+                  ("--source-ref", source["ref"]),
+                  ("--cert-oidc-issuer", os.environ["OIDC_ISSUER"]),
+                  ("--predicate-type", os.environ["PREDICATE_TYPE"]),
+              ]
+
+              def verify_command(prefix, continuation):
+                  lines = [
+                      "gh attestation verify " + prefix + archive + " " + continuation,
+                      "  --bundle " + prefix + proof + " " + continuation,
+                  ]
+                  lines += [
+                      "  " + option + " \"" + value + "\" " + continuation
+                      for option, value in flags
+                  ]
+                  return "\n".join(lines + ["  --deny-self-hosted-runners"])
+
+              windows = "\n".join([
+                  "$ErrorActionPreference = \"Stop\"",
+                  verify_command(".\\", "`"),
+                  "if ($LASTEXITCODE -ne 0) {",
+                  "    throw \"Verification failed. Do not extract or install.\"",
+                  "}",
+                  "Expand-Archive -LiteralPath .\\" + archive + " -DestinationPath .\\siteops-bundle",
+                  "python -B .\\siteops-bundle\\install.py",
+                  "if ($LASTEXITCODE -ne 0) {",
+                  "    throw \"Installation did not complete. Follow the reported guidance.\"",
+                  "}",
+              ])
+              windows = "& {\n" + "\n".join("    " + line for line in windows.splitlines()) + "\n}"
+              linux = "\n".join([
+                  "(",
+                  "set -eu",
+                  "umask 077",
+                  verify_command("./", "\\"),
+                  "mkdir ./siteops-bundle",
+                  "python3 -B -m zipfile -e ./" + archive + " ./siteops-bundle",
+                  "python3 -B ./siteops-bundle/install.py",
+                  ")",
+              ])
+              for title, language, commands in (
+                  ("Windows (PowerShell)", "powershell", windows),
+                  ("Linux (Bash)", "bash", linux),
+              ):
+                  notes += "<details>\n<summary>" + title + "</summary>\n\n"
+                  notes += "```" + language + "\n" + commands + "\n```\n\n</details>\n\n"
+              notes += "Follow any PATH guidance, then use `siteops --version` and `siteops --help`. "
+              notes += "Selecting a different existing pipx build requires an explicit `--replace`.\n\n"
+              notes += "Verification reads the downloaded proof locally. Trusted-root refresh may use the network. "
+              notes += "Installing the CLI does not authenticate to Azure or deploy resources.\n"
           raw = notes.encode("utf-8")
           digest = hashlib.sha256(raw).hexdigest()
           (root / "publish-notes.md").write_bytes(raw)
@@ -552,15 +627,50 @@ jobs:
         run: |
           set -euo pipefail
           python3 -c '
-          import json, os, sys
+          import json, os, re, sys
           from pathlib import Path
+
+          def embedded_notes(text):
+              lines = text.splitlines()
+              headings = {}
+              omitted = set()
+              fence = None
+              previous_text = False
+              for index, line in enumerate(lines):
+                  marker = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+                  if fence:
+                      if marker and marker[1][0] == fence[0] and len(marker[1]) >= fence[1] and not marker[2].strip():
+                          fence = None
+                      previous_text = False
+                      continue
+                  if marker:
+                      fence = (marker[1][0], len(marker[1]))
+                      previous_text = False
+                      continue
+                  heading = re.match(r"^( {0,3})(#{1,6})(?=[ \t]|$)(.*)$", line)
+                  if heading:
+                      headings[index] = (len(heading[2]), heading[1], heading[3])
+                  elif previous_text and re.fullmatch(r" {0,3}(=+|-+)[ \t]*", line):
+                      headings[index - 1] = (1 if line.lstrip().startswith("=") else 2, "", " " + lines[index - 1].strip())
+                      omitted.add(index)
+                  previous_text = bool(
+                      line.strip() and not heading
+                      and not re.match(r"^( {4}|\t| {0,3}(?:>|<|[-+*] |[0-9]+[.)] ))", line)
+                      and not re.fullmatch(r" {0,3}(?:=+|-+|(?:[-*_][ \t]*){3,})[ \t]*", line)
+                      and index not in omitted
+                  )
+              shift = max(0, 3 - min((value[0] for value in headings.values()), default=3))
+              for index, (level, indent, content) in headings.items():
+                  lines[index] = indent + "#" * min(6, level + shift) + content
+              return "\n".join(line for index, line in enumerate(lines) if index not in omitted)
+
           root = Path(sys.argv[1])
           plan = json.loads((root / "plan.json").read_text())
           release, engine = plan["release"], plan["siteops"]
           dry_run = os.environ.get("DRY_RUN") == "true"
           action = "Reuse the matching tag" if os.environ["TAG_EXISTS"] == "true" else "Create the missing tag"
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as output:
-              output.write("## Release preview (no publication)\n\n" if dry_run else "## Ready for release approval\n\n")
+              output.write("# Release preview (no publication)\n\n" if dry_run else "# Ready for release approval\n\n")
               if dry_run:
                   output.write("Preview only. No tag, GitHub Release, or approval request was created.\n\n")
               for label, value in (
@@ -576,7 +686,7 @@ jobs:
                   expected = ["3.10", "3.11", "3.12", "3.13", "3.14"]
                   if not isinstance(matrix, list) or [row.get("python") for row in matrix] != expected:
                       raise SystemExit("::error::Incomplete installation qualification summary.")
-                  output.write("\n### Installation checks\n\n| Python | Linux | Windows |\n|---|---|---|\n")
+                  output.write("\n## Installation checks\n\n| Python | Linux | Windows |\n|---|---|---|\n")
                   allowed = {"passed", "failed", "cancelled", "skipped", "not-run", "unknown"}
                   for row in matrix:
                       if row["python"] not in ("3.10", "3.11", "3.12", "3.13", "3.14") or row["linux"] not in allowed or row["windows"] not in allowed:
@@ -593,5 +703,7 @@ jobs:
               else:
                   output.write("Next: select Review deployments, then siteops-release, then Approve and deploy.\n")
                   output.write("Approval authorizes the listed tag action at this commit and publication of these release assets.\n")
-              output.write("\n### Release notes\n\n" + (root.parent / "publish-notes.md").read_text(encoding="utf-8") + "\n")
+              if engine["bundle"]:
+                  output.write("\nThe release download links below become available after publication. For a preview, use the Actions download above.\n")
+              output.write("\n## Release notes\n\n" + embedded_notes((root.parent / "publish-notes.md").read_text(encoding="utf-8")) + "\n")
           ' "$RUNNER_TEMP/release-plan"

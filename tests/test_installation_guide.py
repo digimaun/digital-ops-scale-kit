@@ -55,6 +55,32 @@ def test_locked_install_explicitly_sets_the_path_returned_from_scoped_extraction
     assert 'pipx install siteops --lock "$bundle' in command
 
 
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        (r"C:\owned tools\wheels", "file:///C:/owned%20tools/wheels"),
+        ("/tmp/owned tools/wheels", "file:///tmp/owned%20tools/wheels"),
+    ],
+)
+def test_powershell_wheelhouse_uri_handles_windows_and_unix_paths(tmp_path, path, expected):
+    powershell = shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("Executing the PowerShell guide requires pwsh.")
+    body = _block(_section("### Provision the pipx backend that reads the lock"), "powershell")
+    assignment = next(line for line in body.splitlines() if line.strip().startswith("$wheelhouse ="))
+    script = tmp_path / "wheelhouse.ps1"
+    script.write_text(
+        "param([string]$tools)\n" + assignment + "\n$wheelhouse\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-File", str(script), path],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected
+
+
 @pytest.mark.parametrize("download_exit", [0, 23])
 def test_powershell_backend_recipe_preserves_space_paths_and_stops_on_failure(
     tmp_path, download_exit,

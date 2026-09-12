@@ -133,7 +133,7 @@ jobs:
           import os
 
           if not os.path.exists("test-results.xml"):
-              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
                   f.write("## \u274c Test Results\n\nNo test results found.\n")
               raise SystemExit(0)
 
@@ -165,10 +165,11 @@ jobs:
                       if failure is not None or error is not None:
                           name = case.attrib.get("name", "unknown")
                           classname = case.attrib.get("classname", "")
-                          msg = (failure or error).attrib.get("message", "")
+                          diagnostic = failure if failure is not None else error
+                          msg = diagnostic.attrib.get("message", "")
                           summary += f"- `{classname}::{name}`: {msg}\n"
 
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
               f.write(summary + "\n")
 
       - name: Upload coverage report

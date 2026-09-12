@@ -265,7 +265,7 @@ feed. It happens before index-free Site Ops installation.
     New-Item -ItemType Directory -Path $tools | Out-Null
     python -m pip download "pip==26.2.1" --no-deps --only-binary=:all: --dest $tools
     if ($LASTEXITCODE -ne 0) { throw "The pip backend wheel could not be downloaded." }
-    $wheelhouse = ([Uri]($tools + [IO.Path]::DirectorySeparatorChar)).AbsoluteUri
+    $wheelhouse = ([UriBuilder]::new("file", "", -1, $tools)).Uri.AbsoluteUri
     pipx upgrade-shared `
       --pip-args "--no-index --only-binary=:all: --no-cache-dir --force-reinstall --find-links=$wheelhouse"
     if ($LASTEXITCODE -ne 0) { throw "The pipx backend could not be provisioned." }

@@ -13,6 +13,11 @@ from pathlib import Path
 import pytest
 from packaging.utils import parse_wheel_filename
 
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -43,11 +48,6 @@ def _copy_build_source(destination: Path) -> Path:
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
     )
     (destination / "scripts").mkdir()
-    shutil.copyfile(SCRIPTS / "install-siteops.py", destination / "scripts" / "install-siteops.py")
-    shutil.copyfile(
-        SCRIPTS / "siteops_distribution.py",
-        destination / "scripts" / "siteops_distribution.py",
-    )
     return destination
 
 
@@ -94,7 +94,10 @@ def _runtime_filenames():
         )
 
 
-def _synthetic_wheelhouse(builder, root: Path, *, extra: str | None = None):
+def _synthetic_wheelhouse(
+    builder, root: Path, *, extra: str | None = None,
+    requires_python: str = ">=3.8", dependencies: tuple[str, ...] = (),
+):
     wheelhouse = root / "wheelhouse"
     wheelhouse.mkdir(parents=True)
     hashes = []
@@ -107,7 +110,9 @@ def _synthetic_wheelhouse(builder, root: Path, *, extra: str | None = None):
         with zipfile.ZipFile(path, "w") as archive:
             archive.writestr(
                 "pyyaml-6.0.3.dist-info/METADATA",
-                "Metadata-Version: 2.3\nName: PyYAML\nVersion: 6.0.3\nRequires-Python: >=3.8\n",
+                "Metadata-Version: 2.3\nName: PyYAML\nVersion: 6.0.3\n"
+                + f"Requires-Python: {requires_python}\n"
+                + "".join(f"Requires-Dist: {value}\n" for value in dependencies),
             )
             archive.writestr(
                 "pyyaml-6.0.3.dist-info/WHEEL",
@@ -260,7 +265,10 @@ def test_wheelhouse_selects_every_declared_target(builder, tmp_path):
     selected = builder._collect_runtime_wheels(wheelhouse, requirements)
 
     assert set(selected) == {key for key, _ in _runtime_filenames()}
-    assert all(wheel.sha256 in requirements[0].hashes for wheel in selected.values())
+    assert all(
+        wheel.sha256 in requirements[0].hashes
+        for wheels in selected.values() for wheel in wheels
+    )
 
 
 def test_wheelhouse_rejects_missing_dependency_target(builder, tmp_path):
@@ -308,6 +316,7 @@ def test_bundle_assembly_is_reproducible_and_has_no_workspace_leakage(
             source=source,
             bundle_root=bundle,
             application_wheel=application,
+            application_sha256=hashlib.sha256(application.read_bytes()).hexdigest(),
             runtime_wheels=runtime,
             repository="example/siteops",
             source_sha="a" * 40,
@@ -328,8 +337,9 @@ def test_bundle_assembly_is_reproducible_and_has_no_workspace_leakage(
         names = archive.namelist()
         assert names == sorted(names)
         assert "bundle.json" in names
-        assert "install.py" in names
-        assert "siteops_distribution.py" in names
+        assert "pylock.toml" in names
+        assert "install.py" not in names
+        assert "siteops_distribution.py" not in names
         assert not any("workspace" in name for name in names)
         assert all(item.date_time == (1980, 1, 1, 0, 0, 0) for item in archive.infolist())
     assert json.loads((bundles[0][0] / "bundle.json").read_text(encoding="utf-8"))[
@@ -464,12 +474,13 @@ def test_runtime_wheel_changed_after_collection_is_not_bundled(
     source, application, _, base, version = built_application
     wheelhouse, requirements = _synthetic_wheelhouse(builder, tmp_path / "dependencies")
     runtime = builder._collect_runtime_wheels(wheelhouse, requirements)
-    changed = next(iter(runtime.values())).path
+    changed = next(iter(runtime.values()))[0].path
     changed.write_bytes(changed.read_bytes() + b"changed after collection")
 
     with pytest.raises(builder.BuildError, match="changed"):
         builder._assemble_bundle(
             source=source, bundle_root=tmp_path / "bundle", application_wheel=application,
+            application_sha256=hashlib.sha256(application.read_bytes()).hexdigest(),
             runtime_wheels=runtime, repository="example/siteops", source_sha="a" * 40,
             source_ref="refs/heads/main", build_number=1, build_attempt=1,
             base_version=base, version=version,
@@ -564,3 +575,222 @@ def test_build_environment_must_match_exact_toolchain(builder, monkeypatch):
 
     with pytest.raises(builder.BuildError, match="does not match"):
         builder._validate_build_environment(requirements)
+
+
+@pytest.mark.parametrize(
+    "dependency",
+    ["unlocked>=1", "PyYAML>=7", "PyYAML==6.0.3; python_version >= '3.12'",
+     "PyYAML[extra]==6.0.3", "PyYAML @ https://example.invalid/unpinned.whl"],
+)
+def test_runtime_dependency_closure_is_checked_before_lock_generation(builder, tmp_path, dependency):
+    wheelhouse, requirements = _synthetic_wheelhouse(
+        builder, tmp_path, dependencies=(dependency,),
+    )
+    with pytest.raises(builder.BuildError, match="dependencies.*runtime lock"):
+        builder._collect_runtime_wheels(wheelhouse, requirements)
+
+
+def test_runtime_python_requirement_must_cover_the_selected_target(builder, tmp_path):
+    wheelhouse, requirements = _synthetic_wheelhouse(
+        builder, tmp_path, requires_python=">=3.11",
+    )
+    with pytest.raises(builder.BuildError, match=r"Python 3\.10"):
+        builder._collect_runtime_wheels(wheelhouse, requirements)
+
+
+def test_runtime_closure_can_include_a_shared_pure_wheel(builder, tmp_path):
+    wheelhouse, requirements = _synthetic_wheelhouse(
+        builder, tmp_path, dependencies=("support>=1",),
+    )
+    path = wheelhouse / "support-1.0-py3-none-any.whl"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "support-1.0.dist-info/METADATA",
+            "Metadata-Version: 2.3\nName: support\nVersion: 1.0\nRequires-Python: >=3.10\n",
+        )
+        archive.writestr(
+            "support-1.0.dist-info/WHEEL",
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        )
+    support = builder.LockedRequirement(
+        name="support", version="1.0",
+        hashes=frozenset({hashlib.sha256(path.read_bytes()).hexdigest()}),
+    )
+    selected = builder._collect_runtime_wheels(wheelhouse, (*requirements, support))
+    assert len(selected) == 10
+    assert all({wheel.name for wheel in wheels} == {"pyyaml", "support"} for wheels in selected.values())
+    assert {wheels[1].path for wheels in selected.values()} == {path}
+
+
+def _assemble_test_bundle(builder, built_application, tmp_path):
+    source, application, _, base, version = built_application
+    wheelhouse, requirements = _synthetic_wheelhouse(builder, tmp_path / "dependencies")
+    runtime = builder._collect_runtime_wheels(wheelhouse, requirements)
+    root = tmp_path / "bundle with spaces"
+    manifest = builder._assemble_bundle(
+        source=source, bundle_root=root, application_wheel=application,
+        application_sha256=hashlib.sha256(application.read_bytes()).hexdigest(),
+        runtime_wheels=runtime, repository="example/siteops", source_sha="a" * 40,
+        source_ref="refs/heads/main", build_number=12345, build_attempt=1,
+        base_version=base, version=version,
+    )
+    return root, manifest
+
+
+def test_generated_pylock_contains_exact_portable_wheel_inventory(builder, built_application, tmp_path):
+    root, manifest = _assemble_test_bundle(builder, built_application, tmp_path)
+    lock = tomllib.loads((root / "pylock.toml").read_text(encoding="utf-8"))
+    assert lock["lock-version"] == "1.0"
+    assert lock["created-by"] == "siteops"
+    assert lock["requires-python"] == ">=3.10,<3.15"
+    assert {(package["name"], package["version"]) for package in lock["packages"]} == {
+        ("siteops", manifest.version), ("pyyaml", "6.0.3"),
+    }
+    expected = {entry.path: entry for entry in manifest.files if entry.path.endswith(".whl")}
+    actual = {}
+    for package in lock["packages"]:
+        assert set(package) == {"name", "version", "wheels"}
+        for wheel in package["wheels"]:
+            assert set(wheel) == {"name", "path", "size", "hashes"}
+            path = wheel["path"]
+            assert path.startswith("wheels/") and "\\" not in path
+            assert (root / path).resolve().is_relative_to(root)
+            assert wheel["name"] == Path(path).name
+            assert wheel["size"] == expected[path].size
+            assert wheel["hashes"] == {"sha256": expected[path].sha256}
+            assert hashlib.sha256((root / path).read_bytes()).hexdigest() == expected[path].sha256
+            assert path not in actual
+            actual[path] = wheel
+    assert actual.keys() == expected.keys()
+    assert set(actual) == {wheel for target in manifest.targets for wheel in target.wheels}
+
+
+def test_lock_environments_allow_only_declared_targets(builder, built_application, tmp_path):
+    from packaging.markers import Marker
+
+    root, manifest = _assemble_test_bundle(builder, built_application, tmp_path)
+    lock = tomllib.loads((root / "pylock.toml").read_text(encoding="utf-8"))
+    markers = [Marker(value) for value in lock["environments"]]
+    assert len(markers) == len(manifest.targets)
+    for python in ("3.9", "3.10", "3.11", "3.12", "3.13", "3.14", "3.15"):
+        for system, machine in (
+            ("win32", "AMD64"), ("linux", "x86_64"), ("darwin", "x86_64"),
+            ("win32", "ARM64"), ("linux", "aarch64"),
+        ):
+            for implementation in ("cpython", "pypy"):
+                matches = sum(marker.evaluate({
+                    "python_version": python, "sys_platform": system,
+                    "platform_machine": machine, "implementation_name": implementation,
+                }) for marker in markers)
+                supported = (
+                    python not in {"3.9", "3.15"} and implementation == "cpython"
+                    and (system, machine) in {("win32", "AMD64"), ("linux", "x86_64")}
+                )
+                assert matches == int(supported)
+
+
+def test_application_wheel_change_after_inspection_is_rejected(builder, built_application, tmp_path):
+    source, application, runtime_requirements, base, version = built_application
+    wheelhouse, requirements = _synthetic_wheelhouse(builder, tmp_path / "dependencies")
+    runtime = builder._collect_runtime_wheels(wheelhouse, requirements)
+    copy = tmp_path / application.name
+    shutil.copyfile(application, copy)
+    digest = builder._inspect_application_wheel(
+        copy, source=source, version=version, runtime_requirements=runtime_requirements,
+    )
+    copy.write_bytes(copy.read_bytes() + b"changed after inspection")
+    with pytest.raises(builder.BuildError, match="application wheel changed"):
+        builder._assemble_bundle(
+            source=source, bundle_root=tmp_path / "bundle", application_wheel=copy,
+            application_sha256=digest, runtime_wheels=runtime, repository="example/siteops",
+            source_sha="a" * 40, source_ref="refs/heads/main", build_number=1,
+            build_attempt=1, base_version=base, version=version,
+        )
+
+
+def test_published_wheel_is_identical_to_the_bundled_wheel(builder, built_application, tmp_path):
+    root, manifest = _assemble_test_bundle(builder, built_application, tmp_path)
+    archive = tmp_path / "staged.zip"
+    builder._write_deterministic_zip(root, archive)
+    output = tmp_path / "output"
+    output.mkdir()
+    wheel = root / manifest.application_wheel
+    digest = next(entry.sha256 for entry in manifest.files if entry.path == manifest.application_wheel)
+    builder._publish_artifacts(archive, wheel, output / "siteops-install.zip", digest)
+    assert {path.name for path in output.iterdir()} == {"siteops-install.zip", wheel.name}
+    with zipfile.ZipFile(output / "siteops-install.zip") as released:
+        assert (output / wheel.name).read_bytes() == released.read(manifest.application_wheel)
+
+
+@pytest.mark.parametrize("existing", ["siteops-install.zip", "siteops-1.0-py3-none-any.whl"])
+def test_publication_never_overwrites_either_artifact(builder, tmp_path, existing):
+    archive = tmp_path / "input.zip"
+    wheel = tmp_path / "siteops-1.0-py3-none-any.whl"
+    archive.write_bytes(b"archive")
+    wheel.write_bytes(b"wheel")
+    output = tmp_path / "output"
+    output.mkdir()
+    sentinel = output / existing
+    sentinel.write_bytes(b"operator file")
+    with pytest.raises(builder.BuildError, match="already exists"):
+        builder._publish_artifacts(
+            archive, wheel, output / "siteops-install.zip",
+            hashlib.sha256(wheel.read_bytes()).hexdigest(),
+        )
+    assert sentinel.read_bytes() == b"operator file"
+    assert list(output.iterdir()) == [sentinel]
+
+
+def test_artifact_copy_failure_removes_only_its_incomplete_outputs(builder, tmp_path):
+    archive = tmp_path / "input.zip"
+    wheel = tmp_path / "siteops-1.0-py3-none-any.whl"
+    archive.write_bytes(b"archive")
+    wheel.write_bytes(b"changed after validation")
+    output = tmp_path / "output"
+    output.mkdir()
+    sentinel = output / "operator.txt"
+    sentinel.write_bytes(b"preserve")
+    with pytest.raises(builder.BuildError, match="changed after verification"):
+        builder._publish_artifacts(archive, wheel, output / "siteops-install.zip", "0" * 64)
+    assert list(output.iterdir()) == [sentinel]
+    assert sentinel.read_bytes() == b"preserve"
+
+
+def test_production_builds_once_and_emits_the_same_wheel(builder, tmp_path, monkeypatch):
+    source = _copy_build_source(tmp_path / "source")
+    wheelhouse, runtime = _synthetic_wheelhouse(builder, tmp_path / "dependencies")
+    shutil.copyfile(tmp_path / "dependencies" / "runtime.txt", source / "scripts" / builder._RUNTIME_LOCK)
+    shutil.copyfile(SCRIPTS / builder._BUILD_LOCK, source / "scripts" / builder._BUILD_LOCK)
+    _git(source, "init", "--quiet")
+    _git(source, "config", "user.name", "Bundle Test")
+    _git(source, "config", "user.email", "bundle-test@example.invalid")
+    _git(source, "add", ".")
+    _git(source, "commit", "--quiet", "-m", "test fixture")
+    sha = _git(source, "rev-parse", "HEAD")
+    monkeypatch.setattr(builder, "_validate_build_environment", lambda requirements: None)
+    builds = []
+    build = builder._build_application_wheel
+
+    def record_build(source, destination):
+        wheel = build(source, destination)
+        builds.append((wheel.name, wheel.read_bytes()))
+        return wheel
+
+    monkeypatch.setattr(builder, "_build_application_wheel", record_build)
+    output = tmp_path / "output"
+    output.mkdir()
+    builder.produce_bundle(
+        root=source, repository="example/siteops", source_ref="refs/heads/main",
+        expected_source_sha=sha, build_number=42, build_attempt=1,
+        output=output / "siteops-install.zip", wheelhouse=wheelhouse,
+        download_dependencies=False,
+    )
+    assert len(builds) == 1
+    name, content = builds[0]
+    assert {path.name for path in output.iterdir()} == {"siteops-install.zip", name}
+    assert (output / name).read_bytes() == content
+    with zipfile.ZipFile(output / "siteops-install.zip") as archive:
+        assert archive.read("wheels/" + name) == content
+        lock = tomllib.loads(archive.read("pylock.toml").decode())
+        assert {p["name"] for p in lock["packages"]} == {"siteops", *[item.name for item in runtime]}
+    assert _git(source, "status", "--porcelain") == ""

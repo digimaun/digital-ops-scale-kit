@@ -1,11 +1,13 @@
-# Reusable workflow that builds, attests, and qualifies one Site Ops installation
-# bundle. The caller repository, ref, and commit identify the source being built.
-# This workflow path and its commit identify the trusted builder.
+# Reusable workflow that builds, attests, and qualifies one Site Ops release wheel
+# and the installation bundle that carries the identical wheel bytes. The caller
+# repository, ref, and commit identify the source being built. This workflow path
+# and its commit identify the trusted builder.
 #
 # The build job executes repository source without signing capability. A separate
 # attestation job receives the staged bytes, executes no repository source, and
-# holds the signing permissions. Qualification verifies the same attested bytes
-# with the runner's GitHub CLI before anything is extracted.
+# signs each published asset independently. Qualification verifies the same
+# attested bytes with the runner's GitHub CLI before anything is extracted or
+# installed, then installs both supported paths with stock pipx.
 #
 # Callers reference this workflow locally as
 # `./.github/workflows/_siteops-distribution.yaml`, which GitHub binds to the
@@ -52,14 +54,20 @@ on:
       archive-sha256:
         description: "SHA-256 of the attested installation archive."
         value: ${{ jobs.build.outputs.archive-sha256 }}
+      wheel-name:
+        description: "File name of the standalone Site Ops wheel published beside the archive."
+        value: ${{ jobs.build.outputs.wheel-name }}
+      wheel-sha256:
+        description: "SHA-256 of the attested standalone Site Ops wheel."
+        value: ${{ jobs.build.outputs.wheel-sha256 }}
       staging-artifact-id:
-        description: "Artifact ID holding the attested archive and its detached proof."
+        description: "Artifact ID holding both attested assets and their detached proofs."
         value: ${{ jobs.attest.outputs.staging-artifact-id }}
       staging-artifact-name:
-        description: "Artifact name holding the attested archive and its detached proof."
+        description: "Artifact name holding both attested assets and their detached proofs."
         value: ${{ jobs.attest.outputs.staging-artifact-name }}
       staging-artifact-url:
-        description: "Download page for the attested archive and its detached proof."
+        description: "Download page for both attested assets and their detached proofs."
         value: ${{ jobs.attest.outputs.staging-artifact-url }}
       qualification-matrix:
         description: "Compact JSON results for each supported Python, Linux, and Windows qualification cell."
@@ -73,6 +81,11 @@ env:
   # Package downloads use the configured feed with no public fallback.
   PACKAGE_INDEX_URL: https://packagefeedproxy.microsoft.io/pypi/simple/
   PIPX_VERSION: 1.17.2
+  # pipx installs its backend into shared libraries. The pylock reader that the
+  # verified path depends on is present, and still explicitly experimental, in
+  # this pinned pip. It matches the committed build lock.
+  SHARED_PIP_SPEC: pip==26.2.1
+  SHARED_PIP_SHA256: 71138adf1f4ca900cdb7d289c21b7494329f2332b6d85f0e1c42108c0384ed3e
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   PYTHONUNBUFFERED: "1"
   # CI results and progress use publication-safe output.
@@ -95,6 +108,8 @@ jobs:
       build-attempt: ${{ steps.build.outputs.build-attempt }}
       archive-name: ${{ steps.build.outputs.archive-name }}
       archive-sha256: ${{ steps.build.outputs.archive-sha256 }}
+      wheel-name: ${{ steps.build.outputs.wheel-name }}
+      wheel-sha256: ${{ steps.build.outputs.wheel-sha256 }}
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
 
     env:
@@ -202,29 +217,67 @@ jobs:
 
           shopt -s dotglob nullglob
           produced=("$staging"/*)
-          if [[ ${#produced[@]} -ne 1 || "${produced[0]}" != "$archive" ]]; then
-            echo "::error::The build produced content other than the expected archive."
+          wheel=""
+          for path in "${produced[@]}"; do
+            if [[ "$path" != "$archive" ]]; then
+              wheel="$path"
+            fi
+          done
+          wheel_name="${wheel##*/}"
+          if [[ ${#produced[@]} -ne 2 || ! -f "$archive" || ! -f "$wheel" ]]; then
+            echo "::error::The build produced content other than the archive and its standalone wheel."
+            exit 1
+          fi
+          if [[ ! "$wheel_name" =~ ^siteops-[A-Za-z0-9._+!-]+-py3-none-any\.whl$ ]]; then
+            echo "::error::The standalone wheel does not carry a supported Site Ops wheel name."
             exit 1
           fi
 
+          # The two published assets must carry one identical application build.
+          python - "$archive" "$wheel" <<'PY'
+          import json
+          import sys
+          import zipfile
+          from pathlib import Path
+
+          archive, wheel = Path(sys.argv[1]), Path(sys.argv[2])
+          member = "wheels/" + wheel.name
+          with zipfile.ZipFile(archive) as bundle:
+              document = json.loads(bundle.read("bundle.json"))
+              if member not in bundle.namelist():
+                  print("::error::The archive does not contain the standalone wheel.")
+                  raise SystemExit(1)
+              packaged = bundle.read(member)
+          if document["package"]["wheel"] != member:
+              print("::error::The archive manifest names a different application wheel.")
+              raise SystemExit(1)
+          if packaged != wheel.read_bytes():
+              print("::error::The standalone wheel is not the archive member byte for byte.")
+              raise SystemExit(1)
+          PY
+
           digest="$(sha256sum "$archive" | cut -d ' ' -f 1)"
+          wheel_digest="$(sha256sum "$wheel" | cut -d ' ' -f 1)"
           version="$(python -c 'import json,sys,zipfile; print(json.loads(zipfile.ZipFile(sys.argv[1]).read("bundle.json"))["package"]["version"])' "$archive")"
           {
             echo "package-version=$version"
             echo "build-number=$BUILD_NUMBER"
             echo "build-attempt=$BUILD_ATTEMPT"
             echo "archive-name=$ARCHIVE_NAME"
-            echo "archive-path=$archive"
             echo "archive-sha256=$digest"
+            echo "wheel-name=$wheel_name"
+            echo "wheel-sha256=$wheel_digest"
+            echo "staging-path=$staging"
           } >> "$GITHUB_OUTPUT"
           echo "Built $ARCHIVE_NAME with digest $digest."
+          echo "Built $wheel_name with digest $wheel_digest."
 
-      - name: Upload the build archive
+      - name: Upload the build artifacts
         id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: siteops-install-build-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ steps.build.outputs.archive-path }}
+          path: ${{ steps.build.outputs.staging-path }}
           if-no-files-found: error
           overwrite: false
           include-hidden-files: false
@@ -252,6 +305,8 @@ jobs:
 
     env:
       EXPECTED_ARCHIVE_SHA256: ${{ needs.build.outputs.archive-sha256 }}
+      EXPECTED_WHEEL_SHA256: ${{ needs.build.outputs.wheel-sha256 }}
+      WHEEL_NAME: ${{ needs.build.outputs.wheel-name }}
 
     steps:
       - name: Resolve the staging artifact name
@@ -261,7 +316,7 @@ jobs:
           set -euo pipefail
           echo "staging-artifact-name=siteops-install-staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
 
-      - name: Download the build archive
+      - name: Download the build artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           artifact-ids: ${{ needs.build.outputs.artifact-id }}
@@ -278,50 +333,76 @@ jobs:
           set -euo pipefail
           subject="$RUNNER_TEMP/siteops-subject"
           archive="$subject/$ARCHIVE_NAME"
+          wheel="$subject/$WHEEL_NAME"
           shopt -s dotglob nullglob
           entries=("$subject"/*)
-          if [[ ${#entries[@]} -ne 1 || "${entries[0]}" != "$archive" ]]; then
-            echo "::error::The downloaded artifact holds content other than $ARCHIVE_NAME."
+          if [[ ${#entries[@]} -ne 2 || ! -f "$archive" || ! -f "$wheel" ]]; then
+            echo "::error::The downloaded artifact holds content other than $ARCHIVE_NAME and the standalone wheel."
             exit 1
           fi
-          digest="$(sha256sum "$archive" | cut -d ' ' -f 1)"
-          if [[ "$digest" != "$EXPECTED_ARCHIVE_SHA256" ]]; then
-            echo "::error::The downloaded archive does not match the digest recorded by the build job."
-            exit 1
-          fi
+          for subject_pair in "$archive|$EXPECTED_ARCHIVE_SHA256" "$wheel|$EXPECTED_WHEEL_SHA256"; do
+            path="${subject_pair%|*}"
+            expected="${subject_pair##*|}"
+            digest="$(sha256sum "$path" | cut -d ' ' -f 1)"
+            if [[ "$digest" != "$expected" ]]; then
+              echo "::error::A downloaded asset does not match the digest recorded by the build job."
+              exit 1
+            fi
+          done
 
-      - name: Attest build provenance
-        id: attest
+      - name: Attest archive provenance
+        id: attest-archive
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: ${{ runner.temp }}/siteops-subject/siteops-install.zip
           show-summary: false
 
+      - name: Attest wheel provenance
+        id: attest-wheel
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/siteops-subject/${{ needs.build.outputs.wheel-name }}
+          show-summary: false
+
       - name: Stage the attested bytes
         shell: bash
         env:
-          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+          ARCHIVE_BUNDLE_PATH: ${{ steps.attest-archive.outputs.bundle-path }}
+          WHEEL_BUNDLE_PATH: ${{ steps.attest-wheel.outputs.bundle-path }}
         run: |
           set -euo pipefail
           umask 077
-          subject="$RUNNER_TEMP/siteops-subject/$ARCHIVE_NAME"
+          subject="$RUNNER_TEMP/siteops-subject"
           staging="$RUNNER_TEMP/siteops-staging"
           rm -rf "$staging"
           mkdir -p "$staging"
-          cp "$subject" "$staging/$ARCHIVE_NAME"
-          cp "$BUNDLE_PATH" "$staging/${ARCHIVE_NAME}${ATTESTATION_SUFFIX}"
+          cp "$subject/$ARCHIVE_NAME" "$staging/$ARCHIVE_NAME"
+          cp "$ARCHIVE_BUNDLE_PATH" "$staging/${ARCHIVE_NAME}${ATTESTATION_SUFFIX}"
+          cp "$subject/$WHEEL_NAME" "$staging/$WHEEL_NAME"
+          cp "$WHEEL_BUNDLE_PATH" "$staging/${WHEEL_NAME}${ATTESTATION_SUFFIX}"
 
-          digest="$(sha256sum "$staging/$ARCHIVE_NAME" | cut -d ' ' -f 1)"
-          if [[ "$digest" != "$EXPECTED_ARCHIVE_SHA256" ]]; then
-            echo "::error::Staging altered the attested archive."
+          for staged_pair in "$ARCHIVE_NAME|$EXPECTED_ARCHIVE_SHA256" "$WHEEL_NAME|$EXPECTED_WHEEL_SHA256"; do
+            name="${staged_pair%|*}"
+            expected="${staged_pair##*|}"
+            digest="$(sha256sum "$staging/$name" | cut -d ' ' -f 1)"
+            if [[ "$digest" != "$expected" ]]; then
+              echo "::error::Staging altered an attested asset."
+              exit 1
+            fi
+            if [[ ! -s "$staging/${name}${ATTESTATION_SUFFIX}" ]]; then
+              echo "::error::An attestation bundle is empty."
+              exit 1
+            fi
+          done
+
+          shopt -s dotglob nullglob
+          staged=("$staging"/*)
+          if [[ ${#staged[@]} -ne 4 ]]; then
+            echo "::error::Staging holds content other than the two assets and their detached proofs."
             exit 1
           fi
-          if [[ ! -s "$staging/${ARCHIVE_NAME}${ATTESTATION_SUFFIX}" ]]; then
-            echo "::error::The attestation bundle is empty."
-            exit 1
-          fi
 
-      - name: Upload the attested bundle
+      - name: Upload the attested assets
         id: stage
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -363,6 +444,8 @@ jobs:
       SIGNER_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/_siteops-distribution.yaml@${{ github.ref }}
       BUILD_NUMBER: ${{ github.run_id }}
       BUILD_ATTEMPT: ${{ github.run_attempt }}
+      WHEEL_NAME: ${{ needs.build.outputs.wheel-name }}
+      PACKAGE_VERSION: ${{ needs.build.outputs.package-version }}
 
     steps:
       - name: Confirm the GitHub CLI verification capabilities
@@ -388,7 +471,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      - name: Download the attested bundle
+      - name: Download the attested assets
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           artifact-ids: ${{ needs.attest.outputs.staging-artifact-id }}
@@ -399,31 +482,35 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
 
-      - name: Verify the bundle before extraction
+      - name: Verify both assets before use
         run: |
           set -euo pipefail
           # The Windows runner reports a backslash temporary path.
           temp="${RUNNER_TEMP//\\//}"
           download="$temp/siteops-download"
           archive="$download/$ARCHIVE_NAME"
-          bundle="${archive}${ATTESTATION_SUFFIX}"
-          if [[ ! -f "$archive" || ! -f "$bundle" ]]; then
-            echo "::error::The staged artifact does not hold the archive and its detached proof."
-            exit 1
-          fi
+          wheel="$download/$WHEEL_NAME"
+          for asset in "$archive" "$wheel"; do
+            if [[ ! -f "$asset" || ! -f "${asset}${ATTESTATION_SUFFIX}" ]]; then
+              echo "::error::The staged artifact does not hold both assets and their detached proofs."
+              exit 1
+            fi
+          done
 
-          gh attestation verify "$archive" \
-            --bundle "$bundle" \
-            --repo "$SOURCE_REPOSITORY" \
-            --cert-identity "$SIGNER_IDENTITY" \
-            --signer-digest "$SIGNER_DIGEST" \
-            --source-digest "$SOURCE_SHA" \
-            --source-ref "$SOURCE_REF" \
-            --cert-oidc-issuer "$OIDC_ISSUER" \
-            --predicate-type "$PREDICATE_TYPE" \
-            --deny-self-hosted-runners
+          for asset in "$archive" "$wheel"; do
+            gh attestation verify "$asset" \
+              --bundle "${asset}${ATTESTATION_SUFFIX}" \
+              --repo "$SOURCE_REPOSITORY" \
+              --cert-identity "$SIGNER_IDENTITY" \
+              --signer-digest "$SIGNER_DIGEST" \
+              --source-digest "$SOURCE_SHA" \
+              --source-ref "$SOURCE_REF" \
+              --cert-oidc-issuer "$OIDC_ISSUER" \
+              --predicate-type "$PREDICATE_TYPE" \
+              --deny-self-hosted-runners
+          done
 
-          echo "The attested archive satisfies the exact source and signer policy."
+          echo "Both attested assets satisfy the exact source and signer policy."
 
       - name: Extract the verified bundle
         env:
@@ -467,6 +554,7 @@ jobs:
           base = package.get("baseVersion", "")
           mode = os.environ["VERSION_MODE"]
           expected = base if mode == "source" else base + "+build." + str(number) + "." + str(attempt) + ".g" + commit[:12]
+          wheel = "wheels/" + os.environ["WHEEL_NAME"]
 
           failures = []
           if mode not in ("build", "source"):
@@ -483,13 +571,23 @@ jobs:
               failures.append("source.ref")
           if build.get("number") != number or build.get("attempt") != attempt:
               failures.append("build")
-          if package.get("version") != expected:
+          if package.get("version") != expected or package.get("version") != os.environ["PACKAGE_VERSION"]:
               failures.append("package.version")
+          if package.get("wheel") != wheel:
+              failures.append("package.wheel")
+          with open(os.path.join(sys.argv[1], *wheel.split("/")), "rb") as stream:
+              packaged = stream.read()
+          with open(sys.argv[2], "rb") as stream:
+              standalone = stream.read()
+          if packaged != standalone:
+              failures.append("standalone wheel bytes")
+          if not os.path.isfile(os.path.join(sys.argv[1], "pylock.toml")):
+              failures.append("pylock.toml")
           if failures:
-              print("::error::The verified bundle describes a different build: " + ", ".join(failures))
+              print("::error::The verified assets describe a different build: " + ", ".join(failures))
               raise SystemExit(1)
-          ' "$temp/siteops-verified"
-          echo "The verified bundle is internally consistent with this build."
+          ' "$temp/siteops-verified" "$temp/siteops-download/$WHEEL_NAME"
+          echo "The verified archive and standalone wheel carry one identical application build."
 
       - name: Install the external qualification tooling
         env:
@@ -503,23 +601,56 @@ jobs:
           temp="${RUNNER_TEMP//\\//}"
           unset PYTHONPATH PYTHONHOME
           export PIP_CONFIG_FILE="$("$PYTHON" -c 'import os; print(os.devnull)')"
-          tooling="$temp/siteops-tooling"
-          rm -rf "$tooling"
+          owned="$temp/siteops-qualification"
+          rm -rf "$owned"
+          umask 077
+          mkdir -p "$owned/logs" "$owned/home" "$owned/tool-wheels"
+          tooling="$owned/tooling"
           "$PYTHON" -m venv "$tooling"
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             bin="$tooling/Scripts"
           else
             bin="$tooling/bin"
           fi
-          umask 077
           if ! "$bin/python" -m pip install --no-cache-dir --disable-pip-version-check \
-            "pipx==$PIPX_VERSION" > "$temp/siteops-qualification-tooling.log" 2>&1; then
+            "pipx==$PIPX_VERSION" > "$owned/logs/tooling.log" 2>&1; then
             echo "::error::Qualification tooling could not be installed from the configured feed."
             exit 1
           fi
-          "$bin/python" -c 'from importlib.metadata import version; print("pipx " + version("pipx"))'
 
-      - name: Install and remove Site Ops from the verified bundle
+          # The lock reader that matters belongs to pipx's shared backend, not to
+          # the interpreter's own pip. Provision the tested pinned release from a
+          # hash-verified wheel with the supported pipx command.
+          printf '%s \\\n    --hash=sha256:%s\n' "$SHARED_PIP_SPEC" "$SHARED_PIP_SHA256" \
+            > "$owned/shared-backend.txt"
+          if ! "$bin/python" -m pip download --no-cache-dir --disable-pip-version-check \
+            --require-hashes --only-binary=:all: --no-deps --dest "$owned/tool-wheels" \
+            --requirement "$owned/shared-backend.txt" \
+            > "$owned/logs/backend-download.log" 2>&1; then
+            echo "::error::The pinned pipx backend wheel could not be obtained from the configured feed."
+            exit 1
+          fi
+
+          export PIPX_HOME="$owned/pipx"
+          export PIPX_BIN_DIR="$owned/pipx-bin"
+          export PIPX_MAN_DIR="$owned/pipx-man"
+          export PIPX_COMPLETION_DIR="$owned/pipx-completions"
+          export PIPX_SHARED_LIBS="$owned/pipx-shared"
+          export PIPX_DEFAULT_PYTHON="$PYTHON"
+          export PIPX_USE_EMOJI=0
+          export PIP_CACHE_DIR="$owned/pip-cache"
+          # pipx splits pip arguments on whitespace, so the wheelhouse is a URI.
+          wheelhouse="$("$PYTHON" -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).as_uri())' "$owned/tool-wheels")"
+          if ! "$bin/pipx" upgrade-shared \
+            --pip-args "--no-index --only-binary=:all: --no-cache-dir --force-reinstall --find-links=$wheelhouse" \
+            > "$owned/logs/backend-provision.log" 2>&1; then
+            echo "::error::pipx could not provision its pinned backend from the verified wheel."
+            exit 1
+          fi
+          "$bin/python" -c 'from importlib.metadata import version; print("pipx " + version("pipx"))'
+          echo "Provisioned the pipx backend $SHARED_PIP_SPEC from a hash-verified wheel."
+
+      - name: Install Site Ops from the verified lock
         env:
           PYTHON: ${{ steps.python.outputs.python-path }}
         run: |
@@ -529,23 +660,144 @@ jobs:
           temp="${RUNNER_TEMP//\\//}"
           extract="$temp/siteops-verified"
           owned="$temp/siteops-qualification"
-          rm -rf "$owned"
-          mkdir -p "$owned/logs"
+          logs="$owned/logs"
           if [[ "$RUNNER_OS" == "Windows" ]]; then
-            tooling_bin="$temp/siteops-tooling/Scripts"
+            tooling_bin="$owned/tooling/Scripts"
+            command_name="siteops.exe"
           else
-            tooling_bin="$temp/siteops-tooling/bin"
+            tooling_bin="$owned/tooling/bin"
+            command_name="siteops"
           fi
 
-          # Every pipx and pip location stays inside this run, so the runner's
-          # own tools and user profile are unchanged.
+          # Every pipx, pip, and profile location stays inside this run, so the
+          # runner's own tools and user profile are unchanged.
+          export HOME="$owned/home"
           export PIPX_HOME="$owned/pipx"
           export PIPX_BIN_DIR="$owned/pipx-bin"
           export PIPX_MAN_DIR="$owned/pipx-man"
           export PIPX_COMPLETION_DIR="$owned/pipx-completions"
           export PIPX_SHARED_LIBS="$owned/pipx-shared"
           export PIPX_DEFAULT_PYTHON="$PYTHON"
+          export PIPX_USE_EMOJI=0
           export PIP_CACHE_DIR="$owned/pip-cache"
+          export PIP_CONFIG_FILE="$("$PYTHON" -c 'import os; print(os.devnull)')"
+          command_bin="$PIPX_BIN_DIR"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            command_bin="$(cygpath -u "$command_bin")"
+            tooling_bin="$(cygpath -u "$tooling_bin")"
+          fi
+          export PATH="$command_bin:$tooling_bin:$PATH"
+          # A source directory must never reach the installed application.
+          cd "$owned"
+
+          install_locked() {
+            label="$1"
+            lock="$2"
+            shift 2
+            pipx install siteops \
+              --lock "$lock" \
+              --backend pip \
+              --fetch-python never \
+              --skip-maintenance \
+              --app siteops \
+              --pip-args "--isolated --require-hashes --no-index --only-binary=:all: --no-cache-dir" \
+              "$@" > "$logs/$label.log" 2>&1
+          }
+
+          expect_working_command() {
+            if ! observed="$(siteops --version 2> "$logs/version-$1.log")"; then
+              echo "::error::The exposed command could not be executed after $1. Inspect the private version log."
+              exit 1
+            fi
+            if [[ "$observed" != "siteops $PACKAGE_VERSION" ]]; then
+              echo "::error::The exposed command reported an unexpected version after $1."
+              exit 1
+            fi
+            resolved="$(command -v siteops)"
+            if [[ "$resolved" != "$command_bin/siteops"* ]]; then
+              echo "::error::The exposed command does not resolve inside this run's command directory."
+              exit 1
+            fi
+          }
+
+          if ! install_locked install "$extract/pylock.toml"; then
+            echo "::error::The verified lock could not be installed with stock pipx."
+            exit 1
+          fi
+          expect_working_command "installation"
+
+          if ! install_locked repeat "$extract/pylock.toml"; then
+            echo "::error::Repeating the same verified installation request failed."
+            exit 1
+          fi
+          expect_working_command "a repeated request"
+
+          if ! install_locked repair "$extract/pylock.toml" --force; then
+            echo "::error::The guarded forced repair of the selected build failed."
+            exit 1
+          fi
+          expect_working_command "a forced repair"
+
+          # A changed payload byte must fail without losing the working command.
+          rm -rf "$owned/tampered"
+          cp -R "$extract" "$owned/tampered"
+          printf 'changed after the producer recorded this wheel' >> "$owned/tampered/wheels/$WHEEL_NAME"
+          if install_locked tampered "$owned/tampered/pylock.toml" --force; then
+            echo "::error::A tampered wheel was accepted by the verified installation policy."
+            exit 1
+          fi
+          expect_working_command "a rejected replacement"
+          rm -rf "$owned/tampered"
+
+          if ! pipx uninstall siteops > "$logs/uninstall.log" 2>&1; then
+            echo "::error::Removal of the installed application failed."
+            exit 1
+          fi
+          # Only this run's command directory may expose the application, and a
+          # shell cache entry must not stand in for a removed file.
+          hash -r
+          remaining="$(command -v siteops || true)"
+          if [[ -e "$PIPX_BIN_DIR/$command_name" || "$remaining" == "$command_bin/siteops"* ]]; then
+            echo "::error::Removal left the exposed Site Ops command in place."
+            exit 1
+          fi
+          echo "The verified lock installed, repeated, repaired, rejected a tampered replacement, and removed cleanly."
+
+      - name: Install Site Ops from the standalone wheel
+        env:
+          PYTHON: ${{ steps.python.outputs.python-path }}
+          PIP_INDEX_URL: ${{ env.PACKAGE_INDEX_URL }}
+          PIP_NO_INPUT: "1"
+          PIP_KEYRING_PROVIDER: disabled
+          PIP_EXTRA_INDEX_URL: ""
+        run: |
+          set -euo pipefail
+          umask 077
+          unset PYTHONPATH PYTHONHOME
+          temp="${RUNNER_TEMP//\\//}"
+          owned="$temp/siteops-qualification"
+          logs="$owned/logs"
+          wheel="$temp/siteops-download/$WHEEL_NAME"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            tooling_bin="$owned/tooling/Scripts"
+            command_name="siteops.exe"
+          else
+            tooling_bin="$owned/tooling/bin"
+            command_name="siteops"
+          fi
+
+          # The online path keeps its own application state and takes runtime
+          # dependencies from the configured feed with no public fallback.
+          export HOME="$owned/home"
+          export PIPX_HOME="$owned/online-pipx"
+          export PIPX_BIN_DIR="$owned/online-pipx-bin"
+          export PIPX_MAN_DIR="$owned/online-pipx-man"
+          export PIPX_COMPLETION_DIR="$owned/online-pipx-completions"
+          export PIPX_SHARED_LIBS="$owned/pipx-shared"
+          export PIPX_DEFAULT_PYTHON="$PYTHON"
+          export PIPX_USE_EMOJI=0
+          export PIP_CACHE_DIR="$owned/pip-cache"
+          export PIP_CONFIG_FILE="$("$PYTHON" -c 'import os; print(os.devnull)')"
           command_bin="$PIPX_BIN_DIR"
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             command_bin="$(cygpath -u "$command_bin")"
@@ -554,69 +806,44 @@ jobs:
           export PATH="$command_bin:$tooling_bin:$PATH"
           cd "$owned"
 
-          run_installer() {
-            label="$1"
-            shift
-            if ! "$PYTHON" "$extract/install.py" --output json \
-              --store-dir "$owned/store" "$@" \
-              > "$owned/logs/$label.json" 2> "$owned/logs/$label.err"; then
-              echo "::error::The bundle helper reported a failure during $label."
-              exit 1
-            fi
-          }
+          if ! pipx install "$wheel" \
+            --backend pip \
+            --fetch-python never \
+            --skip-maintenance \
+            --app siteops \
+            --pip-args "--only-binary=:all: --no-cache-dir" \
+            > "$logs/online-install.log" 2>&1; then
+            echo "::error::The standalone wheel could not be installed from the configured feed."
+            exit 1
+          fi
 
-          run_installer install
-          siteops --version
-          run_installer removal --uninstall
+          if ! observed="$(siteops --version 2> "$logs/online-version.log")"; then
+            echo "::error::The online command could not be executed. Inspect the private version log."
+            exit 1
+          fi
+          if [[ "$observed" != "siteops $PACKAGE_VERSION" ]]; then
+            echo "::error::The online installation exposed an unexpected version."
+            exit 1
+          fi
+          resolved="$(command -v siteops)"
+          if [[ "$resolved" != "$command_bin/siteops"* ]]; then
+            echo "::error::The online command does not resolve inside this run's command directory."
+            exit 1
+          fi
 
-      - name: Confirm the helper result contract
-        env:
-          PYTHON: ${{ steps.python.outputs.python-path }}
-        run: |
-          set -euo pipefail
-          temp="${RUNNER_TEMP//\\//}"
-          logs="$temp/siteops-qualification/logs"
-          "$PYTHON" -c '
-          import json
-          import sys
-
-
-          def load(path):
-              with open(path, encoding="utf-8") as stream:
-                  return json.load(stream)
-
-
-          manifest = load(sys.argv[1])
-          installed = load(sys.argv[2])
-          removed = load(sys.argv[3])
-          private = ("sourceRepository", "sourceCommit", "store", "command", "pathReady")
-
-          failures = []
-          for label, document, status in (
-              ("installation", installed, "installed"),
-              ("removal", removed, "removed"),
-          ):
-              if document.get("apiVersion") != "siteops.install/v1":
-                  failures.append(label + " apiVersion")
-              if document.get("kind") != "SiteOpsInstallationResult":
-                  failures.append(label + " kind")
-              if document.get("package") != "siteops":
-                  failures.append(label + " package")
-              if document.get("status") != status:
-                  failures.append(label + " status")
-              if type(document.get("exitCode")) is not int or document["exitCode"] != 0 or document.get("interrupted") is not False:
-                  failures.append(label + " outcome")
-              if "diagnostic" in document:
-                  failures.append(label + " diagnostic")
-              if any(field in document for field in private):
-                  failures.append(label + " redaction")
-          if installed.get("version") != manifest["package"]["version"]:
-              failures.append("installed version")
-          if failures:
-              print("::error::The bundle helper reported an unsupported result: " + ", ".join(failures))
-              raise SystemExit(1)
-          ' "$temp/siteops-verified/bundle.json" "$logs/install.json" "$logs/removal.json"
-          echo "The bundle helper installed and removed the selected build."
+          if ! pipx uninstall siteops > "$logs/online-uninstall.log" 2>&1; then
+            echo "::error::Removal of the online installation failed."
+            exit 1
+          fi
+          # Only this run's command directory may expose the application, and a
+          # shell cache entry must not stand in for a removed file.
+          hash -r
+          remaining="$(command -v siteops || true)"
+          if [[ -e "$PIPX_BIN_DIR/$command_name" || "$remaining" == "$command_bin/siteops"* ]]; then
+            echo "::error::Removal left the exposed Site Ops command in place."
+            exit 1
+          fi
+          echo "The standalone wheel installed with feed dependencies, exposed the expected version, and removed cleanly."
 
   summary:
     name: Distribution summary
@@ -644,6 +871,8 @@ jobs:
           PACKAGE_VERSION: ${{ needs.build.outputs.package-version }}
           ARCHIVE_NAME_VALUE: ${{ needs.build.outputs.archive-name }}
           ARCHIVE_SHA256: ${{ needs.build.outputs.archive-sha256 }}
+          WHEEL_NAME_VALUE: ${{ needs.build.outputs.wheel-name }}
+          WHEEL_SHA256: ${{ needs.build.outputs.wheel-sha256 }}
           STAGING_ARTIFACT_ID: ${{ needs.attest.outputs.staging-artifact-id }}
           STAGING_ARTIFACT_NAME: ${{ needs.attest.outputs.staging-artifact-name }}
           STAGING_ARTIFACT_URL: ${{ needs.attest.outputs.staging-artifact-url }}
@@ -768,8 +997,8 @@ jobs:
                   )
               else:
                   outcome = (
-                      "All Linux and Windows installation checks passed. The attested "
-                      "bundle is ready for inspection."
+                      "All Linux and Windows installation checks passed. Both attested "
+                      "assets are ready for inspection."
                   )
 
               def code(value):
@@ -796,18 +1025,19 @@ jobs:
               if artifact_url:
                   lines.extend(
                       [
-                          "[Download the attested installation bundle]("
+                          "[Download the attested installation assets]("
                           + artifact_url
                           + ").",
                           "",
-                          "The Actions download contains the installation ZIP and its detached proof. "
-                          "Verify the installation ZIP before extracting it.",
+                          "The Actions download contains the installation ZIP, the standalone "
+                          "Site Ops wheel, and a detached proof for each. Verify an asset "
+                          "before extracting or installing it.",
                           "",
                       ]
                   )
               else:
                   lines.extend(
-                      ["The attested installation bundle is not available for download.", ""]
+                      ["The attested installation assets are not available for download.", ""]
                   )
 
               lines.extend(
@@ -847,6 +1077,8 @@ jobs:
                       "| Source ref | " + code(os.environ["SOURCE_REF"]) + " |",
                       "| Archive | " + code(os.environ["ARCHIVE_NAME_VALUE"]) + " |",
                       "| Archive SHA-256 | " + code(os.environ["ARCHIVE_SHA256"]) + " |",
+                      "| Wheel | " + code(os.environ["WHEEL_NAME_VALUE"]) + " |",
+                      "| Wheel SHA-256 | " + code(os.environ["WHEEL_SHA256"]) + " |",
                       "| Run attempt | " + code(os.environ["GITHUB_RUN_ATTEMPT"]) + " |",
                       "| Artifact ID | " + code(os.environ["STAGING_ARTIFACT_ID"]) + " |",
                       "| Artifact name | " + code(os.environ["STAGING_ARTIFACT_NAME"]) + " |",

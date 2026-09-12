@@ -9,8 +9,10 @@ fakes, so a change that widens the boundary fails here.
 `on` parses as the boolean True, since YAML 1.1 treats it as a keyword.
 """
 
+import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -20,6 +22,18 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tests.native_bundle import (
+    backend_wheelhouse as backend_wheelhouse,
+)
+from tests.native_bundle import (
+    bundle_factory as bundle_factory,
+)
+from tests.native_bundle import (
+    pinned_backend,
+    pipx_program,
+    provision_shared_backend,
+    publish_assets,
+)
 from tests.shell_helpers import (
     bash_path as _bash_path,
 )
@@ -29,7 +43,6 @@ from tests.shell_helpers import (
 from tests.shell_helpers import (
     write_executable as _write_executable,
 )
-from tests.test_distribution_installer import bundle_factory as bundle_factory
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
@@ -46,6 +59,7 @@ PREDICATE_TYPE = "https://slsa.dev/provenance/v1"
 SIGNER_WORKFLOW = ".github/workflows/_siteops-distribution.yaml"
 QUALIFIED_PLATFORMS = ("ubuntu-24.04", "windows-2025")
 QUALIFIED_PYTHONS = ("3.10", "3.11", "3.12", "3.13", "3.14")
+WHEEL_NAME = "siteops-1.0.0b1+build.42.1.gcccccccccccc-py3-none-any.whl"
 
 ACTION_PINS = {
     "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",
@@ -305,31 +319,61 @@ def test_build_job_passes_the_event_identity_to_the_producer():
     assert "--download-dependencies" in script
 
 
+def test_the_build_publishes_exactly_two_assets_from_one_wheel_build():
+    build = REUSABLE["jobs"]["build"]
+    assert build["outputs"]["wheel-name"] == "${{ steps.build.outputs.wheel-name }}"
+    assert build["outputs"]["wheel-sha256"] == "${{ steps.build.outputs.wheel-sha256 }}"
+    script = _script(build, "Build the installation bundle")
+    assert "${#produced[@]} -ne 2" in script
+    assert '"wheels/" + wheel.name' in script
+    assert "is not the archive member byte for byte" in script
+    assert 'document["package"]["wheel"] != member' in script
+    assert "^siteops-[A-Za-z0-9._+!-]+-py3-none-any\\.whl$" in script
+    for output in ("archive-sha256", "wheel-name", "wheel-sha256", "staging-path"):
+        assert f'echo "{output}=' in script
+    upload = _step(build, "Upload the build artifacts")["with"]
+    assert upload["path"] == "${{ steps.build.outputs.staging-path }}"
+
+
 # --- The attested bytes are the exact build output ---------------------------
 
 
 def test_attestation_binds_the_exact_build_artifact_of_this_run():
     attest = REUSABLE["jobs"]["attest"]
-    download = _step(attest, "Download the build archive")["with"]
+    download = _step(attest, "Download the build artifacts")["with"]
     assert download["artifact-ids"] == "${{ needs.build.outputs.artifact-id }}"
     assert download["run-id"] == "${{ github.run_id }}"
     assert download["repository"] == "${{ github.repository }}"
     assert download["digest-mismatch"] == "error"
 
     payload = _script(attest, "Confirm the staged payload")
-    assert "${#entries[@]} -ne 1" in payload
-    assert '"$EXPECTED_ARCHIVE_SHA256"' in payload
+    assert "${#entries[@]} -ne 2" in payload
+    assert "$EXPECTED_ARCHIVE_SHA256" in payload
+    assert "$EXPECTED_WHEEL_SHA256" in payload
 
 
-def test_attestation_signs_the_literal_archive_with_build_provenance():
-    subject = _step(REUSABLE["jobs"]["attest"], "Attest build provenance")
-    assert subject["uses"].startswith("actions/attest@")
-    assert (
-        subject["with"]["subject-path"] == f"${{{{ runner.temp }}}}/siteops-subject/{ARCHIVE_NAME}"
-    )
-    # Omitting every predicate input selects SLSA build provenance.
-    assert set(subject["with"]) == {"subject-path", "show-summary"}
-    assert subject["with"]["show-summary"] is False
+def test_each_published_asset_is_signed_independently():
+    attest = REUSABLE["jobs"]["attest"]
+    subjects = [
+        step for step in attest["steps"] if step.get("uses", "").startswith("actions/attest@")
+    ]
+    assert [step["name"] for step in subjects] == [
+        "Attest archive provenance",
+        "Attest wheel provenance",
+    ]
+    assert [step["with"]["subject-path"] for step in subjects] == [
+        f"${{{{ runner.temp }}}}/siteops-subject/{ARCHIVE_NAME}",
+        "${{ runner.temp }}/siteops-subject/${{ needs.build.outputs.wheel-name }}",
+    ]
+    for step in subjects:
+        # Omitting every predicate input selects SLSA build provenance.
+        assert set(step["with"]) == {"subject-path", "show-summary"}
+        assert step["with"]["show-summary"] is False
+
+    staging = _script(attest, "Stage the attested bytes")
+    assert "${#staged[@]} -ne 4" in staging
+    assert '"$ARCHIVE_BUNDLE_PATH"' in staging
+    assert '"$WHEEL_BUNDLE_PATH"' in staging
 
 
 def test_staging_uploads_never_overwrite_and_fail_on_empty_input():
@@ -374,14 +418,20 @@ def test_qualification_runs_on_hosted_windows_and_linux_without_write_access():
 
 def test_qualification_verifies_before_it_extracts():
     names = _step_names(REUSABLE["jobs"]["qualify"])
-    assert names.index("Verify the bundle before extraction") < names.index(
+    assert names.index("Verify both assets before use") < names.index(
         "Extract the verified bundle"
     )
     assert names.index("Extract the verified bundle") < names.index(
-        "Install and remove Site Ops from the verified bundle"
+        "Confirm the bundle describes this build"
     )
-    assert names.index("Install and remove Site Ops from the verified bundle") < names.index(
-        "Confirm the helper result contract"
+    assert names.index("Confirm the bundle describes this build") < names.index(
+        "Install the external qualification tooling"
+    )
+    assert names.index("Install the external qualification tooling") < names.index(
+        "Install Site Ops from the verified lock"
+    )
+    assert names.index("Install Site Ops from the verified lock") < names.index(
+        "Install Site Ops from the standalone wheel"
     )
 
 
@@ -391,13 +441,15 @@ def test_qualification_policy_pins_the_caller_source_and_local_signer():
     assert environment["SOURCE_REPOSITORY"] == "${{ github.repository }}"
     assert environment["SOURCE_SHA"] == "${{ github.sha }}"
     assert environment["SOURCE_REF"] == "${{ github.ref }}"
+    assert environment["WHEEL_NAME"] == "${{ needs.build.outputs.wheel-name }}"
+    assert environment["PACKAGE_VERSION"] == "${{ needs.build.outputs.package-version }}"
     # A local reusable reference binds to the caller's own event commit, so the
     # signer digest is that commit and the identity carries the caller ref.
     assert environment["SIGNER_DIGEST"] == "${{ github.sha }}"
     assert environment["SIGNER_IDENTITY"] == (
         f"https://github.com/${{{{ github.repository }}}}/{SIGNER_WORKFLOW}@${{{{ github.ref }}}}"
     )
-    script = _script(qualify, "Verify the bundle before extraction")
+    script = _script(qualify, "Verify both assets before use")
     for flag in VERIFY_FLAGS:
         assert flag in script
 
@@ -413,51 +465,159 @@ def test_qualification_requires_the_runner_verifier_capabilities():
 
 
 def test_qualification_isolates_tooling_state_under_the_runner_temporary_path():
-    script = _script(
-        REUSABLE["jobs"]["qualify"],
-        "Install and remove Site Ops from the verified bundle",
-    )
-    for variable in (
-        "PIPX_HOME",
-        "PIPX_BIN_DIR",
-        "PIPX_MAN_DIR",
-        "PIPX_COMPLETION_DIR",
-        "PIPX_SHARED_LIBS",
-        "PIPX_DEFAULT_PYTHON",
-        "PIP_CACHE_DIR",
+    for name in (
+        "Install Site Ops from the verified lock",
+        "Install Site Ops from the standalone wheel",
     ):
-        assert f'export {variable}="$' in script
-    assert 'owned="$temp/siteops-qualification"' in script
-    assert "--output json" in script
-    assert '--store-dir "$owned/store"' in script
-    assert "--uninstall" in script
-    assert '> "$owned/logs/$label.json" 2> "$owned/logs/$label.err"' in script
+        script = _script(REUSABLE["jobs"]["qualify"], name)
+        for variable in (
+            "HOME",
+            "PIPX_HOME",
+            "PIPX_BIN_DIR",
+            "PIPX_MAN_DIR",
+            "PIPX_COMPLETION_DIR",
+            "PIPX_SHARED_LIBS",
+            "PIPX_DEFAULT_PYTHON",
+            "PIP_CACHE_DIR",
+            "PIP_CONFIG_FILE",
+        ):
+            assert f'export {variable}="$' in script
+        assert 'owned="$temp/siteops-qualification"' in script
+        assert "unset PYTHONPATH PYTHONHOME" in script
+        # Raw tool output stays in private run files, never in the job log.
+        assert '> "$logs/' in script
+        checked = [line for line in script.splitlines() if "siteops --version" in line]
+        assert checked, name
+        for line in checked:
+            assert 'observed="$(siteops --version' in line, line
+            assert '2> "$logs/' in line, line
 
 
-def test_qualification_checks_the_helper_result_contract():
-    script = _script(REUSABLE["jobs"]["qualify"], "Confirm the helper result contract")
-    for expected in (
-        "siteops.install/v1",
-        "SiteOpsInstallationResult",
-        '"package") != "siteops"',
-        '"installed"',
-        '"removed"',
-        '"exitCode"',
-        '"interrupted"',
-        "diagnostic",
+def test_qualification_installs_both_supported_paths_with_stock_pipx():
+    verified = _script(REUSABLE["jobs"]["qualify"], "Install Site Ops from the verified lock")
+    assert "pipx install siteops" in verified
+    for flag in (
+        '--lock "$lock"',
+        "--backend pip",
+        "--fetch-python never",
+        "--skip-maintenance",
+        "--app siteops",
+        '--pip-args "--isolated --require-hashes --no-index --only-binary=:all: --no-cache-dir"',
     ):
-        assert expected in script
-    for field in ("sourceRepository", "sourceCommit", "store", "command", "pathReady"):
-        assert field in script
+        assert flag in verified
+    # Install, repeat, guarded forced repair, rejected tamper, and removal.
+    for label in ("install", "repeat", "repair", "tampered", "uninstall"):
+        assert label in verified
+    assert 'install_locked repair "$extract/pylock.toml" --force' in verified
+    assert "if install_locked tampered" in verified
+    assert 'pipx uninstall siteops' in verified
+    assert 'siteops $PACKAGE_VERSION' in verified
+    assert '"$command_bin/siteops"*' in verified
+
+    online = _script(REUSABLE["jobs"]["qualify"], "Install Site Ops from the standalone wheel")
+    assert 'pipx install "$wheel"' in online
+    assert '--pip-args "--only-binary=:all: --no-cache-dir"' in online
+    assert 'wheel="$temp/siteops-download/$WHEEL_NAME"' in online
+    assert 'siteops $PACKAGE_VERSION' in online
+    assert "--no-index" not in online
 
 
-def test_the_qualification_pipx_pin_matches_the_repository_pin():
+def test_the_qualification_tooling_pins_pipx_and_its_lock_reading_backend():
     project = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert f'"pipx=={REUSABLE["env"]["PIPX_VERSION"]}"' in project
+    version, digest = pinned_backend()
+    assert REUSABLE["env"]["SHARED_PIP_SPEC"] == f"pip=={version}"
+    assert REUSABLE["env"]["SHARED_PIP_SHA256"] == digest
+
     script = _script(REUSABLE["jobs"]["qualify"], "Install the external qualification tooling")
     assert '"pipx==$PIPX_VERSION"' in script
-    # The helper expects externally managed tooling, never a bundled copy.
+    assert "--require-hashes" in script
+    assert '"$SHARED_PIP_SPEC"' in script and '"$SHARED_PIP_SHA256"' in script
+    assert "upgrade-shared" in script
+    # Qualification provisions tooling separately from the application bundle.
     assert "venv" in script and "install.py" not in script
+
+    # The guide must name the same qualified baseline, with no wider promise.
+    guide = _guide_text()
+    assert f"Version {REUSABLE['env']['PIPX_VERSION']}" in guide
+    assert f"Version {version}" in guide
+    assert f'"pip=={version}"' in guide
+    for wider in (f"Version {REUSABLE['env']['PIPX_VERSION']}, or", "compatible newer 1.x"):
+        assert wider not in guide, wider
+
+
+def test_the_bundle_ships_no_installation_program():
+    retired = ("install.py", "siteops_distribution", "--store-dir", "SiteOpsInstallationResult")
+    for path in (REUSABLE_PATH, REPO_ROOT / "docs" / "install-siteops.md"):
+        text = path.read_text(encoding="utf-8")
+        for name in retired:
+            assert name not in text, f"{path.name}: {name}"
+    assert not (REPO_ROOT / "scripts" / "install-siteops.py").exists()
+
+
+def test_qualification_consumes_only_the_retained_bundle_payload():
+    """The verified path may depend on nothing the producer stopped shipping."""
+    steps = [step.get("run", "") for step in REUSABLE["jobs"]["qualify"]["steps"]]
+    qualify = "\n".join(steps)
+    for member in ("bundle.json", "pylock.toml", "wheels/$WHEEL_NAME"):
+        assert member in qualify, member
+    referenced = {
+        match.rstrip('"\\').split("/")[-1]
+        for match in re.findall(r"\$extract/[^\s\"']*", qualify)
+    }
+    assert referenced == {"pylock.toml"}, referenced
+
+
+def _guide_text() -> str:
+    return (REPO_ROOT / "docs" / "install-siteops.md").read_text(encoding="utf-8")
+
+
+def _guide_anchors() -> set[str]:
+    anchors = set()
+    for line in _guide_text().splitlines():
+        if line.startswith("#"):
+            heading = line.lstrip("#").strip().lower()
+            anchors.add(
+                "".join(character for character in heading if character.isalnum() or character in " -")
+                .replace(" ", "-")
+            )
+    return anchors
+
+
+def test_generated_notes_and_the_guide_publish_one_installation_command():
+    """A reader must not meet two different commands for the same path."""
+    rendered = [
+        step["run"]
+        for step in _all_steps(CANDIDATE)
+        if "pipx install" in step.get("run", "")
+    ]
+    assert len(rendered) == 1, "One release step renders the installation command."
+    command = rendered[0].replace('\\"', '"')
+    guide = _guide_text()
+    for flag in (
+        "--backend pip --fetch-python never",
+        "--skip-maintenance",
+        "--app siteops",
+        "--only-binary=:all: --no-cache-dir",
+    ):
+        assert flag in guide, flag
+        assert flag in command, flag
+    # Published guidance must not pin an index the reader cannot reach, while the
+    # feed policy for our own runners stays in the workflows that run there.
+    assert "packagefeedproxy" not in command
+    assert "packagefeedproxy" not in guide
+    assert "packagefeedproxy" in REUSABLE_PATH.read_text(encoding="utf-8")
+
+
+def test_release_guidance_links_resolve_inside_the_guide():
+    anchors = _guide_anchors()
+    referenced = set()
+    for path in (CANDIDATE_PATH, RELEASE_PATH, REPO_ROOT / "docs" / "releasing.md"):
+        text = path.read_text(encoding="utf-8")
+        for fragment in text.split("install-siteops.md#")[1:]:
+            referenced.add(fragment.split('"')[0].split(")")[0].split("'")[0].strip())
+    assert referenced, "Release guidance must deep-link into the installation guide."
+    assert referenced <= anchors, referenced - anchors
 
 
 def test_distribution_summary_uses_only_fixed_outputs_and_job_conclusions():
@@ -531,11 +691,15 @@ def test_distribution_outputs_include_artifact_url_and_qualification_matrix():
         "build-attempt",
         "archive-name",
         "archive-sha256",
+        "wheel-name",
+        "wheel-sha256",
         "staging-artifact-id",
         "staging-artifact-name",
         "staging-artifact-url",
         "qualification-matrix",
     }
+    assert outputs["wheel-name"]["value"] == "${{ jobs.build.outputs.wheel-name }}"
+    assert outputs["wheel-sha256"]["value"] == "${{ jobs.build.outputs.wheel-sha256 }}"
     attest = REUSABLE["jobs"]["attest"]
     assert attest["outputs"]["staging-artifact-url"] == "${{ steps.stage.outputs.artifact-url }}"
     assert outputs["staging-artifact-url"]["value"] == (
@@ -621,6 +785,8 @@ def _run_distribution_summary(
             "PACKAGE_VERSION": "1.0.0b1+build.42.2.gcccccccccccc",
             "ARCHIVE_NAME_VALUE": ARCHIVE_NAME,
             "ARCHIVE_SHA256": "d" * 64,
+            "WHEEL_NAME_VALUE": WHEEL_NAME,
+            "WHEEL_SHA256": "e" * 64,
             "STAGING_ARTIFACT_ID": "987" if artifact_available else "",
             "STAGING_ARTIFACT_NAME": (
                 "siteops-install-staging-42-2" if artifact_available else ""
@@ -664,7 +830,7 @@ def test_distribution_summary_reports_the_complete_success_matrix(tmp_path):
     assert summary.count("## Site Ops installer check") == 1
     assert "Version: <code>1.0.0b1+build.42.2.gcccccccccccc</code>" in summary
     assert (
-        "[Download the attested installation bundle]"
+        "[Download the attested installation assets]"
         "(https://github.com/example/publisher/actions/runs/42/artifacts/987)"
         in summary
     )
@@ -674,6 +840,8 @@ def test_distribution_summary_reports_the_complete_success_matrix(tmp_path):
         "Source SHA",
         "Source ref",
         "Archive SHA-256",
+        "Wheel SHA-256",
+        WHEEL_NAME,
         "Run attempt",
         "Artifact ID",
         "Artifact name",
@@ -829,6 +997,8 @@ def test_distribution_summary_fails_without_job_conclusions_and_publishes_nothin
             "PACKAGE_VERSION": "1.0.0b1",
             "ARCHIVE_NAME_VALUE": ARCHIVE_NAME,
             "ARCHIVE_SHA256": "d" * 64,
+            "WHEEL_NAME_VALUE": WHEEL_NAME,
+            "WHEEL_SHA256": "e" * 64,
             "STAGING_ARTIFACT_ID": "987",
             "STAGING_ARTIFACT_NAME": "siteops-install-staging-42-2",
             "STAGING_ARTIFACT_URL": (
@@ -874,6 +1044,7 @@ def _qualification_exports(tmp_path: Path, log: Path) -> dict[str, str]:
         "RUNNER_TEMP": _bash_path(tmp_path / "temp"),
         "ARCHIVE_NAME": ARCHIVE_NAME,
         "ATTESTATION_SUFFIX": ATTESTATION_SUFFIX,
+        "WHEEL_NAME": WHEEL_NAME,
         "SOURCE_REPOSITORY": "example/publisher",
         "SOURCE_SHA": "c" * 40,
         "SOURCE_REF": "refs/heads/main",
@@ -887,63 +1058,94 @@ def _qualification_exports(tmp_path: Path, log: Path) -> dict[str, str]:
     }
 
 
-def _staged_download(tmp_path: Path, *, bundle: bool = True) -> Path:
+def _staged_download(tmp_path: Path, *, missing: str | None = None) -> Path:
     download = tmp_path / "temp" / "siteops-download"
     download.mkdir(parents=True)
-    (download / ARCHIVE_NAME).write_bytes(b"archive bytes")
-    if bundle:
-        (download / (ARCHIVE_NAME + ATTESTATION_SUFFIX)).write_text("{}\n")
+    staged = {
+        ARCHIVE_NAME: b"archive bytes",
+        ARCHIVE_NAME + ATTESTATION_SUFFIX: b"{}\n",
+        WHEEL_NAME: b"wheel bytes",
+        WHEEL_NAME + ATTESTATION_SUFFIX: b"{}\n",
+    }
+    for name, content in staged.items():
+        if name != missing:
+            (download / name).write_bytes(content)
     return download
+
+
+def _expected_verification(asset: str) -> list[str]:
+    return [
+        "attestation",
+        "verify",
+        asset,
+        "--bundle",
+        asset + ATTESTATION_SUFFIX,
+        "--repo",
+        "example/publisher",
+        "--cert-identity",
+        f"https://github.com/example/publisher/{SIGNER_WORKFLOW}@refs/heads/main",
+        "--signer-digest",
+        "c" * 40,
+        "--source-digest",
+        "c" * 40,
+        "--source-ref",
+        "refs/heads/main",
+        "--cert-oidc-issuer",
+        OIDC_ISSUER,
+        "--predicate-type",
+        PREDICATE_TYPE,
+        "--deny-self-hosted-runners",
+    ]
 
 
 def test_qualification_verification_passes_the_exact_policy_to_the_runner_cli(tmp_path):
     _, log = _fake_tools(tmp_path)
     download = _staged_download(tmp_path)
-    script = _script(REUSABLE["jobs"]["qualify"], "Verify the bundle before extraction")
+    script = _script(REUSABLE["jobs"]["qualify"], "Verify both assets before use")
     result = _run_script(script, tmp_path, _qualification_exports(tmp_path, log))
 
     assert result.returncode == 0, result.stdout + result.stderr
-    archive = _bash_path(download / ARCHIVE_NAME)
     assert _invocations(log) == [
-        [
-            "attestation",
-            "verify",
-            archive,
-            "--bundle",
-            archive + ATTESTATION_SUFFIX,
-            "--repo",
-            "example/publisher",
-            "--cert-identity",
-            f"https://github.com/example/publisher/{SIGNER_WORKFLOW}@refs/heads/main",
-            "--signer-digest",
-            "c" * 40,
-            "--source-digest",
-            "c" * 40,
-            "--source-ref",
-            "refs/heads/main",
-            "--cert-oidc-issuer",
-            OIDC_ISSUER,
-            "--predicate-type",
-            PREDICATE_TYPE,
-            "--deny-self-hosted-runners",
-        ]
+        _expected_verification(_bash_path(download / ARCHIVE_NAME)),
+        _expected_verification(_bash_path(download / WHEEL_NAME)),
     ]
 
 
-def test_qualification_stops_when_verification_fails(tmp_path):
-    _, log = _fake_tools(tmp_path)
+@pytest.mark.parametrize("failing", ["archive", "wheel"])
+def test_qualification_stops_when_verification_fails(tmp_path, failing):
+    bin_dir, log = _fake_tools(tmp_path)
     _staged_download(tmp_path)
-    script = _script(REUSABLE["jobs"]["qualify"], "Verify the bundle before extraction")
+    if failing == "wheel":
+        # Fail only the second subject, so a partial verification cannot pass.
+        _write_executable(
+            bin_dir / "gh",
+            """#!/usr/bin/env bash
+{
+  printf '=== gh ===\\n'
+  for argument in "$@"; do printf '%s\\n' "$argument"; done
+} >> "$FAKE_GH_LOG"
+if [[ "$3" == *.whl ]]; then
+  exit 1
+fi
+exit 0
+""",
+        )
+    script = _script(REUSABLE["jobs"]["qualify"], "Verify both assets before use")
     exports = _qualification_exports(tmp_path, log)
-    exports["FAKE_GH_ATTESTATION_EXIT"] = "1"
+    if failing == "archive":
+        exports["FAKE_GH_ATTESTATION_EXIT"] = "1"
     result = _run_script(script, tmp_path, exports)
     assert result.returncode != 0
 
 
-def test_qualification_stops_when_the_detached_proof_is_missing(tmp_path):
+@pytest.mark.parametrize(
+    "missing",
+    [ARCHIVE_NAME + ATTESTATION_SUFFIX, WHEEL_NAME, WHEEL_NAME + ATTESTATION_SUFFIX],
+)
+def test_qualification_stops_when_an_asset_or_proof_is_missing(tmp_path, missing):
     _, log = _fake_tools(tmp_path)
-    _staged_download(tmp_path, bundle=False)
-    script = _script(REUSABLE["jobs"]["qualify"], "Verify the bundle before extraction")
+    _staged_download(tmp_path, missing=missing)
+    script = _script(REUSABLE["jobs"]["qualify"], "Verify both assets before use")
     result = _run_script(script, tmp_path, _qualification_exports(tmp_path, log))
     assert result.returncode != 0
     assert _invocations(log) == []
@@ -997,7 +1199,7 @@ def _bundle_document(**overrides) -> dict:
             "name": "siteops",
             "version": "1.0.0b1+build.42.1.gcccccccccccc",
             "baseVersion": "1.0.0b1",
-            "wheel": "wheels/siteops-1.0.0b1-py3-none-any.whl",
+            "wheel": "wheels/" + WHEEL_NAME,
         },
         "source": {
             "repository": "example/publisher",
@@ -1010,6 +1212,40 @@ def _bundle_document(**overrides) -> dict:
     }
     document.update(overrides)
     return document
+
+
+def _verified_assets(
+    tmp_path: Path,
+    document: dict,
+    *,
+    wheel: bytes = b"one application build",
+    standalone: bytes | None = None,
+    lock: bool = True,
+) -> None:
+    verified = tmp_path / "temp" / "siteops-verified"
+    (verified / "wheels").mkdir(parents=True)
+    (verified / "bundle.json").write_text(json.dumps(document), encoding="utf-8")
+    (verified / "wheels" / WHEEL_NAME).write_bytes(wheel)
+    if lock:
+        (verified / "pylock.toml").write_text('lock-version = "1.0"\n', encoding="utf-8")
+    download = tmp_path / "temp" / "siteops-download"
+    download.mkdir(parents=True, exist_ok=True)
+    (download / WHEEL_NAME).write_bytes(wheel if standalone is None else standalone)
+
+
+def _consistency_exports(tmp_path: Path, *, mode: str = "build") -> dict[str, str]:
+    return {
+        "PYTHON": _python_executable_path(),
+        "RUNNER_TEMP": _bash_path(tmp_path / "temp"),
+        "SOURCE_REPOSITORY": "example/publisher",
+        "SOURCE_SHA": "c" * 40,
+        "SOURCE_REF": "refs/heads/main",
+        "BUILD_NUMBER": "42",
+        "BUILD_ATTEMPT": "1",
+        "VERSION_MODE": mode,
+        "WHEEL_NAME": WHEEL_NAME,
+        "PACKAGE_VERSION": "1.0.0b1+build.42.1.gcccccccccccc",
+    }
 
 
 @pytest.mark.parametrize(
@@ -1043,7 +1279,18 @@ def _bundle_document(**overrides) -> dict:
                     "name": "siteops",
                     "version": "1.0.0b1",
                     "baseVersion": "1.0.0b1",
-                    "wheel": "wheels/siteops.whl",
+                    "wheel": "wheels/" + WHEEL_NAME,
+                }
+            },
+            1,
+        ),
+        (
+            {
+                "package": {
+                    "name": "siteops",
+                    "version": "1.0.0b1+build.42.1.gcccccccccccc",
+                    "baseVersion": "1.0.0b1",
+                    "wheel": "wheels/siteops-other-py3-none-any.whl",
                 }
             },
             1,
@@ -1052,45 +1299,35 @@ def _bundle_document(**overrides) -> dict:
     ],
 )
 def test_bundle_consistency_check_matches_this_build(tmp_path, overrides, code):
-    verified = tmp_path / "temp" / "siteops-verified"
-    verified.mkdir(parents=True)
-    (verified / "bundle.json").write_text(
-        json.dumps(_bundle_document(**overrides)), encoding="utf-8"
-    )
+    _verified_assets(tmp_path, _bundle_document(**overrides))
     script = _script(REUSABLE["jobs"]["qualify"], "Confirm the bundle describes this build")
-    result = _run_script(
-        script,
-        tmp_path,
-        {
-            "PYTHON": _bash_path(Path(sys.executable)),
-            "RUNNER_TEMP": _bash_path(tmp_path / "temp"),
-            "SOURCE_REPOSITORY": "example/publisher",
-            "SOURCE_SHA": "c" * 40,
-            "SOURCE_REF": "refs/heads/main",
-            "BUILD_NUMBER": "42",
-            "BUILD_ATTEMPT": "1",
-            "VERSION_MODE": "build",
-        },
-    )
+    result = _run_script(script, tmp_path, _consistency_exports(tmp_path))
     assert result.returncode == code, result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("difference", ["standalone", "lock"])
+def test_bundle_consistency_rejects_assets_that_disagree(tmp_path, difference):
+    _verified_assets(
+        tmp_path,
+        _bundle_document(),
+        standalone=b"a different application build" if difference == "standalone" else None,
+        lock=difference != "lock",
+    )
+    script = _script(REUSABLE["jobs"]["qualify"], "Confirm the bundle describes this build")
+    result = _run_script(script, tmp_path, _consistency_exports(tmp_path))
+    assert result.returncode == 1, result.stdout + result.stderr
+
+
 def test_bundle_consistency_accepts_an_independent_source_version(tmp_path):
-    verified = tmp_path / "temp" / "siteops-verified"
-    verified.mkdir(parents=True)
     document = _bundle_document()
     document["package"]["version"] = document["package"]["baseVersion"] = "1.1.0"
-    (verified / "bundle.json").write_text(json.dumps(document), encoding="utf-8")
+    _verified_assets(tmp_path, document)
+    exports = _consistency_exports(tmp_path, mode="source")
+    exports["PACKAGE_VERSION"] = "1.1.0"
     result = _run_script(
         _script(REUSABLE["jobs"]["qualify"], "Confirm the bundle describes this build"),
         tmp_path,
-        {
-            "PYTHON": _python_executable_path(),
-            "RUNNER_TEMP": _bash_path(tmp_path / "temp"),
-            "SOURCE_REPOSITORY": "example/publisher", "SOURCE_SHA": "c" * 40,
-            "SOURCE_REF": "refs/heads/main", "BUILD_NUMBER": "42", "BUILD_ATTEMPT": "1",
-            "VERSION_MODE": "source",
-        },
+        exports,
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -1099,108 +1336,379 @@ def _python_executable_path() -> str:
     return _bash_path(Path(sys.executable))
 
 
-def _helper_result(status: str, overrides: dict) -> dict:
-    result = {
-        "apiVersion": "siteops.install/v1",
-        "kind": "SiteOpsInstallationResult",
-        "package": "siteops",
-        "status": status,
-        "version": "1.0.0b1+build.42.1.gcccccccccccc",
-        "exitCode": 0,
-        "interrupted": False,
+def _native_exports(temp: Path, version: str) -> dict[str, str]:
+    return {
+        "RUNNER_TEMP": str(temp),
+        "RUNNER_OS": "Windows" if os.name == "nt" else "Linux",
+        "PYTHON": str(Path(sys._base_executable)),
+        "WHEEL_NAME": "",
+        "PACKAGE_VERSION": version,
+        "PYTHONPATH": str(REPO_ROOT),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "HTTP_PROXY": "http://127.0.0.1:9",
+        "HTTPS_PROXY": "http://127.0.0.1:9",
+        "ALL_PROXY": "http://127.0.0.1:9",
+        "NO_PROXY": "",
     }
-    result.update(overrides)
-    return result
 
 
-@pytest.mark.parametrize(
-    ("installed", "removed", "code"),
-    [
-        ({}, {}, 0),
-        ({"status": "failed"}, {}, 1),
-        ({"status": "already-installed"}, {}, 1),
-        ({}, {"status": "not-installed"}, 1),
-        ({"version": "1.0.0b1"}, {}, 1),
-        ({"exitCode": 1}, {}, 1),
-        ({"exitCode": False}, {}, 1),
-        ({"exitCode": 0.0}, {}, 1),
-        ({"interrupted": True}, {}, 1),
-        ({"kind": "SiteOpsBundle"}, {}, 1),
-        ({"apiVersion": "siteops.install/v2"}, {}, 1),
-        ({"package": "other"}, {}, 1),
-        ({"command": "/home/runner/bin/siteops"}, {}, 1),
-        ({"store": "/home/runner/store"}, {}, 1),
-        ({"sourceCommit": "c" * 40}, {}, 1),
-        ({"pathReady": True}, {}, 1),
-        ({"diagnostic": {"code": "pipx-failed", "message": "x"}}, {}, 1),
-    ],
-)
-def test_helper_result_contract_is_enforced(tmp_path, installed, removed, code):
-    logs = tmp_path / "temp" / "siteops-qualification" / "logs"
-    logs.mkdir(parents=True)
-    verified = tmp_path / "temp" / "siteops-verified"
-    verified.mkdir(parents=True)
-    (verified / "bundle.json").write_text(json.dumps(_bundle_document()), encoding="utf-8")
-    (logs / "install.json").write_text(
-        json.dumps(_helper_result("installed", installed)), encoding="utf-8"
+def _prepared_runner_area(tmp_path: Path, backend_wheelhouse: Path, bundle: Path) -> Path:
+    """Lay out the runner paths the tooling step creates, with a real pipx."""
+    temp = tmp_path / "runner temporary"
+    owned = temp / "siteops-qualification"
+    (owned / "logs").mkdir(parents=True)
+    (owned / "home").mkdir()
+    shutil.copytree(bundle, temp / "siteops-verified")
+    tooling = owned / "tooling" / ("Scripts" if os.name == "nt" else "bin")
+    tooling.mkdir(parents=True)
+    program = pipx_program()
+    shutil.copy2(program, tooling / program.name)
+    provision_shared_backend(
+        program, owned / "backend-provisioning", owned / "pipx-shared", backend_wheelhouse,
     )
-    (logs / "removal.json").write_text(
-        json.dumps(_helper_result("removed", removed)), encoding="utf-8"
-    )
-
-    script = _script(REUSABLE["jobs"]["qualify"], "Confirm the helper result contract")
-    result = _run_script(
-        script,
-        tmp_path,
-        {
-            "PYTHON": _python_executable_path(),
-            "RUNNER_TEMP": _bash_path(tmp_path / "temp"),
-        },
-    )
-    assert result.returncode == code, result.stdout + result.stderr
+    return temp
 
 
 @pytest.mark.skipif(
     sys.platform not in {"win32", "linux"},
     reason="Qualification targets Windows and Linux.",
 )
-def test_native_workflow_installation_uses_the_runner_paths(
+def test_native_verified_installation_step_runs_the_published_recipe(
     tmp_path,
     bundle_factory,
+    backend_wheelhouse,
 ):
-    root, _ = bundle_factory(81)
-    temp = tmp_path / "runner temporary"
-    temp.mkdir()
-    shutil.copytree(root, temp / "siteops-verified")
-    tooling = temp / "siteops-tooling" / ("Scripts" if os.name == "nt" else "bin")
-    tooling.mkdir(parents=True)
-    pipx_name = "pipx.exe" if os.name == "nt" else "pipx"
-    shutil.copy2(Path(sys.executable).parent / pipx_name, tooling / pipx_name)
-    result = _run_script(
-        _script(
-            REUSABLE["jobs"]["qualify"], "Install and remove Site Ops from the verified bundle"
-        ),
-        tmp_path,
-        {
-            "RUNNER_TEMP": str(temp),
-            "RUNNER_OS": "Windows" if os.name == "nt" else "Linux",
-            "PYTHON": str(Path(sys._base_executable)),
-            "PYTHONPATH": str(REPO_ROOT),
-            "SITEOPS_REDACT_OUTPUT": "1",
-            "PYTHONDONTWRITEBYTECODE": "1",
-            "HTTP_PROXY": "http://127.0.0.1:9",
-            "HTTPS_PROXY": "http://127.0.0.1:9",
-            "ALL_PROXY": "http://127.0.0.1:9",
-            "NO_PROXY": "",
-        },
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    for filename, status in (("install.json", "installed"), ("removal.json", "removed")):
-        document = json.loads(
-            (temp / "siteops-qualification" / "logs" / filename).read_text(encoding="utf-8"),
-        )
-        assert document["status"] == status
+    root, manifest = bundle_factory(81)
+    temp = _prepared_runner_area(tmp_path, backend_wheelhouse, root)
+    exports = _native_exports(temp, manifest.version)
+    exports["WHEEL_NAME"] = Path(manifest.application_wheel).name
 
+    result = _run_script(
+        _script(REUSABLE["jobs"]["qualify"], "Install Site Ops from the verified lock"),
+        tmp_path,
+        exports,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    command = temp / "siteops-qualification" / "pipx-bin" / (
+        "siteops.exe" if os.name == "nt" else "siteops"
+    )
+    assert not command.exists()
+    assert not (temp / "siteops-qualification" / "tampered").exists()
+    logs = temp / "siteops-qualification" / "logs"
+    assert {"install.log", "repeat.log", "repair.log", "tampered.log", "uninstall.log"} <= {
+        path.name for path in logs.iterdir()
+    }
+    # Raw tool output stays in the private run files.
+    assert "Fatal error from pip" not in result.stdout
+
+
+@pytest.mark.skipif(
+    sys.platform not in {"win32", "linux"},
+    reason="Qualification targets Windows and Linux.",
+)
+def test_native_verified_installation_step_fails_on_a_changed_payload(
+    tmp_path,
+    bundle_factory,
+    backend_wheelhouse,
+):
+    root, manifest = bundle_factory(82)
+    temp = _prepared_runner_area(tmp_path, backend_wheelhouse, root)
+    wheel = temp / "siteops-verified" / manifest.application_wheel
+    with wheel.open("ab") as stream:
+        stream.write(b"changed before the step installed anything")
+    exports = _native_exports(temp, manifest.version)
+    exports["WHEEL_NAME"] = Path(manifest.application_wheel).name
+
+    result = _run_script(
+        _script(REUSABLE["jobs"]["qualify"], "Install Site Ops from the verified lock"),
+        tmp_path,
+        exports,
+    )
+
+    assert result.returncode != 0
+    assert "could not be installed with stock pipx" in result.stdout + result.stderr
+
+
+@pytest.mark.skipif(
+    sys.platform not in {"win32", "linux"},
+    reason="Qualification targets Windows and Linux.",
+)
+@pytest.mark.parametrize("command_exit", [0, 43])
+def test_native_online_installation_step_installs_the_standalone_wheel(
+    tmp_path,
+    bundle_factory,
+    backend_wheelhouse,
+    command_exit,
+):
+    root, manifest = bundle_factory(83)
+    temp = _prepared_runner_area(tmp_path, backend_wheelhouse, root)
+    download = temp / "siteops-download"
+    download.mkdir()
+    wheel_name = Path(manifest.application_wheel).name
+    shutil.copy2(root / manifest.application_wheel, download / wheel_name)
+    exports = _native_exports(temp, manifest.version)
+    exports["WHEEL_NAME"] = wheel_name
+    # The step takes dependencies from the configured feed. This run substitutes
+    # a local wheelhouse for that feed instead of reaching any index.
+    exports["PIP_NO_INDEX"] = "1"
+    exports["PIP_FIND_LINKS"] = (root / "wheels").as_uri()
+
+    script = _script(REUSABLE["jobs"]["qualify"], "Install Site Ops from the standalone wheel")
+    if command_exit:
+        script = f"siteops() {{ echo 'private online diagnostic' >&2; return {command_exit}; }}\n" + script
+    result = _run_script(
+        script,
+        tmp_path,
+        exports,
+    )
+
+    if command_exit:
+        assert result.returncode != 0
+        assert "online command could not be executed" in result.stdout
+        assert "private online diagnostic" not in result.stdout + result.stderr
+        assert "private online diagnostic" in (
+            temp / "siteops-qualification" / "logs" / "online-version.log"
+        ).read_text()
+        return
+    assert result.returncode == 0, result.stdout + result.stderr
+    command = temp / "siteops-qualification" / "online-pipx-bin" / (
+        "siteops.exe" if os.name == "nt" else "siteops"
+    )
+    assert not command.exists()
+
+
+@pytest.mark.skipif(
+    sys.platform not in {"win32", "linux"},
+    reason="Qualification targets Windows and Linux.",
+)
+@pytest.mark.parametrize("fault", ["version", "execution"])
+def test_native_installation_steps_reject_an_unexpected_exposed_version(
+    tmp_path,
+    bundle_factory,
+    backend_wheelhouse,
+    fault,
+):
+    root, manifest = bundle_factory(84)
+    temp = _prepared_runner_area(tmp_path, backend_wheelhouse, root)
+    exports = _native_exports(temp, manifest.version + ".unexpected")
+    exports["WHEEL_NAME"] = Path(manifest.application_wheel).name
+
+    script = _script(REUSABLE["jobs"]["qualify"], "Install Site Ops from the verified lock")
+    if fault == "execution":
+        script = "siteops() { echo 'private command diagnostic' >&2; return 43; }\n" + script
+    result = _run_script(
+        script,
+        tmp_path,
+        exports,
+    )
+
+    assert result.returncode != 0
+    expected = "reported an unexpected version" if fault == "version" else "could not be executed"
+    assert expected in result.stdout + result.stderr
+    assert "private command diagnostic" not in result.stdout + result.stderr
+    if fault == "execution":
+        assert "private command diagnostic" in (
+            temp / "siteops-qualification" / "logs" / "version-installation.log"
+        ).read_text()
+
+
+
+
+# --- The published asset set, exercised as shell -----------------------------
+
+
+def _producer_shim(tmp_path: Path, archive: Path, wheel: Path | None, extra: str | None = None):
+    """Stand in for the producer so the workflow's own validation can run."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    _write_executable(
+        bin_dir / "python",
+        """#!/usr/bin/env bash
+if [[ "$1" == "scripts/build-siteops-bundle.py" ]]; then
+  output=""
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--output" ]]; then
+      output="$2"
+    fi
+    shift
+  done
+  staging="$(dirname "$output")"
+  cp "$FAKE_ARCHIVE" "$output"
+  if [[ -n "${FAKE_WHEEL:-}" ]]; then
+    cp "$FAKE_WHEEL" "$staging/$(basename "$FAKE_WHEEL")"
+  fi
+  if [[ -n "${FAKE_EXTRA:-}" ]]; then
+    printf 'unexpected build output\\n' > "$staging/$FAKE_EXTRA"
+  fi
+  exit 0
+fi
+exec "$REAL_PYTHON" "$@"
+""",
+    )
+    exports = {
+        "REAL_PYTHON": _python_executable_path(),
+        "FAKE_ARCHIVE": _bash_path(archive),
+        "FAKE_WHEEL": _bash_path(wheel) if wheel else "",
+        "FAKE_EXTRA": extra or "",
+        "RUNNER_TEMP": _bash_path(tmp_path / "temp"),
+        "ARCHIVE_NAME": ARCHIVE_NAME,
+        "SOURCE_REPOSITORY": "example/publisher",
+        "SOURCE_REF": "refs/heads/main",
+        "SOURCE_SHA": "c" * 40,
+        "BUILD_NUMBER": "42",
+        "BUILD_ATTEMPT": "1",
+        "VERSION_MODE": "build",
+        "GITHUB_OUTPUT": _bash_path(tmp_path / "github-output.txt"),
+    }
+    (tmp_path / "temp").mkdir(exist_ok=True)
+    return exports
+
+
+def _step_outputs(tmp_path: Path) -> dict[str, str]:
+    path = tmp_path / "github-output.txt"
+    if not path.exists():
+        return {}
+    return dict(
+        line.split("=", 1)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if "=" in line
+    )
+
+
+def test_build_step_publishes_and_records_both_assets(tmp_path, bundle_factory):
+    root, manifest = bundle_factory(91)
+    archive, wheel = publish_assets(root, manifest, tmp_path / "published")
+
+    result = _run_script(
+        _script(REUSABLE["jobs"]["build"], "Build the installation bundle"),
+        tmp_path,
+        _producer_shim(tmp_path, archive, wheel),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    outputs = _step_outputs(tmp_path)
+    assert outputs["archive-name"] == ARCHIVE_NAME
+    assert outputs["wheel-name"] == wheel.name
+    assert outputs["package-version"] == manifest.version
+    assert outputs["archive-sha256"] == hashlib.sha256(archive.read_bytes()).hexdigest()
+    assert outputs["wheel-sha256"] == hashlib.sha256(wheel.read_bytes()).hexdigest()
+    assert outputs["staging-path"].endswith("/siteops-build")
+    staging = Path(tmp_path / "temp" / "siteops-build")
+    assert sorted(path.name for path in staging.iterdir()) == sorted(
+        [ARCHIVE_NAME, wheel.name]
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("missing-wheel", "content other than the archive"),
+        ("extra-file", "content other than the archive"),
+        ("unsupported-name", "supported Site Ops wheel name"),
+        ("absent-member", "does not contain the standalone wheel"),
+        ("changed-bytes", "byte for byte"),
+    ],
+)
+def test_build_step_refuses_an_inconsistent_asset_pair(tmp_path, bundle_factory, case, message):
+    root, manifest = bundle_factory(92)
+    archive, wheel = publish_assets(root, manifest, tmp_path / "published")
+    extra = None
+    if case == "missing-wheel":
+        wheel = None
+    elif case == "extra-file":
+        extra = "siteops-notes.txt"
+    elif case == "unsupported-name":
+        renamed = wheel.with_name("siteops-installer.whl")
+        wheel = wheel.rename(renamed)
+    elif case == "absent-member":
+        renamed = wheel.with_name("siteops-9.9.9-py3-none-any.whl")
+        wheel = wheel.rename(renamed)
+    else:
+        with wheel.open("ab") as stream:
+            stream.write(b"changed after the archive was written")
+
+    result = _run_script(
+        _script(REUSABLE["jobs"]["build"], "Build the installation bundle"),
+        tmp_path,
+        _producer_shim(tmp_path, archive, wheel, extra),
+    )
+
+    assert result.returncode != 0
+    assert message in result.stdout + result.stderr
+    assert "wheel-sha256" not in _step_outputs(tmp_path)
+
+
+def _staged_subject(tmp_path: Path, wheel_name: str = WHEEL_NAME) -> dict[str, str]:
+    subject = tmp_path / "temp" / "siteops-subject"
+    subject.mkdir(parents=True)
+    (subject / ARCHIVE_NAME).write_bytes(b"archive bytes")
+    (subject / wheel_name).write_bytes(b"wheel bytes")
+    for name in ("archive-proof", "wheel-proof"):
+        (tmp_path / name).write_text("{}\n", encoding="utf-8")
+    return {
+        "RUNNER_TEMP": _bash_path(tmp_path / "temp"),
+        "ARCHIVE_NAME": ARCHIVE_NAME,
+        "ATTESTATION_SUFFIX": ATTESTATION_SUFFIX,
+        "WHEEL_NAME": wheel_name,
+        "EXPECTED_ARCHIVE_SHA256": hashlib.sha256(b"archive bytes").hexdigest(),
+        "EXPECTED_WHEEL_SHA256": hashlib.sha256(b"wheel bytes").hexdigest(),
+        "ARCHIVE_BUNDLE_PATH": _bash_path(tmp_path / "archive-proof"),
+        "WHEEL_BUNDLE_PATH": _bash_path(tmp_path / "wheel-proof"),
+    }
+
+
+def test_signing_stages_exactly_the_four_published_files(tmp_path):
+    exports = _staged_subject(tmp_path)
+    attest = REUSABLE["jobs"]["attest"]
+
+    confirmed = _run_script(_script(attest, "Confirm the staged payload"), tmp_path, exports)
+    assert confirmed.returncode == 0, confirmed.stdout + confirmed.stderr
+
+    staged = _run_script(_script(attest, "Stage the attested bytes"), tmp_path, exports)
+    assert staged.returncode == 0, staged.stdout + staged.stderr
+    assert sorted(path.name for path in (tmp_path / "temp" / "siteops-staging").iterdir()) == (
+        sorted(
+            [
+                ARCHIVE_NAME,
+                ARCHIVE_NAME + ATTESTATION_SUFFIX,
+                WHEEL_NAME,
+                WHEEL_NAME + ATTESTATION_SUFFIX,
+            ]
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "case", ["extra-subject", "changed-archive", "changed-wheel", "missing-wheel"]
+)
+def test_signing_refuses_a_payload_that_is_not_the_build_output(tmp_path, case):
+    exports = _staged_subject(tmp_path)
+    subject = tmp_path / "temp" / "siteops-subject"
+    if case == "extra-subject":
+        (subject / "unexpected.txt").write_text("extra", encoding="utf-8")
+    elif case == "changed-archive":
+        (subject / ARCHIVE_NAME).write_bytes(b"replaced archive bytes")
+    elif case == "changed-wheel":
+        (subject / WHEEL_NAME).write_bytes(b"replaced wheel bytes")
+    else:
+        (subject / WHEEL_NAME).unlink()
+
+    result = _run_script(
+        _script(REUSABLE["jobs"]["attest"], "Confirm the staged payload"), tmp_path, exports
+    )
+    assert result.returncode != 0
+
+
+@pytest.mark.parametrize("empty", ["archive-proof", "wheel-proof"])
+def test_signing_refuses_an_empty_detached_proof(tmp_path, empty):
+    exports = _staged_subject(tmp_path)
+    (tmp_path / empty).write_text("", encoding="utf-8")
+    result = _run_script(
+        _script(REUSABLE["jobs"]["attest"], "Stage the attested bytes"), tmp_path, exports
+    )
+    assert result.returncode != 0
+    assert "attestation bundle is empty" in result.stdout + result.stderr
 
 def test_every_run_block_parses_as_bash(tmp_path):
     blocks = []

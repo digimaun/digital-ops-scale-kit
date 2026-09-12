@@ -33,6 +33,11 @@ pytest -m "not integration" --cov=siteops --cov-report=term-missing
 - Use fixtures from `conftest.py` for workspace setup
 - Install the development dependencies before running packaging tests. They
   build a wheel in a temporary directory with package-index access disabled.
+- Native installation tests use pipx in isolated temporary directories. On
+  Windows, select a short owned `pytest --basetemp` path so generated executable
+  paths remain within the platform limit. For offline tests, set
+  `SITEOPS_TEST_BACKEND_WHEELHOUSE` to a directory holding the pip wheel pinned
+  in `scripts/siteops-build-requirements.txt`.
 
 ## Pull Request Process
 
@@ -92,10 +97,11 @@ siteops/v1.0.1                tool-only fix
 v1.2.0 + siteops/v1.1.0        content requiring a newer tool version
 ```
 
-## Site Ops installation bundles
+## Site Ops release artifacts
 
-Use the [installation guide](docs/install-siteops.md) to install an identified
-bundle and the [release guide](docs/releasing.md) to prepare and publish one.
+Use the [installation guide](docs/install-siteops.md) to install a release wheel
+or verified bundle through pipx, and the [release guide](docs/releasing.md) to
+prepare and publish them.
 Release declarations and notes are reviewed in Git. The release workflow
 prepares an exact candidate, shows an approval preview, and creates its tag and
 GitHub Release only after approval.
@@ -111,7 +117,7 @@ CI offers `run-mode: ci-only`, `installer-check`, or `release-preview`. The
 latter two use `expected-source-sha`. The release preview also accepts
 `release-file`, defaulting to a committed example. No CI mode publishes.
 
-### Produce a local bundle
+### Produce local artifacts
 
 Use a clean checkout and an isolated Python 3.11 or newer build environment. Install
 `scripts/siteops-build-requirements.txt` with pip's `--require-hashes` and
@@ -131,18 +137,26 @@ python scripts/build-siteops-bundle.py
 Join the lines for your shell. `--download-dependencies` explicitly allows
 hash-pinned runtime wheel downloads from the configured feed. Alternatively,
 use `--wheelhouse <directory>` with the complete locked wheel set. Exactly
-one of these options is required. Existing output is never overwritten.
+one of these options is required. The output directory receives
+`siteops-install.zip` and the standalone Site Ops wheel. Both contain identical
+application wheel bytes. Neither existing artifact is overwritten.
 `--version-mode build` is the default and adds the build identity suffix.
 `--version-mode source` retains the source package version for an independently
 versioned engine release.
 
-The producer exports tracked source, derives the artifact version and
-dependency pins only in staging, and writes the bundle. Local generation
-does not create a GitHub attestation or make the bundle an official release.
+The producer exports tracked source and derives the artifact version and
+dependency pins only in staging. The ZIP contains that wheel, runtime wheels,
+their relative paths and hashes in `pylock.toml`, the bundle inventory, and
+license notices. Native pipx manages installation and removal. The lock reader
+requires the supported pipx backend described in the installation guide.
+Local generation creates neither GitHub attestations nor an official release.
 
 When changing runtime dependencies, update the runtime lock, target wheel
-coverage, and notices together. Build tooling is pinned separately and is
-not redistributed in the installation archive.
+coverage, and notices together. Every declared target must have one compatible
+wheel per locked package, and each runtime wheel's dependencies must be
+satisfied by unconditional entries in that lock. Conditional runtime
+dependencies, extras, and direct URLs require a separately defined policy.
+Build tooling is pinned separately and is not redistributed in the archive.
 
 ## Microsoft Open Source
 

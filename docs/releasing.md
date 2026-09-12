@@ -2,7 +2,7 @@
 
 Prepare the release tag and notes in a pull request. After merge, review the
 prepared candidate and approve publication. A candidate is the exact source
-commit, notes, and package bytes proposed for that release.
+commit, notes, and release asset bytes proposed for that release.
 
 Site Ops and Scale Kit have independent version streams in the same repository.
 A content release can reference an existing engine release without rebuilding
@@ -44,9 +44,10 @@ combined preview path using the selected source commit. Examples are accepted
 only for a dry run and never trigger publication when merged.
 
 The preview runs ordinary CI, then uses the real release-file preparation,
-bundle production, attestation, and installation qualification.
+wheel and bundle production, independent attestation, and installation
+qualification.
 The final summary shows one Python/platform matrix and a link to the attested
-bundle. Individual job logs remain available for diagnosis.
+release assets. Individual job logs remain available for diagnosis.
 
 This path needs no `siteops-release` environment. Its jobs have no repository
 content-write permission, request no publishing approval, and create no tag or
@@ -75,12 +76,12 @@ Markdown release notes. The tag defines the release version. The folder name
 identifies the record, rather than providing another version setting.
 
 Write the changes and release-specific guidance in `notes.md`. The workflow
-adds **Install Site Ops** automatically: prerequisites, exact release downloads,
-and complete Windows/PowerShell and Linux/Bash verification and installation
-commands. The commands download into a fresh private folder and work from any
-current directory. A content-only release links to its independently published engine.
-There is no need to copy installation commands, source hashes, or download URLs
-into the authored notes.
+adds **Install Site Ops** automatically. It includes the exact versioned wheel
+URL for the simple online pipx path, the configured package index policy, the
+four release asset links, and the source-pinned verified installation guide.
+A content-only release links to its independently published engine. There is no
+need to copy installation commands, source hashes, or download URLs into the
+authored notes.
 
 | Location | Purpose |
 |---|---|
@@ -102,9 +103,10 @@ formats, not scheduled releases.
 ```
 
 The version must exactly match `siteops.__version__` in the selected source
-commit. The workflow builds the engine wheel with that source version, retains
-its pinned runtime dependencies and notices, and qualifies the installation
-bundle. Scale Kit content does not need a version change.
+commit. The workflow builds the engine wheel once with that source version. It
+publishes the identical standalone wheel and includes those same bytes in a ZIP
+with the pinned runtime wheels, `pylock.toml`, metadata, and notices. Scale Kit
+content does not need a version change.
 
 The current beta policy still keeps the source package at `1.0.0b1`.
 Do not create another Site Ops beta tag without an approved version-policy
@@ -127,7 +129,10 @@ on `main`. Confirm content compatibility with the referenced engine as part of
 the release evidence.
 
 The reference is an exact engine release, not a minimum-version range.
-Stable content requires a stable referenced engine release.
+Stable content requires a stable referenced engine release. Candidate
+preparation requires its complete native asset set: the ZIP, standalone wheel,
+and one detached proof for each. It freezes their GitHub digests and rejects an
+older ZIP-only release.
 
 Scale Kit content currently comes from the tagged repository. This workflow
 does not produce a separately packaged workspace or claim that GitHub's
@@ -149,10 +154,10 @@ while the source engine version follows its existing policy. The included
 engine receives a distinguishable build version such as
 `1.0.0b1+build.12345.1.gabcdef123456`.
 
-It creates one content release with the Site Ops ZIP and detached attestation
-attached. It does not create another Site Ops tag. This option requires a
-prerelease content version. Stable content references a separately released
-engine instead.
+It creates one content release with the Site Ops ZIP and standalone wheel. Each
+subject has its own detached attestation. It does not create another Site Ops
+tag. This option requires a prerelease content version. Stable content
+references a separately released engine instead.
 
 ## Release-file defaults
 
@@ -180,7 +185,7 @@ Merge to main at commit A
           v
 Read release files from A
 Run CI for A
-Build, attest, and qualify an engine bundle when requested
+Build, attest, and qualify the engine ZIP and standalone wheel when requested
           |
           v
 Review the candidate summary and applicable content evidence
@@ -210,14 +215,17 @@ An unrelated advance of `main` does not change the candidate. Changing its
 release file or notes requires a fresh candidate and approval.
 
 The approval summary shows the tag, source commit, version stream, engine
-selection, bundle digest when applicable, tag action, and final release notes.
+selection, ZIP and wheel digests when applicable, tag action, and final release
+notes.
 The summary nests the note headings beneath **Release notes**. Published notes
 retain their authored Markdown heading levels. Installation commands are
 included in the final notes before approval and remain bound to that approval.
-You may download the attested installation artifact for a hands-on trial.
-Authenticate the installation ZIP before extracting or running its contents,
-following [the installation guide](install-siteops.md).
-The generated download-and-install commands are for the published release.
+You may download the attested release artifact for a hands-on trial. It contains
+exactly the ZIP, wheel, and one detached proof for each. The pipeline
+authenticates both subjects and confirms their application wheel bytes match.
+For a verified installation, consume only the ZIP and its proof by following
+[the installation guide](install-siteops.md).
+The generated online command is for the published release.
 For a candidate preview, use the Actions artifact above the notes and the
 installation guide's steps for manually downloaded files.
 
@@ -234,8 +242,9 @@ This is a GitHub approval gate, not an Azure environment. It needs no
 environment secrets for the current workflow.
 
 The workflow checks this after reading an active release file and before
-building its bundle. Choose self-review and administrator-bypass settings
-according to repository policy. Previews do not need this environment.
+building its native release assets. Choose self-review and
+administrator-bypass settings according to repository policy. Previews do not
+need this environment.
 
 After reviewing the generated summary, an authorized reviewer uses **Review
 deployments**, selects `siteops-release`, then selects **Approve and deploy**.
@@ -245,21 +254,24 @@ approve the run.
 
 After approval, the workflow:
 
-1. Downloads and verifies the same release file, notes, and qualified bundle.
+1. Downloads and verifies the same release file, notes, frozen asset list, and
+   qualified release assets.
 2. Confirms the release file has not changed and the referenced engine, if any,
    still has the same release identity and tag target.
 3. Creates a missing tag at the approved commit, or reuses a tag already
    pointing there. It never moves a conflicting tag.
-4. Creates the GitHub Release with the approved notes and declared assets.
-5. Confirms the uploaded asset digests and verifies GitHub's release attestation
-   when immutable releases are enabled.
+4. Reauthenticates the ZIP and standalone wheel, confirms their byte identity,
+   and creates the GitHub Release with the approved notes and four declared
+   assets.
+5. Confirms every uploaded asset digest and verifies GitHub's release
+   attestation when immutable releases are enabled.
 
 The destination is the repository running the workflow. Official publication
 occurs in `Azure/digital-ops-scale-kit`. A fork's workflow writes only to that
 fork. Existing releases are never overwritten.
 
-With installer assets, GitHub CLI creates a draft, uploads the files, and then
-publishes. This temporary draft is not a separate human-review stage.
+With native installation assets, GitHub CLI creates a draft, uploads the files,
+and then publishes. This temporary draft is not a separate human-review stage.
 If immutability is enabled, GitHub locks the uploaded assets and tag when
 publication completes. Titles and release notes remain editable through
 GitHub's normal controls. The workflow does not enable immutability itself.

@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Build a complete, deterministic Site Ops installation bundle."""
+"""Build an identified Site Ops wheel and its deterministic installation bundle."""
 
 from __future__ import annotations
 
@@ -77,6 +77,7 @@ class RuntimeWheel:
     version: str
     sha256: str
     tags: frozenset[Any]
+    requires_python: str
 
 
 def _normalized_name(name: str) -> str:
@@ -457,7 +458,7 @@ def _inspect_application_wheel(
     source: Path,
     version: str,
     runtime_requirements: tuple[LockedRequirement, ...],
-) -> None:
+) -> str:
     try:
         from packaging.requirements import InvalidRequirement, Requirement
         from packaging.specifiers import InvalidSpecifier, SpecifierSet
@@ -474,7 +475,9 @@ def _inspect_application_wheel(
         raise BuildError("The application wheel must use only the py3-none-any tag.")
 
     try:
-        with zipfile.ZipFile(wheel) as archive:
+        _regular_file(wheel, "application wheel")
+        content = wheel.read_bytes()
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
             names = archive.namelist()
             metadata_names = [name for name in names if name.endswith(".dist-info/METADATA")]
             wheel_names = [name for name in names if name.endswith(".dist-info/WHEEL")]
@@ -532,6 +535,7 @@ def _inspect_application_wheel(
         raise
     except (KeyError, OSError, UnicodeError, zipfile.BadZipFile) as error:
         raise BuildError("The application wheel could not be inspected.") from error
+    return hashlib.sha256(content).hexdigest()
 
 
 def _download_environment() -> dict[str, str]:
@@ -605,8 +609,11 @@ def _runtime_wheel(path: Path, locks: tuple[LockedRequirement, ...]) -> RuntimeW
         raise BuildError("A runtime wheel does not match the committed hash pins.")
     requirement = matching_locks[0]
     try:
+        from packaging.requirements import Requirement
+        from packaging.specifiers import SpecifierSet
         from packaging.tags import parse_tag
         from packaging.utils import canonicalize_name, parse_wheel_filename
+        from packaging.version import Version
     except ImportError as error:
         raise BuildError("The committed build requirements are not installed.") from error
     try:
@@ -639,6 +646,21 @@ def _runtime_wheel(path: Path, locks: tuple[LockedRequirement, ...]) -> RuntimeW
             }
             if declared_tags != set(tags):
                 raise BuildError("Runtime wheel tags do not match its filename.")
+            requires_python = metadata["Requires-Python"] or ""
+            SpecifierSet(requires_python)
+            locked = {item.name: item for item in locks}
+            for value in metadata.get_all("Requires-Dist", []):
+                dependency = Requirement(value)
+                selected = locked.get(canonicalize_name(dependency.name))
+                if (
+                    dependency.url or dependency.extras or dependency.marker
+                    or selected is None
+                    or Version(selected.version) not in dependency.specifier
+                ):
+                    raise BuildError(
+                        "Runtime wheel dependencies must be satisfied by unconditional "
+                        "entries in the runtime lock."
+                    )
     except (KeyError, ValueError, zipfile.BadZipFile) as error:
         raise BuildError("A runtime wheel metadata record could not be inspected.") from error
     return RuntimeWheel(
@@ -647,31 +669,31 @@ def _runtime_wheel(path: Path, locks: tuple[LockedRequirement, ...]) -> RuntimeW
         version=requirement.version,
         sha256=digest,
         tags=frozenset(tags),
+        requires_python=requires_python,
     )
 
 
 def _matches_target(wheel: RuntimeWheel, python_tag: str, platform_name: str) -> bool:
-    interpreter = f"cp{python_tag}"
-    if platform_name == "windows-x86_64":
-        return any(
-            tag.interpreter == interpreter
-            and tag.abi == interpreter
-            and tag.platform == "win_amd64"
-            for tag in wheel.tags
-        )
-    return any(
-        tag.interpreter == interpreter
-        and tag.abi == interpreter
-        and tag.platform.startswith("manylinux")
-        and tag.platform.endswith("_x86_64")
-        for tag in wheel.tags
+    from packaging.tags import compatible_tags, cpython_tags
+
+    python_version = (int(python_tag[0]), int(python_tag[1:]))
+    platforms = (
+        ["win_amd64"] if platform_name == "windows-x86_64"
+        else ["manylinux2014_x86_64", "manylinux_2_17_x86_64"]
     )
+    supported = {
+        *cpython_tags(python_version, abis=[f"cp{python_tag}"], platforms=platforms),
+        *compatible_tags(python_version, interpreter=f"cp{python_tag}", platforms=platforms),
+    }
+    return bool(wheel.tags & supported)
 
 
 def _collect_runtime_wheels(
     wheelhouse: Path,
     locks: tuple[LockedRequirement, ...],
-) -> dict[tuple[str, str], RuntimeWheel]:
+) -> dict[tuple[str, str], tuple[RuntimeWheel, ...]]:
+    from packaging.specifiers import SpecifierSet
+
     try:
         info = wheelhouse.lstat()
         entries = list(wheelhouse.iterdir())
@@ -687,21 +709,25 @@ def _collect_runtime_wheels(
     if any(entry.suffix.lower() != ".whl" for entry in entries):
         raise BuildError("The runtime wheelhouse may contain only wheel files.")
     wheels = [_runtime_wheel(entry, locks) for entry in sorted(entries)]
-    selected: dict[tuple[str, str], RuntimeWheel] = {}
+    selected: dict[tuple[str, str], tuple[RuntimeWheel, ...]] = {}
     used: set[Path] = set()
     for python, platform_name, python_tag, _ in _TARGETS:
-        matches = [
-            wheel
-            for wheel in wheels
-            if _matches_target(wheel, python_tag, platform_name)
-        ]
-        if len(matches) != 1:
-            raise BuildError(
-                f"The runtime wheelhouse must contain one wheel for Python {python} "
-                f"on {platform_name}."
-            )
-        selected[(python, platform_name)] = matches[0]
-        used.add(matches[0].path)
+        target_wheels = []
+        for requirement in locks:
+            matches = [
+                wheel for wheel in wheels
+                if wheel.name == requirement.name
+                and _matches_target(wheel, python_tag, platform_name)
+                and python in SpecifierSet(wheel.requires_python)
+            ]
+            if len(matches) != 1:
+                raise BuildError(
+                    f"The runtime wheelhouse must contain one {requirement.name} wheel "
+                    f"for Python {python} on {platform_name}."
+                )
+            target_wheels.append(matches[0])
+            used.add(matches[0].path)
+        selected[(python, platform_name)] = tuple(target_wheels)
     if used != {wheel.path for wheel in wheels}:
         raise BuildError("The runtime wheelhouse contains an unsupported or duplicate wheel.")
     expected_names = {requirement.name for requirement in locks}
@@ -747,12 +773,57 @@ def _payload_files(root: Path) -> tuple[PayloadFile, ...]:
     return tuple(files)
 
 
+def _write_pylock(root: Path, targets: tuple[BundleTarget, ...]) -> None:
+    from packaging.utils import parse_wheel_filename
+
+    versions = sorted({tuple(map(int, target.python.split("."))) for target in targets})
+    minimum, maximum = versions[0], versions[-1]
+    environments = []
+    for target in targets:
+        system, machine = (
+            ("win32", "AMD64") if target.platform == "windows-x86_64"
+            else ("linux", "x86_64")
+        )
+        environments.append(
+            f"implementation_name == 'cpython' and python_version == '{target.python}' "
+            f"and sys_platform == '{system}' and platform_machine == '{machine}'"
+        )
+    lines = [
+        'lock-version = "1.0"',
+        'created-by = "siteops"',
+        f'requires-python = ">={minimum[0]}.{minimum[1]},<{maximum[0]}.{maximum[1] + 1}"',
+        "environments = " + json.dumps(environments),
+    ]
+    packages: dict[tuple[str, str], list[PayloadFile]] = {}
+    for entry in _payload_files(root):
+        if not entry.path.endswith(".whl"):
+            continue
+        name, version, _, _ = parse_wheel_filename(Path(entry.path).name)
+        packages.setdefault((str(name), str(version)), []).append(entry)
+    for (name, version), wheels in sorted(packages.items()):
+        lines.extend([
+            "", "[[packages]]", "name = " + json.dumps(name),
+            "version = " + json.dumps(version),
+        ])
+        for wheel in wheels:
+            lines.extend([
+                "[[packages.wheels]]",
+                "name = " + json.dumps(Path(wheel.path).name),
+                "path = " + json.dumps(wheel.path),
+                "size = " + str(wheel.size),
+                "[packages.wheels.hashes]",
+                "sha256 = " + json.dumps(wheel.sha256),
+            ])
+    _write_utf8(root / "pylock.toml", "\n".join(lines) + "\n", "installation lock")
+
+
 def _assemble_bundle(
     *,
     source: Path,
     bundle_root: Path,
     application_wheel: Path,
-    runtime_wheels: dict[tuple[str, str], RuntimeWheel],
+    application_sha256: str,
+    runtime_wheels: dict[tuple[str, str], tuple[RuntimeWheel, ...]],
     repository: str,
     source_sha: str,
     source_ref: str,
@@ -763,38 +834,40 @@ def _assemble_bundle(
 ) -> BundleManifest:
     bundle_root.mkdir()
     for source_path, destination in (
-        (source / "scripts" / "install-siteops.py", bundle_root / "install.py"),
-        (
-            source / "scripts" / "siteops_distribution.py",
-            bundle_root / "siteops_distribution.py",
-        ),
         (source / "LICENSE", bundle_root / "LICENSE"),
         (source / "ThirdPartyNotices.txt", bundle_root / "ThirdPartyNotices.txt"),
     ):
         _copy_regular(source_path, destination, "required bundle source file")
     app_destination = bundle_root / "wheels" / application_wheel.name
-    _copy_regular(application_wheel, app_destination, "application wheel")
+    _copy_regular(
+        application_wheel, app_destination, "application wheel",
+        expected_sha256=application_sha256,
+    )
 
-    dependency_paths: dict[tuple[str, str], str] = {}
+    dependency_paths: dict[tuple[str, str], tuple[str, ...]] = {}
     copied_dependencies: set[Path] = set()
-    for key, wheel in runtime_wheels.items():
-        destination = bundle_root / "wheels" / wheel.path.name
-        if wheel.path not in copied_dependencies:
-            _copy_regular(
-                wheel.path, destination, "runtime wheel", expected_sha256=wheel.sha256,
-            )
-            copied_dependencies.add(wheel.path)
-        dependency_paths[key] = destination.relative_to(bundle_root).as_posix()
+    for key, wheels in runtime_wheels.items():
+        paths = []
+        for wheel in wheels:
+            destination = bundle_root / "wheels" / wheel.path.name
+            if wheel.path not in copied_dependencies:
+                _copy_regular(
+                    wheel.path, destination, "runtime wheel", expected_sha256=wheel.sha256,
+                )
+                copied_dependencies.add(wheel.path)
+            paths.append(destination.relative_to(bundle_root).as_posix())
+        dependency_paths[key] = tuple(paths)
 
     application_path = app_destination.relative_to(bundle_root).as_posix()
     targets = tuple(
         BundleTarget(
             python=python,
             platform=platform_name,
-            wheels=(application_path, dependency_paths[(python, platform_name)]),
+            wheels=(application_path, *dependency_paths[(python, platform_name)]),
         )
         for python, platform_name, _, _ in _TARGETS
     )
+    _write_pylock(bundle_root, targets)
     manifest = BundleManifest(
         version=version,
         base_version=base_version,
@@ -840,7 +913,7 @@ def _write_deterministic_zip(bundle_root: Path, destination: Path) -> None:
         raise BuildError("The installation ZIP could not be created.") from error
 
 
-def _publish(staged_zip: Path, output: Path) -> None:
+def _publish(staged_file: Path, output: Path, expected_sha256: str) -> None:
     try:
         descriptor = os.open(
             output,
@@ -853,8 +926,13 @@ def _publish(staged_zip: Path, output: Path) -> None:
         raise BuildError("The output path could not be created.") from error
     created = True
     try:
-        with os.fdopen(descriptor, "wb") as destination, staged_zip.open("rb") as source:
-            shutil.copyfileobj(source, destination)
+        with os.fdopen(descriptor, "wb") as destination, staged_file.open("rb") as source:
+            digest = hashlib.sha256()
+            while chunk := source.read(1024 * 1024):
+                destination.write(chunk)
+                digest.update(chunk)
+        if digest.hexdigest() != expected_sha256:
+            raise BuildError("An output artifact changed after verification.")
         created = False
     finally:
         if created:
@@ -862,6 +940,29 @@ def _publish(staged_zip: Path, output: Path) -> None:
                 output.unlink()
             except OSError:
                 print("Warning: the incomplete output could not be removed.", file=sys.stderr)
+
+
+def _publish_artifacts(staged_zip: Path, staged_wheel: Path, output: Path, wheel_sha256: str) -> None:
+    destinations = (output, output.with_name(staged_wheel.name))
+    if any(path.exists() or path.is_symlink() for path in destinations):
+        raise BuildError("An output artifact path already exists.")
+    created: list[Path] = []
+    complete = False
+    try:
+        for source, destination, digest in (
+            (staged_zip, destinations[0], hashlib.sha256(staged_zip.read_bytes()).hexdigest()),
+            (staged_wheel, destinations[1], wheel_sha256),
+        ):
+            _publish(source, destination, digest)
+            created.append(destination)
+        complete = True
+    finally:
+        if not complete:
+            for path in created:
+                try:
+                    path.unlink()
+                except OSError:
+                    print("Warning: an incomplete artifact set could not be removed.", file=sys.stderr)
 
 
 def produce_bundle(
@@ -877,7 +978,7 @@ def produce_bundle(
     download_dependencies: bool,
     version_mode: str = "build",
 ) -> None:
-    """Produce one verified ZIP from an exact clean Git checkout."""
+    """Produce a wheel and verified ZIP beside it from an exact clean Git checkout."""
     if output.name != _OUTPUT_NAME:
         raise BuildError(f"The output filename must be {_OUTPUT_NAME}.")
     if output.exists() or output.is_symlink():
@@ -922,7 +1023,7 @@ def produce_bundle(
             _download_runtime_wheels(runtime_lock_path, dependency_source)
         runtime_wheels = _collect_runtime_wheels(dependency_source, runtime_requirements)
         application_wheel = _build_application_wheel(source, staging / "application-wheel")
-        _inspect_application_wheel(
+        application_sha256 = _inspect_application_wheel(
             application_wheel,
             source=source,
             version=version,
@@ -933,6 +1034,7 @@ def produce_bundle(
             source=source,
             bundle_root=bundle_root,
             application_wheel=application_wheel,
+            application_sha256=application_sha256,
             runtime_wheels=runtime_wheels,
             repository=repository,
             source_sha=expected_source_sha,
@@ -944,7 +1046,10 @@ def produce_bundle(
         )
         staged_zip = staging / _OUTPUT_NAME
         _write_deterministic_zip(bundle_root, staged_zip)
-        _publish(staged_zip, output)
+        _publish_artifacts(
+            staged_zip, bundle_root / "wheels" / application_wheel.name,
+            output, application_sha256,
+        )
 
 
 def _positive(value: str) -> int:
@@ -959,7 +1064,7 @@ def _positive(value: str) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Build a complete Site Ops installation bundle from an exact clean checkout.",
+        description="Build a Site Ops wheel and installation ZIP from an exact clean checkout.",
     )
     parser.add_argument("--repository", required=True)
     parser.add_argument("--source-ref", required=True)
@@ -992,7 +1097,7 @@ def main(argv: list[str] | None = None) -> int:
     except OSError:
         print("Bundle production failed because a required file could not be accessed.", file=sys.stderr)
         return 1
-    print(f"Created {_OUTPUT_NAME}.")
+    print(f"Created {_OUTPUT_NAME} and its identical standalone Site Ops wheel.")
     return 0
 
 

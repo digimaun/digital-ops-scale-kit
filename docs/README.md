@@ -8,7 +8,7 @@ Extended documentation for the Digital Operations Scale Kit.
 
 | Document | Description |
 |----------|-------------|
-| [install-siteops.md](install-siteops.md) | Verified release bundles, prerequisites, installation, and build lifecycle |
+| [install-siteops.md](install-siteops.md) | Release wheels, verified bundles, pipx prerequisites, and installation lifecycle |
 | [releasing.md](releasing.md) | CI previews, reviewed release files, independent versions, and approved publication |
 | [migrating.md](migrating.md) | What to change in a workspace when moving to a newer Scale Kit release |
 | [site-configuration.md](site-configuration.md) | Site definitions, inheritance, overlays |

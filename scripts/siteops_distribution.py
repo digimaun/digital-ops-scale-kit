@@ -202,8 +202,7 @@ class BundleManifest:
 
         inventory = {entry.path for entry in files}
         required = {
-            "install.py",
-            "siteops_distribution.py",
+            "pylock.toml",
             "LICENSE",
             "ThirdPartyNotices.txt",
             application_wheel,
@@ -310,11 +309,6 @@ def select_target(manifest: BundleManifest, python: str, platform: str) -> Bundl
         f"This bundle does not support Python {python} on {platform}. "
         f"Declared targets: {supported}."
     )
-
-
-def manifest_digest(root: Path) -> str:
-    """Return a local content-store key for the exact bundle.json bytes."""
-    return hashlib.sha256(_read_manifest_bytes(Path(root))).hexdigest()
 
 
 def _object(value: Any, keys: set[str], label: str) -> dict[str, Any]:

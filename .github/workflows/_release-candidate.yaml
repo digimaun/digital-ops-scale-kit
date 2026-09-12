@@ -34,8 +34,16 @@ on:
         value: ${{ jobs.review.outputs.notes-sha }}
       bundle-sha:
         value: ${{ jobs.review.outputs.bundle-sha }}
+      wheel-name:
+        value: ${{ jobs.review.outputs.wheel-name }}
+      wheel-sha:
+        value: ${{ jobs.review.outputs.wheel-sha }}
+      asset-list-sha:
+        value: ${{ jobs.review.outputs.asset-list-sha }}
       bundle-artifact-id:
         value: ${{ jobs.distribution.outputs.staging-artifact-id }}
+      assets-artifact-id:
+        value: ${{ jobs.review.outputs.assets-artifact-id }}
       build-number:
         value: ${{ jobs.distribution.outputs.build-number }}
       build-attempt:
@@ -216,13 +224,19 @@ jobs:
       BUILD_NUMBER: ${{ needs.distribution.outputs.build-number }}
       BUILD_ATTEMPT: ${{ needs.distribution.outputs.build-attempt }}
       BUILD_ARCHIVE_SHA: ${{ needs.distribution.outputs.archive-sha256 }}
+      BUILD_WHEEL_NAME: ${{ needs.distribution.outputs.wheel-name }}
+      BUILD_WHEEL_SHA: ${{ needs.distribution.outputs.wheel-sha256 }}
     outputs:
       plan-sha: ${{ steps.candidate.outputs.plan-sha }}
       bundle-sha: ${{ steps.candidate.outputs.bundle-sha }}
+      wheel-name: ${{ steps.candidate.outputs.wheel-name }}
+      wheel-sha: ${{ steps.candidate.outputs.wheel-sha }}
+      asset-list-sha: ${{ steps.candidate.outputs.asset-list-sha }}
       engine-id: ${{ steps.candidate.outputs.engine-id }}
       engine-ref: ${{ steps.candidate.outputs.engine-ref }}
       notes-sha: ${{ steps.notes.outputs.sha256 }}
       notes-artifact-id: ${{ steps.notes-upload.outputs.artifact-id }}
+      assets-artifact-id: ${{ steps.assets-upload.outputs.artifact-id }}
     steps:
       - name: Require successful CI for the candidate
         id: ci
@@ -285,7 +299,7 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
 
-      - name: Download the qualified bundle
+      - name: Download the qualified release assets
         if: needs.prepare.outputs.bundle == 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -409,24 +423,66 @@ jobs:
           done
 
           bundle="$(python3 -c 'import json,sys; print(str(json.load(open(sys.argv[1]))["siteops"]["bundle"]).lower())' "$plan")"
+          assets="$RUNNER_TEMP/release-assets"
+          mkdir -p "$assets"
           if [[ "$bundle" == "true" ]]; then
             archive="$RUNNER_TEMP/release-bundle/$ARCHIVE_NAME"
-            proof="${archive}${ATTESTATION_SUFFIX}"
-            gh attestation verify "$archive" --bundle "$proof" --repo "$GITHUB_REPOSITORY" \
+            archive_proof="${archive}${ATTESTATION_SUFFIX}"
+            if [[ ! "$BUILD_WHEEL_NAME" =~ ^siteops-[0-9A-Za-z][0-9A-Za-z.!+_~-]*-py3-none-any\.whl$ || "$BUILD_WHEEL_NAME" == *".."* ]]; then
+              echo "::error::The standalone wheel filename is invalid."
+              exit 1
+            fi
+            wheel="$RUNNER_TEMP/release-bundle/$BUILD_WHEEL_NAME"
+            wheel_proof="${wheel}${ATTESTATION_SUFFIX}"
+            gh attestation verify "$archive" --bundle "$archive_proof" --repo "$GITHUB_REPOSITORY" \
               --cert-identity "$SIGNER_IDENTITY" --signer-digest "$SOURCE_SHA" \
               --source-digest "$SOURCE_SHA" --source-ref "$SOURCE_REF" \
               --cert-oidc-issuer "$OIDC_ISSUER" \
               --predicate-type "$PREDICATE_TYPE" --deny-self-hosted-runners
-            digest="$(sha256sum "$archive" | cut -d ' ' -f 1)"
-            if [[ "$digest" != "$BUILD_ARCHIVE_SHA" ]]; then
-              echo "::error::The archive differs from the qualified bytes."
-              exit 1
-            fi
+            gh attestation verify "$wheel" --bundle "$wheel_proof" --repo "$GITHUB_REPOSITORY" \
+              --cert-identity "$SIGNER_IDENTITY" --signer-digest "$SOURCE_SHA" \
+              --source-digest "$SOURCE_SHA" --source-ref "$SOURCE_REF" \
+              --cert-oidc-issuer "$OIDC_ISSUER" \
+              --predicate-type "$PREDICATE_TYPE" --deny-self-hosted-runners
             python3 -c '
-          import json, os, sys, zipfile
-          plan = json.load(open(sys.argv[1]))
-          with zipfile.ZipFile(sys.argv[2]) as archive:
+          import hashlib, json, os, re, sys, zipfile
+          from pathlib import Path
+
+          plan_path, bundle_path, output_path = map(Path, sys.argv[1:])
+          plan = json.loads(plan_path.read_text(encoding="utf-8"))
+          archive_name = os.environ["ARCHIVE_NAME"]
+          wheel_name = os.environ["BUILD_WHEEL_NAME"]
+          suffix = os.environ["ATTESTATION_SUFFIX"]
+          expected_names = [archive_name, archive_name + suffix, wheel_name, wheel_name + suffix]
+          entries = list(bundle_path.iterdir())
+          if (
+              sorted(entry.name for entry in entries) != sorted(expected_names)
+              or any(entry.is_symlink() or not entry.is_file() for entry in entries)
+              or len({entry.name for entry in entries}) != 4
+          ):
+              raise SystemExit("::error::The staged release asset inventory is invalid.")
+          paths = {name: bundle_path / name for name in expected_names}
+          if any(paths[name].stat().st_size == 0 for name in (archive_name + suffix, wheel_name + suffix)):
+              raise SystemExit("::error::A staged attestation proof is empty.")
+
+          def digest(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          archive_digest = digest(paths[archive_name])
+          wheel_digest = digest(paths[wheel_name])
+          if archive_digest != os.environ["BUILD_ARCHIVE_SHA"]:
+              raise SystemExit("::error::The archive differs from the qualified bytes.")
+          if wheel_digest != os.environ["BUILD_WHEEL_SHA"]:
+              raise SystemExit("::error::The wheel differs from the qualified bytes.")
+          with zipfile.ZipFile(paths[archive_name]) as archive:
+              if archive.namelist().count("bundle.json") != 1:
+                  raise SystemExit("::error::The bundle manifest inventory is invalid.")
               manifest = json.loads(archive.read("bundle.json"))
+              wheel_path = "wheels/" + wheel_name
+              if archive.namelist().count(wheel_path) != 1:
+                  raise SystemExit("::error::The bundle does not contain the standalone wheel.")
+              if archive.read(wheel_path) != paths[wheel_name].read_bytes():
+                  raise SystemExit("::error::The standalone wheel differs from the wheel in the bundle.")
           engine = plan["siteops"]
           expected = engine["baseVersion"]
           if engine["versionMode"] == "build":
@@ -437,28 +493,98 @@ jobs:
               or manifest.get("build") != {"number": int(os.environ["BUILD_NUMBER"]), "attempt": int(os.environ["BUILD_ATTEMPT"])}
               or manifest.get("package", {}).get("name") != "siteops"
               or manifest.get("package", {}).get("version") != expected
+              or manifest.get("package", {}).get("wheel") != "wheels/" + wheel_name
           ):
               raise SystemExit("::error::The bundle does not describe the selected candidate.")
+          asset_list = {
+              "apiVersion": "siteops.release.assets/v1",
+              "kind": "SiteOpsReleaseAssets",
+              "mode": "publish",
+              "source": plan["source"],
+              "assets": [
+                  {"name": name, "sha256": digest(paths[name])}
+                  for name in expected_names
+              ],
+          }
+          output_path.write_text(
+              json.dumps(asset_list, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+              newline="\n",
+          )
           print("engine-version=" + expected)
-            ' "$plan" "$archive" >> "$GITHUB_OUTPUT"
-            echo "bundle-sha=$digest" >> "$GITHUB_OUTPUT"
+          print("bundle-sha=" + archive_digest)
+          print("wheel-name=" + wheel_name)
+          print("wheel-sha=" + wheel_digest)
+            ' "$plan" "$RUNNER_TEMP/release-bundle" "$assets/release-assets.json" >> "$GITHUB_OUTPUT"
           else
             engine_tag="$(python3 -c 'import json,sys,urllib.parse; print(urllib.parse.quote(json.load(open(sys.argv[1]))["siteops"]["releaseTag"], safe=""))' "$plan")"
             gh api "repos/$GITHUB_REPOSITORY/releases/tags/$engine_tag" > "$RUNNER_TEMP/engine-release.json"
             gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$engine_tag" > "$RUNNER_TEMP/engine-ref.json"
             python3 -c '
-          import json, os, sys
-          plan, release, ref = [json.load(open(path)) for path in sys.argv[1:]]
+          import json, os, re, sys
+          from pathlib import Path
+
+          plan, release, ref = [json.load(open(path)) for path in sys.argv[1:4]]
           if release.get("draft") is not False or release.get("tag_name") != plan["siteops"]["releaseTag"]:
               raise SystemExit("::error::The referenced Site Ops release is not published.")
-          required = {os.environ["ARCHIVE_NAME"], os.environ["ARCHIVE_NAME"] + os.environ["ATTESTATION_SUFFIX"]}
-          if not required.issubset({asset.get("name") for asset in release.get("assets", [])}):
-              raise SystemExit("::error::The referenced Site Ops release has no complete installation bundle.")
-          identity, target = str(release["id"]), ref["object"]["sha"]
+          archive = os.environ["ARCHIVE_NAME"]
+          suffix = os.environ["ATTESTATION_SUFFIX"]
+          values = release.get("assets", [])
+          if not isinstance(values, list) or len(values) != 4:
+              raise SystemExit("::error::The referenced Site Ops release has no complete native asset set.")
+          by_name = {asset.get("name"): asset for asset in values if isinstance(asset, dict)}
+          wheels = [
+              name for name in by_name
+              if isinstance(name, str)
+              and re.fullmatch(r"siteops-[0-9A-Za-z][0-9A-Za-z.!+_~-]*-py3-none-any\.whl", name)
+              and ".." not in name
+          ]
+          if len(wheels) != 1:
+              raise SystemExit("::error::The referenced Site Ops release has an invalid wheel inventory.")
+          wheel = wheels[0]
+          names = [archive, archive + suffix, wheel, wheel + suffix]
+          if set(by_name) != set(names):
+              raise SystemExit("::error::The referenced Site Ops release has no complete native asset set.")
+          assets = []
+          for name in names:
+              asset = by_name[name]
+              digest = asset.get("digest")
+              if asset.get("state") != "uploaded" or not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                  raise SystemExit("::error::The referenced Site Ops release asset identity is incomplete.")
+              assets.append({"name": name, "sha256": digest.removeprefix("sha256:")})
+          identity_value = release.get("id")
+          target = ref.get("object", {}).get("sha")
+          if not isinstance(identity_value, int) or identity_value <= 0:
+              raise SystemExit("::error::The referenced Site Ops release identity is invalid.")
+          identity = str(identity_value)
+          if not isinstance(target, str) or not re.fullmatch(r"[0-9a-f]{40}", target):
+              raise SystemExit("::error::The referenced Site Ops tag target is invalid.")
+          asset_list = {
+              "apiVersion": "siteops.release.assets/v1",
+              "kind": "SiteOpsReleaseAssets",
+              "mode": "reference",
+              "engine": {
+                  "releaseId": identity,
+                  "tag": plan["siteops"]["releaseTag"],
+                  "target": target,
+              },
+              "assets": assets,
+          }
+          Path(sys.argv[4]).write_text(
+              json.dumps(asset_list, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+              newline="\n",
+          )
           print("engine-id=" + identity)
           print("engine-ref=" + target)
-            ' "$plan" "$RUNNER_TEMP/engine-release.json" "$RUNNER_TEMP/engine-ref.json" >> "$GITHUB_OUTPUT"
+          print("wheel-name=" + wheel)
+          print("wheel-sha=" + by_name[wheel]["digest"].removeprefix("sha256:"))
+            ' "$plan" "$RUNNER_TEMP/engine-release.json" "$RUNNER_TEMP/engine-ref.json" "$assets/release-assets.json" >> "$GITHUB_OUTPUT"
           fi
+          python3 -c '
+          import hashlib, sys
+          print("asset-list-sha=" + hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())
+          ' "$assets/release-assets.json" >> "$GITHUB_OUTPUT"
 
       - name: Render the final release notes
         id: notes
@@ -481,80 +607,50 @@ jobs:
               tag = engine["releaseTag"]
               url = home + "/releases/tag/" + urllib.parse.quote(tag, safe="")
               notes += "Use [" + tag + "](" + url + ") and its installation instructions. "
-              notes += "The engine release has its own source commit and installation assets.\n"
+              notes += "The referenced engine release has its own source commit and native installation assets.\n"
           else:
               version = os.environ["ENGINE_VERSION"]
               archive = os.environ["ARCHIVE_NAME"]
-              proof = archive + os.environ["ATTESTATION_SUFFIX"]
+              archive_proof = archive + os.environ["ATTESTATION_SUFFIX"]
+              asset_list = json.loads((root / "release-assets/release-assets.json").read_text(encoding="utf-8"))
+              wheels = [item["name"] for item in asset_list["assets"] if item["name"].endswith(".whl")]
+              if asset_list.get("mode") != "publish" or len(wheels) != 1:
+                  raise SystemExit("::error::The release asset list cannot render installation guidance.")
+              wheel = wheels[0]
+              wheel_proof = wheel + os.environ["ATTESTATION_SUFFIX"]
               downloads = home + "/releases/download/" + urllib.parse.quote(plan["release"]["tag"], safe="") + "/"
-              guide = home + "/blob/" + source["commit"] + "/docs/install-siteops.md"
+              guide = home + "/blob/" + source["commit"] + "/docs/install-siteops.md#install-the-verified-bundle"
               notes += "Package version: `" + version + "`.\n\n"
-              notes += "Expected publisher: `" + repository + "`.\n\n"
-              notes += "**Prerequisites:** standard 64-bit CPython 3.10-3.14, pipx 1.17.2 or a compatible newer 1.x release, "
-              notes += "and GitHub CLI 2.95.0 or newer. Use Windows x64 or Linux x64 with glibc 2.17 or newer.\n\n"
-              notes += "Obtain prerequisites through trusted managed channels. "
-              notes += "[Installation guide](" + guide + ") covers setup, PATH, replacement, and removal.\n\n"
-              notes += "1. Download [" + archive + "](" + downloads + archive + ") and "
-              notes += "[" + proof + "](" + downloads + proof + ") into one private folder.\n"
-              notes += "2. Open your terminal in that folder and run the commands for your platform below.\n\n"
-              notes += "Use these two assets, not the generated Source code archives. "
-              notes += "Verification must succeed before the installation ZIP is extracted. "
-              notes += "Use a new extraction directory and run as your ordinary user.\n\n"
-
-              identity = home + "/.github/workflows/_siteops-distribution.yaml@" + source["ref"]
-              flags = [
-                  ("--repo", repository),
-                  ("--cert-identity", identity),
-                  ("--source-digest", source["commit"]),
-                  ("--signer-digest", source["commit"]),
-                  ("--source-ref", source["ref"]),
-                  ("--cert-oidc-issuer", os.environ["OIDC_ISSUER"]),
-                  ("--predicate-type", os.environ["PREDICATE_TYPE"]),
-              ]
-
-              def verify_command(prefix, continuation):
-                  lines = [
-                      "gh attestation verify " + prefix + archive + " " + continuation,
-                      "  --bundle " + prefix + proof + " " + continuation,
-                  ]
-                  lines += [
-                      "  " + option + " \"" + value + "\" " + continuation
-                      for option, value in flags
-                  ]
-                  return "\n".join(lines + ["  --deny-self-hosted-runners"])
-
-              windows = "\n".join([
-                  "$ErrorActionPreference = \"Stop\"",
-                  verify_command(".\\", "`"),
-                  "if ($LASTEXITCODE -ne 0) {",
-                  "    throw \"Verification failed. Do not extract or install.\"",
-                  "}",
-                  "Expand-Archive -LiteralPath .\\" + archive + " -DestinationPath .\\siteops-bundle",
-                  "python -B .\\siteops-bundle\\install.py",
-                  "if ($LASTEXITCODE -ne 0) {",
-                  "    throw \"Installation did not complete. Follow the reported guidance.\"",
-                  "}",
-              ])
-              windows = "& {\n" + "\n".join("    " + line for line in windows.splitlines()) + "\n}"
-              linux = "\n".join([
-                  "(",
-                  "set -eu",
-                  "umask 077",
-                  verify_command("./", "\\"),
-                  "mkdir ./siteops-bundle",
-                  "python3 -B -m zipfile -e ./" + archive + " ./siteops-bundle",
-                  "python3 -B ./siteops-bundle/install.py",
-                  ")",
-              ])
-              for title, language, commands in (
-                  ("Windows (PowerShell)", "powershell", windows),
-                  ("Linux (Bash)", "bash", linux),
-              ):
-                  notes += "<details>\n<summary>" + title + "</summary>\n\n"
-                  notes += "```" + language + "\n" + commands + "\n```\n\n</details>\n\n"
-              notes += "Follow any PATH guidance, then use `siteops --version` and `siteops --help`. "
-              notes += "Selecting a different existing pipx build requires an explicit `--replace`.\n\n"
-              notes += "Verification reads the downloaded proof locally. Trusted-root refresh may use the network. "
+              notes += "**Prerequisites:** standard 64-bit CPython 3.10-3.14 and pipx 1.17.2. "
+              notes += "Use Windows x64 or Linux x64 with glibc 2.17 or newer. "
+              notes += "Configure an approved package index that serves the runtime dependencies as wheels.\n\n"
+              wheel_url = downloads + wheel
+              command = (
+                  "pipx install \"" + wheel_url + "\" --backend pip --fetch-python never "
+                  "--skip-maintenance --app siteops "
+                  "--pip-args \"--only-binary=:all: --no-cache-dir\""
+              )
+              notes += "Install the versioned wheel from this release. Runtime dependencies come from your configured package index as wheels. "
+              notes += "To name it explicitly, add `--index-url <your approved index>` inside `--pip-args`.\n\n"
+              notes += "```console\n" + command + "\n```\n\n"
+              notes += "To replace an existing online installation, review any pipx pin and rerun the command with `--force`. "
+              notes += "Confirm the result with `siteops --version` and `siteops --help`.\n\n"
+              notes += "pipx does not automatically verify GitHub attestations for the online command. "
+              notes += "For external verification before extraction and a hash-locked native install from stable private storage, "
+              notes += "follow the [verified installation guide](" + guide + "). "
+              notes += "That path downloads only the ZIP and its detached proof, authenticates the ZIP before extraction, "
+              notes += "then installs from the authenticated `pylock.toml` with stock pipx.\n\n"
+              notes += "Expected publisher: `" + repository + "`. Source commit: `" + source["commit"] + "`. "
+              notes += "Source ref: `" + source["ref"] + "`. "
+              notes += "Use these values with the guide verification policy. "
+              notes += "The guide also describes switching between online and locked installations.\n\n"
+              notes += "The locked path is qualified with pipx 1.17.2 and its shared pip 26.2.1. "
+              notes += "pip support for `pylock.toml` remains experimental.\n\n"
+              notes += "Release assets: [" + wheel + "](" + wheel_url + "), "
+              notes += "[" + wheel_proof + "](" + downloads + wheel_proof + "), "
+              notes += "[" + archive + "](" + downloads + archive + "), and "
+              notes += "[" + archive_proof + "](" + downloads + archive_proof + "). "
+              notes += "Use these assets instead of the generated source archives.\n\n"
               notes += "Installing the CLI does not authenticate to Azure or deploy resources.\n"
           raw = notes.encode("utf-8")
           digest = hashlib.sha256(raw).hexdigest()
@@ -615,10 +711,23 @@ jobs:
           overwrite: false
           retention-days: 30
 
+      - name: Retain the frozen asset list
+        id: assets-upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-assets/release-assets.json
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 30
+
       - name: Show the release approval preview
         shell: bash
         env:
           BUNDLE_SHA: ${{ steps.candidate.outputs.bundle-sha }}
+          WHEEL_NAME: ${{ steps.candidate.outputs.wheel-name }}
+          WHEEL_SHA: ${{ steps.candidate.outputs.wheel-sha }}
+          ASSET_LIST_SHA: ${{ steps.candidate.outputs.asset-list-sha }}
           TAG_EXISTS: ${{ steps.target.outputs.tag-exists }}
           ENGINE_VERSION: ${{ steps.candidate.outputs.engine-version }}
           CI_URL: ${{ steps.ci.outputs.url }}
@@ -692,9 +801,12 @@ jobs:
                       if row["python"] not in ("3.10", "3.11", "3.12", "3.13", "3.14") or row["linux"] not in allowed or row["windows"] not in allowed:
                           raise SystemExit("::error::Invalid qualification summary.")
                       output.write("| " + row["python"] + " | " + row["linux"] + " | " + row["windows"] + " |\n")
-                  output.write("\n[Download the attested installation bundle](" + os.environ["ARTIFACT_URL"] + ")\n")
-                  output.write("\nThe Actions download contains the installation ZIP and its detached proof. Verify the installation ZIP before extracting it.\n")
-                  output.write("\n<details><summary>Artifact identity</summary>\n\nSHA-256: `" + os.environ["BUNDLE_SHA"] + "`\n\n</details>\n")
+                  output.write("\n[Download the attested release assets](" + os.environ["ARTIFACT_URL"] + ")\n")
+                  output.write("\nThe Actions download contains the installation ZIP, standalone wheel, and a detached proof for each. For a verified installation, use the ZIP and its proof.\n")
+                  output.write("\n<details><summary>Artifact identity</summary>\n\n")
+                  output.write("- `" + os.environ["ARCHIVE_NAME"] + "` SHA-256: `" + os.environ["BUNDLE_SHA"] + "`\n")
+                  output.write("- `" + os.environ["WHEEL_NAME"] + "` SHA-256: `" + os.environ["WHEEL_SHA"] + "`\n")
+                  output.write("- Frozen asset list SHA-256: `" + os.environ["ASSET_LIST_SHA"] + "`\n\n</details>\n")
               output.write("\nCI passed for this candidate. Installation qualification passed when a bundle is included.\n")
               output.write("CI evidence: " + os.environ["CI_URL"] + "\n")
               output.write("For content releases, confirm the applicable content/AIO evidence before approving.\n")
@@ -704,6 +816,6 @@ jobs:
                   output.write("Next: select Review deployments, then siteops-release, then Approve and deploy.\n")
                   output.write("Approval authorizes the listed tag action at this commit and publication of these release assets.\n")
               if engine["bundle"]:
-                  output.write("\nThe release download links below become available after publication. For a preview, use the Actions download above.\n")
+                  output.write("\nThe installation guidance below is for the published release. To try a candidate before publication, use the Actions download above and the installation guide for manually downloaded files.\n")
               output.write("\n## Release notes\n\n" + embedded_notes((root.parent / "publish-notes.md").read_text(encoding="utf-8")) + "\n")
           ' "$RUNNER_TEMP/release-plan"

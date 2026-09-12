@@ -1,148 +1,318 @@
 # Install Site Ops from a release
 
-Install an identified Site Ops build without cloning this repository. Release
-bundles contain the engine wheel, pinned runtime dependency wheels, an installer,
-and license notices. The same CLI works with local workspaces and automation.
+Install an identified Site Ops build without cloning this repository. A release
+publishes two assets that carry the same application bytes:
 
-Use this path with a release that provides `siteops-install.zip` and
-`siteops-install.zip.attestation.jsonl`. A release without those assets uses the
+| Asset | Contents | Use it for |
+|---|---|---|
+| `siteops-<version>-py3-none-any.whl` | The Site Ops engine wheel | Ordinary installation from a release you already trust |
+| `siteops-install.zip` | That identical wheel, pinned runtime dependency wheels, `pylock.toml`, the bundle inventory, and license notices | Verified, index-free installation with a recorded dependency set |
+
+Each asset has its own detached proof, `<asset>.attestation.jsonl`, and the
+publishing pipeline signs and cross-checks both. As an operator you use one
+asset: install the wheel directly, or download the archive with its proof and
+install from the authenticated bundle. Both paths install with stock
+[pipx](https://pipx.pypa.io/). Site Ops ships no installer program, no bootstrap
+script, and no private package store.
+
+A release without these assets uses the
 [linked Site Ops release](releasing.md#release-content-against-an-existing-engine)
 or the [source installation](../README.md#quick-start) path.
 
 ## Before you start
 
-Use a private directory and run as your ordinary user, rather than as an
-administrator or with `sudo`.
+Run as your ordinary user rather than as an administrator or with `sudo`, and
+keep downloaded files in a private directory.
 
-| Prerequisite | Requirement |
-|---|---|
-| Platform | Windows x64, or Linux x64 using glibc 2.17 or newer |
-| Python | Standard 64-bit CPython 3.10 through 3.14, with working `venv` and `ensurepip` support |
-| pipx | Version 1.17.2, or a compatible newer 1.x release, available as `pipx` |
-| GitHub CLI | Version 2.95.0 or newer, available as `gh` |
+| Prerequisite | Requirement | Needed for |
+|---|---|---|
+| Platform | Windows x64, or Linux x64 using glibc 2.17 or newer | Both paths |
+| Python | Standard 64-bit CPython 3.10 through 3.14, with working `venv` support | Both paths |
+| pipx | Version 1.17.2, available as `pipx` | Both paths |
+| Package feed | An approved index that serves the runtime dependencies as wheels | Release wheel path |
+| pipx backend pip | Version 26.2.1 | Verified bundle path |
+| GitHub CLI | Version 2.95.0 or newer, providing `gh attestation verify` with the flags used below | Downloading and verifying assets |
 
-Obtain these tools through your organization's managed software channel or
-their official installation instructions:
+Obtain these tools through your organization's managed software channel or their
+official instructions:
 [Python](https://www.python.org/downloads/),
 [pipx](https://pipx.pypa.io/stable/installation/), and
 [GitHub CLI](https://cli.github.com/).
-They are maintained separately from the Site Ops bundle.
-Some Linux distributions package Python's venv support separately.
-
-The installer uses pipx's pip backend and locally supplied wheels. It does not
-fetch Python, upgrade pipx's shared tooling, or build source distributions.
-Prerequisite installation and signing-root refresh can require network access.
-This is not a promise of a fully offline bootstrap.
+They are maintained separately from Site Ops, and some Linux distributions
+package Python's `venv` support separately. Prepare them first: the Site Ops
+installation commands below add no tooling of their own.
 
 Installing the CLI does not authenticate to Azure, acquire a workspace, or
 deploy resources. Azure CLI, Bicep, and kubectl requirements depend on the
 operations you later select.
 
-## Select and authenticate a release
+## Install the release wheel
 
-Releases with an installation bundle include an **Install Site Ops** section.
-Its download links and Windows/Linux commands already identify that release.
-Use those commands instead of assembling the verification values yourself.
-The examples below explain the same verification policy.
-
-1. Open the [official releases](https://github.com/Azure/digital-ops-scale-kit/releases)
-   and select an explicit release.
-2. Confirm its tag and full source commit in the official repository. Keep
-   that commit as the expected identity for verification.
-3. Download both installation assets into your private directory. Keep the
-   ZIP unopened until verification succeeds.
-
-Versioned engine releases use `siteops/v...` tags. Content previews may include
-an identified engine build. If a content release links to a separate Site Ops
-release, follow that link and use the engine release's source commit for the
-verification below, not the content release's commit.
-
-The repository, signing workflow, and expected commit are trust decisions.
-Take them from the official repository and this guidance, not from a downloaded
-manifest or a command supplied inside the archive. A checksum beside a download
-does not authenticate its publisher.
-
-The commands below enforce official builds from `main`. A build from a fork
-does not satisfy that policy. The signed provenance covers the entire ZIP,
-including its installer and wheels.
-
-### Windows PowerShell
-
-Run from the directory containing the downloaded assets. Replace the source
-commit placeholder with the full commit you selected.
+This is the ordinary path. It trusts the release channel you download from and
+the package feed your environment is configured to use.
 
 ```powershell
-$sourceSha = "<full source commit from the selected official release>"
-
-gh attestation verify .\siteops-install.zip `
-  --bundle .\siteops-install.zip.attestation.jsonl `
-  --repo Azure/digital-ops-scale-kit `
-  --cert-identity "https://github.com/Azure/digital-ops-scale-kit/.github/workflows/_siteops-distribution.yaml@refs/heads/main" `
-  --source-ref refs/heads/main `
-  --source-digest $sourceSha `
-  --signer-digest $sourceSha `
-  --cert-oidc-issuer "https://token.actions.githubusercontent.com" `
-  --predicate-type "https://slsa.dev/provenance/v1" `
-  --deny-self-hosted-runners
-
-if ($LASTEXITCODE -ne 0) {
-    throw "Verification failed. Do not extract or install this bundle."
-}
-
-Expand-Archive -LiteralPath .\siteops-install.zip -DestinationPath .\siteops-bundle
-python -B .\siteops-bundle\install.py
-if ($LASTEXITCODE -ne 0) {
-    throw "Installation did not complete. Follow the reported guidance."
-}
+pipx install "https://github.com/Azure/digital-ops-scale-kit/releases/download/<tag>/siteops-<version>-py3-none-any.whl" `
+  --backend pip --fetch-python never --skip-maintenance --app siteops `
+  --pip-args "--only-binary=:all: --no-cache-dir"
 ```
-
-Use a new extraction directory for each download. Follow the installer's PATH
-guidance if the command directory is not already available in your terminal.
-
-### Linux
-
-Run from the directory containing the downloaded assets. Replace the source
-commit placeholder. The `&&` chain stops before extraction or installation
-when an earlier command fails.
 
 ```bash
-source_sha="<full source commit from the selected official release>"
-umask 077
-
-gh attestation verify ./siteops-install.zip \
-  --bundle ./siteops-install.zip.attestation.jsonl \
-  --repo Azure/digital-ops-scale-kit \
-  --cert-identity "https://github.com/Azure/digital-ops-scale-kit/.github/workflows/_siteops-distribution.yaml@refs/heads/main" \
-  --source-ref refs/heads/main \
-  --source-digest "$source_sha" \
-  --signer-digest "$source_sha" \
-  --cert-oidc-issuer "https://token.actions.githubusercontent.com" \
-  --predicate-type "https://slsa.dev/provenance/v1" \
-  --deny-self-hosted-runners &&
-mkdir ./siteops-bundle &&
-python3 -B -m zipfile -e ./siteops-install.zip ./siteops-bundle &&
-python3 -B ./siteops-bundle/install.py
+pipx install "https://github.com/Azure/digital-ops-scale-kit/releases/download/<tag>/siteops-<version>-py3-none-any.whl" \
+  --backend pip --fetch-python never --skip-maintenance --app siteops \
+  --pip-args "--only-binary=:all: --no-cache-dir"
 ```
 
-### What verification means
+Take the tag and wheel file name from the release page, or use the command the
+release notes already print for that build. `--backend pip` and
+`--fetch-python never` keep pipx from selecting another backend or downloading
+an interpreter, `--skip-maintenance` leaves its shared backend alone, and
+`--app siteops` declares the command the installation must provide, so a later
+failed replacement keeps the working one. `--only-binary=:all:` keeps
+installation to built wheels and never builds a downloaded source distribution.
+
+Runtime dependencies come from the package index your environment is already
+configured to use. To name that index in the command instead, add
+`--index-url <your approved index>` inside `--pip-args`. Adding `--isolated`
+ignores pip environment variables and user configuration, but not global
+configuration. An index that your network cannot reach fails the installation,
+so do not copy an index URL from another organization's instructions.
+
+pipx records the URL it installed from and takes runtime dependencies from your
+configured index. **pipx does not check the publisher's provenance
+attestation**, and a checksum published beside a download does not authenticate
+its publisher. Use the verified bundle path below when you require that
+authentication together with the recorded runtime dependencies. The standalone
+wheel's proof is available for independent provenance inspection. The verified
+bundle path does not use it.
+
+Replacing an online installation uses the same command with `--force`. Review
+any pipx pin first, and confirm the result with `siteops --version`. If the
+installation already records a verified lock, `--force` does not clear it.
+Use the explicit [installation transition](#select-another-build-repair-or-remove)
+instead of an ordinary online replacement request.
+
+## Install the verified bundle
+
+Use this path when the installation must record its complete dependency set, run
+without a package index, and start from authenticated publisher provenance.
+
+It needs exactly two files: `siteops-install.zip` and
+`siteops-install.zip.attestation.jsonl`. Verifying the archive authenticates
+every file inside it, including the engine wheel, so this path never downloads
+or verifies the standalone wheel.
+
+### Download the archive and its proof
+
+`gh` works from any directory, so every command below uses an explicit path.
+
+```powershell
+& {
+    $ErrorActionPreference = "Stop"
+    $tag = "<tag>"
+    $download = Join-Path $env:TEMP ("siteops-download-" + [guid]::NewGuid())
+    New-Item -ItemType Directory -Path $download | Out-Null
+    gh release download $tag --repo Azure/digital-ops-scale-kit `
+      --pattern "siteops-install.zip" `
+      --pattern "siteops-install.zip.attestation.jsonl" `
+      --dir $download
+    if ($LASTEXITCODE -ne 0) { throw "The release assets could not be downloaded." }
+    $download
+}
+```
+
+```bash
+(
+  set -euo pipefail
+  umask 077
+  tag="<tag>"
+  download="$(mktemp -d)"
+  gh release download "$tag" --repo Azure/digital-ops-scale-kit \
+    --pattern "siteops-install.zip" \
+    --pattern "siteops-install.zip.attestation.jsonl" \
+    --dir "$download"
+  printf '%s\n' "$download"
+)
+```
+
+The parentheses and the `& { ... }` block keep `set -euo pipefail` and
+`$ErrorActionPreference` scoped to the download, so your interactive shell keeps
+its own settings.
+
+### Authenticate the archive
+
+Confirm the release tag and its full source commit in the official repository
+first, and keep that commit as the expected identity. The repository, signing
+workflow, and expected commit are trust decisions: take them from the official
+repository and this guidance, never from a downloaded manifest or a command
+supplied inside the archive.
+
+```powershell
+& {
+    $ErrorActionPreference = "Stop"
+    $download = "<download directory>"
+    $sourceSha = "<full source commit from the selected official release>"
+    $archive = Join-Path $download "siteops-install.zip"
+
+    gh attestation verify $archive `
+      --bundle "$archive.attestation.jsonl" `
+      --repo Azure/digital-ops-scale-kit `
+      --cert-identity "https://github.com/Azure/digital-ops-scale-kit/.github/workflows/_siteops-distribution.yaml@refs/heads/main" `
+      --source-ref refs/heads/main `
+      --source-digest $sourceSha `
+      --signer-digest $sourceSha `
+      --cert-oidc-issuer "https://token.actions.githubusercontent.com" `
+      --predicate-type "https://slsa.dev/provenance/v1" `
+      --deny-self-hosted-runners
+    if ($LASTEXITCODE -ne 0) { throw "Verification failed. Do not extract this archive." }
+}
+```
+
+```bash
+(
+  set -euo pipefail
+  download="<download directory>"
+  source_sha="<full source commit from the selected official release>"
+  archive="$download/siteops-install.zip"
+
+  gh attestation verify "$archive" \
+    --bundle "$archive.attestation.jsonl" \
+    --repo Azure/digital-ops-scale-kit \
+    --cert-identity "https://github.com/Azure/digital-ops-scale-kit/.github/workflows/_siteops-distribution.yaml@refs/heads/main" \
+    --source-ref refs/heads/main \
+    --source-digest "$source_sha" \
+    --signer-digest "$source_sha" \
+    --cert-oidc-issuer "https://token.actions.githubusercontent.com" \
+    --predicate-type "https://slsa.dev/provenance/v1" \
+    --deny-self-hosted-runners
+)
+```
+
+These commands authenticate the ZIP and all of its contents. You do not need
+the standalone wheel or its proof for this path. The commands enforce official
+builds from `main`, so a build from a fork does not satisfy that policy. For an
+explicitly selected preview, use its repository, source ref, and source commit
+consistently in the verifier policy. Use the engine release's source commit
+when a content release links to a separate Site Ops release.
 
 GitHub CLI validates the signing chain, the expected workflow and repository
-identity, the source and signer commits, and the archive digest. Its
-`--bundle` option reads the downloaded attestation rather than fetching it
-through the GitHub attestation API. Default trusted-root refresh may still
-contact the network.
+identity, the source and signer commits, and the file digest. `--bundle` reads
+the downloaded proof instead of the attestation API, although the default
+trusted-root refresh can still use the network. Verification establishes origin
+and integrity. It does not promise that the selected build is free of defects,
+and fully offline verification requires independently provisioned trusted
+signing roots.
 
-The installer runs only after that verification. It checks the manifest and
-payload hashes, retains the verified files, and installs from local wheel links
-with SHA-256 constraints. It does not perform publisher-signature verification
-itself.
+### Keep the verified files in a stable private directory
 
-Keep the downloaded and extracted files private between these steps. Signature
-verification establishes origin and integrity, not that the selected source is
-free of defects or that another process cannot modify your local files.
-Fully offline verification requires independently provisioned trusted signing
-roots. Never accept a replacement trust root merely because it accompanied
-the download.
+pipx records where it installed from, so the extracted lock and wheels must stay
+in a durable location that you own. After verification succeeds, use one
+directory per archive digest.
+
+```powershell
+& {
+    $ErrorActionPreference = "Stop"
+    $download = "<download directory>"
+    $bundleId = (Get-FileHash -LiteralPath (Join-Path $download "siteops-install.zip") -Algorithm SHA256).Hash.ToLowerInvariant()
+    $bundle = Join-Path $env:LOCALAPPDATA "siteops\bundles\$bundleId"
+    if (Test-Path $bundle) { throw "That bundle directory already exists." }
+
+    New-Item -ItemType Directory -Path $bundle -Force | Out-Null
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    icacls $bundle /inheritance:r /grant:r "*${sid}:(OI)(CI)F" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "The bundle directory could not be protected." }
+    Expand-Archive -LiteralPath (Join-Path $download "siteops-install.zip") -DestinationPath $bundle
+    $bundle
+}
+```
+
+```bash
+(
+  set -euo pipefail
+  umask 077
+  download="<download directory>"
+  bundle_id="$(sha256sum "$download/siteops-install.zip" | cut -d ' ' -f 1)"
+  bundle="${XDG_DATA_HOME:-$HOME/.local/share}/siteops/bundles/$bundle_id"
+  mkdir -p "$(dirname "$bundle")"
+  mkdir "$bundle"
+  python3 -B -m zipfile -e "$download/siteops-install.zip" "$bundle"
+  printf '%s\n' "$bundle"
+)
+```
+
+`icacls` and `umask` keep the extracted files private without any Site Ops cache
+manager. Windows inherits ACLs, so choose a location protected for your account.
+These commands do not rewrite permissions on directories that already exist. The
+downloaded archive and its proof remain yours: keep them for later
+re-verification, or remove them once the bundle directory is in place.
+
+### Provision the pipx backend that reads the lock
+
+pipx installs packages with a shared backend of its own, not with your shell's
+`python -m pip`. The verified path needs a backend that reads `pylock.toml`,
+which pip gained in 26.1 and **still labels experimental** in the qualified
+26.2.1 release.
+
+This is a separate tooling operation, and it changes the shared pip backend
+used by your other pipx applications too. Obtain organizational approval when
+that tooling is centrally managed. The download uses your approved package
+feed. It happens before index-free Site Ops installation.
+
+```powershell
+& {
+    $ErrorActionPreference = "Stop"
+    $tools = Join-Path $env:TEMP ("siteops-tools-" + [guid]::NewGuid())
+    New-Item -ItemType Directory -Path $tools | Out-Null
+    python -m pip download "pip==26.2.1" --no-deps --only-binary=:all: --dest $tools
+    if ($LASTEXITCODE -ne 0) { throw "The pip backend wheel could not be downloaded." }
+    $wheelhouse = ([UriBuilder]::new("file", "", -1, $tools)).Uri.AbsoluteUri
+    pipx upgrade-shared `
+      --pip-args "--no-index --only-binary=:all: --no-cache-dir --force-reinstall --find-links=$wheelhouse"
+    if ($LASTEXITCODE -ne 0) { throw "The pipx backend could not be provisioned." }
+}
+```
+
+```bash
+(
+  set -euo pipefail
+  umask 077
+  tools="$(mktemp -d)"
+  python3 -m pip download "pip==26.2.1" --no-deps --only-binary=:all: --dest "$tools"
+  wheelhouse="$(python3 -B -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).as_uri())' "$tools")"
+  pipx upgrade-shared \
+    --pip-args "--no-index --only-binary=:all: --no-cache-dir --force-reinstall --find-links=$wheelhouse"
+)
+```
+
+`--force-reinstall` selects the downloaded backend even if another version is
+already installed. Download the wheel with `--require-hashes` and a hash-pinned requirements file
+when your policy demands hash-pinned tooling. `pipx upgrade-shared` is the
+supported way to change that backend. Never edit pipx's shared libraries or its
+metadata by hand.
+
+### Install from the verified lock
+
+```powershell
+$bundle = "<retained bundle directory printed by the extraction step>"
+pipx install siteops --lock "$bundle\pylock.toml" `
+  --backend pip --fetch-python never --skip-maintenance --app siteops `
+  --pip-args "--isolated --require-hashes --no-index --only-binary=:all: --no-cache-dir"
+```
+
+```bash
+bundle="<retained bundle directory printed by the extraction step>"
+pipx install siteops --lock "$bundle/pylock.toml" \
+  --backend pip --fetch-python never --skip-maintenance --app siteops \
+  --pip-args "--isolated --require-hashes --no-index --only-binary=:all: --no-cache-dir"
+```
+
+Every flag is load-bearing. `--lock` selects the producer's recorded dependency
+set, `--backend pip` and `--fetch-python never` keep pipx from selecting another
+backend or downloading an interpreter, `--skip-maintenance` leaves the backend
+you provisioned in place, and `--app siteops` states the expected command. The
+pip policy ignores pip environment variables and user configuration, requires
+a recorded hash for every file, forbids any index, accepts only built wheels,
+and writes no cache.
 
 ## Use the installed CLI
 
@@ -151,10 +321,15 @@ siteops --version
 siteops --help
 ```
 
-The package and command report the exact artifact version. Versioned Site Ops
-releases use their declared source package version. Identified builds add a
-suffix, for example `1.0.0b1+build.12345.1.gabcdef123456`.
-The engine version and Scale Kit content version remain separate identities.
+The package and command report the exact artifact version. Versioned releases
+use their declared source package version, and identified builds add a suffix,
+for example `1.0.0b1+build.12345.1.gabcdef123456`. The engine version and Scale
+Kit content version remain separate identities.
+
+If the command is not found, add pipx's command directory to `PATH`, for example
+with `pipx ensurepath`, and open a new terminal. A successful installation
+message is not proof that `PATH` resolves to that command: check
+`siteops --version` after any installation change.
 
 Use `siteops -w <workspace>` with your local content. See
 [site configuration](site-configuration.md) and
@@ -162,103 +337,101 @@ Use `siteops -w <workspace>` with your local content. See
 
 ## Select another build, repair, or remove
 
-Run these operations with the helper from an authenticated extracted bundle.
-Linux uses `python3` in place of `python`.
+`<bundle>` is the stable directory of the authenticated build you selected.
+Windows uses `\` in that path.
 
 | Task | Command |
 |---|---|
-| Install, or confirm the same build | `python -B <bundle>/install.py` |
-| Upgrade or deliberately downgrade | `python -B <selected-bundle>/install.py --replace` |
-| Repair the same selected build | `python -B <bundle>/install.py --reinstall` |
-| Remove Site Ops | `python -B <bundle>/install.py --uninstall` |
-| Choose private retained storage | Add `--store-dir <absolute-directory>` |
+| Confirm or install the selected build | `pipx install siteops --lock <bundle>/pylock.toml --backend pip --fetch-python never --skip-maintenance --app siteops --pip-args "--isolated --require-hashes --no-index --only-binary=:all: --no-cache-dir"` |
+| Upgrade, downgrade, or repair | The same command with `--force` |
+| Remove Site Ops | `pipx uninstall siteops` |
+| Move an online installation to a verified one | The verified command with `--force` |
+| Move a verified installation to an online one | `pipx manifest sync <manifest>.toml --backend pip --skip-maintenance` |
+| Prevent unattended upgrades | `pipx pin siteops` |
 
-A different installed build requires `--replace`. Repair does not select a
-different version. With no installation present, repair performs a fresh
-installation. Removing an already absent installation succeeds.
+Repeating the install request for the build that is already present succeeds and
+does not replace the existing environment. To select a different bundle,
+including another build, use `--force` deliberately. Repair also uses `--force`
+with the bundle you intend to end up with. Site Ops never uninstalls first and
+never edits pipx metadata to change installation state.
 
-Replacement uses the existing environment's Python interpreter. A fresh
-installation uses `PIPX_DEFAULT_PYTHON` when configured, otherwise the base
-interpreter running the helper. Changing the Python interpreter is a separate
-pipx maintenance operation.
+A recorded lock persists until you deliberately replace it. Select another
+authenticated lock with `--force` to change the locked build. Leaving the locked
+state is an explicit `pipx manifest sync` with a lock-free manifest that names
+the release wheel URL you want. That command takes no `--pip-args`, so
+configure its approved index and `PIP_ONLY_BINARY=:all:` through your
+environment. Keep `PIPX_FETCH_PYTHON=never` when automatic interpreter
+acquisition is not permitted. This manifest is a pipx tool declaration, not a
+dependency lock: only the producer generates `pylock.toml`, and you never write
+or edit one.
 
-The helper checks for conflicting exposed commands before changing the
-installation. It also refuses replacement or repair of pinned, injected,
-separately locked, or non-isolated pipx environments. Resolve those explicit
-operator customizations before using this installation path.
+```toml
+[project]
+name = "siteops-installation"
+version = "1"
+dependencies = []
 
-The installer supplies the expected `siteops` application to pipx so a failed
-replacement can use pipx's native environment preservation. It does not
-uninstall the previous build first. Forced process termination, power loss,
-or storage failure is not a guaranteed rollback.
+[dependency-groups]
+siteops = ["siteops @ https://github.com/Azure/digital-ops-scale-kit/releases/download/<tag>/siteops-<version>-py3-none-any.whl"]
 
-Ctrl-C requests a stop. An active pipx change finishes before the helper
-returns, and the helper starts no further change. Mutating pipx commands do
-not have an installer timeout. The final result reports interruption even
-when the active change completed successfully.
+[tool.pipx]
+version = "1.0"
+
+[tool.pipx.tools.siteops]
+apps = ["siteops"]
+```
+
+Installation behavior:
+
+- pipx preserves the previous environment when an installation command reports
+  a failure. Confirm the exposed command with `siteops --version` before
+  continuing.
+- A changed or truncated wheel fails the hash policy and cannot become the
+  selected installation.
+- Explicit `--force` overrides `pipx pin siteops`. A pin stops routine upgrades,
+  not a deliberate replacement.
+- pipx refuses `pipx inject` into a locked environment, so a verified
+  installation keeps exactly the payload the producer recorded.
+- An unrelated command already at pipx's command path is never overwritten, and
+  pipx still reports the package installation as successful. Confirm
+  `siteops --version` rather than the installation message.
+- Replacement uses the existing environment's interpreter. Changing the Python
+  interpreter is a separate pipx operation.
+- Interruption is not a transaction. Forced process termination, power loss, or
+  storage failure is not a guaranteed rollback.
 
 ## Retained files and private diagnostics
 
-The installer retains the bundle because pipx records the wheel source and
-installation arguments for later use.
-
-| Platform | Default retained-data root |
+| Platform | Suggested bundle root |
 |---|---|
-| Windows | `%LOCALAPPDATA%\siteops\installations` |
-| Linux | `$XDG_DATA_HOME/siteops/installations`, or `~/.local/share/siteops/installations` |
+| Windows | `%LOCALAPPDATA%\siteops\bundles\<bundle-id>` |
+| Linux | `$XDG_DATA_HOME/siteops/bundles/<bundle-id>`, or `~/.local/share/siteops/bundles/<bundle-id>` |
 
-Each bundle has a content-addressed directory containing `payload` and
-`wheel-links.html`. The reported data location identifies that directory.
-Its `payload` includes a copy of `install.py` for later lifecycle operations.
-The digest used as its directory name is an integrity key, not a separate
-publisher signature.
+Keep a bundle directory while an installation refers to it. A repair reads
+the recorded lock and its wheels again. Missing, moved, or modified files
+prevent that repair. Restore the directory, or download, verify, and extract
+the release again into a new bundle directory.
 
-Pipx continues to own its environment and command directories. Existing
-`PIPX_HOME`, `PIPX_BIN_DIR`, `PIPX_MAN_DIR`, `PIPX_COMPLETION_DIR`, and
-`PIPX_SHARED_LIBS` selections are honored and must be absolute paths outside
-the extracted bundle. Installation storage must also stay outside the bundle.
-
-POSIX storage is created with private permissions and requires trusted parent
-directories. Windows uses inherited ACLs, so select a directory protected for
-your account. The helper does not rewrite permissions on existing directories.
-
-Private tool output is retained in `logs` under the data root. Removal keeps
-retained bundles and diagnostics. Keep those bundles while an installation
-uses them, and remove only identified obsolete data when reclaiming space.
-The original extraction directory can be removed after successful installation.
-
-## Automation output
-
-Add `--output json` for one `SiteOpsInstallationResult` document on stdout.
-Progress goes to stderr. Check the process exit code as well as the result.
-
-| Exit code | Meaning |
-|---|---|
-| `0` | The requested operation completed, including an already satisfied state |
-| `1` | Installation, tooling, or payload failure |
-| `2` | Invalid command-line arguments |
-| `130` | Stop requested, possibly after an active change completed |
-
-The document identifies `apiVersion: siteops.install/v1`, package, status,
-version, exit code, and interruption. Status is `installed`,
-`already-installed`, `replaced`, `reinstalled`, `removed`, `not-installed`, or
-`failed`. Command-line parser failures use argparse diagnostics rather than
-this result document.
-
-GitHub Actions and Azure Pipelines enable output redaction automatically.
-`SITEOPS_REDACT_OUTPUT=1` enables it elsewhere. Redacted results omit local
-paths and source identifiers while retaining fixed, actionable error messages.
-Authorized private automation can use `SITEOPS_REDACT_OUTPUT=0`.
-Do not publish the private pipx logs.
+pipx owns its environments, command directory, and logs. Existing `PIPX_HOME`,
+`PIPX_BIN_DIR`, `PIPX_MAN_DIR`, `PIPX_COMPLETION_DIR`, and `PIPX_SHARED_LIBS`
+selections are honored. Its logs can contain local paths and environment detail,
+so keep them private and review them before attaching them to a report.
 
 ## Common problems
 
 | Symptom | Action |
 |---|---|
-| Attestation verification fails | Stop before extraction. Confirm the selected release, source commit, both asset files, and trusted GitHub CLI installation. |
-| No supported Python or wheel target | Use a standard supported CPython and platform combination. PyPy, free-threaded Python, musl, macOS, and ARM are outside this bundle matrix. |
-| `pipx is required` | Install supported pipx through a trusted channel and make its command available in PATH. |
-| A different build is installed | Use the authenticated selected bundle with `--replace`. |
-| The exposed command conflicts | Inspect the existing command and resolve ownership before retrying. The helper leaves that command in place. |
-| Retained content has changed | Investigate the existing entry. Re-extract the authenticated release and use a new private `--store-dir` with `--reinstall` rather than merging into damaged data. |
-| A pipx step fails | Inspect its private log locally. Retain the reported exit status, even if an earlier part of the operation completed. |
+| Attestation verification fails | Stop before extracting or installing. Confirm the selected release, source commit, both files, and a trusted GitHub CLI installation. |
+| `pylock.toml` is rejected or reported as unsupported | The pipx backend is older than pip 26.1. Provision the qualified backend as described above, then retry. |
+| No matching distribution during a release wheel installation | The configured feed does not serve a required runtime wheel for this interpreter. Use the verified bundle, which carries them. |
+| `pipx` is not found | Install supported pipx through a trusted channel and make its command available in `PATH`. |
+| The installed build is not the one you selected | Repeat the verified command for the intended bundle with `--force`. |
+| `siteops` runs an unexpected program | Another command with that name is earlier in `PATH`. Resolve the ownership of that command before retrying. |
+| Windows reports `WinError 206` or cannot launch the installed command from a deeply nested path | Use a shorter pipx state location for a fresh installation. Preserve existing environments rather than moving them, because their launchers record interpreter paths. |
+| A locked installation refuses a named request | That is the expected transition policy. Use `--force` with the verified lock, or an explicit manifest sync to leave the locked state. |
+
+## Supported targets
+
+Each Site Ops release qualifies both installation paths on Windows and Linux
+across CPython 3.10 through 3.14 before publication. PyPy, free-threaded Python,
+musl-based Linux, macOS, and ARM are outside the supported matrix.

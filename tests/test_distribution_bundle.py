@@ -18,7 +18,6 @@ from siteops_distribution import (  # noqa: E402
     DistributionError,
     PayloadFile,
     load_manifest,
-    manifest_digest,
     select_target,
     verify_payload,
 )
@@ -26,8 +25,7 @@ from siteops_distribution import (  # noqa: E402
 
 def _write_bundle(root: Path) -> BundleManifest:
     payload = {
-        "install.py": b"print('install')\n",
-        "siteops_distribution.py": b"# shared contract\n",
+        "pylock.toml": b'lock-version = "1.0"\n',
         "LICENSE": b"license\n",
         "ThirdPartyNotices.txt": b"notices\n",
         "wheels/siteops-1.0.0-py3-none-any.whl": b"application wheel\n",
@@ -75,14 +73,11 @@ def _write_bundle(root: Path) -> BundleManifest:
 
 def test_valid_manifest_round_trips_verifies_and_selects_exact_target(tmp_path):
     manifest = _write_bundle(tmp_path)
-    raw = (tmp_path / "bundle.json").read_bytes()
-
     loaded = load_manifest(tmp_path)
 
     assert loaded == manifest
     assert BundleManifest.from_dict(loaded.to_dict()) == manifest
     verify_payload(tmp_path, loaded)
-    assert manifest_digest(tmp_path) == hashlib.sha256(raw).hexdigest()
     assert select_target(loaded, "3.11", "windows-x86_64") == loaded.targets[0]
 
 
@@ -210,14 +205,15 @@ def test_manifest_requires_application_wheel_in_every_target(tmp_path):
         BundleManifest.from_dict(document)
 
 
-def test_manifest_requires_all_named_payloads(tmp_path):
+@pytest.mark.parametrize("required", ["ThirdPartyNotices.txt", "pylock.toml"])
+def test_manifest_requires_all_named_payloads(tmp_path, required):
     manifest = _write_bundle(tmp_path)
     document = manifest.to_dict()
     document["files"] = [
-        entry for entry in document["files"] if entry["path"] != "ThirdPartyNotices.txt"
+        entry for entry in document["files"] if entry["path"] != required
     ]
 
-    with pytest.raises(DistributionError, match="ThirdPartyNotices.txt"):
+    with pytest.raises(DistributionError, match=required):
         BundleManifest.from_dict(document)
 
 
@@ -283,7 +279,7 @@ def test_verify_payload_rejects_symbolic_links_when_supported(tmp_path):
         verify_payload(tmp_path, manifest)
 
 
-def test_manifest_digest_rejects_linked_metadata(tmp_path):
+def test_load_manifest_rejects_linked_metadata(tmp_path):
     _write_bundle(tmp_path)
     original = tmp_path / "bundle-original.json"
     (tmp_path / "bundle.json").replace(original)
@@ -293,7 +289,7 @@ def test_manifest_digest_rejects_linked_metadata(tmp_path):
         pytest.skip(f"Hard links are unavailable: {error}")
 
     with pytest.raises(DistributionError, match="must not be linked"):
-        manifest_digest(tmp_path)
+        load_manifest(tmp_path)
 
 
 def test_load_manifest_rejects_oversized_metadata(tmp_path):

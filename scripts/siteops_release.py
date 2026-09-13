@@ -154,7 +154,6 @@ def load_release_intent(
                 "The Site Ops release tag must exactly match the selected source version."
             )
         stream = "siteops"
-        title = f"Site Ops {version}"
         bundle = True
         version_mode = "source"
         base_version = source_version
@@ -168,7 +167,6 @@ def load_release_intent(
             )
         prerelease = _is_prerelease(version)
         stream = "scalekit"
-        title = f"Digital Operations Scale Kit {version}"
         if set(siteops) == {"build"} and siteops["build"] is True:
             if not prerelease:
                 raise ReleaseIntentError(
@@ -216,7 +214,7 @@ def load_release_intent(
         stream=stream,
         tag=tag,
         version=str(version),
-        title=title,
+        title=f"{tag}: {declaration['headline']}",
         prerelease=prerelease,
         latest=latest,
         bundle=bundle,
@@ -243,9 +241,13 @@ def discover_release_intent(root: Path, before_sha: str, source_sha: str) -> str
     directories: set[str] = set()
     for path in changed_paths:
         parts = path.split("/")
-        if len(parts) != 3 or parts[0] != "releases":
+        if parts[0] != "releases" or parts[-1] not in {"release.json", "notes.md"}:
             continue
-        if parts[2] not in {"release.json", "notes.md"}:
+        if len(parts) != 3:
+            if _tree_entry(repository_root, source_sha, path) is not None:
+                raise ReleaseIntentError(
+                    "Release records must use releases/<name>/release.json and sibling notes.md."
+                )
             continue
         candidate_path = _validate_intent_path(
             f"releases/{parts[1]}/release.json"
@@ -274,6 +276,8 @@ def inactive_release_plan(
     source_sha: str,
     repository: str,
     source_ref: str,
+    *,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Return the inactive plan after validating the selected source identity."""
     repository_root = _repository_root(root)
@@ -284,7 +288,7 @@ def inactive_release_plan(
         "apiVersion": _API_VERSION,
         "kind": _KIND,
         "active": False,
-        "dryRun": False,
+        "dryRun": dry_run,
         "source": {
             "repository": repository,
             "commit": source_sha,
@@ -561,7 +565,7 @@ def _parse_declaration(raw: bytes) -> dict[str, Any]:
         ) from error
     if type(document) is not dict:
         raise ReleaseIntentError("The release file must be a JSON object.")
-    unknown = set(document) - {"tag", "siteops", "latest"}
+    unknown = set(document) - {"tag", "headline", "siteops", "latest"}
     if unknown:
         raise ReleaseIntentError(
             "The release file contains unknown fields: "
@@ -572,6 +576,14 @@ def _parse_declaration(raw: bytes) -> dict[str, Any]:
         raise ReleaseIntentError("The release file tag must be a string.")
     if len(document["tag"]) > 160:
         raise ReleaseIntentError("The release file tag is too long.")
+    headline = document.get("headline")
+    if (
+        type(headline) is not str or not 1 <= len(headline) <= 120
+        or headline != headline.strip() or not headline.isprintable()
+    ):
+        raise ReleaseIntentError(
+            "The release headline must be 1-120 printable characters with no surrounding whitespace."
+        )
     if "latest" in document and type(document["latest"]) is not bool:
         raise ReleaseIntentError("The release file latest field must be a boolean.")
     if "siteops" in document and type(document["siteops"]) is not dict:

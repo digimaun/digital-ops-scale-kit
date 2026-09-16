@@ -54,6 +54,10 @@ on:
         value: ${{ jobs.review.outputs.engine-ref }}
       notes-artifact-id:
         value: ${{ jobs.review.outputs.notes-artifact-id }}
+      workspace-artifact-id:
+        value: ${{ jobs.workspace-build.outputs.artifact-id }}
+      workspace-record-sha:
+        value: ${{ jobs.workspace-build.outputs.record-sha }}
 
 permissions:
   contents: read
@@ -82,6 +86,9 @@ jobs:
       tag: ${{ steps.plan.outputs.tag }}
       bundle: ${{ steps.plan.outputs.bundle }}
       version-mode: ${{ steps.plan.outputs.version-mode }}
+      workspaces: ${{ steps.plan.outputs.workspaces }}
+      intent-path: ${{ steps.plan.outputs.intent-path }}
+      plan-sha: ${{ steps.plan.outputs.plan-sha }}
       tag-exists: ${{ steps.target.outputs.tag-exists }}
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
@@ -154,11 +161,14 @@ jobs:
             --source-ref "$SOURCE_REF" --output-dir "$RUNNER_TEMP/release-plan" \
             "${arguments[@]}"
           python -c '
-          import json, os, sys
-          with open(sys.argv[1], encoding="utf-8") as stream:
-              plan = json.load(stream)
+          import hashlib, json, os, sys
+          raw = open(sys.argv[1], "rb").read()
+          plan = json.loads(raw)
           print("active=" + str(plan["active"]).lower())
+          print("workspaces=" + str(bool(plan.get("workspaces"))).lower())
+          print("plan-sha=" + hashlib.sha256(raw).hexdigest())
           if plan["active"]:
+              print("intent-path=" + plan["intent"]["path"])
               print("tag=" + plan["release"]["tag"])
               print("bundle=" + str(plan["siteops"]["bundle"]).lower())
               print("version-mode=" + (plan["siteops"]["versionMode"] or "build"))
@@ -262,14 +272,169 @@ jobs:
       id-token: write
       attestations: write
 
+  workspace-build:
+    name: Build candidate workspaces
+    needs: prepare
+    if: needs.prepare.outputs.active == 'true' && needs.prepare.outputs.workspaces == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      record-sha: ${{ steps.build.outputs.record-sha }}
+    env:
+      HOME: ${{ runner.temp }}/workspace-home
+      AZURE_CONFIG_DIR: ${{ runner.temp }}/workspace-azure
+      AZURE_CORE_OUTPUT: none
+      AZURE_CORE_COLLECT_TELEMETRY: "false"
+      WORKSPACE_PYTHON: ${{ runner.temp }}/workspace-tools/bin/python
+      BICEP_VERSION: v0.45.15
+      INTENT_PATH: ${{ needs.prepare.outputs.intent-path }}
+      EXPECTED_PLAN_SHA: ${{ needs.prepare.outputs.plan-sha }}
+    steps:
+      - name: Checkout the event commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Download the prepared workspace plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.artifact-id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/workspace-plan
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Install workspace production tools
+        shell: bash
+        env:
+          PIP_CONFIG_FILE: /dev/null
+          PIP_INDEX_URL: https://packagefeedproxy.microsoft.io/pypi/simple/
+          PIP_EXTRA_INDEX_URL: ""
+          PIP_NO_INPUT: "1"
+          PIP_KEYRING_PROVIDER: disabled
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$HOME" "$AZURE_CONFIG_DIR"
+          python -m venv "$RUNNER_TEMP/workspace-tools"
+          if ! "$WORKSPACE_PYTHON" -m pip install --require-hashes --only-binary=:all: --no-cache-dir \
+            -r scripts/siteops-build-requirements.txt -r scripts/siteops-runtime-requirements.txt \
+            > "$RUNNER_TEMP/workspace-tooling.log" 2>&1; then
+            echo "::error::Workspace production tooling could not be installed from the configured feed."
+            exit 1
+          fi
+          if ! az bicep install --version "$BICEP_VERSION" \
+            > "$RUNNER_TEMP/workspace-bicep.log" 2>&1; then
+            echo "::error::The selected Bicep compiler could not be provisioned."
+            exit 1
+          fi
+
+      - name: Produce the prepared workspaces
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          arguments=()
+          if [[ "$DRY_RUN" == "true" ]]; then
+            arguments+=(--dry-run)
+          fi
+          if ! "$WORKSPACE_PYTHON" -B scripts/build-workspace-release.py \
+            --root "$GITHUB_WORKSPACE" --repository "$GITHUB_REPOSITORY" \
+            --expected-source-sha "$SOURCE_SHA" --source-ref "$SOURCE_REF" \
+            --release-file "$INTENT_PATH" \
+            --prepared-plan "$RUNNER_TEMP/workspace-plan/plan.json" --expected-plan-sha "$EXPECTED_PLAN_SHA" \
+            --build-number "$GITHUB_RUN_ID" --build-attempt "$GITHUB_RUN_ATTEMPT" \
+            --bicep "$AZURE_CONFIG_DIR/bin/bicep" --output-dir "$RUNNER_TEMP/workspace-assets" \
+            "${arguments[@]}" > "$RUNNER_TEMP/workspace-build-summary.json" 2> "$RUNNER_TEMP/workspace-build.err"; then
+            echo "::error::Workspace production failed. Check the declared source, compatibility, indexes and compiler inputs."
+            exit 1
+          fi
+          "$WORKSPACE_PYTHON" -c '
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"])
+          summary = json.loads((root / "workspace-build-summary.json").read_bytes())
+          assets = root / "workspace-assets"
+          raw = (assets / "workspace-builds.json").read_bytes()
+          record = json.loads(raw)
+          plan_raw = (root / "workspace-plan/plan.json").read_bytes()
+          plan = json.loads(plan_raw)
+          if (
+              hashlib.sha256(raw).hexdigest() != summary["sha256"]
+              or hashlib.sha256(plan_raw).hexdigest() != os.environ["EXPECTED_PLAN_SHA"]
+              or record["planSha256"] != os.environ["EXPECTED_PLAN_SHA"]
+              or record["source"] != plan["source"]
+              or record["dryRun"] is not (os.environ["DRY_RUN"] == "true")
+              or record["provenance"] != "not-established"
+              or len(record["workspaces"]) != len(plan["workspaces"])
+          ):
+              raise SystemExit("::error::Workspace production did not retain the prepared identities.")
+          names = {"workspace-builds.json"}
+          for request, produced in zip(plan["workspaces"], record["workspaces"]):
+              package = produced["package"]
+              if (
+                  produced["workspace"] != request["workspace"]
+                  or produced["kit"] != {"id": request["id"], "version": plan["release"]["version"]}
+                  or package["name"] != request["package"]
+                  or package["name"] in names
+              ):
+                  raise SystemExit("::error::A workspace output differs from the prepared selection.")
+              names.add(package["name"])
+              path = assets / package["name"]
+              if (
+                  path.is_symlink() or not path.is_file()
+                  or path.stat().st_size != package["size"]
+                  or not 0 < package["size"] <= 134217728
+              ):
+                  raise SystemExit("::error::A workspace output has an invalid file identity.")
+              digest = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(1048576), b""):
+                      digest.update(chunk)
+              if digest.hexdigest() != package["sha256"]:
+                  raise SystemExit("::error::A workspace output changed after production.")
+          if {path.name for path in assets.iterdir()} != names:
+              raise SystemExit("::error::Workspace output includes undeclared files.")
+          print("record-sha=" + summary["sha256"])
+          ' >> "$GITHUB_OUTPUT"
+
+      - name: Retain the unsigned workspace assets
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: workspace-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/workspace-assets
+          if-no-files-found: error
+          overwrite: false
+          compression-level: 0
+          retention-days: 30
+
   review:
     name: Prepare release summary
-    needs: [prepare, distribution]
+    needs: [prepare, distribution, workspace-build]
     if: >-
       always() && needs.prepare.result == 'success' &&
       needs.prepare.outputs.active == 'true' &&
       ((needs.prepare.outputs.bundle == 'true' && needs.distribution.result == 'success') ||
-       (needs.prepare.outputs.bundle == 'false' && needs.distribution.result == 'skipped'))
+       (needs.prepare.outputs.bundle == 'false' && needs.distribution.result == 'skipped')) &&
+      ((needs.prepare.outputs.workspaces == 'true' && needs.workspace-build.result == 'success') ||
+       (needs.prepare.outputs.workspaces == 'false' && needs.workspace-build.result == 'skipped'))
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:

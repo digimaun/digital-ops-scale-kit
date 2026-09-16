@@ -159,9 +159,15 @@ in the checkout. `--dry-run` permits a committed file under
 
 The directory receives each declared ZIP and `workspace-builds.json`, which
 records their exact sizes, hashes, source, content version and selected engine
-version. Production uses the same complete-workspace builder as the individual
-package command. A failure removes outputs created by that invocation, with
+version. The record also binds the prepared plan's SHA-256. Production uses the
+same complete-workspace builder as the individual package command. A failure
+removes outputs created by that invocation, with
 an explicit warning if cleanup cannot complete.
+
+Automation can supply `--prepared-plan <file>` together with
+`--expected-plan-sha <sha256>`. The producer requires both the exact expected
+bytes and agreement with the release intent loaded from the selected commit.
+Omitting these options derives the plan directly from that committed intent.
 
 Declarations allow up to 64 distinct workspace paths, within the release
 file's byte limit. Package names are unique portable ZIP filenames and reserve
@@ -182,11 +188,18 @@ workspace. Consumer inspection and extraction still enforce the actual
 installed engine's version and supported features. For an individual package,
 `--engine-version` selects the producer target explicitly.
 
-These outputs are unsigned. The command creates neither detached proofs nor
-the public `siteops-workspaces.json` descriptor, and performs no publication.
-Current release automation delivers engine assets. A candidate declaring
-workspaces must contain all of its packages, proofs and routing metadata
-before it can reach publication approval.
+The existing candidate workflow has a separate workspace build job with read
+permissions. It consumes the prepared plan artifact from the same run,
+restores the committed Python locks through the configured feed, provisions
+the selected Bicep version through Azure CLI, and produces the declared
+workspaces with private configuration and temporary directories. It retains
+the complete unsigned output as an Actions artifact after checking its
+selection and byte identities.
+
+These outputs are unsigned. Neither this build job nor the local command
+creates detached proofs, the public `siteops-workspaces.json` descriptor, or
+a release. A candidate declaring workspaces must contain all of its packages,
+proofs and routing metadata before it can reach publication approval.
 
 ## Package identities
 

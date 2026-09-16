@@ -49,6 +49,11 @@ class ReleaseIntentError(ValueError):
     """The selected release declaration does not satisfy the release contract."""
 
 
+def serialize_release_plan(plan: dict[str, Any]) -> bytes:
+    """Serialize the prepared plan consistently for artifact identity."""
+    return (json.dumps(plan, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+
+
 @dataclass(frozen=True)
 class ReleaseIntent:
     """A release plan bound to declaration and notes blobs in one Git commit."""

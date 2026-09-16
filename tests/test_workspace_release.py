@@ -9,6 +9,7 @@ import subprocess
 import sys
 
 import pytest
+import yaml
 
 from siteops.artifacts import ArtifactError
 from siteops.content_index import build_content_index, write_content_index
@@ -25,6 +26,7 @@ from tests.release_helpers import (
     _write_source_version,
 )
 from tests.release_helpers import repository as repository
+from tests.shell_helpers import run_script, write_executable
 
 sys.path.insert(0, str(SCRIPTS))
 
@@ -32,6 +34,11 @@ from siteops_release import ReleaseIntentError, load_release_intent  # noqa: E40
 from workspace_release import WorkspaceBuild, load_workspace_builds  # noqa: E402
 
 PRODUCER = SCRIPTS / "build-workspace-release.py"
+CANDIDATE = yaml.safe_load((ROOT / ".github" / "workflows" / "_release-candidate.yaml").read_text())
+
+
+def _build_step(name):
+    return next(step for step in CANDIDATE["jobs"]["workspace-build"]["steps"] if step.get("name") == name)
 
 
 def _workspace(repository, name="workspace", *, index=False, github=False):
@@ -354,3 +361,206 @@ def test_release_cleanup_reports_retained_outputs_without_swallowing_primary_err
     assert "could not be removed" in captured.err
     assert "directory was retained" in captured.err
     assert {path.name for path in output.iterdir()} == {"workspace.zip"}
+
+
+@pytest.mark.parametrize("fault", [None, "digest", "request", "source", "boolean", "oversized", "half-pair"])
+def test_producer_requires_the_exact_prepared_plan(repository, tmp_path, fault):
+    request = _workspace(repository)
+    _write_record(repository, _declaration([request]))
+    sha = _commit(repository, "prepared workspace")
+    plan = _load(repository, sha).to_dict()
+    path = tmp_path / "prepared.json"
+    if fault == "request":
+        plan["workspaces"][0]["id"] = "unreviewed"
+    elif fault == "source":
+        plan["source"]["commit"] = "d" * 40
+    elif fault == "boolean":
+        plan["dryRun"] = 0
+    raw = json.dumps(plan).encode()
+    if fault == "oversized":
+        raw += b" " * (1024 * 1024)
+    path.write_bytes(raw)
+    expected = "a" * 64 if fault == "digest" else hashlib.sha256(raw).hexdigest()
+    extra = ["--prepared-plan", str(path)]
+    if fault != "half-pair":
+        extra.extend(("--expected-plan-sha", expected))
+    output = tmp_path / "assets"
+    result = _produce(repository, sha, output, *extra)
+    if fault is None:
+        assert result.returncode == 0, result.stdout + result.stderr
+        record = json.loads((output / "workspace-builds.json").read_bytes())
+        assert record["planSha256"] == expected
+    else:
+        assert result.returncode != 0
+        assert not output.exists()
+        if fault in {"source", "request", "boolean"}:
+            assert "differs from the committed release intent" in result.stderr
+
+
+def test_workspace_job_uses_the_prepared_candidate_with_no_signing_authority():
+    job = CANDIDATE["jobs"]["workspace-build"]
+    assert job["permissions"] == {"contents": "read", "actions": "read"}
+    assert job["needs"] == "prepare"
+    assert job["if"] == "needs.prepare.outputs.active == 'true' && needs.prepare.outputs.workspaces == 'true'"
+    assert "environment" not in job
+    checkout = _build_step("Checkout the event commit")["with"]
+    assert checkout["ref"] == "${{ github.sha }}"
+    assert checkout["persist-credentials"] is False
+    download = _build_step("Download the prepared workspace plan")["with"]
+    assert download["artifact-ids"] == "${{ needs.prepare.outputs.artifact-id }}"
+    assert download["run-id"] == "${{ github.run_id }}"
+    assert download["digest-mismatch"] == "error"
+    assert job["env"]["EXPECTED_PLAN_SHA"] == "${{ needs.prepare.outputs.plan-sha }}"
+    assert job["env"]["INTENT_PATH"] == "${{ needs.prepare.outputs.intent-path }}"
+    upload = _build_step("Retain the unsigned workspace assets")["with"]
+    assert upload["path"] == "${{ runner.temp }}/workspace-assets"
+    assert upload["overwrite"] is False and upload["if-no-files-found"] == "error"
+    assert "github.run_attempt" in upload["name"]
+    assert not any("attest@" in step.get("uses", "") for step in job["steps"])
+    review = CANDIDATE["jobs"]["review"]
+    assert "workspace-build" in review["needs"]
+    assert "needs.workspace-build.result == 'success'" in review["if"]
+    assert "needs.workspace-build.result == 'skipped'" in review["if"]
+    production = _build_step("Produce the prepared workspaces")["run"]
+    assert '--build-number "$GITHUB_RUN_ID" --build-attempt "$GITHUB_RUN_ATTEMPT"' in production
+    assert '--prepared-plan "$RUNNER_TEMP/workspace-plan/plan.json" --expected-plan-sha "$EXPECTED_PLAN_SHA"' in production
+
+
+@pytest.mark.parametrize("failure", [None, "python", "bicep"])
+def test_workspace_tooling_setup_uses_locked_feed_and_private_configuration(tmp_path, failure):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    commands = tmp_path / "commands"
+    for name in ("python", "az"):
+        write_executable(bin_dir / name, """#!/usr/bin/env bash
+case "$(basename "$0"):$1:$2" in
+  python:-m:venv|python:-m:pip|az:bicep:install) ;;
+  *) exit 99 ;;
+esac
+printf '%s %s\\n' "$(basename "$0")" "$*" >> "$TOOL_CALLS"
+if [[ "$(basename "$0")" == python && "$FAIL_TOOL" == python && "$2" == pip ]]; then exit 7; fi
+if [[ "$(basename "$0")" == az && "$FAIL_TOOL" == bicep ]]; then exit 8; fi
+""")
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    result = run_script(
+        _build_step("Install workspace production tools")["run"], tmp_path,
+        {
+            "HOME": str(runtime / "home"), "AZURE_CONFIG_DIR": str(runtime / "azure"),
+            "RUNNER_TEMP": runtime.as_posix(), "WORKSPACE_PYTHON": (bin_dir / "python").as_posix(),
+            "BICEP_VERSION": CANDIDATE["jobs"]["workspace-build"]["env"]["BICEP_VERSION"],
+            "TOOL_CALLS": commands.as_posix(), "FAIL_TOOL": failure or "",
+        },
+    )
+    assert result.returncode == (0 if failure is None else 1), result.stdout + result.stderr
+    calls = commands.read_text()
+    assert "--require-hashes --only-binary=:all: --no-cache-dir" in calls
+    assert "-r scripts/siteops-build-requirements.txt -r scripts/siteops-runtime-requirements.txt" in calls
+    assert ("az bicep install --version v0.45.15" in calls) is (failure != "python")
+    assert _build_step("Install workspace production tools")["env"]["PIP_INDEX_URL"] == (
+        "https://packagefeedproxy.microsoft.io/pypi/simple/"
+    )
+
+
+def _workspace_job(repository, tmp_path, *, combined=False, dry_run=False):
+    request = _workspace(repository)
+    _write_record(repository, _declaration([request], combined=combined))
+    scripts = repository / "scripts"
+    scripts.mkdir()
+    for name in (
+        "build-workspace-release.py", "workspace_producer.py", "workspace_release.py",
+        "siteops_release.py", "siteops_release_assets.py", "source_snapshot.py",
+    ):
+        shutil.copyfile(SCRIPTS / name, scripts / name)
+    shutil.copytree(ROOT / "siteops", repository / "siteops", ignore=shutil.ignore_patterns("__pycache__"))
+    _write_source_version(repository, '__version__ = "1.2.3"\n')
+    (repository / ".gitignore").write_text("workflow-step.sh\nbin/\n")
+    sha = _commit(repository, "workflow candidate")
+    runtime = tmp_path / "runtime"
+    (runtime / "workspace-plan").mkdir(parents=True)
+    plan = _load(repository, sha).to_dict()
+    plan["dryRun"] = dry_run
+    raw = json.dumps(plan).encode()
+    (runtime / "workspace-plan" / "plan.json").write_bytes(raw)
+    output = tmp_path / "outputs"
+    (repository / "bin").mkdir()
+    write_executable(repository / "bin" / "az", "#!/usr/bin/env bash\nexit 99\n")
+    environment = {
+            "WORKSPACE_PYTHON": sys.executable.replace("\\", "/"), "GITHUB_WORKSPACE": repository.as_posix(),
+            "GITHUB_REPOSITORY": REPOSITORY, "SOURCE_SHA": sha, "SOURCE_REF": SOURCE_REF,
+            "GITHUB_RUN_ID": "42", "GITHUB_RUN_ATTEMPT": "3", "DRY_RUN": str(dry_run).lower(),
+            "INTENT_PATH": "releases/candidate/release.json", "EXPECTED_PLAN_SHA": hashlib.sha256(raw).hexdigest(),
+            "RUNNER_TEMP": runtime.as_posix(), "AZURE_CONFIG_DIR": (runtime / "azure").as_posix(),
+            "PYTHONDONTWRITEBYTECODE": "1", "GITHUB_OUTPUT": output.as_posix(),
+    }
+    return runtime, output, environment, sha
+
+
+@pytest.mark.parametrize("combined", [False, True])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_actual_workspace_build_step_runs_the_shared_producer(repository, tmp_path, combined, dry_run):
+    runtime, output, environment, sha = _workspace_job(
+        repository, tmp_path, combined=combined, dry_run=dry_run,
+    )
+    result = run_script(
+        _build_step("Produce the prepared workspaces")["run"], repository, environment,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr + (
+        (runtime / "workspace-build.err").read_text() if (runtime / "workspace-build.err").exists() else ""
+    )
+    record = runtime / "workspace-assets" / "workspace-builds.json"
+    assert output.read_text().strip() == "record-sha=" + hashlib.sha256(record.read_bytes()).hexdigest()
+    document = json.loads(record.read_bytes())
+    assert document["source"]["commit"] == sha
+    assert document["dryRun"] is dry_run
+    assert document["engineVersion"] == ("1.2.3+build.42.3.g" + sha[:12] if combined else "1.2.3")
+
+
+@pytest.mark.parametrize("fault", ["extra", "digest", "size", "request", "record", "plan"])
+def test_workspace_job_refuses_outputs_changed_after_production(repository, tmp_path, fault):
+    runtime, output, environment, _ = _workspace_job(repository, tmp_path)
+    wrapper = tmp_path / "python-wrapper.py"
+    wrapper.write_text(
+        """import hashlib, json, os, subprocess, sys
+from pathlib import Path
+args = sys.argv[1:]
+if args[:2] != ["-B", "scripts/build-workspace-release.py"] and args[0] != "-c":
+    raise SystemExit("Unexpected workspace Python invocation")
+result = subprocess.run([sys.executable, *args], check=False)
+if result.returncode or args[0] != "-B":
+    raise SystemExit(result.returncode)
+root = Path(os.environ["RUNNER_TEMP"])
+record_path = root / "workspace-assets/workspace-builds.json"
+record = json.loads(record_path.read_bytes())
+package = root / "workspace-assets/workspace.zip"
+fault = os.environ["OUTPUT_FAULT"]
+if fault == "extra":
+    (root / "workspace-assets/.extra").write_bytes(b"unlisted")
+elif fault == "digest":
+    package.write_bytes(b"x" * package.stat().st_size)
+elif fault == "size":
+    package.write_bytes(package.read_bytes() + b"x")
+elif fault == "plan":
+    (root / "workspace-plan/plan.json").write_bytes(b"{}")
+elif fault in {"request", "record"}:
+    record["workspaces"][0]["kit"]["id"] = "changed"
+    raw = json.dumps(record).encode()
+    record_path.write_bytes(raw)
+    if fault == "request":
+        path = root / "workspace-build-summary.json"
+        summary = json.loads(path.read_bytes())
+        summary["sha256"] = hashlib.sha256(raw).hexdigest()
+        path.write_text(json.dumps(summary))
+""",
+        encoding="utf-8",
+    )
+    executable = repository / "bin" / "workspace-python"
+    write_executable(executable, '#!/usr/bin/env bash\nexec "$REAL_PYTHON" "$JOB_WRAPPER" "$@"\n')
+    environment.update(
+        WORKSPACE_PYTHON=executable.as_posix(), REAL_PYTHON=sys.executable.replace("\\", "/"),
+        JOB_WRAPPER=wrapper.as_posix(), OUTPUT_FAULT=fault,
+    )
+    result = run_script(_build_step("Produce the prepared workspaces")["run"], repository, environment)
+    assert result.returncode != 0
+    assert "::error::" in result.stdout + result.stderr
+    assert not output.exists() or output.read_text() == ""

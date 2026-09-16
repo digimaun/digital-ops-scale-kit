@@ -46,6 +46,10 @@ only for a dry run and never trigger publication when merged.
 The preview runs ordinary CI, then uses the real release-file preparation,
 wheel and bundle production, independent attestation, and installation
 qualification.
+Declared workspace builds run separately with read permissions and retain
+their unsigned packages. The build consumes the exact prepared plan and
+checks committed index freshness. Workspace publication additionally requires
+the complete package, proof and routing descriptor inventory.
 The final summary shows one Python/platform matrix and a link to the attested
 release assets. Individual job logs remain available for diagnosis.
 

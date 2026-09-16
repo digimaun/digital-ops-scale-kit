@@ -416,6 +416,9 @@ jobs:
               raise SystemExit("::error::The candidate boolean fields are invalid.")
           if release["stream"] != ("siteops" if tag.startswith("siteops/") else "scalekit"):
               raise SystemExit("::error::The release stream and tag disagree.")
+          components = "siteops" if release["stream"] == "siteops" else ("both" if engine["bundle"] else "content")
+          if release.get("components") != components:
+              raise SystemExit("::error::The release components disagree with the engine selection.")
           if release["version"] != tag.removeprefix("siteops/").removeprefix("v"):
               raise SystemExit("::error::The release version and tag disagree.")
           if release["latest"] and (release["prerelease"] or release["stream"] != "scalekit"):
@@ -571,14 +574,14 @@ jobs:
           ):
               raise SystemExit("::error::The bundle does not describe the selected candidate.")
           asset_list = {
-              "apiVersion": "siteops.release.assets/v1",
+              "apiVersion": "siteops.release.assets/v2",
               "kind": "SiteOpsReleaseAssets",
-              "mode": "publish",
               "source": plan["source"],
               "assets": [
-                  {"name": name, "sha256": digest(paths[name])}
+                  {"name": name, "size": paths[name].stat().st_size, "sha256": digest(paths[name])}
                   for name in expected_names
               ],
+              "engine": None,
           }
           output_path.write_text(
               json.dumps(asset_list, indent=2, sort_keys=True) + "\n",
@@ -623,26 +626,32 @@ jobs:
           for name in names:
               asset = by_name[name]
               digest = asset.get("digest")
-              if asset.get("state") != "uploaded" or not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+              size = asset.get("size")
+              if (
+                  asset.get("state") != "uploaded"
+                  or not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+                  or type(size) is not int or not 0 < size <= 4294967296
+              ):
                   raise SystemExit("::error::The referenced Site Ops release asset identity is incomplete.")
-              assets.append({"name": name, "sha256": digest.removeprefix("sha256:")})
+              assets.append({"name": name, "size": size, "sha256": digest.removeprefix("sha256:")})
           identity_value = release.get("id")
           target = ref.get("object", {}).get("sha")
-          if not isinstance(identity_value, int) or identity_value <= 0:
+          if type(identity_value) is not int or identity_value <= 0:
               raise SystemExit("::error::The referenced Site Ops release identity is invalid.")
           identity = str(identity_value)
           if not isinstance(target, str) or not re.fullmatch(r"[0-9a-f]{40}", target):
               raise SystemExit("::error::The referenced Site Ops tag target is invalid.")
           asset_list = {
-              "apiVersion": "siteops.release.assets/v1",
+              "apiVersion": "siteops.release.assets/v2",
               "kind": "SiteOpsReleaseAssets",
-              "mode": "reference",
+              "source": plan["source"],
+              "assets": [],
               "engine": {
                   "releaseId": identity,
                   "tag": plan["siteops"]["releaseTag"],
                   "target": target,
+                  "assets": assets,
               },
-              "assets": assets,
           }
           Path(sys.argv[4]).write_text(
               json.dumps(asset_list, indent=2, sort_keys=True) + "\n",
@@ -666,7 +675,9 @@ jobs:
           ref: ${{ github.sha }}
           path: release-tools
           persist-credentials: false
-          sparse-checkout: scripts/render-siteops-release.py
+          sparse-checkout: |
+            scripts/render-siteops-release.py
+            scripts/siteops_release_assets.py
           sparse-checkout-cone-mode: false
 
       - name: Render the final release notes

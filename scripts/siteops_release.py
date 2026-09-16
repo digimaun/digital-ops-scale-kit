@@ -14,7 +14,7 @@ import subprocess
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from packaging.version import InvalidVersion, Version
 
@@ -69,6 +69,13 @@ class ReleaseIntent:
     notes: str
     dry_run: bool = False
 
+    @property
+    def components(self) -> Literal["siteops", "content", "both"]:
+        """Resolve component selection from the reviewed stream and engine choice."""
+        if self.stream == "siteops":
+            return "siteops"
+        return "both" if self.bundle else "content"
+
     def to_dict(self) -> dict[str, Any]:
         """Return the stable release candidate plan."""
         return {
@@ -89,6 +96,7 @@ class ReleaseIntent:
             },
             "release": {
                 "stream": self.stream,
+                "components": self.components,
                 "tag": self.tag,
                 "version": self.version,
                 "title": self.title,

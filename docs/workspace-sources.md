@@ -188,9 +188,11 @@ then frozen with their identities in the existing reviewed candidate inventory.
 The publisher must upload those exact bytes rather than regenerate them.
 
 Keep the existing internal `SiteOpsReleaseAssets` approval document separate
-from this public routing contract. Engine assets and workspace assets retain
-their independent version and compatibility rules. Extending publication
-must use the existing release pipeline rather than introduce another system.
+from this public routing contract. Its publication list is separate from the
+identity and assets of an existing engine release. Engine assets and workspace
+assets retain their independent version and compatibility rules. Workspace
+delivery must use the existing release pipeline rather than introduce another
+system.
 
 See [workspace packages](workspace-packages.md) for package contents and
 [artifact verification](artifact-verification.md) for consumer trust policy.

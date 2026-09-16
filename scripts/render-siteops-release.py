@@ -16,6 +16,11 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from siteops_release_assets import (
+    FrozenReleaseAssets,
+    native_engine_wheel,
+)
+
 
 class RenderingError(ValueError):
     """Candidate presentation metadata is incomplete or invalid."""
@@ -24,7 +29,7 @@ class RenderingError(ValueError):
 def render_notes(
     plan: dict[str, Any],
     authored: str,
-    assets: dict[str, Any],
+    assets: FrozenReleaseAssets,
     *,
     engine_version: str,
     archive_name: str,
@@ -32,21 +37,24 @@ def render_notes(
 ) -> str:
     """Append release-specific installation guidance to the authored notes."""
     source, engine = plan["source"], plan["siteops"]
+    if assets.source != source:
+        raise RenderingError("The release asset inventory describes a different source.")
     repository = source["repository"]
     home = "https://github.com/" + repository
     notes = authored.rstrip() + "\n\n## Install Site Ops\n\n"
     if not engine["bundle"]:
         tag = engine["releaseTag"]
+        if assets.engine is None or assets.engine.tag != tag or assets.assets:
+            raise RenderingError("The release asset inventory does not match the engine selection.")
         url = home + "/releases/tag/" + urllib.parse.quote(tag, safe="")
         return (
             notes + f"Use [{tag}]({url}) and its installation instructions. "
             "The referenced engine release has its own source commit and native installation assets.\n"
         )
 
-    wheels = [item["name"] for item in assets["assets"] if item["name"].endswith(".whl")]
-    if assets.get("mode") != "publish" or len(wheels) != 1:
+    if assets.engine is not None:
         raise RenderingError("The release asset list cannot render installation guidance.")
-    wheel = wheels[0]
+    wheel = native_engine_wheel(assets.assets).name
     downloads = home + "/releases/download/" + urllib.parse.quote(plan["release"]["tag"], safe="") + "/"
     guide = home + "/blob/" + source["commit"] + "/docs/install-siteops.md#install-the-verified-bundle"
     command = (
@@ -125,6 +133,13 @@ def render_summary(plan: dict[str, Any], notes: str, values: Mapping[str, str]) 
     """Render the complete approval preview before publishing any summary text."""
     release, engine = plan["release"], plan["siteops"]
     dry_run = values.get("DRY_RUN") == "true"
+    components = {"siteops": "Site Ops only", "content": "Content only", "both": "Both"}
+    mode = release["components"]
+    expected_mode = "siteops" if release["stream"] == "siteops" else (
+        "both" if engine["bundle"] else "content"
+    )
+    if type(mode) is not str or mode not in components or mode != expected_mode:
+        raise RenderingError("The release components disagree with the engine selection.")
     action = "Reuse the matching tag" if values["TAG_EXISTS"] == "true" else "Create the missing tag"
     lines = ["# Release preview (no publication)\n" if dry_run else "# Ready for release approval\n"]
     if dry_run:
@@ -132,7 +147,10 @@ def render_summary(plan: dict[str, Any], notes: str, values: Mapping[str, str]) 
     for label, value in (
         ("Release", release["tag"]), ("Title", release["title"]),
         ("Source commit", plan["source"]["commit"]), ("Release file", plan["intent"]["path"]),
-        ("Stream", release["stream"]), ("Prerelease", release["prerelease"]),
+        ("Components", components[mode]), ("Stream", release["stream"]),
+        ("Content version", release["version"] if mode != "siteops" else "Not included"),
+        ("Engine selection", "Build from this commit" if engine["bundle"] else "Use an existing release"),
+        ("Prerelease", release["prerelease"]),
         ("Latest", release["latest"]), ("Proposed tag action" if dry_run else "Tag action", action),
         ("Site Ops", engine["releaseTag"] or values["ENGINE_VERSION"]),
     ):
@@ -192,7 +210,7 @@ def main(argv: list[str] | None = None) -> int:
         plan = json.loads((root / "release-plan" / "plan.json").read_text(encoding="utf-8"))
         if args.mode == "notes":
             authored = (root / "release-plan" / "release-notes.md").read_text(encoding="utf-8")
-            assets = json.loads((root / "release-assets" / "release-assets.json").read_text(encoding="utf-8"))
+            assets = FrozenReleaseAssets.read(root / "release-assets" / "release-assets.json")
             raw = render_notes(
                 plan, authored, assets, engine_version=os.environ.get("ENGINE_VERSION", ""),
                 archive_name=os.environ["ARCHIVE_NAME"], attestation_suffix=os.environ["ATTESTATION_SUFFIX"],

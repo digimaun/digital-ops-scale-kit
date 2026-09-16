@@ -149,6 +149,7 @@ def test_engine_release_matches_literal_source_without_importing(repository: Pat
         },
         "release": {
             "stream": "siteops",
+            "components": "siteops",
             "tag": "siteops/v1.2.3",
             "version": "1.2.3",
             "title": "siteops/v1.2.3: " + HEADLINE,
@@ -247,6 +248,7 @@ def test_content_only_release_does_not_read_current_engine_version(
     intent = _load(repository, source_sha)
 
     assert intent.stream == "scalekit"
+    assert intent.components == "content"
     assert intent.bundle is False
     assert intent.version_mode is None
     assert intent.base_version is None
@@ -266,6 +268,7 @@ def test_combined_preview_uses_selected_source_as_build_base(repository: Path):
 
     assert intent.to_dict()["release"] == {
         "stream": "scalekit",
+        "components": "both",
         "tag": "v2.0.0.dev4",
         "version": "2.0.0.dev4",
         "title": "v2.0.0.dev4: " + HEADLINE,

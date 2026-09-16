@@ -107,8 +107,18 @@ CI validates changed release declarations on pull requests.
 Invalid fields, version choices, headlines, or record paths fail before the
 publication workflow needs to build installation assets.
 
-Choose the release-file shape that matches the release. These examples illustrate
-formats, not scheduled releases.
+Choose the components through the release tag and engine selection:
+
+| Components | Reviewed declaration |
+|---|---|
+| Site Ops only | A `siteops/v...` tag that matches the source engine version |
+| Content only | A `v...` tag and `siteops.release` naming an existing engine release |
+| Both | A prerelease `v...` tag and `siteops.build: true` |
+
+The generated plan and approval summary show that resolved choice, the content
+version, and whether the engine is built or referenced. The workflow uses that
+reviewed choice directly. The examples below illustrate formats, not scheduled
+releases.
 
 ### Release Site Ops independently
 
@@ -252,9 +262,9 @@ Source and artifact identities remain fixed while approval is pending.
 An unrelated advance of `main` does not change the candidate. Changing its
 release file or notes requires a fresh candidate and approval.
 
-The approval summary shows the tag, source commit, version stream, engine
-selection, title, ZIP and wheel digests when applicable, tag action, and final
-release notes.
+The approval summary shows the components, tag, source commit, independent
+content and engine versions, engine selection, title, ZIP and wheel digests
+when applicable, tag action, and final release notes.
 The summary nests the note headings beneath **Release notes**. Published notes
 retain their authored Markdown heading levels. Installation commands are
 included in the final notes before approval and remain bound to that approval.
@@ -266,6 +276,17 @@ For a verified installation, consume only the ZIP and its proof by following
 The generated online command is for the published release.
 For a candidate preview, use the Actions artifact above the notes and the
 installation guide's steps for manually downloaded files.
+
+The frozen asset inventory separates files to publish from an existing engine
+release. Every asset records its filename, byte size, and SHA-256 digest.
+Referenced engine assets retain their own release identity and tag target.
+They are not uploaded to the content release again. The publisher consumes
+the approved publication list and compares the uploaded identities with that
+list.
+
+This approval inventory is distinct from the public `siteops-workspaces.json`
+routing descriptor. Workspace package delivery is described in
+[workspace release sources](workspace-sources.md).
 
 CI and engine installation qualification are automated. For content releases,
 the reviewer must also confirm the applicable content/AIO evidence and any

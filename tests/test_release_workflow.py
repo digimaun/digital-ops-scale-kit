@@ -31,6 +31,7 @@ PROOF = ARCHIVE + ".attestation.jsonl"
 WHEEL = "siteops-1.0.0b1+build.42.1.gcccccccccccc-py3-none-any.whl"
 WHEEL_PROOF = WHEEL + ".attestation.jsonl"
 RENDERER = ROOT / "scripts" / "render-siteops-release.py"
+ASSET_MODEL = ROOT / "scripts" / "siteops_release_assets.py"
 
 
 def step(job, name):
@@ -82,7 +83,7 @@ def candidate(tmp_path):
             "notesPath": "releases/candidate/notes.md", "notesSha256": digest(notes),
         },
         "release": {
-            "stream": "scalekit", "tag": "v1.0.0b8", "version": "1.0.0b8",
+            "stream": "scalekit", "components": "both", "tag": "v1.0.0b8", "version": "1.0.0b8",
             "title": "v1.0.0b8: Release highlights", "prerelease": True, "latest": False,
         },
         "siteops": {
@@ -110,14 +111,15 @@ def candidate(tmp_path):
     (directory / "release-notes" / "publish-notes.md").write_bytes(notes)
     (directory / "release-assets").mkdir()
     assets = {
-        "apiVersion": "siteops.release.assets/v1",
+        "apiVersion": "siteops.release.assets/v2",
         "kind": "SiteOpsReleaseAssets",
-        "mode": "publish",
         "source": plan["source"],
         "assets": [
-            {"name": name, "sha256": digest((bundle_dir / name).read_bytes())}
+            {"name": name, "size": (bundle_dir / name).stat().st_size,
+             "sha256": digest((bundle_dir / name).read_bytes())}
             for name in (ARCHIVE, PROOF, WHEEL, WHEEL_PROOF)
         ],
+        "engine": None,
     }
     (directory / "release-assets" / "release-assets.json").write_text(
         json.dumps(assets, indent=2, sort_keys=True) + "\n",
@@ -132,11 +134,23 @@ def candidate(tmp_path):
     return {"root": directory, "plan": plan, "declaration": declaration, "responses": responses}
 
 
+def _reference_inventory(candidate):
+    path = candidate["root"] / "release-assets" / "release-assets.json"
+    inventory = json.loads(path.read_text(encoding="utf-8"))
+    inventory["engine"] = {
+        "releaseId": "71", "tag": "siteops/v1.0.0", "target": "d" * 40,
+        "assets": inventory["assets"],
+    }
+    inventory["assets"] = []
+    path.write_text(json.dumps(inventory), encoding="utf-8")
+
+
 @pytest.fixture
 def runner(tmp_path, candidate):
     rendering_source = tmp_path / "release-tools" / "scripts"
     rendering_source.mkdir(parents=True)
     (rendering_source / RENDERER.name).write_bytes(RENDERER.read_bytes())
+    (rendering_source / ASSET_MODEL.name).write_bytes(ASSET_MODEL.read_bytes())
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     fake = tmp_path / "fake-gh.py"
@@ -178,6 +192,7 @@ raise SystemExit(0 if 200 <= status < 300 else 1)
     shim = tmp_path / "python-shim.py"
     shim.write_text(
         """import os, runpy, subprocess, sys, time
+from pathlib import Path
 native = subprocess.run
 def isolated_run(command, *args, **kwargs):
     if command[0] != "gh":
@@ -196,6 +211,7 @@ if sys.argv[1] == "-c":
     exec(compile(code, "<workflow>", "exec"), {"__name__": "__main__"})
 else:
     sys.argv = sys.argv[1:]
+    sys.path.insert(0, str(Path(sys.argv[0]).resolve().parent))
     runpy.run_path(sys.argv[0], run_name="__main__")
 """,
         encoding="utf-8",
@@ -228,9 +244,8 @@ else:
         asset_document = json.loads(
             (candidate["root"] / "release-assets" / "release-assets.json").read_text()
         )
-        approved_wheel = next(
-            item for item in asset_document["assets"] if item["name"].endswith(".whl")
-        )
+        engine_assets = asset_document["engine"]["assets"] if asset_document["engine"] else asset_document["assets"]
+        approved_wheel = next(item for item in engine_assets if item["name"].endswith(".whl"))
         environment = {
             "FAKE_PYTHON": Path(sys.executable).as_posix(),
             "FAKE_PROGRAM": fake.as_posix(), "FAKE_SHIM": shim.as_posix(),
@@ -329,7 +344,8 @@ def test_rendering_source_is_pinned_and_only_executed_in_read_only_preparation()
     checkout = step("review", "Checkout the exact rendering source")
     assert checkout["with"] == {
         "ref": "${{ github.sha }}", "path": "release-tools", "persist-credentials": False,
-        "sparse-checkout": "scripts/render-siteops-release.py", "sparse-checkout-cone-mode": False,
+        "sparse-checkout": "scripts/render-siteops-release.py\nscripts/siteops_release_assets.py\n",
+        "sparse-checkout-cone-mode": False,
     }
     assert JOBS["review"]["permissions"] == {"contents": "read", "actions": "read"}
     names = [item["name"] for item in JOBS["review"]["steps"]]
@@ -478,6 +494,57 @@ def test_approval_preview_discloses_tag_authorization_notes_and_evidence(candida
     for value in (SHA, "Create the missing tag", "Reviewed release notes", "Content", "Approval authorizes"):
         assert value.lower() in summary.lower()
     assert "- Title: `v1.0.0b8: Release highlights`" in summary
+    assert "- Components: `Both`" in summary
+    assert "- Content version: `1.0.0b8`" in summary
+    assert "- Engine selection: `Build from this commit`" in summary
+
+
+@pytest.mark.parametrize(
+    "mode,label,version",
+    [("siteops", "Site Ops only", "Not included"), ("content", "Content only", "1.0.0b8"),
+     ("both", "Both", "1.0.0b8")],
+)
+def test_component_summary_distinguishes_versions_and_engine_source(
+    candidate, renderer, mode, label, version,
+):
+    plan = candidate["plan"]
+    plan["release"]["components"] = mode
+    plan["release"]["stream"] = "siteops" if mode == "siteops" else "scalekit"
+    if mode == "content":
+        plan["siteops"] = {"bundle": False, "releaseTag": "siteops/v1.2.3"}
+    summary = renderer.render_summary(plan, "## Changes\n", summary_values())
+    assert f"- Components: `{label}`" in summary
+    assert f"- Content version: `{version}`" in summary
+    if mode == "content":
+        assert "- Engine selection: `Use an existing release`" in summary
+        assert "- Site Ops: `siteops/v1.2.3`" in summary
+    else:
+        assert "- Engine selection: `Build from this commit`" in summary
+        assert "- Site Ops: `1.0.0b1+build.42`" in summary
+
+
+@pytest.mark.parametrize("mode", [None, {}, "unreviewed"])
+def test_invalid_component_summary_leaves_existing_output_unchanged(candidate, runner, mode):
+    _render_install_notes(candidate, runner)
+    candidate["plan"]["release"]["components"] = mode
+    summary = candidate["root"].parent / "summary.md"
+    summary.write_text("Earlier summary\n")
+    result, _, _ = runner("review", "Show the release approval preview", extra=summary_values())
+    assert result.returncode != 0
+    assert "components disagree" in result.stdout + result.stderr
+    assert summary.read_text() == "Earlier summary\n"
+
+
+def test_note_renderer_rejects_unknown_inventory_fields_before_output(candidate, runner):
+    path = candidate["root"] / "release-assets" / "release-assets.json"
+    inventory = json.loads(path.read_text())
+    inventory["mode"] = "publish"
+    path.write_text(json.dumps(inventory))
+    result, _, _ = runner(
+        "review", "Render the final release notes", extra={"ENGINE_VERSION": "1.0.0b1+build.42"},
+    )
+    assert result.returncode != 0
+    assert not (candidate["root"] / "publish-notes.md").exists()
 
 
 def test_every_embedded_python_program_compiles_without_shell_indentation():
@@ -510,6 +577,7 @@ def test_valid_preview_bundle_keeps_its_exact_source_and_artifact(candidate, run
     )
     assert [item["name"] for item in asset_list["assets"]] == [ARCHIVE, PROOF, WHEEL, WHEEL_PROOF]
     for item in asset_list["assets"]:
+        assert item["size"] == (candidate["root"] / "release-bundle" / item["name"]).stat().st_size
         assert item["sha256"] == digest(
             (candidate["root"] / "release-bundle" / item["name"]).read_bytes()
         )
@@ -605,7 +673,7 @@ def test_real_git_declaration_and_cli_feed_the_candidate_controller(
         tag = "siteops/v1.0.0"
         encoded = urllib.parse.quote(tag, safe="")
         assets = [
-            {"name": name, "digest": "sha256:" + digest(name.encode()), "state": "uploaded"}
+            {"name": name, "size": len(name), "digest": "sha256:" + digest(name.encode()), "state": "uploaded"}
             for name in (ARCHIVE, PROOF, WHEEL, WHEEL_PROOF)
         ]
         candidate["responses"][f"repos/{REPO}/releases/tags/{encoded}"] = {
@@ -628,7 +696,7 @@ def test_real_git_declaration_and_cli_feed_the_candidate_controller(
     assert "\u03b1" in (candidate["root"] / "publish-notes.md").read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize("fault", ["source", "notes", "latest", "version", "mode", "title", "current-intent"])
+@pytest.mark.parametrize("fault", ["source", "notes", "latest", "version", "mode", "components", "title", "current-intent"])
 def test_invalid_or_superseded_candidate_cannot_reach_tag_creation(candidate, runner, fault):
     plan = candidate["plan"]
     if fault == "source":
@@ -641,6 +709,8 @@ def test_invalid_or_superseded_candidate_cannot_reach_tag_creation(candidate, ru
         plan["release"]["version"] = "1.0.0"
     elif fault == "mode":
         plan["siteops"]["versionMode"] = "source"
+    elif fault == "components":
+        plan["release"]["components"] = "content"
     elif fault == "title":
         plan["release"]["title"] = "v1.0.0b8: Unreviewed title"
     else:
@@ -738,6 +808,7 @@ def test_publisher_rejects_approved_wheel_that_differs_from_the_bundle(candidate
     next(item for item in asset_list["assets"] if item["name"] == WHEEL)["sha256"] = digest(
         wheel.read_bytes()
     )
+    next(item for item in asset_list["assets"] if item["name"] == WHEEL)["size"] = wheel.stat().st_size
     asset_path.write_text(
         json.dumps(asset_list, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -753,14 +824,17 @@ def test_independent_content_uses_released_engine_without_bundle_verification(ca
     plan = candidate["plan"]
     tag = "siteops/v1.0.0"
     raw = json.dumps({"tag": "v2.0.0", "headline": "Content highlights", "siteops": {"release": tag}}).encode()
-    plan["release"].update(tag="v2.0.0", version="2.0.0", prerelease=False, title="v2.0.0: Content highlights")
+    plan["release"].update(
+        tag="v2.0.0", version="2.0.0", components="content",
+        prerelease=False, title="v2.0.0: Content highlights",
+    )
     plan["siteops"] = {"bundle": False, "versionMode": None, "baseVersion": None, "releaseTag": tag}
     plan["intent"]["sha256"] = digest(raw)
     for revision in (SHA, "refs/heads/main"):
         candidate["responses"][f"repos/{REPO}/contents/releases/candidate/release.json?ref={revision}"]["raw"] = raw.decode()
     encoded = urllib.parse.quote(tag, safe="")
     assets = [
-        {"name": name, "digest": "sha256:" + digest(name.encode()), "state": "uploaded"}
+        {"name": name, "size": len(name), "digest": "sha256:" + digest(name.encode()), "state": "uploaded"}
         for name in (ARCHIVE, PROOF, WHEEL, WHEEL_PROOF)
     ]
     candidate["responses"][f"repos/{REPO}/releases/tags/{encoded}"] = {
@@ -775,6 +849,12 @@ def test_independent_content_uses_released_engine_without_bundle_verification(ca
     assert outputs["engine-id"] == "71"
     assert outputs["wheel-name"] == WHEEL
     assert not any(call[0] == "attestation" for call in calls)
+    inventory = json.loads(
+        (candidate["root"] / "release-assets" / "release-assets.json").read_text()
+    )
+    assert inventory["source"] == plan["source"]
+    assert inventory["assets"] == []
+    assert len(inventory["engine"]["assets"]) == 4
     candidate["responses"][f"repos/{REPO}/releases/tags/{encoded}"]["body"]["assets"] = [
         {"name": ARCHIVE, "digest": "sha256:" + digest(ARCHIVE.encode()), "state": "uploaded"},
         {"name": PROOF, "digest": "sha256:" + digest(PROOF.encode()), "state": "uploaded"},
@@ -798,6 +878,73 @@ def test_independent_content_uses_released_engine_without_bundle_verification(ca
     assets[2]["digest"] = "sha256:" + digest(WHEEL.encode())
     result, _, _ = runner("publish", "Verify the approved candidate", extra={"APPROVED_ENGINE_ID": "71", "APPROVED_ENGINE_REF": "e" * 40})
     assert result.returncode != 0
+
+
+@pytest.mark.parametrize("components", ["siteops", "content", None])
+def test_publisher_rejects_inconsistent_components(candidate, runner, components):
+    candidate["plan"]["release"]["components"] = components
+    result, _, calls = runner("publish", "Verify the approved candidate")
+    assert result.returncode != 0
+    assert "components disagree" in result.stdout + result.stderr
+    assert not any("--method" in call for call in calls)
+
+
+@pytest.mark.parametrize("size", [None, True, 0, -1, 4294967297, "12"])
+def test_publisher_rejects_invalid_frozen_asset_size(candidate, runner, size):
+    path = candidate["root"] / "release-assets" / "release-assets.json"
+    inventory = json.loads(path.read_text())
+    inventory["assets"][0]["size"] = size
+    path.write_text(json.dumps(inventory))
+    result, _, calls = runner("publish", "Verify the approved candidate")
+    assert result.returncode != 0
+    assert "asset identity is invalid" in result.stdout + result.stderr
+    assert not any("--method" in call for call in calls)
+
+
+def test_publisher_detects_size_drift_before_authentication(candidate, runner):
+    path = candidate["root"] / "release-assets" / "release-assets.json"
+    inventory = json.loads(path.read_text())
+    inventory["assets"][0]["size"] += 1
+    path.write_text(json.dumps(inventory))
+    result, _, calls = runner("publish", "Verify the approved release assets")
+    assert result.returncode != 0
+    assert not calls
+
+
+@pytest.mark.parametrize("fault", ["digest", "size", "approved-list"])
+def test_publication_rechecks_frozen_bytes_before_upload(candidate, runner, fault):
+    extra = {"TITLE": "Example release", "PRERELEASE": "true", "LATEST": "false"}
+    wheel = candidate["root"] / "release-bundle" / WHEEL
+    if fault == "digest":
+        wheel.write_bytes(b"x" * wheel.stat().st_size)
+    elif fault == "size":
+        wheel.write_bytes(wheel.read_bytes() + b"x")
+    else:
+        extra["APPROVED_ASSET_LIST_SHA"] = "a" * 64
+    result, _, calls = runner("publish", "Publish the approved release", extra=extra)
+    assert result.returncode != 0
+    assert not any(call[:2] == ["release", "create"] for call in calls)
+
+
+def test_published_identity_comes_from_approval_not_changed_local_bytes(candidate, runner):
+    path = candidate["root"] / "release-bundle" / WHEEL
+    path.write_bytes(b"changed after upload")
+    asset_path = candidate["root"] / "release-assets" / "release-assets.json"
+    inventory = json.loads(asset_path.read_text())
+    candidate["responses"][f"repos/{REPO}/releases/tags/v1.0.0b8"] = {
+        "status": 200,
+        "body": {
+            "tag_name": "v1.0.0b8", "draft": False, "prerelease": True, "immutable": False,
+            "assets": [
+                {**asset, "digest": "sha256:" + asset["sha256"], "state": "uploaded"}
+                for asset in inventory["assets"]
+            ],
+        },
+    }
+    result, _, _ = runner(
+        "publish", "Confirm published assets and immutability", extra={"PRERELEASE": "true"},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("state", ["missing", "matching", "conflicting", "unavailable", "published"])
@@ -1019,6 +1166,7 @@ def test_content_only_install_notes_link_to_the_engine_release_without_wrong_sou
     candidate["plan"]["siteops"] = {
         "bundle": False, "versionMode": None, "baseVersion": None, "releaseTag": "siteops/v1.0.0",
     }
+    _reference_inventory(candidate)
     notes = _render_install_notes(candidate, runner)
     assert f"https://github.com/{REPO}/releases/tag/siteops%2Fv1.0.0" in notes
     assert "own source commit and native installation assets" in notes
@@ -1095,7 +1243,9 @@ def test_invalid_rendering_inputs_leave_existing_summary_unchanged(candidate, ru
 
 
 @pytest.mark.parametrize("bundle", [False, True])
-def test_publication_uploads_only_declared_assets(runner, bundle):
+def test_publication_uploads_only_declared_assets(candidate, runner, bundle):
+    if not bundle:
+        _reference_inventory(candidate)
     result, _, calls = runner(
         "publish", "Publish the approved release",
         extra={"TITLE": "Example release", "PRERELEASE": "true", "LATEST": "false", "BUNDLE": str(bundle).lower()},
@@ -1120,7 +1270,8 @@ def test_publication_uploads_only_declared_assets(runner, bundle):
 def test_published_asset_digests_and_immutable_release_are_checked(candidate, runner, immutable):
     tag = candidate["plan"]["release"]["tag"]
     assets = [
-        {"name": name, "digest": "sha256:" + digest((candidate["root"] / "release-bundle" / name).read_bytes()), "state": "uploaded"}
+        {"name": name, "size": (candidate["root"] / "release-bundle" / name).stat().st_size,
+         "digest": "sha256:" + digest((candidate["root"] / "release-bundle" / name).read_bytes()), "state": "uploaded"}
         for name in (ARCHIVE, PROOF, WHEEL, WHEEL_PROOF)
     ]
     endpoint = f"repos/{REPO}/releases/tags/{tag}"

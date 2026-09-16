@@ -46,7 +46,9 @@ def digest(value):
 def renderer():
     spec = importlib.util.spec_from_file_location("siteops_release_renderer", RENDERER)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    with pytest.MonkeyPatch.context() as context:
+        context.syspath_prepend(str(RENDERER.parent))
+        spec.loader.exec_module(module)
     return module
 
 
@@ -526,6 +528,25 @@ def test_component_summary_distinguishes_versions_and_engine_source(
     else:
         assert "- Engine selection: `Build from this commit`" in summary
         assert "- Site Ops: `1.0.0b1+build.42`" in summary
+
+
+def test_workspace_summary_preserves_literal_reviewed_values(candidate, renderer):
+    request = {
+        "workspace": "workspaces/storage_demo",
+        "id": "[Label](https://example.invalid) | <b>bold</b> `code` \\ *text*",
+        "package": "storage_demo.zip",
+        "compatibility": {"siteops": ">=1.0.0b1,<2"},
+    }
+    candidate["plan"]["workspaces"] = [request]
+    summary = renderer.render_summary(candidate["plan"], "## Changes\n", summary_values())
+    rows = summary.split("\n## Workspace builds\n", 1)[1].split("\n## Installation checks", 1)[0].strip().splitlines()
+    assert len(rows) == 3
+    assert rows[2].count("|") == 5
+    assert "storage&#95;demo" in rows[2]
+    assert "&#91;Label&#93;&#40;https://example.invalid&#41;" in rows[2]
+    assert "&#124; &lt;b&gt;bold&lt;/b&gt; &#96;code&#96; &#92; &#42;text&#42;" in rows[2]
+    assert "&gt;=1.0.0b1,&lt;2" in rows[2]
+    assert candidate["plan"]["workspaces"] == [request]
 
 
 @pytest.mark.parametrize("mode", [None, {}, "unreviewed"])

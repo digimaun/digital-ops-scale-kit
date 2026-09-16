@@ -164,7 +164,9 @@ def render_summary(plan: dict[str, Any], notes: str, values: Mapping[str, str]) 
         ])
         for request in plan["workspaces"]:
             cells = [
-                html.escape(value, quote=False).replace("|", "&#124;").replace("`", "&#96;")
+                html.escape(value, quote=False).translate(str.maketrans({
+                    character: f"&#{ord(character)};" for character in "\\`*_[]()|~"
+                }))
                 for value in (
                     request["workspace"], request["id"], request["package"],
                     request["compatibility"]["siteops"],

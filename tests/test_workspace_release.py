@@ -2,6 +2,7 @@
 
 import copy
 import hashlib
+import importlib.util
 import json
 import shutil
 import subprocess
@@ -28,6 +29,7 @@ from tests.release_helpers import repository as repository
 sys.path.insert(0, str(SCRIPTS))
 
 from siteops_release import ReleaseIntentError, load_release_intent  # noqa: E402
+from workspace_release import WorkspaceBuild, load_workspace_builds  # noqa: E402
 
 PRODUCER = SCRIPTS / "build-workspace-release.py"
 
@@ -149,7 +151,9 @@ def test_release_rejects_incomplete_or_stale_committed_indexes(repository, tmp_p
     root = repository / "workspace"
     if fault == "stale":
         manifest = root / "manifests" / "storage" / "manifest.yaml"
-        manifest.write_bytes(manifest.read_bytes() + b"\n# new reviewed input\n")
+        raw = manifest.read_bytes()
+        newline = b"\r\n" if b"\r\n" in raw else b"\n"
+        manifest.write_bytes(raw + newline + b"# new reviewed input" + newline)
     elif fault == "missing-bindings":
         (root / "siteops-index.inputs.json").unlink()
     elif fault == "missing-index":
@@ -164,6 +168,8 @@ def test_release_rejects_incomplete_or_stale_committed_indexes(repository, tmp_p
     output = tmp_path / "assets"
     result = _produce(repository, sha, output)
     assert result.returncode != 0
+    if fault == "stale":
+        assert "Generated index outputs need to be rebuilt." in result.stderr
     assert not result.stdout and not output.exists()
 
 
@@ -258,3 +264,93 @@ def test_prepare_cli_retains_the_exact_workspace_request(repository, tmp_path):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert json.loads((output / "plan.json").read_text())["workspaces"] == [request]
+
+
+def test_declaration_loading_needs_no_runtime_or_provider_modules(repository, tmp_path):
+    request = _workspace(repository)
+    _write_source_version(repository, 'raise RuntimeError("do not import the selected source")\n')
+    _write_record(repository, _declaration([request]))
+    sha = _commit(repository, "pure declaration")
+    code = """
+import builtins, sys
+from pathlib import Path
+source, scripts, repository, sha = sys.argv[1:]
+sys.path[:0] = [scripts, source]
+original = builtins.__import__
+def guarded(name, *args, **kwargs):
+    if name in {"yaml", "siteops.compilation", "siteops.models", "siteops.github_source"}:
+        raise AssertionError("Declaration loading imported a runtime or provider module: " + name)
+    return original(name, *args, **kwargs)
+builtins.__import__ = guarded
+from siteops_release import load_release_intent
+intent = load_release_intent(
+    Path(repository), sha, "releases/candidate/release.json", "example/releases", "refs/heads/main",
+)
+assert intent.workspaces[0].package_name == "workspace.zip"
+assert intent.engine_version() == "1.2.3"
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", code, str(ROOT), str(SCRIPTS), str(repository), sha],
+        cwd=tmp_path, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("number,attempt", [(None, None), (0, 1), (1, 0), (-1, 1), (10**20, 1)])
+def test_combined_workspace_build_requires_a_bounded_build_identity(repository, tmp_path, number, attempt):
+    request = _workspace(repository)
+    _write_source_version(repository, '__version__ = "1.2.3"\n')
+    _write_record(repository, _declaration([request], combined=True))
+    sha = _commit(repository, "combined candidate")
+    output = tmp_path / "assets"
+    extra = () if number is None else ("--build-number", str(number), "--build-attempt", str(attempt))
+    result = _produce(repository, sha, output, *extra)
+    assert result.returncode != 0
+    assert "build number and attempt" in result.stderr
+    assert not output.exists()
+
+
+def test_workspace_request_round_trip_preserves_absent_and_empty_options(repository):
+    request = _workspace(repository)
+    assert WorkspaceBuild.from_document(request).document() == request
+    request["include"] = []
+    request["compatibility"]["requiredFeatures"] = ["composition/v1", "manifest/v1"]
+    assert WorkspaceBuild.from_document(request).document() == request
+    requests = [
+        {**request, "workspace": f"workspace-{number}", "package": f"workspace-{number}.zip"}
+        for number in range(64)
+    ]
+    assert len(load_workspace_builds(requests, engine_version="1.2.3")) == 64
+
+
+def test_release_cleanup_reports_retained_outputs_without_swallowing_primary_error(
+    repository, tmp_path, monkeypatch, capsys,
+):
+    requests = [_workspace(repository), _workspace(repository, "second")]
+    (repository / "second" / "templates" / "storage.template.json").write_text("invalid template")
+    _write_record(repository, _declaration(requests))
+    sha = _commit(repository, "failure after first package")
+    spec = importlib.util.spec_from_file_location("workspace_release_producer_test", PRODUCER)
+    producer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(producer)
+    output = tmp_path / "assets"
+    monkeypatch.setattr(sys, "argv", [
+        str(PRODUCER), "--root", str(repository), "--repository", REPOSITORY,
+        "--expected-source-sha", sha, "--source-ref", SOURCE_REF,
+        "--release-file", "releases/candidate/release.json", "--output-dir", str(output),
+    ])
+    original = type(output).unlink
+
+    def deny_owned_output(path, *args, **kwargs):
+        if path == output / "workspace.zip":
+            raise PermissionError("Controlled cleanup failure")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(output), "unlink", deny_owned_output)
+    assert producer.main() == 1
+    captured = capsys.readouterr()
+    assert not captured.out
+    assert "Template" in captured.err
+    assert "could not be removed" in captured.err
+    assert "directory was retained" in captured.err
+    assert {path.name for path in output.iterdir()} == {"workspace.zip"}

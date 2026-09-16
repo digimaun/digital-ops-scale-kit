@@ -9,7 +9,6 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -17,8 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from siteops_release import (  # noqa: E402
     ReleaseIntentError,
+    bind_prepared_plan,
     load_release_intent,
-    serialize_release_plan,
 )
 from source_snapshot import SourceSnapshotError, validate_repository  # noqa: E402
 from workspace_producer import build_committed_workspace  # noqa: E402
@@ -26,8 +25,6 @@ from workspace_release import BUILD_RECORD, WorkspaceReleaseError  # noqa: E402
 
 from siteops.artifacts import (  # noqa: E402
     ArtifactError,
-    load_artifact_json,
-    open_regular_file,
     require_node,
 )
 from siteops.browse import BrowseError  # noqa: E402
@@ -47,6 +44,7 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="Allow a committed release example")
     parser.add_argument("--prepared-plan", type=Path, help="Existing candidate plan to compare with committed intent")
     parser.add_argument("--expected-plan-sha", help="Independent SHA-256 of the prepared candidate plan")
+    parser.add_argument("--release-workspace", help="Build only this exact workspace from the reviewed declaration")
     args = parser.parse_args()
     if (args.prepared_plan is None) != (args.expected_plan_sha is None):
         parser.error("--prepared-plan and --expected-plan-sha must be supplied together")
@@ -66,26 +64,19 @@ def main() -> int:
         )
         if not intent.workspaces:
             raise WorkspaceReleaseError("The release file does not declare workspace builds.")
-        plan_bytes = serialize_release_plan(intent.to_dict())
-        if args.prepared_plan is not None:
-            if re.fullmatch(r"[0-9a-f]{64}", args.expected_plan_sha) is None:
-                raise WorkspaceReleaseError("The expected plan identity must be a lowercase SHA-256.")
-            with open_regular_file(args.prepared_plan) as stream:
-                plan_bytes = stream.read(1024 * 1024 + 1)
-            if hashlib.sha256(plan_bytes).hexdigest() != args.expected_plan_sha:
-                raise WorkspaceReleaseError("The prepared plan differs from its expected identity.")
-            plan = load_artifact_json(plan_bytes, limit=1024 * 1024, label="Prepared release plan")
-            if json.dumps(plan, sort_keys=True, allow_nan=False) != json.dumps(
-                intent.to_dict(), sort_keys=True, allow_nan=False,
-            ):
-                raise WorkspaceReleaseError("The prepared plan differs from the committed release intent.")
+        plan_sha = bind_prepared_plan(intent, args.prepared_plan, args.expected_plan_sha)
+        requests = intent.workspaces
+        if args.release_workspace is not None:
+            requests = tuple(request for request in requests if request.workspace == args.release_workspace)
+            if len(requests) != 1:
+                raise WorkspaceReleaseError("Select an exact workspace from the reviewed release declaration.")
         engine_version = intent.engine_version(args.build_number, args.build_attempt)
-        for request in intent.workspaces:
+        for request in requests:
             request.require_engine(engine_version)
         output.mkdir(mode=0o700)
         output_created = True
         workspaces = []
-        for request in intent.workspaces:
+        for request in requests:
             path = output / request.package_name
             inspection, index = build_committed_workspace(
                 root, intent.source_sha, path, workspace=request.workspace,
@@ -108,7 +99,7 @@ def main() -> int:
             "apiVersion": "siteops.release.workspaces/v1", "kind": "WorkspaceBuilds",
             "source": intent.to_dict()["source"],
             "intent": {"path": intent.intent_path, "sha256": intent.intent_sha256},
-            "planSha256": hashlib.sha256(plan_bytes).hexdigest(),
+            "planSha256": plan_sha,
             "dryRun": intent.dry_run, "engineVersion": engine_version,
             "provenance": "not-established", "workspaces": workspaces,
         }

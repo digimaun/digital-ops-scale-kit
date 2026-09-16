@@ -12,8 +12,6 @@ import pytest
 import yaml
 
 from siteops.artifacts import ArtifactError
-from siteops.content_index import build_content_index, write_content_index
-from siteops.github_catalog import github_input_digests
 from siteops.workspace_package import extract_package, inspect_package, inspect_produced_package
 from tests.release_helpers import (
     REPOSITORY,
@@ -27,57 +25,19 @@ from tests.release_helpers import (
 )
 from tests.release_helpers import repository as repository
 from tests.shell_helpers import run_script, write_executable
+from tests.workspace_release_helpers import PRODUCER, _declaration, _load, _produce, _workspace
 
 sys.path.insert(0, str(SCRIPTS))
 
-from siteops_release import ReleaseIntentError, load_release_intent  # noqa: E402
+from siteops_release import ReleaseIntentError  # noqa: E402
 from workspace_release import WorkspaceBuild, load_workspace_builds  # noqa: E402
 
-PRODUCER = SCRIPTS / "build-workspace-release.py"
 CANDIDATE = yaml.safe_load((ROOT / ".github" / "workflows" / "_release-candidate.yaml").read_text())
+WORKSPACE_WORKFLOW = yaml.safe_load((ROOT / ".github" / "workflows" / "_workspace-distribution.yaml").read_text())
 
 
 def _build_step(name):
-    return next(step for step in CANDIDATE["jobs"]["workspace-build"]["steps"] if step.get("name") == name)
-
-
-def _workspace(repository, name="workspace", *, index=False, github=False):
-    root = repository / name
-    shutil.copytree(ROOT / "tests" / "fixtures" / "browse-workspace", root)
-    (repository / "LICENSE").write_text("Owned fixture license\n")
-    if index:
-        write_content_index(root, build_content_index(
-            root, approve_public=True, additional_digests=github_input_digests if github else None,
-        ))
-    return {
-        "workspace": name, "id": "fixture.storage", "package": name + ".zip",
-        "compatibility": {"siteops": ">=1.2,<2"}, "licenses": ["LICENSE"],
-    }
-
-
-def _declaration(requests, *, combined=False):
-    return {
-        "tag": "v2.0.0b1" if combined else "v2.0.0",
-        "siteops": {"build": True} if combined else {"release": "siteops/v1.2.3"},
-        "workspaces": requests,
-    }
-
-
-def _load(repository, sha):
-    return load_release_intent(
-        repository, sha, "releases/candidate/release.json", REPOSITORY, SOURCE_REF,
-    )
-
-
-def _produce(repository, sha, output, *extra):
-    return subprocess.run(
-        [sys.executable, "-B", str(PRODUCER), "--root", str(repository),
-         "--repository", REPOSITORY, "--expected-source-sha", sha,
-         "--source-ref", SOURCE_REF, "--release-file", "releases/candidate/release.json",
-         "--output-dir", str(output), *extra],
-        cwd=output.parent, capture_output=True, text=True, stdin=subprocess.DEVNULL,
-        timeout=120, check=False,
-    )
+    return next(step for step in WORKSPACE_WORKFLOW["jobs"]["build"]["steps"] if step.get("name") == name)
 
 
 def test_workspace_declaration_is_source_bound_and_does_not_import_referenced_engine(repository):
@@ -398,29 +358,33 @@ def test_producer_requires_the_exact_prepared_plan(repository, tmp_path, fault):
 
 
 def test_workspace_job_uses_the_prepared_candidate_with_no_signing_authority():
-    job = CANDIDATE["jobs"]["workspace-build"]
+    job = WORKSPACE_WORKFLOW["jobs"]["build"]
     assert job["permissions"] == {"contents": "read", "actions": "read"}
-    assert job["needs"] == "prepare"
-    assert job["if"] == "needs.prepare.outputs.active == 'true' && needs.prepare.outputs.workspaces == 'true'"
+    caller = CANDIDATE["jobs"]["workspace-build"]
+    assert caller["needs"] == "prepare"
+    assert caller["if"] == "needs.prepare.outputs.active == 'true' && needs.prepare.outputs.workspaces == 'true'"
+    assert caller["uses"] == "./.github/workflows/_workspace-distribution.yaml"
+    assert caller["strategy"]["max-parallel"] == 4
+    assert caller["with"]["workspace"] == "${{ matrix.workspace }}"
     assert "environment" not in job
     checkout = _build_step("Checkout the event commit")["with"]
     assert checkout["ref"] == "${{ github.sha }}"
     assert checkout["persist-credentials"] is False
     download = _build_step("Download the prepared workspace plan")["with"]
-    assert download["artifact-ids"] == "${{ needs.prepare.outputs.artifact-id }}"
+    assert download["artifact-ids"] == "${{ inputs.plan-artifact-id }}"
     assert download["run-id"] == "${{ github.run_id }}"
     assert download["digest-mismatch"] == "error"
-    assert job["env"]["EXPECTED_PLAN_SHA"] == "${{ needs.prepare.outputs.plan-sha }}"
-    assert job["env"]["INTENT_PATH"] == "${{ needs.prepare.outputs.intent-path }}"
+    assert WORKSPACE_WORKFLOW["env"]["EXPECTED_PLAN_SHA"] == "${{ inputs.expected-plan-sha }}"
+    assert WORKSPACE_WORKFLOW["env"]["INTENT_PATH"] == "${{ inputs.intent }}"
     upload = _build_step("Retain the unsigned workspace assets")["with"]
     assert upload["path"] == "${{ runner.temp }}/workspace-assets"
     assert upload["overwrite"] is False and upload["if-no-files-found"] == "error"
     assert "github.run_attempt" in upload["name"]
     assert not any("attest@" in step.get("uses", "") for step in job["steps"])
     review = CANDIDATE["jobs"]["review"]
-    assert "workspace-build" in review["needs"]
-    assert "needs.workspace-build.result == 'success'" in review["if"]
-    assert "needs.workspace-build.result == 'skipped'" in review["if"]
+    assert "workspace-assets" in review["needs"]
+    assert "needs.workspace-assets.result == 'success'" in review["if"]
+    assert "needs.workspace-assets.result == 'skipped'" in review["if"]
     production = _build_step("Produce the prepared workspaces")["run"]
     assert '--build-number "$GITHUB_RUN_ID" --build-attempt "$GITHUB_RUN_ATTEMPT"' in production
     assert '--prepared-plan "$RUNNER_TEMP/workspace-plan/plan.json" --expected-plan-sha "$EXPECTED_PLAN_SHA"' in production
@@ -448,7 +412,7 @@ if [[ "$(basename "$0")" == az && "$FAIL_TOOL" == bicep ]]; then exit 8; fi
         {
             "HOME": str(runtime / "home"), "AZURE_CONFIG_DIR": str(runtime / "azure"),
             "RUNNER_TEMP": runtime.as_posix(), "WORKSPACE_PYTHON": (bin_dir / "python").as_posix(),
-            "BICEP_VERSION": CANDIDATE["jobs"]["workspace-build"]["env"]["BICEP_VERSION"],
+            "BICEP_VERSION": WORKSPACE_WORKFLOW["jobs"]["build"]["env"]["BICEP_VERSION"],
             "TOOL_CALLS": commands.as_posix(), "FAIL_TOOL": failure or "",
         },
     )
@@ -488,6 +452,7 @@ def _workspace_job(repository, tmp_path, *, combined=False, dry_run=False):
     environment = {
             "WORKSPACE_PYTHON": sys.executable.replace("\\", "/"), "GITHUB_WORKSPACE": repository.as_posix(),
             "GITHUB_REPOSITORY": REPOSITORY, "SOURCE_SHA": sha, "SOURCE_REF": SOURCE_REF,
+            "EXPECTED_SOURCE_SHA": sha, "WORKSPACE_SELECTION": "workspace", "WORKSPACE_SLOT": "1",
             "GITHUB_RUN_ID": "42", "GITHUB_RUN_ATTEMPT": "3", "DRY_RUN": str(dry_run).lower(),
             "INTENT_PATH": "releases/candidate/release.json", "EXPECTED_PLAN_SHA": hashlib.sha256(raw).hexdigest(),
             "RUNNER_TEMP": runtime.as_posix(), "AZURE_CONFIG_DIR": (runtime / "azure").as_posix(),
@@ -509,10 +474,13 @@ def test_actual_workspace_build_step_runs_the_shared_producer(repository, tmp_pa
         (runtime / "workspace-build.err").read_text() if (runtime / "workspace-build.err").exists() else ""
     )
     record = runtime / "workspace-assets" / "workspace-builds.json"
-    assert output.read_text().strip() == "record-sha=" + hashlib.sha256(record.read_bytes()).hexdigest()
+    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert values["record-sha"] == hashlib.sha256(record.read_bytes()).hexdigest()
     document = json.loads(record.read_bytes())
     assert document["source"]["commit"] == sha
     assert document["dryRun"] is dry_run
+    assert values["package-name"] == "workspace.zip"
+    assert values["package-sha"] == document["workspaces"][0]["package"]["sha256"]
     assert document["engineVersion"] == ("1.2.3+build.42.3.g" + sha[:12] if combined else "1.2.3")
 
 
@@ -564,3 +532,18 @@ elif fault in {"request", "record"}:
     assert result.returncode != 0
     assert "::error::" in result.stdout + result.stderr
     assert not output.exists() or output.read_text() == ""
+
+
+def test_release_workspace_selection_keeps_the_complete_prepared_intent(repository, tmp_path):
+    requests = [_workspace(repository), _workspace(repository, "second")]
+    _write_record(repository, _declaration(requests))
+    sha = _commit(repository, "selected workspace")
+    output = tmp_path / "selected"
+    result = _produce(repository, sha, output, "--release-workspace", "second")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert {path.name for path in output.iterdir()} == {"second.zip", "workspace-builds.json"}
+    record = json.loads((output / "workspace-builds.json").read_bytes())
+    assert [row["workspace"] for row in record["workspaces"]] == ["second"]
+    rejected = tmp_path / "unknown"
+    result = _produce(repository, sha, rejected, "--release-workspace", "absent")
+    assert result.returncode != 0 and not rejected.exists()

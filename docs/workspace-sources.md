@@ -5,9 +5,10 @@ package and detached proof from a content release. Selection does not require
 inspection of every ZIP or a descriptive index.
 
 [`project pin`](projects.md) acquires this source and connects its verified
-workspace to ordinary planning and deployment. Current release automation
-publishes engine assets only. It does not generate or publish the workspace
-asset set.
+workspace to ordinary planning and deployment. Release candidate preparation
+can build workspace packages, attest them and generate this descriptor.
+Workspace publication remains gated on qualification and complete release
+integration.
 
 ## Descriptor
 
@@ -183,9 +184,19 @@ Those observations never authorize package execution.
 
 ## Publication integration
 
-The descriptor should be generated after the package and proof bytes exist,
-then frozen with their identities in the existing reviewed candidate inventory.
-The publisher must upload those exact bytes rather than regenerate them.
+Candidate preparation builds each workspace from the reviewed declaration
+through the existing package producer. Its separate signing job attests the
+ZIP and its build record as independent subjects. The collector verifies the
+record before interpreting it and the ZIP before inspecting its metadata.
+Both proofs must satisfy the independently supplied repository, source and
+workflow policy.
+
+Only after every selected workspace passes collection does it generate the
+descriptor and freeze its bytes with the package and proof identities.
+Each workspace proof names one artifact, matching the current consumer
+contract. The descriptor contains no policy or trust-root selection.
+The publisher must ultimately upload these exact bytes rather than
+regenerate them after approval.
 
 Keep the existing internal `SiteOpsReleaseAssets` approval document separate
 from this public routing contract. Its publication list is separate from the

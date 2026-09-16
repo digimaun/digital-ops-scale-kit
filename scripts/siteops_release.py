@@ -20,7 +20,7 @@ from packaging.version import InvalidVersion, Version
 from siteops_release_assets import ReleaseAssetsError
 from workspace_release import WorkspaceBuild, WorkspaceReleaseError, load_workspace_builds
 
-from siteops.artifacts import ArtifactError
+from siteops.artifacts import ArtifactError, load_artifact_json, open_regular_file
 
 _API_VERSION = "siteops.release/v1"
 _KIND = "ReleaseCandidate"
@@ -140,6 +140,28 @@ class ReleaseIntent:
         ):
             raise ReleaseIntentError("Workspace production needs the positive engine build number and attempt.")
         return f"{self.base_version}+build.{build_number}.{build_attempt}.g{self.source_sha[:12]}"
+
+
+def bind_prepared_plan(
+    intent: ReleaseIntent, path: Path | None = None, expected_sha256: str | None = None,
+) -> str:
+    """Bind an independently identified prepared plan to the committed declaration."""
+    if (path is None) != (expected_sha256 is None):
+        raise ReleaseIntentError("The prepared plan and expected SHA-256 must be supplied together.")
+    raw = serialize_release_plan(intent.to_dict())
+    if path is not None:
+        if not isinstance(expected_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None:
+            raise ReleaseIntentError("The expected plan identity must be a lowercase SHA-256.")
+        with open_regular_file(path) as stream:
+            raw = stream.read(1024 * 1024 + 1)
+        if hashlib.sha256(raw).hexdigest() != expected_sha256:
+            raise ReleaseIntentError("The prepared plan differs from its expected identity.")
+        plan = load_artifact_json(raw, limit=1024 * 1024, label="Prepared release plan")
+        if json.dumps(plan, sort_keys=True, allow_nan=False) != json.dumps(
+            intent.to_dict(), sort_keys=True, allow_nan=False,
+        ):
+            raise ReleaseIntentError("The prepared plan differs from the committed release intent.")
+    return hashlib.sha256(raw).hexdigest()
 
 
 def load_release_intent(

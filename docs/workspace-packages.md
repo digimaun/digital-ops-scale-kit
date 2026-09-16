@@ -156,6 +156,8 @@ When `siteops.release` selects an existing engine, omit the build number and
 attempt. Its exact version is used instead of the development engine version
 in the checkout. `--dry-run` permits a committed file under
 `.github/release-examples/`. It marks the build record as a preview.
+`--release-workspace <workspace>` selects one exact workspace from the
+declaration while retaining the identity of the complete prepared plan.
 
 The directory receives each declared ZIP and `workspace-builds.json`, which
 records their exact sizes, hashes, source, content version and selected engine
@@ -188,18 +190,24 @@ workspace. Consumer inspection and extraction still enforce the actual
 installed engine's version and supported features. For an individual package,
 `--engine-version` selects the producer target explicitly.
 
-The existing candidate workflow has a separate workspace build job with read
-permissions. It consumes the prepared plan artifact from the same run,
-restores the committed Python locks through the configured feed, provisions
-the selected Bicep version through Azure CLI, and produces the declared
-workspaces with private configuration and temporary directories. It retains
-the complete unsigned output as an Actions artifact after checking its
-selection and byte identities.
+The candidate workflow uses one reusable build/sign path per workspace, with
+bounded parallelism. Its build job has read permissions and consumes the
+prepared plan artifact from the same run. It restores the committed Python
+locks through the configured feed, provisions the selected Bicep version
+through Azure CLI, and produces the selected workspace with private
+configuration and temporary directories.
 
-These outputs are unsigned. Neither this build job nor the local command
-creates detached proofs, the public `siteops-workspaces.json` descriptor, or
-a release. A candidate declaring workspaces must contain all of its packages,
-proofs and routing metadata before it can reach publication approval.
+A separate signing job downloads only that workspace's build artifact.
+It admits the exact package and build record before producing one detached
+attestation for each subject. It executes no repository scripts. A read-only
+collector verifies both proofs under independent workflow policy, checks
+the package against the reviewed declaration, and then generates
+`siteops-workspaces.json` and the frozen workspace asset inventory.
+
+The local build command still produces unsigned files only. The candidate's
+workspace proofs and descriptor are retained as Actions artifacts. Actual
+engine qualification and publication remain separate gates. A candidate
+must complete those gates before its workspace assets can be published.
 
 ## Package identities
 

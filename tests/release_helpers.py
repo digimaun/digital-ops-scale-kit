@@ -30,7 +30,11 @@ def _git(repository: Path, *arguments: str, input_bytes: bytes | None = None) ->
 
 @pytest.fixture
 def repository(tmp_path: Path) -> Path:
-    root = tmp_path / "repository"
+    return create_repository(tmp_path / "repository")
+
+
+def create_repository(root: Path) -> Path:
+    """Create a new test-owned repository with deterministic local Git settings."""
     root.mkdir()
     _git(root, "init", "--quiet")
     _git(root, "config", "user.name", "Release Intent Test")

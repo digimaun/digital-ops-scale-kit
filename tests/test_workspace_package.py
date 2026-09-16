@@ -201,6 +201,18 @@ def test_complete_package_preserves_workspace_and_companion_paths(snapshot, tmp_
     assert (destination / package.PACKAGE_NAME).is_file()
 
 
+@pytest.mark.parametrize("engine_version", ["invalid", "99.0.0"])
+def test_producer_target_is_checked_before_template_discovery(snapshot, tmp_path, monkeypatch, engine_version):
+    def unexpected(*args):
+        pytest.fail("Invalid engine selection must fail before template discovery.")
+
+    monkeypatch.setattr(package_builder, "_discover_template_sources", unexpected)
+    output = tmp_path / "package.zip"
+    with pytest.raises(ArtifactError, match="compatibility declaration|different Site Ops version"):
+        _build(snapshot, output, engine_version=engine_version)
+    assert not output.exists()
+
+
 def test_materialized_binding_resolves_manifest_name_and_revalidates_inventory(
     snapshot,
     tmp_path,

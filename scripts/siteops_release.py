@@ -17,6 +17,10 @@ from pathlib import Path
 from typing import Any, Literal
 
 from packaging.version import InvalidVersion, Version
+from siteops_release_assets import ReleaseAssetsError
+from workspace_release import WorkspaceBuild, WorkspaceReleaseError, load_workspace_builds
+
+from siteops.artifacts import ArtifactError
 
 _API_VERSION = "siteops.release/v1"
 _KIND = "ReleaseCandidate"
@@ -68,6 +72,7 @@ class ReleaseIntent:
     release_tag: str | None
     notes: str
     dry_run: bool = False
+    workspaces: tuple[WorkspaceBuild, ...] = ()
 
     @property
     def components(self) -> Literal["siteops", "content", "both"]:
@@ -78,7 +83,7 @@ class ReleaseIntent:
 
     def to_dict(self) -> dict[str, Any]:
         """Return the stable release candidate plan."""
-        return {
+        result = {
             "apiVersion": _API_VERSION,
             "kind": _KIND,
             "active": True,
@@ -110,6 +115,26 @@ class ReleaseIntent:
                 "releaseTag": self.release_tag,
             },
         }
+        if self.workspaces:
+            result["workspaces"] = [request.document() for request in self.workspaces]
+        return result
+
+    def engine_version(self, build_number: int | None = None, build_attempt: int | None = None) -> str:
+        """Resolve the selected engine identity without consulting the current checkout."""
+        if not self.bundle:
+            if self.release_tag is None:
+                raise ReleaseIntentError("The selected engine release is missing.")
+            return self.release_tag.removeprefix("siteops/v")
+        if self.base_version is None:
+            raise ReleaseIntentError("The selected engine build version is missing.")
+        if self.version_mode == "source":
+            return self.base_version
+        if (
+            type(build_number) is not int or not 0 < build_number < 10**20
+            or type(build_attempt) is not int or not 0 < build_attempt < 10**10
+        ):
+            raise ReleaseIntentError("Workspace production needs the positive engine build number and attempt.")
+        return f"{self.base_version}+build.{build_number}.{build_attempt}.g{self.source_sha[:12]}"
 
 
 def load_release_intent(
@@ -149,6 +174,8 @@ def load_release_intent(
     tag = declaration["tag"]
     latest = declaration.get("latest", False)
     if tag.startswith("siteops/v"):
+        if "workspaces" in declaration:
+            raise ReleaseIntentError("A Site Ops only release cannot declare workspace builds.")
         if "siteops" in declaration:
             raise ReleaseIntentError(
                 "A Site Ops release file must not contain the siteops field."
@@ -210,6 +237,33 @@ def load_release_intent(
             "The release tag must start with v or siteops/v and contain a canonical version."
         )
 
+    workspaces = ()
+    if "workspaces" in declaration:
+        selected_engine = base_version if bundle else release_tag
+        if selected_engine is None:
+            raise ReleaseIntentError("The workspace build has no selected engine version.")
+        if not bundle:
+            selected_engine = selected_engine.removeprefix("siteops/v")
+        if len(str(version)) > 128:
+            raise ReleaseIntentError("Workspace package versions are limited to 128 characters.")
+        try:
+            workspaces = load_workspace_builds(
+                declaration["workspaces"], engine_version=selected_engine,
+            )
+        except (ArtifactError, ReleaseAssetsError, WorkspaceReleaseError) as error:
+            raise ReleaseIntentError(str(error)) from error
+        for request in workspaces:
+            if request.workspace != ".":
+                entry = _tree_entry(repository_root, source_sha, request.workspace)
+                if entry is None or entry[:2] != ("040000", "tree"):
+                    raise ReleaseIntentError("A declared workspace must be a directory in the selected commit.")
+            for path in (*request.licenses, *(request.includes or ())):
+                entry = _tree_entry(repository_root, source_sha, path)
+                if entry is None or entry[0] not in {*_REGULAR_GIT_MODES, "040000"}:
+                    raise ReleaseIntentError("A workspace companion must be a regular committed file or directory.")
+                if path in request.licenses and entry[0] not in _REGULAR_GIT_MODES:
+                    raise ReleaseIntentError("A workspace license must be a regular committed file.")
+
     prerelease = _is_prerelease(version)
     return ReleaseIntent(
         repository=repository,
@@ -231,6 +285,7 @@ def load_release_intent(
         release_tag=release_tag,
         notes=notes,
         dry_run=dry_run,
+        workspaces=workspaces,
     )
 
 
@@ -573,7 +628,7 @@ def _parse_declaration(raw: bytes) -> dict[str, Any]:
         ) from error
     if type(document) is not dict:
         raise ReleaseIntentError("The release file must be a JSON object.")
-    unknown = set(document) - {"tag", "headline", "siteops", "latest"}
+    unknown = set(document) - {"tag", "headline", "siteops", "latest", "workspaces"}
     if unknown:
         raise ReleaseIntentError(
             "The release file contains unknown fields: "

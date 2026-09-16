@@ -465,6 +465,8 @@ jobs:
               if hashlib.sha256(Path(path).read_bytes()).hexdigest() != plan["intent"][field]:
                   raise SystemExit("::error::The release file or notes changed. Prepare and review a new candidate.")
           declaration = json.loads(Path(sys.argv[2]).read_text())
+          if plan.get("workspaces") != declaration.get("workspaces"):
+              raise SystemExit("::error::The workspace builds differ from the reviewed declaration.")
           release, engine = plan["release"], plan["siteops"]
           headline = declaration.get("headline")
           if (
@@ -665,9 +667,18 @@ jobs:
             ' "$plan" "$RUNNER_TEMP/engine-release.json" "$RUNNER_TEMP/engine-ref.json" "$assets/release-assets.json" >> "$GITHUB_OUTPUT"
           fi
           python3 -c '
-          import hashlib, sys
-          print("asset-list-sha=" + hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())
-          ' "$assets/release-assets.json" >> "$GITHUB_OUTPUT"
+          import hashlib, json, sys
+          raw = open(sys.argv[1], "rb").read()
+          inventory = json.loads(raw)
+          plan = json.load(open(sys.argv[2]))
+          if plan.get("workspaces"):
+              required = {"siteops-workspaces.json"}
+              for request in plan["workspaces"]:
+                  required.update((request["package"], request["package"] + ".attestation.jsonl"))
+              if not required <= {asset["name"] for asset in inventory["assets"]}:
+                  raise SystemExit("::error::The candidate lacks declared workspace packages, proofs or routing metadata.")
+          print("asset-list-sha=" + hashlib.sha256(raw).hexdigest())
+          ' "$assets/release-assets.json" "$plan" >> "$GITHUB_OUTPUT"
 
       - name: Checkout the exact rendering source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

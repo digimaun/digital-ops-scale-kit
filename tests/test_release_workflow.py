@@ -14,10 +14,10 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tests.release_helpers import CLI, _commit, _write_record, _write_source_version
+from tests.release_helpers import repository as repository
 from tests.shell_helpers import bash_path, write_executable
 from tests.shell_helpers import run_script as _run_script
-from tests.test_release_intent import CLI, _commit, _write_record, _write_source_version
-from tests.test_release_intent import repository as repository
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = yaml.safe_load((ROOT / ".github" / "workflows" / "release.yaml").read_text())
@@ -387,9 +387,14 @@ def test_operator_guide_matches_the_visible_workflow_controls():
 def _source_check_fixture(repository, tmp_path):
     scripts = repository / "scripts"
     scripts.mkdir()
-    for name in ("prepare-siteops-release.py", "siteops_release.py"):
+    for name in (
+        "prepare-siteops-release.py", "siteops_release.py",
+        "siteops_release_assets.py", "workspace_release.py",
+    ):
         shutil.copyfile(ROOT / "scripts" / name, scripts / name)
     _write_source_version(repository, '__version__ = "1.0.0b1"\n')
+    for name in ("artifacts.py", "workspace_compatibility.py"):
+        shutil.copyfile(ROOT / "siteops" / name, repository / "siteops" / name)
     before = _commit(repository, "source before release")
     (repository / "bin").mkdir()
     write_executable(
@@ -533,6 +538,28 @@ def test_invalid_component_summary_leaves_existing_output_unchanged(candidate, r
     assert result.returncode != 0
     assert "components disagree" in result.stdout + result.stderr
     assert summary.read_text() == "Earlier summary\n"
+
+
+@pytest.mark.parametrize("job,name", [
+    ("review", "Verify the pinned candidate"), ("publish", "Verify the approved candidate"),
+])
+@pytest.mark.parametrize("fault", ["omitted", "missing-assets"])
+def test_declared_workspaces_cannot_be_silently_omitted(candidate, runner, job, name, fault):
+    request = {
+        "workspace": "workspace", "id": "fixture.storage", "package": "workspace.zip",
+        "compatibility": {"siteops": ">=1.0.0b1,<2"}, "licenses": ["LICENSE"],
+    }
+    declaration = {**candidate["declaration"], "workspaces": [request]}
+    raw = json.dumps(declaration)
+    candidate["plan"]["intent"]["sha256"] = digest(raw.encode())
+    for revision in (SHA, "refs/heads/main"):
+        candidate["responses"][f"repos/{REPO}/contents/releases/candidate/release.json?ref={revision}"]["raw"] = raw
+    if fault == "missing-assets":
+        candidate["plan"]["workspaces"] = [request]
+    result, _, calls = runner(job, name)
+    assert result.returncode != 0
+    assert "workspace" in (result.stdout + result.stderr).lower()
+    assert not any("--method" in call or call[:2] == ["release", "create"] for call in calls)
 
 
 def test_note_renderer_rejects_unknown_inventory_fields_before_output(candidate, runner):

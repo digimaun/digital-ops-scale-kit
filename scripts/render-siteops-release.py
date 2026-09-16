@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import os
 import re
@@ -155,6 +156,21 @@ def render_summary(plan: dict[str, Any], notes: str, values: Mapping[str, str]) 
         ("Site Ops", engine["releaseTag"] or values["ENGINE_VERSION"]),
     ):
         lines.append(f"- {label}: `{value}`")
+    if plan.get("workspaces"):
+        lines.extend([
+            "\n## Workspace builds\n",
+            "| Workspace | Kit | Package | Required Site Ops |",
+            "|---|---|---|---|",
+        ])
+        for request in plan["workspaces"]:
+            cells = [
+                html.escape(value, quote=False).replace("|", "&#124;").replace("`", "&#96;")
+                for value in (
+                    request["workspace"], request["id"], request["package"],
+                    request["compatibility"]["siteops"],
+                )
+            ]
+            lines.append("| " + " | ".join(cells) + " |")
     if engine["bundle"]:
         matrix = json.loads(values["MATRIX"])
         expected = ["3.10", "3.11", "3.12", "3.13", "3.14"]

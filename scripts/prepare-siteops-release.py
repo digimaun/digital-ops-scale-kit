@@ -11,7 +11,9 @@ import os
 import sys
 from pathlib import Path
 
-from siteops_release import (
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from siteops_release import (  # noqa: E402
     ReleaseIntentError,
     discover_release_intent,
     inactive_release_plan,

@@ -29,6 +29,17 @@ class ReleaseAssetsError(ValueError):
     """The frozen inventory is incomplete or has an invalid identity."""
 
 
+def validate_asset_name(name: str) -> str:
+    """Validate a portable leaf name before any release bytes have been produced."""
+    _text(name, r"[0-9A-Za-z][0-9A-Za-z.!+_~-]*", 255)
+    if (
+        ".." in name or name.endswith(".")
+        or name.split(".", 1)[0].upper() in _RESERVED_NAMES
+    ):
+        raise ReleaseAssetsError("Release assets require portable filenames.")
+    return name
+
+
 def _object(value: Any, keys: set[str]) -> dict[str, Any]:
     if type(value) is not dict or set(value) != keys:
         raise ReleaseAssetsError("The release asset inventory contains unsupported or missing fields.")
@@ -50,12 +61,7 @@ class ReleaseAsset:
     sha256: str
 
     def __post_init__(self) -> None:
-        _text(self.name, r"[0-9A-Za-z][0-9A-Za-z.!+_~-]*", 255)
-        if (
-            ".." in self.name or self.name.endswith(".")
-            or self.name.split(".", 1)[0].upper() in _RESERVED_NAMES
-        ):
-            raise ReleaseAssetsError("Release assets require portable filenames.")
+        validate_asset_name(self.name)
         if type(self.size) is not int or not 0 < self.size <= MAX_ASSET_BYTES:
             raise ReleaseAssetsError("A release asset size is outside its limit.")
         _text(self.sha256, r"[0-9a-f]{64}", 64)

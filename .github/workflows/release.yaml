@@ -234,6 +234,8 @@ jobs:
                   raise SystemExit("::error::The release file or notes changed. Prepare and review a new candidate.")
               if path_key == "path":
                   declaration = json.loads(result.stdout)
+                  if plan.get("workspaces") != declaration.get("workspaces"):
+                      raise SystemExit("::error::The workspace builds differ from the reviewed declaration.")
                   headline = declaration.get("headline")
                   if (
                       not isinstance(headline, str) or not 1 <= len(headline) <= 120
@@ -242,6 +244,12 @@ jobs:
                       or plan["release"]["title"] != declaration["tag"] + ": " + headline
                   ):
                       raise SystemExit("::error::The release title differs from the reviewed declaration.")
+          if plan.get("workspaces"):
+              required = {"siteops-workspaces.json"}
+              for request in plan["workspaces"]:
+                  required.update((request["package"], request["package"] + ".attestation.jsonl"))
+              if not required <= set(published_assets):
+                  raise SystemExit("::error::The candidate lacks declared workspace packages, proofs or routing metadata.")
           if engine["bundle"]:
               if approved_assets[os.environ["ARCHIVE_NAME"]][1] != os.environ["APPROVED_BUNDLE_SHA"]:
                   raise SystemExit("::error::The approved publish asset list is inconsistent.")

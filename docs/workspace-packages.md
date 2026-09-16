@@ -101,6 +101,93 @@ workspace path, plus the number of mapped deployment templates. Keep those
 exact bytes for separate provenance signing and qualification. Reconstructing
 another ZIP is a different artifact.
 
+## Build workspaces declared by a release
+
+A content release file can declare complete workspace builds alongside its
+engine choice. The content tag supplies the kit version. Each workspace names
+its own package, compatibility range and licensing files:
+
+```json
+{
+  "tag": "v1.0.0b8",
+  "headline": "Verified workspace content",
+  "siteops": {"build": true},
+  "workspaces": [
+    {
+      "workspace": "workspaces/iot-operations",
+      "id": "azure.iot-operations",
+      "package": "iot-operations.zip",
+      "compatibility": {
+        "siteops": ">=1.0.0b1,<2",
+        "requiredFeatures": ["manifest/v1", "composition/v1"]
+      },
+      "include": ["docs", "README.md"],
+      "licenses": ["LICENSE", "ThirdPartyNotices.txt"]
+    }
+  ]
+}
+```
+
+Commit this as `releases/workspace-candidate/release.json` with a sibling
+`notes.md`. Choose the tag and engine selection according to the
+[release policy](releasing.md). The example describes the format rather than
+a scheduled release.
+
+From a clean checkout, build the declared unsigned assets into a new directory.
+Supply the build number and attempt for the engine build that these workspaces
+will accompany:
+
+```powershell
+$commit = git rev-parse HEAD
+$sourceRef = git symbolic-ref --quiet HEAD
+if ($LASTEXITCODE -ne 0) { throw 'Use a named source branch for this example.' }
+python scripts\build-workspace-release.py `
+  --root . `
+  --repository '<owner/repository>' `
+  --expected-source-sha $commit `
+  --source-ref $sourceRef `
+  --release-file releases/workspace-candidate/release.json `
+  --build-number <build-number> `
+  --build-attempt <build-attempt> `
+  --output-dir '<new-absolute-output-directory>'
+```
+
+When `siteops.release` selects an existing engine, omit the build number and
+attempt. Its exact version is used instead of the development engine version
+in the checkout. `--dry-run` permits a committed file under
+`.github/release-examples/`. It marks the build record as a preview.
+
+The directory receives each declared ZIP and `workspace-builds.json`, which
+records their exact sizes, hashes, source, content version and selected engine
+version. Production uses the same complete-workspace builder as the individual
+package command. A failure removes outputs created by that invocation, with
+an explicit warning if cleanup cannot complete.
+
+Declarations allow up to 64 distinct workspace paths, within the release
+file's byte limit. Package names are unique portable ZIP filenames and reserve
+room for their detached proof names. Workspace and companion paths must exist
+in the selected commit. License paths must identify regular files. `include`
+is optional, and omitted `requiredFeatures` defaults to `manifest/v1`.
+The producer also records `compiled-templates/v1`.
+
+If a workspace contains either generated index file, both must be present and
+current for that exact source. Production preserves the existing generic or
+GitHub binding settings and records the public index's exact digest. It never
+rewrites a stale index. A workspace without generated indexes remains a valid
+package source.
+
+The producer checks declared compatibility against the selected engine
+version. This does not establish that the released engine supports the
+workspace. Consumer inspection and extraction still enforce the actual
+installed engine's version and supported features. For an individual package,
+`--engine-version` selects the producer target explicitly.
+
+These outputs are unsigned. The command creates neither detached proofs nor
+the public `siteops-workspaces.json` descriptor, and performs no publication.
+Current release automation delivers engine assets. A candidate declaring
+workspaces must contain all of its packages, proofs and routing metadata
+before it can reach publication approval.
+
 ## Package identities
 
 The first member, `siteops-package.json`, uses `siteops/v1alpha1` and kind

@@ -6,25 +6,19 @@
 import argparse
 import json
 import sys
-import tempfile
 from pathlib import Path
 
 from source_snapshot import (
     SourceSnapshotError,
-    export_tracked_source,
-    require_complete_export,
-    require_workspace_configuration_boundary,
     validate_repository,
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from workspace_producer import build_committed_workspace  # noqa: E402
+
+from siteops import __version__  # noqa: E402
 from siteops.artifacts import ArtifactError, relative_artifact_path  # noqa: E402
-from siteops.package_builder import (  # noqa: E402
-    build_package,
-    create_producer_compilation_session,
-    workspace_bicep_sources,
-)
 
 
 def main() -> int:
@@ -35,6 +29,7 @@ def main() -> int:
     parser.add_argument("--id", required=True, help="Provider-neutral kit identifier")
     parser.add_argument("--version", required=True, help="Kit version, independent of the engine version")
     parser.add_argument("--requires-siteops", required=True, help="Bounded PEP 440 engine range")
+    parser.add_argument("--engine-version", default=__version__, help="Producer target engine version, without consumer authorization")
     parser.add_argument("--require-feature", action="append", default=[], help="Required engine feature")
     parser.add_argument("--include", action="append", default=[], help="Approved companion file or directory")
     parser.add_argument("--license", action="append", required=True, help="Required source-relative license file")
@@ -49,35 +44,16 @@ def main() -> int:
         root = args.root.resolve()
         output = args.output.absolute()
         workspace = "." if args.workspace == "." else relative_artifact_path(args.workspace)
-        companions = tuple(relative_artifact_path(value) for value in (*args.include, *args.license))
-        paths = (workspace, *companions)
+        includes = tuple(relative_artifact_path(value) for value in args.include)
+        licenses = tuple(relative_artifact_path(value) for value in args.license)
         validate_repository(root, args.expected_source_sha)
-        with tempfile.TemporaryDirectory(prefix="siteops-package-source-") as temporary:
-            control_root = Path(temporary)
-            snapshot = control_root / "source"
-            export_tracked_source(root, snapshot, args.expected_source_sha, paths=paths)
-            require_complete_export(root, args.expected_source_sha, paths, snapshot)
-            bicep_sources = workspace_bicep_sources(snapshot, workspace)
-            if bicep_sources:
-                require_workspace_configuration_boundary(
-                    root,
-                    args.expected_source_sha,
-                    workspace,
-                )
-            for license_path in args.license:
-                if not snapshot.joinpath(*license_path.split("/")).is_file():
-                    raise ArtifactError("A declared package license file is missing.")
-            result = build_package(
-                snapshot, output, workspace=workspace, kit_id=args.id, version=args.version,
-                source_revision=args.expected_source_sha, siteops_range=args.requires_siteops,
-                companions=companions,
-                required_features=tuple(args.require_feature) or ("manifest/v1",),
-                compilation_session_factory=lambda: create_producer_compilation_session(
-                    snapshot,
-                    control_root,
-                    bicep_path=args.bicep,
-                ),
-            )
+        result, _ = build_committed_workspace(
+            root, args.expected_source_sha, output, workspace=workspace,
+            kit_id=args.id, version=args.version, siteops_range=args.requires_siteops,
+            includes=includes, licenses=licenses,
+            required_features=tuple(args.require_feature) or ("manifest/v1",),
+            engine_version=args.engine_version, bicep_path=args.bicep,
+        )
     except (ArtifactError, SourceSnapshotError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1

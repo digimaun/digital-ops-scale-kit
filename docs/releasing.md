@@ -195,6 +195,7 @@ references a separately released engine instead.
 | `tag` | Required version identity. `v...` releases Scale Kit content, while `siteops/v...` releases the engine independently. |
 | `headline` | Required short description used with the tag to form the release title. |
 | `siteops` | Required for a content release. Choose `{"build": true}` or `{"release": "siteops/v<version>"}`. Omit it for an independent engine release. |
+| `workspaces` | Optional reviewed workspace build inputs for a content release. See [workspace production](workspace-packages.md#build-workspaces-declared-by-a-release). Publication requires every declared package, proof and the routing descriptor. |
 | `latest` | Optional, defaults to `false`. Set `true` only to designate a stable Scale Kit release as GitHub's Latest release. |
 
 `siteops.build` is a selection, not an on/off switch. `true` includes a fresh

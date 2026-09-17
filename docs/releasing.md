@@ -65,6 +65,20 @@ Use the maintained runner image for baseline tools. Existing workflow steps
 select Python, install locked packages through the configured feed and verify
 the Bicep compiler before use. A custom image bootstrap is not required.
 
+### Check the runner without producing artifacts
+
+Use **Actions > CI > Run workflow**, select a reviewed branch, choose
+`runner-check` for `run-mode`, and enter its full `expected-source-sha`.
+The configured pool runs two short jobs without repository checkout, signing
+permissions, artifact production or deployment. The first records baseline
+Python, Git, GitHub CLI and Azure CLI versions using temporary empty profiles.
+The second requires a different boot session. The summary contains tool
+versions and the comparison outcome, not machine identities or credentials.
+
+This mode leaves the release artifact gate closed. Different boot sessions
+do not establish complete machine isolation, Trusted Launch or provenance.
+Ordinary CI still runs on public runners, and `release-file` is ignored.
+
 ## Preview a release without publishing
 
 In **Actions > CI > Run workflow**, select the feature branch and choose:

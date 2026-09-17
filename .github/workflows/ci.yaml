@@ -32,13 +32,13 @@ on:
   workflow_dispatch:
     inputs:
       run-mode:
-        description: "CI always runs. Optional installer checks and release previews never publish."
+        description: "CI always runs. Runner checks, installer checks and release previews never publish."
         type: choice
         required: false
-        options: [ci-only, installer-check, release-preview]
+        options: [ci-only, runner-check, installer-check, release-preview]
         default: ci-only
       expected-source-sha:
-        description: "For installer-check or release-preview: full commit SHA of the selected branch."
+        description: "For runner-check, installer-check or release-preview: full commit SHA of the selected branch."
         type: string
         required: false
         default: ""
@@ -54,11 +54,11 @@ permissions:
 jobs:
   release-runner:
     name: Select release artifact runners
-    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.run-mode == 'installer-check' || inputs.run-mode == 'release-preview') }}
+    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.run-mode == 'runner-check' || inputs.run-mode == 'installer-check' || inputs.run-mode == 'release-preview') }}
     uses: ./.github/workflows/_release-runner.yaml
     with:
       expected-source-sha: ${{ inputs.expected-source-sha }}
-      mode: preview
+      mode: ${{ inputs.run-mode == 'runner-check' && 'check' || 'preview' }}
     permissions:
       contents: read
 

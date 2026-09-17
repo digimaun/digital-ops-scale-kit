@@ -1,6 +1,8 @@
 """Keep release artifact work on admitted 1ES pools and ordinary checks on public runners."""
 
+import hashlib
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -167,7 +169,10 @@ def test_every_release_entry_point_requires_runner_admission():
     for document, mode in ((ci, "preview"), (release, "release")):
         gate = document["jobs"]["release-runner"]
         assert gate["uses"] == "./.github/workflows/_release-runner.yaml"
-        assert gate["with"]["mode"] == mode
+        assert gate["with"]["mode"] == (
+            "${{ inputs.run-mode == 'runner-check' && 'check' || 'preview' }}"
+            if mode == "preview" else mode
+        )
         assert gate["permissions"] == {"contents": "read"}
     assert "github.event_name == 'workflow_dispatch'" in ci["jobs"]["release-runner"]["if"]
     assert ci["jobs"]["installer-check"]["needs"] == "release-runner"
@@ -178,3 +183,116 @@ def test_every_release_entry_point_requires_runner_admission():
         assert document["jobs"][key]["with"]["release-pool"] == "${{ needs.release-runner.outputs.pool }}"
     for key in ("distribution", "workspace-build"):
         assert candidate["jobs"][key]["with"]["release-pool"] == "${{ inputs.release-pool }}"
+
+
+@pytest.mark.parametrize("event,allowed", [("workflow_dispatch", True), ("pull_request", False), ("pull_request_target", False), ("push", False)])
+def test_runner_check_is_the_only_nonsigning_gate_exception(tmp_path, event, allowed):
+    result, output = admit(
+        tmp_path, RELEASE_MODE="check", RELEASE_PROVENANCE_READY="false", CALLER_EVENT=event,
+    )
+    assert (result.returncode == 0) is allowed, result.stderr
+    assert ("pool=" in output) is allowed
+
+
+def test_runner_check_jobs_have_no_source_or_signing_permissions():
+    for key in ("probe", "recheck"):
+        job = ADMISSION["jobs"][key]
+        assert job["permissions"] == {}
+        assert job["if"] == "inputs.mode == 'check'"
+        assert job["timeout-minutes"] <= 10
+        assert all("uses" not in step for step in job["steps"])
+        assert job["runs-on"][:2] == [
+            "self-hosted", "${{ format('1ES.Pool={0}', needs.select.outputs.pool) }}",
+        ]
+    assert ADMISSION["jobs"]["probe"]["needs"] == "select"
+    assert ADMISSION["jobs"]["recheck"]["needs"] == ["select", "probe"]
+    assert ADMISSION["jobs"]["probe"]["runs-on"][2] != ADMISSION["jobs"]["recheck"]["runs-on"][2]
+    ci = workflow("ci.yaml")
+    for job in ("installer-check", "release-preview"):
+        assert ci["jobs"][job]["if"] == (
+            "${{ github.event_name == 'workflow_dispatch' && inputs.run-mode == '" + job + "' }}"
+        )
+
+
+BOOT = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+
+@pytest.fixture
+def probe_environment(tmp_path, monkeypatch):
+    output, summary = tmp_path / "outputs", tmp_path / "summary"
+    for key, value in {
+        "RUNNER_CLASS": "self-hosted", "RUNNER_TEMP": str(tmp_path),
+        "GITHUB_RUN_ID": "42", "GITHUB_RUN_ATTEMPT": "1",
+        "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(summary),
+        "GH_TOKEN": "PRIVATE_SENTINEL", "AZURE_CLIENT_SECRET": "PRIVATE_SENTINEL",
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(sys, "platform", "linux")
+    read = Path.read_text
+
+    def boot_read(path, *args, **kwargs):
+        return BOOT if path == Path("/proc/sys/kernel/random/boot_id") else read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", boot_read)
+    return output, summary
+
+
+@pytest.mark.parametrize("fault", [None, "missing", "tool-error", "old-gh", "timeout"])
+def test_runner_probe_uses_closed_version_commands_and_private_profiles(probe_environment, tmp_path, monkeypatch, fault):
+    output, summary = probe_environment
+    calls = []
+    monkeypatch.setattr(shutil, "which", lambda name: None if fault == "missing" else name)
+
+    def run(argv, **options):
+        expected = {
+            "git": (["git", "--version"], "git version 2.50.0\n"),
+            "gh": (["gh", "--version"], "gh version 2.94.0\n" if fault == "old-gh" else "gh version 2.101.0\n"),
+            "az": (["az", "version", "--query", '"azure-cli"', "--output", "tsv"], "2.90.0\n"),
+        }
+        assert argv == expected[argv[0]][0]
+        assert options["timeout"] == 30 and options["stdin"] == subprocess.DEVNULL
+        environment = options["env"]
+        assert "GH_TOKEN" not in environment and "AZURE_CLIENT_SECRET" not in environment
+        assert Path(environment["HOME"]).is_relative_to(tmp_path)
+        assert Path(environment["AZURE_CONFIG_DIR"]).is_relative_to(Path(environment["HOME"]))
+        assert Path(environment["GH_CONFIG_DIR"]).is_relative_to(Path(environment["HOME"]))
+        assert environment["AZURE_CORE_COLLECT_TELEMETRY"] == "false"
+        calls.append(argv)
+        if fault == "timeout":
+            raise subprocess.TimeoutExpired(argv, 30)
+        return subprocess.CompletedProcess(argv, 7 if fault == "tool-error" else 0, expected[argv[0]][1], "PRIVATE_SENTINEL")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    script = ADMISSION["jobs"]["probe"]["steps"][0]["run"]
+    if fault is None:
+        exec(compile(script, "<runner-probe>", "exec"), {})
+        assert len(calls) == 3
+        text = summary.read_text()
+        assert "2.101.0" in text and "PRIVATE_SENTINEL" not in text and BOOT not in text
+        assert output.read_text() == "boot-session=" + hashlib.sha256(("42:1:" + BOOT).encode()).hexdigest() + "\n"
+    else:
+        with pytest.raises(SystemExit, match="::error::") as failure:
+            exec(compile(script, "<runner-probe>", "exec"), {})
+        assert "PRIVATE_SENTINEL" not in str(failure.value)
+        assert not output.exists() and not summary.exists()
+
+
+@pytest.mark.parametrize("previous,success", [
+    (hashlib.sha256(("42:1:" + BOOT).encode()).hexdigest(), False),
+    ("b" * 64, True),
+    ("", False),
+])
+def test_runner_session_comparison_reports_only_the_observed_boundary(probe_environment, monkeypatch, previous, success):
+    _, summary = probe_environment
+    monkeypatch.setenv("PREVIOUS_BOOT_SESSION", previous)
+    script = ADMISSION["jobs"]["recheck"]["steps"][0]["run"]
+    if success:
+        exec(compile(script, "<runner-recheck>", "exec"), {})
+        text = summary.read_text()
+        assert "different boot sessions" in text
+        assert "does not establish Trusted Launch" in text
+        assert BOOT not in text and previous not in text
+    else:
+        with pytest.raises(SystemExit, match="::error::"):
+            exec(compile(script, "<runner-recheck>", "exec"), {})
+        assert not summary.exists()

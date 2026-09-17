@@ -52,12 +52,12 @@ jobs:
           expected = os.environ["EXPECTED_SOURCE_SHA"]
           if not re.fullmatch("[0-9a-f]{40}", expected) or expected != os.environ["SOURCE_SHA"]:
               reject("Select the full current source commit before requesting release runners.")
-          workflow = {"preview": "ci.yaml", "release": "release.yaml"}.get(mode)
+          workflow = {"check": "ci.yaml", "preview": "ci.yaml", "release": "release.yaml"}.get(mode)
           if workflow is None or os.environ["CALLER_WORKFLOW"] != (
               os.environ["SOURCE_REPOSITORY"] + "/.github/workflows/" + workflow + "@" + ref
           ):
               reject("Release runners require the supported CI or Release entry point.")
-          if mode == "preview":
+          if mode in {"check", "preview"}:
               if event != "workflow_dispatch" or not ref.startswith("refs/heads/"):
                   reject("Release previews require an explicit dispatch from a reviewed branch.")
           elif event not in {"push", "workflow_dispatch"} or ref != "refs/heads/main":
@@ -65,7 +65,7 @@ jobs:
           pool = os.environ["RELEASE_POOL"]
           if not re.fullmatch("[A-Za-z0-9][A-Za-z0-9._-]{0,99}", pool):
               reject("Configure SITEOPS_RELEASE_POOL with this repository's dedicated 1ES pool name.")
-          if os.environ["RELEASE_PROVENANCE_READY"] != "true":
+          if mode != "check" and os.environ["RELEASE_PROVENANCE_READY"] != "true":
               reject(
                   "1ES release artifact execution is not enabled. Current provenance verification "
                   "requires github-hosted runners. Complete the 1ES runner and provenance "
@@ -73,4 +73,119 @@ jobs:
               )
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write("pool=" + pool + "\n")
-          print("Release artifact jobs will use the configured 1ES pool. Test runners are unchanged.")
+          print("The configured 1ES pool was selected for this request. Test runners are unchanged.")
+
+  probe:
+    name: Check runner tools
+    needs: select
+    if: inputs.mode == 'check'
+    runs-on:
+      - self-hosted
+      - ${{ format('1ES.Pool={0}', needs.select.outputs.pool) }}
+      - ${{ format('JobId=siteops-runner-check-first-{0}-{1}', github.run_id, github.run_attempt) }}
+    timeout-minutes: 10
+    permissions: {}
+    outputs:
+      boot-session: ${{ steps.probe.outputs.boot-session }}
+    steps:
+      - name: Inspect baseline tools without source or credentials
+        id: probe
+        shell: python
+        env:
+          RUNNER_CLASS: ${{ runner.environment }}
+        run: |
+          import hashlib
+          import os
+          import re
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          if sys.platform != "linux" or os.environ["RUNNER_CLASS"] != "self-hosted" or sys.version_info < (3, 10):
+              raise SystemExit("::error::The check requires the configured Linux 1ES runner.")
+          boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+          if not re.fullmatch("[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", boot):
+              raise SystemExit("::error::A bounded worker boot identity is required.")
+          salt = os.environ["GITHUB_RUN_ID"] + ":" + os.environ["GITHUB_RUN_ATTEMPT"]
+          session = hashlib.sha256((salt + ":" + boot).encode()).hexdigest()
+          with tempfile.TemporaryDirectory(prefix="siteops-runner-check-", dir=os.environ["RUNNER_TEMP"]) as temporary:
+              environment = {
+                  "PATH": os.environ["PATH"], "HOME": temporary,
+                  "AZURE_CONFIG_DIR": str(Path(temporary) / "azure"),
+                  "GH_CONFIG_DIR": str(Path(temporary) / "github"),
+                  "AZURE_CORE_COLLECT_TELEMETRY": "false",
+                  "AZURE_EXTENSION_USE_DYNAMIC_INSTALL": "no",
+                  "GH_PROMPT_DISABLED": "1", "LC_ALL": "C.UTF-8",
+              }
+              versions = [("Python", ".".join(map(str, sys.version_info[:3])))]
+              commands = (
+                  ("git", ("--version",), r"git version ([0-9]+\.[0-9]+\.[0-9]+)"),
+                  ("gh", ("--version",), r"gh version ([0-9]+\.[0-9]+\.[0-9]+)"),
+                  ("az", ("version", "--query", '"azure-cli"', "--output", "tsv"), r"([0-9]+\.[0-9]+\.[0-9]+)"),
+              )
+              for tool, arguments, pattern in commands:
+                  executable = shutil.which(tool)
+                  if executable is None:
+                      raise SystemExit("::error::The maintained image must provide " + tool + ".")
+                  try:
+                      result = subprocess.run(
+                          [executable, *arguments], cwd=temporary, env=environment,
+                          stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30,
+                      )
+                  except (OSError, subprocess.TimeoutExpired):
+                      raise SystemExit("::error::The baseline tool check could not complete for " + tool + ".") from None
+                  version = re.match(pattern, result.stdout)
+                  if result.returncode or len(result.stdout) > 32768 or version is None:
+                      raise SystemExit("::error::The baseline tool returned an unsupported version result: " + tool + ".")
+                  if tool == "gh" and tuple(map(int, version[1].split("."))) < (2, 95, 0):
+                      raise SystemExit("::error::GitHub CLI 2.95 or newer is required for release verification.")
+                  versions.append((tool, version[1]))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("boot-session=" + session + "\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as output:
+              output.write("## 1ES runner baseline\n\n| Tool | Version |\n|---|---|\n")
+              for tool, version in versions:
+                  output.write("| " + tool + " | " + version + " |\n")
+              output.write("\nNo source was checked out, no artifact was built or signed, and no cloud resources were requested.\n")
+
+  recheck:
+    name: Check a separate worker session
+    needs: [select, probe]
+    if: inputs.mode == 'check'
+    runs-on:
+      - self-hosted
+      - ${{ format('1ES.Pool={0}', needs.select.outputs.pool) }}
+      - ${{ format('JobId=siteops-runner-check-second-{0}-{1}', github.run_id, github.run_attempt) }}
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Compare job boot sessions without publishing machine identities
+        shell: python
+        env:
+          PREVIOUS_BOOT_SESSION: ${{ needs.probe.outputs.boot-session }}
+          RUNNER_CLASS: ${{ runner.environment }}
+        run: |
+          import hashlib
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          if sys.platform != "linux" or os.environ["RUNNER_CLASS"] != "self-hosted":
+              raise SystemExit("::error::The check requires the configured Linux 1ES runner.")
+          previous = os.environ["PREVIOUS_BOOT_SESSION"]
+          boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+          if not re.fullmatch("[0-9a-f]{64}", previous) or not re.fullmatch("[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", boot):
+              raise SystemExit("::error::Both job boot identities are required.")
+          salt = os.environ["GITHUB_RUN_ID"] + ":" + os.environ["GITHUB_RUN_ATTEMPT"]
+          current = hashlib.sha256((salt + ":" + boot).encode()).hexdigest()
+          if current == previous:
+              raise SystemExit("::error::Both jobs used the same worker boot session.")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as output:
+              output.write(
+                  "## Worker session check\n\nThe two jobs used different boot sessions.\n\n"
+                  "This observation is not attestation evidence and does not establish Trusted Launch, "
+                  "complete machine isolation or release readiness. Artifact execution remains gated.\n"
+              )

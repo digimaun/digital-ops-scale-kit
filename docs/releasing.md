@@ -173,9 +173,10 @@ preparation requires its complete native asset set: the ZIP, standalone wheel,
 and one detached proof for each. It freezes their GitHub digests and rejects an
 older ZIP-only release.
 
-Scale Kit content currently comes from the tagged repository. This workflow
-does not produce a separately packaged workspace or claim that GitHub's
-generated source archives are verified workspace packages.
+Add reviewed `workspaces` records to publish complete workspace packages
+and their detached proofs with the content release. Their kit version comes
+from the content tag, while the referenced engine retains its own version
+and assets. See [workspace production](workspace-packages.md#build-workspaces-declared-by-a-release).
 
 ### Include an engine build in a content prerelease
 
@@ -194,10 +195,11 @@ while the source engine version follows its existing policy. The included
 engine receives a distinguishable build version such as
 `1.0.0b1+build.12345.1.gabcdef123456`.
 
-It creates one content release with the Site Ops ZIP and standalone wheel. Each
-subject has its own detached attestation. It does not create another Site Ops
-tag. This option requires a prerelease content version. Stable content
-references a separately released engine instead.
+It creates one content release with the Site Ops ZIP and standalone wheel,
+plus any declared workspace packages and their proofs. Each signed subject
+has its own detached attestation. It does not create another Site Ops tag.
+This option requires a prerelease content version. Stable content references
+a separately released engine instead.
 
 ## Release fields and defaults
 
@@ -296,6 +298,12 @@ They are not uploaded to the content release again. The publisher consumes
 the approved publication list and compares the uploaded identities with that
 list.
 
+When workspaces are declared, the final payload combines their qualified ZIPs,
+proofs and `siteops-workspaces.json` with any engine assets built for this
+release. The referenced engine's files remain in its own release. Candidate
+preparation compares its frozen engine selection with the current native
+inventory, preserving the exact engine that qualified the workspaces.
+
 This approval inventory is distinct from the public `siteops-workspaces.json`
 routing descriptor. Workspace package delivery is described in
 [workspace release sources](workspace-sources.md).
@@ -337,8 +345,9 @@ After approval, the workflow:
 3. Creates a missing tag at the approved commit, or reuses a tag already
    pointing there. It never moves a conflicting tag.
 4. Reauthenticates the ZIP and standalone wheel, confirms their byte identity,
-   and creates the GitHub Release with the approved notes and four declared
-   assets.
+   and reauthenticates each declared workspace package. It compares workspace
+   routing, source, kit and compatibility metadata with the approved
+   declaration before creating the release with its unchanged payload.
 5. Confirms every uploaded asset digest and verifies GitHub's release
    attestation when immutable releases are enabled.
 

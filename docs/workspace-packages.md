@@ -238,8 +238,10 @@ workspace inventory and plan.
 Direct `pip install <wheel-url>` and `pipx install <wheel-url>` remain
 available through the [installation guide](install-siteops.md). The isolated
 qualification environment is release tooling, not another operator installer.
-Final publisher integration and the applicable live release evidence remain
-required before publishing workspace content.
+The final candidate payload includes the qualified workspaces and any engine
+assets built for that release. After approval, the publisher rechecks those
+exact bytes, proofs and source contracts. The applicable live release evidence
+and configured publication environment remain required.
 
 ## Package identities
 

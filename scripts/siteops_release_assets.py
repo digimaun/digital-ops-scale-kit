@@ -222,3 +222,30 @@ class FrozenReleaseAssets:
         if len(raw) > MAX_INVENTORY_BYTES:
             raise ReleaseAssetsError("The release asset inventory exceeds its byte limit.")
         return raw
+
+
+def publication_assets(plan: dict[str, Any], inventory: FrozenReleaseAssets) -> tuple[tuple[ReleaseAsset, ...], tuple[ReleaseAsset, ...]]:
+    """Partition the exact approved publication set by declared engine/workspace roles."""
+    if inventory.source != plan["source"]:
+        raise ReleaseAssetsError("The publication inventory describes another candidate.")
+    requests = plan.get("workspaces", [])
+    if type(requests) is not list or len(requests) > 64:
+        raise ReleaseAssetsError("The publication workspace selection is invalid.")
+    workspace_names: set[str] = {"siteops-workspaces.json"} if requests else set()
+    for request in requests:
+        name = validate_asset_name(request["package"])
+        names = {name, validate_asset_name(name + PROOF_SUFFIX)}
+        if workspace_names & names:
+            raise ReleaseAssetsError("Publication workspace filenames must be unique.")
+        workspace_names.update(names)
+    workspace = tuple(asset for asset in inventory.assets if asset.name in workspace_names)
+    native = tuple(asset for asset in inventory.assets if asset.name not in workspace_names)
+    if {asset.name for asset in workspace} != workspace_names:
+        raise ReleaseAssetsError("The publication set lacks declared workspace packages, proofs or routing metadata.")
+    if plan["siteops"]["bundle"]:
+        if inventory.engine is not None:
+            raise ReleaseAssetsError("A built engine cannot also select a referenced engine.")
+        native_engine_wheel(native)
+    elif native or inventory.engine is None or inventory.engine.tag != plan["siteops"]["releaseTag"]:
+        raise ReleaseAssetsError("The referenced engine differs from the reviewed selection.")
+    return native, workspace

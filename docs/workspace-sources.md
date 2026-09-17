@@ -8,8 +8,8 @@ inspection of every ZIP or a descriptive index.
 workspace to ordinary planning and deployment. Release candidate preparation
 can build workspace packages, attest them, generate this descriptor and
 qualify their consumption through the selected installed engine.
-Workspace publication remains gated on complete release integration and
-the applicable release evidence.
+Publication requires the complete qualified inventory, configured approval
+environment and applicable release evidence.
 
 ## Descriptor
 
@@ -196,8 +196,8 @@ Only after every selected workspace passes collection does it generate the
 descriptor and freeze its bytes with the package and proof identities.
 Each workspace proof names one artifact, matching the current consumer
 contract. The descriptor contains no policy or trust-root selection.
-The publisher must ultimately upload these exact bytes rather than
-regenerate them after approval.
+After approval, the publisher rechecks the package proofs, source contracts
+and descriptor against the approved inventory, then uploads those exact bytes.
 
 Keep the existing internal `SiteOpsReleaseAssets` approval document separate
 from this public routing contract. Its publication list is separate from the

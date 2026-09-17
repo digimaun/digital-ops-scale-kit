@@ -20,6 +20,7 @@ from typing import Any
 from siteops_release_assets import (
     FrozenReleaseAssets,
     native_engine_wheel,
+    publication_assets,
 )
 
 
@@ -38,24 +39,37 @@ def render_notes(
 ) -> str:
     """Append release-specific installation guidance to the authored notes."""
     source, engine = plan["source"], plan["siteops"]
+    native, workspace = publication_assets(plan, assets)
     if assets.source != source:
         raise RenderingError("The release asset inventory describes a different source.")
     repository = source["repository"]
     home = "https://github.com/" + repository
     notes = authored.rstrip() + "\n\n## Install Site Ops\n\n"
+    workspace_notes = ""
+    if workspace:
+        downloads = home + "/releases/download/" + urllib.parse.quote(plan["release"]["tag"], safe="") + "/"
+        workspace_notes = (
+            "\n\n## Workspace content\n\n"
+            "This release contains complete workspace packages and their detached proofs. "
+            "Use `project pin` with this release and independently supplied trust policy and roots.\n\n"
+            + "\n".join(f"- [{asset.name}]({downloads}{asset.name})" for asset in workspace)
+            + "\n\nPackage compatibility and catalog loading are qualified through the selected engine. "
+            "Deployment permissions and workload outcomes remain specific to your environment.\n"
+        )
     if not engine["bundle"]:
         tag = engine["releaseTag"]
-        if assets.engine is None or assets.engine.tag != tag or assets.assets:
+        if assets.engine is None or assets.engine.tag != tag or native:
             raise RenderingError("The release asset inventory does not match the engine selection.")
         url = home + "/releases/tag/" + urllib.parse.quote(tag, safe="")
         return (
             notes + f"Use [{tag}]({url}) and its installation instructions. "
             "The referenced engine release has its own source commit and native installation assets.\n"
+            + workspace_notes
         )
 
     if assets.engine is not None:
         raise RenderingError("The release asset list cannot render installation guidance.")
-    wheel = native_engine_wheel(assets.assets).name
+    wheel = native_engine_wheel(native).name
     downloads = home + "/releases/download/" + urllib.parse.quote(plan["release"]["tag"], safe="") + "/"
     guide = home + "/blob/" + source["commit"] + "/docs/install-siteops.md#install-the-verified-bundle"
     command = (
@@ -89,7 +103,7 @@ def render_notes(
         "Use these assets instead of the generated source archives.",
         "Installing the CLI does not authenticate to Azure or deploy resources.",
     ]
-    return notes + "\n\n".join(paragraphs) + "\n"
+    return notes + "\n\n".join(paragraphs) + "\n" + workspace_notes
 
 
 def embedded_notes(text: str) -> str:
@@ -173,6 +187,12 @@ def render_summary(plan: dict[str, Any], notes: str, values: Mapping[str, str]) 
                 )
             ]
             lines.append("| " + " | ".join(cells) + " |")
+        lines.extend([
+            "\nThe selected installed engine consumed the frozen workspace packages on its declared targets. "
+            "This covers package/cache compatibility and guarded catalog loading, not deployment or workload health.\n",
+            f"[Download the complete release payload]({values['ARTIFACT_URL']})\n",
+            f"Frozen publication inventory SHA-256: `{values['ASSET_LIST_SHA']}`",
+        ])
     if engine["bundle"]:
         matrix = json.loads(values["MATRIX"])
         expected = ["3.10", "3.11", "3.12", "3.13", "3.14"]
@@ -190,7 +210,9 @@ def render_summary(plan: dict[str, Any], notes: str, values: Mapping[str, str]) 
             lines.append(f"| {row['python']} | {row['linux']} | {row['windows']} |")
         lines.extend([
             f"\n[Download the attested release assets]({values['ARTIFACT_URL']})\n",
-            "The Actions download contains the installation ZIP, standalone wheel, and a detached proof for each. "
+            "The Actions download contains the installation ZIP, standalone wheel, and a detached proof for each"
+            + (", together with the declared workspace assets. " if plan.get("workspaces") else ". ")
+            +
             "For a verified installation, use the ZIP and its proof.\n",
             "<details><summary>Artifact identity</summary>\n",
             f"- `{values['ARCHIVE_NAME']}` SHA-256: `{values['BUNDLE_SHA']}`",
@@ -222,13 +244,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("notes", "summary"))
     parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--inventory", type=Path, help="The final frozen publication inventory")
     args = parser.parse_args(argv)
     root = args.root
     try:
         plan = json.loads((root / "release-plan" / "plan.json").read_text(encoding="utf-8"))
         if args.mode == "notes":
             authored = (root / "release-plan" / "release-notes.md").read_text(encoding="utf-8")
-            assets = FrozenReleaseAssets.read(root / "release-assets" / "release-assets.json")
+            assets = FrozenReleaseAssets.read(args.inventory or root / "release-assets" / "release-assets.json")
             raw = render_notes(
                 plan, authored, assets, engine_version=os.environ.get("ENGINE_VERSION", ""),
                 archive_name=os.environ["ARCHIVE_NAME"], attestation_suffix=os.environ["ATTESTATION_SUFFIX"],

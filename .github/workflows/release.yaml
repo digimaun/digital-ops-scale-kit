@@ -104,10 +104,10 @@ jobs:
           digest-mismatch: error
 
       - name: Download the qualified release assets
-        if: needs.candidate.outputs.bundle == 'true'
+        if: needs.candidate.outputs.bundle == 'true' || needs.candidate.outputs.workspaces == 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          artifact-ids: ${{ needs.candidate.outputs.bundle-artifact-id }}
+          artifact-ids: ${{ needs.candidate.outputs.payload-artifact-id }}
           repository: ${{ github.repository }}
           run-id: ${{ github.run_id }}
           github-token: ${{ github.token }}
@@ -205,13 +205,30 @@ jobs:
           if release.get("components") != components:
               raise SystemExit("::error::The release components disagree with the engine selection.")
           reference = asset_list["engine"]
+          workspace_names = set()
+          requests = plan.get("workspaces", [])
+          if not isinstance(requests, list) or len(requests) > 64:
+              raise SystemExit("::error::The approved workspace selection is invalid.")
+          if requests:
+              workspace_names.add("siteops-workspaces.json")
+          for request in requests:
+              name = request.get("package") if isinstance(request, dict) else None
+              if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.!+_~-]*\.zip", name) or ".." in name:
+                  raise SystemExit("::error::The approved workspace filename is invalid.")
+              pair = {name, name + ".attestation.jsonl"}
+              if workspace_names & pair:
+                  raise SystemExit("::error::The approved workspace filenames are ambiguous.")
+              workspace_names.update(pair)
+          if not workspace_names <= set(published_assets):
+              raise SystemExit("::error::The candidate lacks declared workspace packages, proofs or routing metadata.")
+          native_assets = {name: value for name, value in published_assets.items() if name not in workspace_names}
           if engine["bundle"]:
               if reference is not None:
                   raise SystemExit("::error::A built engine cannot also reference an existing engine.")
-              approved_assets = published_assets
+              approved_assets = native_assets
           else:
               if (
-                  published_assets or not isinstance(reference, dict)
+                  native_assets or not isinstance(reference, dict)
                   or set(reference) != {"releaseId", "tag", "target", "assets"}
               ):
                   raise SystemExit("::error::The approved engine reference is inconsistent.")
@@ -244,12 +261,6 @@ jobs:
                       or plan["release"]["title"] != declaration["tag"] + ": " + headline
                   ):
                       raise SystemExit("::error::The release title differs from the reviewed declaration.")
-          if plan.get("workspaces"):
-              required = {"siteops-workspaces.json"}
-              for request in plan["workspaces"]:
-                  required.update((request["package"], request["package"] + ".attestation.jsonl"))
-              if not required <= set(published_assets):
-                  raise SystemExit("::error::The candidate lacks declared workspace packages, proofs or routing metadata.")
           if engine["bundle"]:
               if approved_assets[os.environ["ARCHIVE_NAME"]][1] != os.environ["APPROVED_BUNDLE_SHA"]:
                   raise SystemExit("::error::The approved publish asset list is inconsistent.")
@@ -288,15 +299,17 @@ jobs:
               "prerelease": str(release["prerelease"]).lower(),
               "latest": str(release["latest"]).lower(), "bundle": str(engine["bundle"]).lower(),
               "wheel-name": approved_wheel,
+              "workspaces": str(bool(requests)).lower(),
           }.items():
               print(key + "=" + value)
           ' >> "$GITHUB_OUTPUT"
 
       - name: Verify the approved release assets
-        if: needs.candidate.outputs.bundle == 'true'
+        if: steps.candidate.outputs.bundle == 'true' || steps.candidate.outputs.workspaces == 'true'
         shell: bash
         env:
           WHEEL_NAME: ${{ steps.candidate.outputs.wheel-name }}
+          BUNDLE: ${{ steps.candidate.outputs.bundle }}
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/release-bundle/$ARCHIVE_NAME"
@@ -315,21 +328,29 @@ jobs:
           if (
               sorted(entry.name for entry in entries) != sorted(expected)
               or any(entry.is_symlink() or not entry.is_file() for entry in entries)
-              or len(entries) != 4
+              or len(entries) != len(expected)
           ):
               raise SystemExit("::error::The downloaded release asset inventory is invalid.")
           for name, digest in expected.items():
               path = root / name
               size = next(item["size"] for item in values if item["name"] == name)
-              actual = hashlib.sha256(path.read_bytes()).hexdigest()
-              if path.stat().st_size != size or actual != digest:
+              actual = hashlib.sha256()
+              count = 0
+              with path.open("rb") as stream:
+                  while chunk := stream.read(min(1048576, size - count + 1)):
+                      count += len(chunk)
+                      if count > size:
+                          raise SystemExit("::error::A release asset exceeds its approved size.")
+                      actual.update(chunk)
+              if path.stat().st_size != size or count != size or actual.hexdigest() != digest:
                   raise SystemExit("::error::A release asset differs from the approved bytes.")
-          if (
+          if os.environ["BUNDLE"] == "true" and (
               expected[os.environ["ARCHIVE_NAME"]] != os.environ["APPROVED_BUNDLE_SHA"]
               or expected[os.environ["WHEEL_NAME"]] != os.environ["APPROVED_WHEEL_SHA"]
           ):
               raise SystemExit("::error::The approved release asset digests are inconsistent.")
           ' "$RUNNER_TEMP/release-bundle" "$RUNNER_TEMP/release-assets/release-assets.json"
+          if [[ "$BUNDLE" == "true" ]]; then
           gh attestation verify "$archive" --bundle "$archive_proof" \
             --repo "$GITHUB_REPOSITORY" --cert-identity "$SIGNER_IDENTITY" \
             --signer-digest "$SOURCE_SHA" --source-digest "$SOURCE_SHA" --source-ref "$SOURCE_REF" \
@@ -351,6 +372,80 @@ jobs:
               if archive.read(embedded) != wheel_path.read_bytes():
                   raise SystemExit("::error::The approved standalone wheel differs from the wheel in the bundle.")
           ' "$archive" "$wheel"
+          fi
+
+      - name: Verify the approved workspace subjects and descriptor
+        if: steps.candidate.outputs.workspaces == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -c '
+          import json, os, subprocess, zipfile
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"])
+          plan = json.loads((root / "release-plan/plan.json").read_bytes())
+          inventory = json.loads((root / "release-assets/release-assets.json").read_bytes())
+          assets = {asset["name"]: asset for asset in inventory["assets"]}
+          payload = root / "release-bundle"
+          path = payload / "siteops-workspaces.json"
+          if path.stat().st_size > 262144:
+              raise SystemExit("::error::The approved workspace descriptor exceeds its limit.")
+          descriptor = json.loads(path.read_bytes())
+          if (
+              set(descriptor) != {"apiVersion", "kind", "source", "workspaces"}
+              or descriptor["apiVersion"] != "siteops/v1alpha1" or descriptor["kind"] != "WorkspaceReleaseAssets"
+              or descriptor["source"] != {"revision": os.environ["SOURCE_SHA"]}
+              or not isinstance(descriptor["workspaces"], list)
+              or len(descriptor["workspaces"]) != len(plan["workspaces"])
+          ):
+              raise SystemExit("::error::The workspace descriptor describes another candidate.")
+          rows = {entry["workspace"]: entry for entry in descriptor["workspaces"]}
+          if len(rows) != len(descriptor["workspaces"]):
+              raise SystemExit("::error::The workspace descriptor contains ambiguous selections.")
+          signer = "https://github.com/" + os.environ["GITHUB_REPOSITORY"] + "/.github/workflows/_workspace-distribution.yaml@" + os.environ["SOURCE_REF"]
+          for request in plan["workspaces"]:
+              package = request["package"]
+              proof = package + ".attestation.jsonl"
+              entry = rows.get(request["workspace"])
+              if (
+                  not isinstance(entry, dict)
+                  or not {"workspace", "kit", "package", "proof"} <= entry.keys()
+                  or entry.keys() - {"workspace", "kit", "package", "proof", "index"}
+                  or entry["kit"] != {"id": request["id"], "version": plan["release"]["version"]}
+                  or entry["package"] != assets[package] or entry["proof"] != assets[proof]
+              ):
+                  raise SystemExit("::error::The workspace routing differs from the approved assets.")
+              subprocess.run([
+                  "gh", "attestation", "verify", str(payload / package), "--bundle", str(payload / proof),
+                  "--repo", os.environ["GITHUB_REPOSITORY"], "--cert-identity", signer,
+                  "--signer-digest", os.environ["SOURCE_SHA"], "--source-digest", os.environ["SOURCE_SHA"],
+                  "--source-ref", os.environ["SOURCE_REF"], "--cert-oidc-issuer", os.environ["OIDC_ISSUER"],
+                  "--predicate-type", os.environ["PREDICATE_TYPE"], "--deny-self-hosted-runners",
+              ], check=True)
+              with zipfile.ZipFile(payload / package) as archive:
+                  entries = [item for item in archive.infolist() if item.filename == "siteops-package.json"]
+                  if len(entries) != 1 or not 0 < entries[0].file_size <= 4194304:
+                      raise SystemExit("::error::The verified workspace metadata is invalid.")
+                  with archive.open(entries[0]) as stream:
+                      raw = stream.read(4194305)
+                  if len(raw) > 4194304:
+                      raise SystemExit("::error::The verified workspace metadata exceeds its limit.")
+                  metadata = json.loads(raw)
+              required = set(request["compatibility"].get("requiredFeatures", ["manifest/v1"])) | {"compiled-templates/v1"}
+              if (
+                  metadata.get("apiVersion") != "siteops/v1alpha1" or metadata.get("kind") != "WorkspacePackage"
+                  or metadata.get("source") != {"revision": os.environ["SOURCE_SHA"]}
+                  or metadata.get("kit") != entry["kit"] or metadata.get("workspace", {}).get("root") != request["workspace"]
+                  or metadata.get("compatibility", {}).get("siteops") != request["compatibility"]["siteops"]
+                  or set(metadata.get("compatibility", {}).get("requiredFeatures", [])) != required
+              ):
+                  raise SystemExit("::error::The verified workspace differs from the reviewed source contract.")
+              if "index" in entry:
+                  index_path = ("" if request["workspace"] == "." else request["workspace"] + "/") + "siteops-index.json"
+                  matches = [item for item in metadata["files"] if item["path"] == index_path]
+                  if len(matches) != 1 or entry["index"] != {"sha256": matches[0]["sha256"]}:
+                      raise SystemExit("::error::The workspace index differs from its verified package.")
+          '
 
       - name: Check the publication target
         id: target

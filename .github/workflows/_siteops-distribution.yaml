@@ -24,6 +24,10 @@ name: _Site Ops Distribution
 on:
   workflow_call:
     inputs:
+      release-pool:
+        description: "Dedicated 1ES pool admitted by the caller's release runner configuration."
+        required: true
+        type: string
       expected-source-sha:
         description: "Full 40 character commit the caller expects to build. Asserted against the event commit, never used to select what is checked out."
         required: true
@@ -95,7 +99,13 @@ env:
 jobs:
   build:
     name: Build bundle
-    runs-on: ubuntu-24.04
+    if: >-
+      inputs.release-pool != '' && inputs.release-pool == vars.SITEOPS_RELEASE_POOL &&
+      (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    runs-on:
+      - self-hosted
+      - ${{ format('1ES.Pool={0}', inputs.release-pool) }}
+      - ${{ format('JobId=siteops-build-{0}-{1}', github.run_id, github.run_attempt) }}
 
     # The build job executes repository source. It holds no OIDC, attestation, or
     # release capability.
@@ -288,7 +298,10 @@ jobs:
   attest:
     name: Attest bundle
     needs: build
-    runs-on: ubuntu-24.04
+    runs-on:
+      - self-hosted
+      - ${{ format('1ES.Pool={0}', inputs.release-pool) }}
+      - ${{ format('JobId=siteops-attest-{0}-{1}', github.run_id, github.run_attempt) }}
 
     # The signing job downloads staged bytes. It never checks out or executes
     # repository source.

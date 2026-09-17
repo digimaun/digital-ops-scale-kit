@@ -3,6 +3,10 @@ name: _Workspace Distribution
 on:
   workflow_call:
     inputs:
+      release-pool:
+        description: "Dedicated 1ES pool admitted by the caller's release runner configuration."
+        required: true
+        type: string
       expected-source-sha:
         required: true
         type: string
@@ -43,7 +47,13 @@ env:
 jobs:
   build:
     name: Build workspace
-    runs-on: ubuntu-24.04
+    if: >-
+      inputs.release-pool != '' && inputs.release-pool == vars.SITEOPS_RELEASE_POOL &&
+      (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    runs-on:
+      - self-hosted
+      - ${{ format('1ES.Pool={0}', inputs.release-pool) }}
+      - ${{ format('JobId=siteops-workspace-build-{0}-{1}-{2}', github.run_id, github.run_attempt, inputs.slot) }}
     timeout-minutes: 30
     permissions:
       contents: read
@@ -223,7 +233,10 @@ jobs:
   attest:
     name: Attest workspace
     needs: build
-    runs-on: ubuntu-24.04
+    runs-on:
+      - self-hosted
+      - ${{ format('1ES.Pool={0}', inputs.release-pool) }}
+      - ${{ format('JobId=siteops-workspace-attest-{0}-{1}-{2}', github.run_id, github.run_attempt, inputs.slot) }}
     timeout-minutes: 15
     permissions:
       contents: read

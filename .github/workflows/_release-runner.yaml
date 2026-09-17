@@ -1,0 +1,76 @@
+name: _Release Runner
+
+on:
+  workflow_call:
+    inputs:
+      expected-source-sha:
+        required: true
+        type: string
+      mode:
+        required: true
+        type: string
+    outputs:
+      pool:
+        value: ${{ jobs.select.outputs.pool }}
+
+permissions:
+  contents: read
+
+jobs:
+  select:
+    name: Confirm release runner configuration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      pool: ${{ steps.select.outputs.pool }}
+    steps:
+      - name: Admit the release runner request
+        id: select
+        shell: python
+        env:
+          # Enable only with the reviewed 1ES provenance implementation and qualification.
+          RELEASE_PROVENANCE_READY: "false"
+          RELEASE_POOL: ${{ vars.SITEOPS_RELEASE_POOL }}
+          RELEASE_MODE: ${{ inputs.mode }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected-source-sha }}
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_REF: ${{ github.ref }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          CALLER_WORKFLOW: ${{ github.workflow_ref }}
+          CALLER_EVENT: ${{ github.event_name }}
+        run: |
+          import os
+          import re
+
+          def reject(message):
+              raise SystemExit("::error::" + message)
+
+          mode = os.environ["RELEASE_MODE"]
+          ref = os.environ["SOURCE_REF"]
+          event = os.environ["CALLER_EVENT"]
+          expected = os.environ["EXPECTED_SOURCE_SHA"]
+          if not re.fullmatch("[0-9a-f]{40}", expected) or expected != os.environ["SOURCE_SHA"]:
+              reject("Select the full current source commit before requesting release runners.")
+          workflow = {"preview": "ci.yaml", "release": "release.yaml"}.get(mode)
+          if workflow is None or os.environ["CALLER_WORKFLOW"] != (
+              os.environ["SOURCE_REPOSITORY"] + "/.github/workflows/" + workflow + "@" + ref
+          ):
+              reject("Release runners require the supported CI or Release entry point.")
+          if mode == "preview":
+              if event != "workflow_dispatch" or not ref.startswith("refs/heads/"):
+                  reject("Release previews require an explicit dispatch from a reviewed branch.")
+          elif event not in {"push", "workflow_dispatch"} or ref != "refs/heads/main":
+              reject("Publication candidates require a push or explicit dispatch on main.")
+          pool = os.environ["RELEASE_POOL"]
+          if not re.fullmatch("[A-Za-z0-9][A-Za-z0-9._-]{0,99}", pool):
+              reject("Configure SITEOPS_RELEASE_POOL with this repository's dedicated 1ES pool name.")
+          if os.environ["RELEASE_PROVENANCE_READY"] != "true":
+              reject(
+                  "1ES release artifact execution is not enabled. Current provenance verification "
+                  "requires github-hosted runners. Complete the 1ES runner and provenance "
+                  "qualification before enabling release builds, signing or publication."
+              )
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("pool=" + pool + "\n")
+          print("Release artifact jobs will use the configured 1ES pool. Test runners are unchanged.")

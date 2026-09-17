@@ -52,12 +52,24 @@ permissions:
   contents: read
 
 jobs:
+  release-runner:
+    name: Select release artifact runners
+    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.run-mode == 'installer-check' || inputs.run-mode == 'release-preview') }}
+    uses: ./.github/workflows/_release-runner.yaml
+    with:
+      expected-source-sha: ${{ inputs.expected-source-sha }}
+      mode: preview
+    permissions:
+      contents: read
+
   installer-check:
     name: Check installer (no publication)
+    needs: release-runner
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run-mode == 'installer-check' }}
     uses: ./.github/workflows/_siteops-distribution.yaml
     with:
       expected-source-sha: ${{ inputs.expected-source-sha }}
+      release-pool: ${{ needs.release-runner.outputs.pool }}
     permissions:
       contents: read
       actions: read
@@ -66,13 +78,14 @@ jobs:
 
   release-preview:
     name: Preview release (no publication)
-    needs: [lint, test, validate]
+    needs: [lint, test, validate, release-runner]
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run-mode == 'release-preview' }}
     uses: ./.github/workflows/_release-candidate.yaml
     with:
       expected-source-sha: ${{ inputs.expected-source-sha }}
       intent: ${{ inputs.release-file }}
       dry-run: true
+      release-pool: ${{ needs.release-runner.outputs.pool }}
     permissions:
       contents: read
       actions: read

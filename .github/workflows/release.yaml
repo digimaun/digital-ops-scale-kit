@@ -32,14 +32,25 @@ env:
   SIGNER_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/_siteops-distribution.yaml@${{ github.ref }}
 
 jobs:
+  release-runner:
+    name: Select release artifact runners
+    uses: ./.github/workflows/_release-runner.yaml
+    with:
+      expected-source-sha: ${{ github.event_name != 'workflow_dispatch' && github.sha || inputs.expected-source-sha }}
+      mode: release
+    permissions:
+      contents: read
+
   candidate:
     name: Prepare release candidate
+    needs: release-runner
     uses: ./.github/workflows/_release-candidate.yaml
     with:
       expected-source-sha: ${{ github.event_name != 'workflow_dispatch' && github.sha || inputs.expected-source-sha }}
       intent: ${{ inputs.release-file || '' }}
       before-sha: ${{ github.event.before || '' }}
       dry-run: false
+      release-pool: ${{ needs.release-runner.outputs.pool }}
     permissions:
       contents: read
       actions: read
@@ -48,9 +59,12 @@ jobs:
 
   publish:
     name: Approve tag creation and publication
-    needs: candidate
+    needs: [release-runner, candidate]
     if: needs.candidate.result == 'success' && needs.candidate.outputs.active == 'true'
-    runs-on: ubuntu-24.04
+    runs-on:
+      - self-hosted
+      - ${{ format('1ES.Pool={0}', needs.release-runner.outputs.pool) }}
+      - ${{ format('JobId=siteops-publish-{0}-{1}', github.run_id, github.run_attempt) }}
     concurrency:
       group: release-${{ needs.candidate.outputs.tag }}
       cancel-in-progress: false

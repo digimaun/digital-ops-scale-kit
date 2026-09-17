@@ -134,7 +134,10 @@ def test_ci_rehearsal_requires_an_explicit_manual_request_and_source_commit():
         "inputs.run-mode == 'installer-check' }}"
     )
     assert job["uses"] == "./.github/workflows/_siteops-distribution.yaml"
-    assert job["with"] == {"expected-source-sha": "${{ inputs.expected-source-sha }}"}
+    assert job["with"] == {
+        "expected-source-sha": "${{ inputs.expected-source-sha }}",
+        "release-pool": "${{ needs.release-runner.outputs.pool }}",
+    }
     assert "steps" not in job
     assert "secrets" not in job
     assert job["permissions"] == {
@@ -152,7 +155,7 @@ def test_ci_rehearsal_preserves_normal_ci_permissions_and_cannot_promote():
     assert all(job.get("permissions", {}).get("contents") != "write" for job in CI["jobs"].values())
     assert "release.yaml" not in yaml.safe_dump(CI["jobs"]["installer-check"])
     release = CI["jobs"]["release-preview"]
-    assert release["needs"] == ["lint", "test", "validate"]
+    assert release["needs"] == ["lint", "test", "validate", "release-runner"]
     assert release["if"] == (
         "${{ github.event_name == 'workflow_dispatch' && inputs.run-mode == 'release-preview' }}"
     )
@@ -161,6 +164,7 @@ def test_ci_rehearsal_preserves_normal_ci_permissions_and_cannot_promote():
         "expected-source-sha": "${{ inputs.expected-source-sha }}",
         "intent": "${{ inputs.release-file }}",
         "dry-run": True,
+        "release-pool": "${{ needs.release-runner.outputs.pool }}",
     }
     assert release["permissions"] == {
         "contents": "read",
@@ -225,7 +229,9 @@ def _invocations(log: Path) -> list[list[str]]:
 def test_build_job_executes_source_without_signing_capability():
     build = REUSABLE["jobs"]["build"]
     assert build["permissions"] == {"contents": "read"}
-    assert build["runs-on"] == "ubuntu-24.04"
+    assert build["runs-on"][:2] == [
+        "self-hosted", "${{ format('1ES.Pool={0}', inputs.release-pool) }}",
+    ]
     assert "environment" not in build
     assert all(step.get("uses", "").split("@")[0] != "actions/attest" for step in build["steps"])
 
@@ -264,7 +270,7 @@ def test_build_checks_out_the_asserted_event_commit_without_credentials():
 
 def test_expected_source_sha_is_only_an_assertion():
     inputs = REUSABLE[ON]["workflow_call"]["inputs"]
-    assert set(inputs) == {"expected-source-sha", "version-mode", "report-summary"}
+    assert set(inputs) == {"expected-source-sha", "version-mode", "report-summary", "release-pool"}
     assert REUSABLE[ON]["workflow_call"]["inputs"]["version-mode"]["default"] == "build"
     assert inputs["report-summary"] == {
         "description": "Write the aggregate distribution report to the workflow summary.",

@@ -27,6 +27,44 @@ file must first exist on the repository's default branch. Use the already
 registered CI workflow to preview feature-branch changes. Changing the default
 branch or pushing the feature directly to `main` is not needed for a preview.
 
+## Configure release artifact runners
+
+In each publishing or rehearsal repository, set the Actions repository variable
+`SITEOPS_RELEASE_POOL` to its dedicated 1ES GitHub runner pool name. Register
+the pool for that exact repository. A fork has its own configuration and pool,
+separate from the upstream repository.
+
+Release artifact execution is currently gated before worker allocation.
+The existing provenance verifier requires `github-hosted` evidence, while
+1ES GitHub runners are classified as `self-hosted`. Configuring a pool does
+not enable builds or signing. Enabling this path requires a reviewed provenance
+implementation and qualification of the runner configuration and actual
+attestation evidence. A pool label is not proof of 1ES membership, and the
+current verification requirements remain unchanged.
+
+| Work | Runner |
+|---|---|
+| Runner configuration admission | Public GitHub runner, without source checkout or write permissions |
+| Release preparation, engine and workspace builds, signing, descriptor and payload assembly, publication | Configured 1ES pool |
+| Lint, unit tests, template validation, installation and workspace qualification, result summaries | Public GitHub runners |
+
+The admission job requires the expected source commit and a supported entry
+point before allocating release workers. CI requests release workers only for
+explicit `installer-check` or `release-preview` dispatches. The Release workflow
+requires `main`. Pull request events cannot enter the reusable release producers.
+Missing or malformed pool configuration fails explicitly, with no fallback to
+public runners.
+
+The pool comes from repository configuration, not a release declaration or
+dispatch override. Jobs use the pool label and distinct `JobId` labels for the
+run, attempt and workspace slot. Keep source builds separate from signing and
+publishing jobs. Their permissions and publication approval remain independent
+of runner placement.
+
+Use the maintained runner image for baseline tools. Existing workflow steps
+select Python, install locked packages through the configured feed and verify
+the Bicep compiler before use. A custom image bootstrap is not required.
+
 ## Preview a release without publishing
 
 In **Actions > CI > Run workflow**, select the feature branch and choose:
@@ -50,7 +88,8 @@ artifacts under a content tag. Examples are accepted only for a dry run and
 never trigger publication when merged.
 
 For the default example, the CI preview performs real builds and signing, but
-it cannot publish and cannot be promoted into a release. After ordinary CI, it:
+it cannot publish and cannot be promoted into a release. Once the runner and
+provenance gate above is enabled, it follows ordinary CI with these steps:
 
 1. Prepares the exact release plan and requested engine assets.
 2. Builds each declared workspace with read permissions, using that release

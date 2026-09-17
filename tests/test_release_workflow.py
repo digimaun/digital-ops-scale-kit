@@ -401,7 +401,7 @@ def test_publication_uses_only_the_completed_candidate_and_required_approval():
     condition = " ".join(JOBS["review"]["if"].split())
     assert "needs.distribution.result == 'success'" in condition
     assert "needs.distribution.result == 'skipped'" in condition
-    assert JOBS["publish"]["needs"] == "candidate"
+    assert JOBS["publish"]["needs"] == ["release-runner", "candidate"]
     assert JOBS["publish"]["if"] == "needs.candidate.result == 'success' && needs.candidate.outputs.active == 'true'"
     assert JOBS["candidate"]["uses"] == "./.github/workflows/_release-candidate.yaml"
     assert JOBS["candidate"]["with"]["dry-run"] is False
@@ -1164,7 +1164,7 @@ def test_release_rehearsal_cannot_reach_publishing_permissions():
     assert "release create" not in text and "--method POST" not in text
     ci = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yaml").read_text())
     job = ci["jobs"]["release-preview"]
-    assert job["needs"] == ["lint", "test", "validate"]
+    assert job["needs"] == ["lint", "test", "validate", "release-runner"]
     assert job["with"]["dry-run"] is True
     assert job["permissions"]["contents"] == "read"
 
@@ -1207,6 +1207,7 @@ def test_dry_run_uses_completed_ci_jobs_without_waiting_for_its_own_run(candidat
     required_names = [
         CI_WORKFLOW["jobs"][job]["name"]
         for job in CI_WORKFLOW["jobs"]["release-preview"]["needs"]
+        if job != "release-runner"
     ]
     candidate["responses"][f"repos/{REPO}/actions/runs/42/attempts/1/jobs?per_page=100"] = {
         "status": 200, "body": {"jobs": [

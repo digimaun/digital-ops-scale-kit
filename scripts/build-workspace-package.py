@@ -29,7 +29,11 @@ def main() -> int:
     parser.add_argument("--id", required=True, help="Provider-neutral kit identifier")
     parser.add_argument("--version", required=True, help="Kit version, independent of the engine version")
     parser.add_argument("--requires-siteops", required=True, help="Bounded PEP 440 engine range")
-    parser.add_argument("--engine-version", default=__version__, help="Producer target engine version, without consumer authorization")
+    parser.add_argument(
+        "--target-engine-version", default=__version__, metavar="VERSION",
+        help="Compatibility target checked against --requires-siteops. Defaults to the producer's "
+        "Site Ops version. Does not acquire an engine or authorize consumer use.",
+    )
     parser.add_argument("--require-feature", action="append", default=[], help="Required engine feature")
     parser.add_argument("--include", action="append", default=[], help="Approved companion file or directory")
     parser.add_argument("--license", action="append", required=True, help="Required source-relative license file")
@@ -52,7 +56,7 @@ def main() -> int:
             kit_id=args.id, version=args.version, siteops_range=args.requires_siteops,
             includes=includes, licenses=licenses,
             required_features=tuple(args.require_feature) or ("manifest/v1",),
-            engine_version=args.engine_version, bicep_path=args.bicep,
+            engine_version=args.target_engine_version, bicep_path=args.bicep,
         )
     except (ArtifactError, SourceSnapshotError) as error:
         print(f"Error: {error}", file=sys.stderr)

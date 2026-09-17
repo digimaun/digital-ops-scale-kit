@@ -40,6 +40,32 @@ def _build_step(name):
     return next(step for step in WORKSPACE_WORKFLOW["jobs"]["build"]["steps"] if step.get("name") == name)
 
 
+@pytest.mark.parametrize("script,options", [
+    ("build-workspace-package.py", ("--target-engine-version VERSION",)),
+    ("build-workspace-release.py", ("--root DIRECTORY", "--release-workspace PATH", "--expected-plan-sha SHA256")),
+    ("assemble-workspace-release.py", ("--staging DIRECTORY", "--trusted-root FILE", "--expected-plan-sha SHA256")),
+    ("prepare-workspace-engine.py", ("--control DIRECTORY", "--built-assets DIRECTORY", "--archive-sha SHA256")),
+    ("qualify-workspace-engine.py", (
+        "--engine DIRECTORY", "--expected-engine-selection-sha256 SHA256",
+        "--expected-workspace-inventory-sha256 SHA256", "--state DIRECTORY", "--gh FILE",
+    )),
+    ("stage-release-payload.py", (
+        "--engine-inventory FILE", "--engine-selection FILE", "--expected-engine-inventory-sha256 SHA256",
+        "--expected-engine-selection-sha256 SHA256", "--expected-workspace-inventory-sha256 SHA256",
+    )),
+    ("probe-installed-workspaces.py", ("--spec FILE", "--expected-spec-sha SHA256")),
+])
+def test_release_tool_help_identifies_paths_and_digest_inputs(tmp_path, script, options):
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS / script), "--help"],
+        cwd=tmp_path, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    help_text = " ".join(result.stdout.split())
+    for option in options:
+        assert option in help_text
+
+
 def test_workspace_declaration_is_source_bound_and_does_not_import_referenced_engine(repository):
     request = _workspace(repository)
     _write_source_version(repository, 'raise RuntimeError("never import candidate source")\n')
@@ -370,7 +396,7 @@ def test_workspace_job_uses_the_prepared_candidate_with_no_signing_authority():
     checkout = _build_step("Checkout the event commit")["with"]
     assert checkout["ref"] == "${{ github.sha }}"
     assert checkout["persist-credentials"] is False
-    download = _build_step("Download the prepared workspace plan")["with"]
+    download = _build_step("Download the prepared release plan")["with"]
     assert download["artifact-ids"] == "${{ inputs.plan-artifact-id }}"
     assert download["run-id"] == "${{ github.run_id }}"
     assert download["digest-mismatch"] == "error"

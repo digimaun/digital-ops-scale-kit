@@ -32,7 +32,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--dry-run", action="store_true", help="Prepare a non-publishable rehearsal, allowing committed examples.")
     selection = parser.add_mutually_exclusive_group(required=True)
-    selection.add_argument("--intent")
+    selection.add_argument("--intent", metavar="PATH", help="Committed release.json path relative to the repository.")
     selection.add_argument("--before-sha")
     return parser.parse_args()
 

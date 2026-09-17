@@ -20,23 +20,29 @@ from siteops.cache_filesystem import make_private_directory  # noqa: E402
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in (
-        "repository",
-        "source-sha",
-        "source-ref",
-        "release-file",
-        "expected-plan-sha",
-        "builder-workflow",
+    for name, metavar, help_text in (
+        ("repository", "REPOSITORY", "Source repository as owner/repository."),
+        ("source-sha", "COMMIT", "Exact reviewed Git commit."),
+        ("source-ref", "REF", "Full Git ref for the reviewed source."),
+        ("release-file", "PATH", "Committed release.json path relative to the repository."),
+        ("expected-plan-sha", "SHA256", "Independent SHA-256 of --prepared-plan."),
+        ("builder-workflow", "PATH", "Repository path of the calling workflow approved for built engine provenance."),
     ):
-        parser.add_argument("--" + name, required=True)
-    for name in ("root", "prepared-plan", "output", "control", "trusted-root"):
-        parser.add_argument("--" + name, required=True, type=Path)
-    parser.add_argument("--built-assets", type=Path)
-    parser.add_argument("--archive-sha")
-    parser.add_argument("--wheel-sha")
-    parser.add_argument("--build-number", required=True, type=int)
-    parser.add_argument("--build-attempt", required=True, type=int)
-    parser.add_argument("--dry-run", action="store_true")
+        parser.add_argument("--" + name, required=True, metavar=metavar, help=help_text)
+    for name, metavar, help_text in (
+        ("root", "DIRECTORY", "Source repository containing the reviewed commit."),
+        ("prepared-plan", "FILE", "Prepared release plan selecting the engine and workspaces."),
+        ("output", "DIRECTORY", "New directory for verified engine assets and their selection record."),
+        ("control", "DIRECTORY", "Private directory for verification policy snapshots and downloads."),
+        ("trusted-root", "FILE", "Independently provisioned signing roots."),
+    ):
+        parser.add_argument("--" + name, required=True, type=Path, metavar=metavar, help=help_text)
+    parser.add_argument("--built-assets", type=Path, metavar="DIRECTORY", help="Completed engine build assets. Omit for a referenced engine release.")
+    parser.add_argument("--archive-sha", metavar="SHA256", help="Independent SHA-256 of siteops-install.zip in --built-assets.")
+    parser.add_argument("--wheel-sha", metavar="SHA256", help="Independent SHA-256 of the standalone engine wheel in --built-assets.")
+    parser.add_argument("--build-number", required=True, type=int, help="Candidate workflow run number.")
+    parser.add_argument("--build-attempt", required=True, type=int, help="Candidate workflow run attempt.")
+    parser.add_argument("--dry-run", action="store_true", help="Require preview identities and allow a committed release example.")
     args = parser.parse_args()
     try:
         intent = load_release_intent(
@@ -87,7 +93,7 @@ def main() -> int:
             if isinstance(error, ValueError)
             else "Engine qualification inputs could not be prepared."
         )
-        print(f"workspace-engine: {message}", file=sys.stderr)
+        print(f"prepare-workspace-engine: {message}", file=sys.stderr)
         return 1
     print(
         json.dumps(

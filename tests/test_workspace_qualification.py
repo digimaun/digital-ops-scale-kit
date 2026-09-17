@@ -163,8 +163,8 @@ def test_controller_installs_authenticated_lock_then_uses_selected_engine(qualif
     report = values["root"] / "qualified.json"
     result = checked([
         values["python"], "-I", values["harness"], ROOT,
-        "--engine", values["engine"], "--expected-engine-sha", values["engine_sha"],
-        "--workspaces", values["workspaces"], "--expected-workspace-sha", values["workspace_sha"],
+        "--engine", values["engine"], "--expected-engine-selection-sha256", values["engine_sha"],
+        "--workspaces", values["workspaces"], "--expected-workspace-inventory-sha256", values["workspace_sha"],
         "--trusted-root", values["roots"], "--expected-plan-sha", "e" * 64,
         "--builder-workflow", ".github/workflows/ci.yaml", "--platform", values["platform"],
         "--state", values["root"] / "qualification", "--output", report, "--gh", values["gh"],

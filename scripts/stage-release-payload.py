@@ -92,40 +92,45 @@ def stage(
                 try:
                     path.unlink()
                 except OSError:
-                    print("release-payload: Incomplete output was retained.", file=sys.stderr)
+                    print("stage-release-payload: Incomplete output was retained.", file=sys.stderr)
             try:
                 output.rmdir()
             except OSError:
-                print("release-payload: The incomplete payload directory was retained.", file=sys.stderr)
+                print("stage-release-payload: The incomplete payload directory was retained.", file=sys.stderr)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("plan", "native-inventory", "output", "output-inventory"):
-        parser.add_argument("--" + name, required=True, type=Path)
-    parser.add_argument("--expected-plan-sha", required=True)
-    parser.add_argument("--expected-native-sha", required=True)
-    parser.add_argument("--engine-directory", type=Path)
-    parser.add_argument("--workspace-directory", type=Path)
-    parser.add_argument("--workspace-sha")
-    parser.add_argument("--selected-engine", type=Path)
-    parser.add_argument("--selected-engine-sha")
+    for name, metavar, help_text in (
+        ("plan", "FILE", "Prepared release plan for the approved asset selection."),
+        ("engine-inventory", "FILE", "Frozen inventory of built or referenced engine assets."),
+        ("output", "DIRECTORY", "New directory for the complete publication payload."),
+        ("output-inventory", "FILE", "Final inventory file within a new parent directory."),
+    ):
+        parser.add_argument("--" + name, required=True, type=Path, metavar=metavar, help=help_text)
+    parser.add_argument("--expected-plan-sha", required=True, metavar="SHA256", help="Independent SHA-256 of --plan.")
+    parser.add_argument("--expected-engine-inventory-sha256", required=True, metavar="SHA256", help="Independent SHA-256 of --engine-inventory.")
+    parser.add_argument("--engine-directory", type=Path, metavar="DIRECTORY", help="Built engine assets to publish. Referenced engine assets stay in their release.")
+    parser.add_argument("--workspace-directory", type=Path, metavar="DIRECTORY", help="Qualified workspace assets and their release-assets.json inventory.")
+    parser.add_argument("--expected-workspace-inventory-sha256", metavar="SHA256", help="Independent SHA-256 of release-assets.json in --workspace-directory.")
+    parser.add_argument("--engine-selection", type=Path, metavar="FILE", help="Engine selection record used to qualify the workspaces.")
+    parser.add_argument("--expected-engine-selection-sha256", metavar="SHA256", help="Independent SHA-256 of --engine-selection.")
     args = parser.parse_args()
     try:
         plan = json.loads(read_expected(args.plan, args.expected_plan_sha))
         inventory = stage(
             plan, args.expected_plan_sha,
-            FrozenReleaseAssets.from_bytes(read_expected(args.native_inventory, args.expected_native_sha)), args.output,
+            FrozenReleaseAssets.from_bytes(read_expected(args.engine_inventory, args.expected_engine_inventory_sha256)), args.output,
             engine_directory=args.engine_directory, workspace_directory=args.workspace_directory,
-            workspace_sha=args.workspace_sha, selected_engine=args.selected_engine,
-            selected_engine_sha=args.selected_engine_sha,
+            workspace_sha=args.expected_workspace_inventory_sha256, selected_engine=args.engine_selection,
+            selected_engine_sha=args.expected_engine_selection_sha256,
         )
         args.output_inventory.parent.mkdir(mode=0o700)
         with args.output_inventory.open("xb") as stream:
             stream.write(inventory.serialized())
     except (ReleaseAssetsError, OSError, ValueError) as error:
         message = str(error) if isinstance(error, ValueError) else "Publication payload inputs or output could not be accessed."
-        print(f"release-payload: {message}", file=sys.stderr)
+        print(f"stage-release-payload: {message}", file=sys.stderr)
         return 1
     print("asset-list-sha=" + hashlib.sha256(inventory.serialized()).hexdigest())
     return 0

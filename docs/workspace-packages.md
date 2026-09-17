@@ -188,7 +188,8 @@ The producer checks declared compatibility against the selected engine
 version. This does not establish that the released engine supports the
 workspace. Consumer inspection and extraction still enforce the actual
 installed engine's version and supported features. For an individual package,
-`--engine-version` selects the producer target explicitly.
+`--target-engine-version` sets the compatibility target explicitly. It does
+not acquire an engine or authorize consumer use.
 
 The candidate workflow uses one reusable build/sign path per workspace, with
 bounded parallelism. Its build job has read permissions and consumes the

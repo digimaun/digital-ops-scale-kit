@@ -137,16 +137,23 @@ def run(argv: list[str], *, root: Path, log: Path, environment=None, timeout=180
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("engine", "workspaces", "trusted-root", "state", "output", "gh"):
-        parser.add_argument("--" + name, required=True, type=Path)
-    for name in (
-        "expected-engine-sha",
-        "expected-workspace-sha",
-        "expected-plan-sha",
-        "builder-workflow",
-        "platform",
+    for name, metavar, help_text in (
+        ("engine", "DIRECTORY", "Prepared engine assets and workspace-engine.json selection record."),
+        ("workspaces", "DIRECTORY", "Verified workspace assets and release-assets.json inventory."),
+        ("trusted-root", "FILE", "Independently provisioned signing roots."),
+        ("state", "DIRECTORY", "New private directory outside the assets for installation, policy and logs."),
+        ("output", "FILE", "New qualification result file."),
+        ("gh", "FILE", "Trusted GitHub CLI executable used for provenance verification."),
     ):
-        parser.add_argument("--" + name, required=True)
+        parser.add_argument("--" + name, required=True, type=Path, metavar=metavar, help=help_text)
+    for name, metavar, help_text in (
+        ("expected-engine-selection-sha256", "SHA256", "Independent SHA-256 of workspace-engine.json in --engine."),
+        ("expected-workspace-inventory-sha256", "SHA256", "Independent SHA-256 of release-assets.json in --workspaces."),
+        ("expected-plan-sha", "SHA256", "Independent SHA-256 of the prepared release plan."),
+        ("builder-workflow", "PATH", "Repository path of the calling workflow approved for candidate provenance."),
+        ("platform", "PLATFORM", "Platform from the verified engine matrix: linux-x86_64 or windows-x86_64."),
+    ):
+        parser.add_argument("--" + name, required=True, metavar=metavar, help=help_text)
     args = parser.parse_args()
     try:
         if importlib.metadata.version("pip") != "26.2.1":
@@ -165,9 +172,9 @@ def main() -> int:
             raise ArtifactError(
                 "Qualification requires new private state outside the selected assets."
             )
-        selection = EngineSelection.read(args.engine / SELECTION_NAME, args.expected_engine_sha)
+        selection = EngineSelection.read(args.engine / SELECTION_NAME, args.expected_engine_selection_sha256)
         raw = (args.workspaces / "release-assets.json").read_bytes()
-        if hashlib.sha256(raw).hexdigest() != args.expected_workspace_sha:
+        if hashlib.sha256(raw).hexdigest() != args.expected_workspace_inventory_sha256:
             raise ArtifactError(
                 "Workspace qualification assets differ from the prepared inventory."
             )
@@ -286,7 +293,7 @@ def main() -> int:
             "descriptor": descriptor.document(),
             "policy": str(workspace_policy.policy_file),
             "trustedRoot": str(workspace_policy.root),
-            "workspaceInventorySha256": args.expected_workspace_sha,
+            "workspaceInventorySha256": args.expected_workspace_inventory_sha256,
         }
         specification = (json.dumps(spec, sort_keys=True) + "\n").encode()
         path = args.state / "probe.json"
@@ -311,7 +318,7 @@ def main() -> int:
             type(report) is not dict
             or report.get("kind") != "WorkspaceEngineQualification"
             or report.get("engineVersion") != selection.version
-            or report.get("workspaceInventorySha256") != args.expected_workspace_sha
+            or report.get("workspaceInventorySha256") != args.expected_workspace_inventory_sha256
             or type(report.get("packages")) is not int
             or report["packages"] != len(workspace_descriptor.workspaces)
             or type(report.get("catalogManifests")) is not int or report["catalogManifests"] < 0
@@ -321,7 +328,7 @@ def main() -> int:
             raise ArtifactError(
                 "The installed engine returned an unsupported qualification result."
             )
-        report["engineSelectionSha256"] = args.expected_engine_sha
+        report["engineSelectionSha256"] = args.expected_engine_selection_sha256
         report["planSha256"] = args.expected_plan_sha
         report["target"] = {"python": target.python, "platform": target.platform}
         with args.output.open("x", encoding="utf-8") as stream:
@@ -332,7 +339,7 @@ def main() -> int:
             if isinstance(error, ValueError)
             else "Workspace qualification could not complete within its execution boundary."
         )
-        print(f"workspace-qualification: {message}", file=sys.stderr)
+        print(f"qualify-workspace-engine: {message}", file=sys.stderr)
         return 1
     print("The selected installed engine consumed the frozen workspace packages.")
     return 0

@@ -1307,6 +1307,22 @@ def test_git_producer_uses_reviewed_source_not_ignored_files_or_cwd_tools(git_sn
     assert "PRIVATE_SENTINEL" not in result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("target,compatible", [("1.2.3", True), ("2.0.0", False)])
+def test_git_producer_checks_the_explicit_target_engine_version(git_snapshot, tmp_path, target, compatible):
+    root, sha = git_snapshot
+    output = tmp_path / "package.zip"
+    result = _producer(root, sha, output, "--target-engine-version", target)
+    assert result.returncode == (0 if compatible else 1), result.stdout + result.stderr
+    assert output.exists() is compatible
+    if compatible:
+        receipt = json.loads(result.stdout)
+        assert receipt["provenance"] == "not-established"
+        inspected = package.inspect_package(output, receipt["sha256"])
+        assert inspected.metadata.siteops_range == ">=1.0.0b1,<2"
+    else:
+        assert "This package requires a different Site Ops version." in result.stderr
+
+
 @pytest.mark.parametrize("fault", ["dirty", "wrong-commit", "export-ignore"])
 def test_git_producer_refuses_unidentified_or_incomplete_source(git_snapshot, tmp_path, fault):
     root, sha = git_snapshot

@@ -29,20 +29,20 @@ from siteops.github_attestation import (  # noqa: E402
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", required=True, type=Path)
-    parser.add_argument("--repository", required=True)
-    parser.add_argument("--source-sha", required=True)
-    parser.add_argument("--source-ref", required=True)
-    parser.add_argument("--release-file", required=True)
-    parser.add_argument("--prepared-plan", required=True, type=Path)
-    parser.add_argument("--expected-plan-sha", required=True)
-    parser.add_argument("--staging", required=True, type=Path)
-    parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--build-number", required=True, type=int)
-    parser.add_argument("--build-attempt", required=True, type=int)
-    parser.add_argument("--trust-policy", required=True, type=Path)
-    parser.add_argument("--trusted-root", required=True, type=Path)
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--root", required=True, type=Path, metavar="DIRECTORY", help="Source repository containing the reviewed commit.")
+    parser.add_argument("--repository", required=True, help="Source repository as owner/repository.")
+    parser.add_argument("--source-sha", required=True, metavar="COMMIT", help="Exact reviewed Git commit.")
+    parser.add_argument("--source-ref", required=True, metavar="REF", help="Full Git ref for the reviewed source.")
+    parser.add_argument("--release-file", required=True, metavar="PATH", help="Committed release.json path relative to the repository.")
+    parser.add_argument("--prepared-plan", required=True, type=Path, metavar="FILE", help="Prepared release plan for the staged workspaces.")
+    parser.add_argument("--expected-plan-sha", required=True, metavar="SHA256", help="Independent SHA-256 of --prepared-plan.")
+    parser.add_argument("--staging", required=True, type=Path, metavar="DIRECTORY", help="Downloaded workspace build artifacts, including packages, records and proofs.")
+    parser.add_argument("--output", required=True, type=Path, metavar="DIRECTORY", help="New directory for verified workspace assets, descriptor and frozen inventory.")
+    parser.add_argument("--build-number", required=True, type=int, help="Run number shared by the workspace builds.")
+    parser.add_argument("--build-attempt", required=True, type=int, help="Run attempt shared by the workspace builds.")
+    parser.add_argument("--trust-policy", required=True, type=Path, metavar="FILE", help="Independent verification policy outside staged content.")
+    parser.add_argument("--trusted-root", required=True, type=Path, metavar="FILE", help="Independent signing roots approved by the verification policy.")
+    parser.add_argument("--dry-run", action="store_true", help="Require preview identities and allow a committed release example.")
     args = parser.parse_args()
     try:
         intent = load_release_intent(
@@ -74,7 +74,7 @@ def main() -> int:
         )
     except (ReleaseIntentError, ReleaseAssetsError, ArtifactError, OSError) as error:
         message = str(error) if isinstance(error, ValueError) else "Workspace collection could not access its inputs or output."
-        print(f"workspace-release: {message}", file=sys.stderr)
+        print(f"assemble-workspace-release: {message}", file=sys.stderr)
         return 1
     print(json.dumps({
         "inventorySha256": hashlib.sha256(inventory.serialized()).hexdigest(),

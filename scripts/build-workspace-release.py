@@ -32,19 +32,19 @@ from siteops.browse import BrowseError  # noqa: E402
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", required=True, type=Path)
-    parser.add_argument("--repository", required=True)
-    parser.add_argument("--expected-source-sha", required=True)
-    parser.add_argument("--source-ref", required=True)
-    parser.add_argument("--release-file", required=True)
-    parser.add_argument("--output-dir", required=True, type=Path)
-    parser.add_argument("--build-number", type=int)
-    parser.add_argument("--build-attempt", type=int)
-    parser.add_argument("--bicep", type=Path)
-    parser.add_argument("--dry-run", action="store_true", help="Allow a committed release example")
-    parser.add_argument("--prepared-plan", type=Path, help="Existing candidate plan to compare with committed intent")
-    parser.add_argument("--expected-plan-sha", help="Independent SHA-256 of the prepared candidate plan")
-    parser.add_argument("--release-workspace", help="Build only this exact workspace from the reviewed declaration")
+    parser.add_argument("--root", required=True, type=Path, metavar="DIRECTORY", help="Clean source repository.")
+    parser.add_argument("--repository", required=True, help="Source repository as owner/repository.")
+    parser.add_argument("--expected-source-sha", required=True, metavar="COMMIT", help="Exact reviewed Git commit.")
+    parser.add_argument("--source-ref", required=True, metavar="REF", help="Full Git ref for the reviewed source.")
+    parser.add_argument("--release-file", required=True, metavar="PATH", help="Committed release.json path relative to the repository.")
+    parser.add_argument("--output-dir", required=True, type=Path, metavar="DIRECTORY", help="New absolute directory for unsigned packages and their build record.")
+    parser.add_argument("--build-number", type=int, help="Engine build run number. Required when the release builds an engine.")
+    parser.add_argument("--build-attempt", type=int, help="Engine build run attempt. Required when the release builds an engine.")
+    parser.add_argument("--bicep", type=Path, metavar="FILE", help="Provisioned Bicep executable to use through Azure CLI.")
+    parser.add_argument("--dry-run", action="store_true", help="Allow a committed release example and mark the output as a preview.")
+    parser.add_argument("--prepared-plan", type=Path, metavar="FILE", help="Prepared release plan to compare with the committed declaration.")
+    parser.add_argument("--expected-plan-sha", metavar="SHA256", help="Independent SHA-256 of --prepared-plan. Supply both options together.")
+    parser.add_argument("--release-workspace", metavar="PATH", help="Build only this exact workspace path from the reviewed declaration.")
     args = parser.parse_args()
     if (args.prepared_plan is None) != (args.expected_plan_sha is None):
         parser.error("--prepared-plan and --expected-plan-sha must be supplied together")
@@ -113,10 +113,10 @@ def main() -> int:
             os.fsync(stream.fileno())
         complete = True
     except (ReleaseIntentError, WorkspaceReleaseError, SourceSnapshotError, ArtifactError, BrowseError) as error:
-        print(f"workspace-release: {error}", file=sys.stderr)
+        print(f"build-workspace-release: {error}", file=sys.stderr)
         return 1
     except OSError:
-        print("workspace-release: Workspace output could not be created or retained.", file=sys.stderr)
+        print("build-workspace-release: Workspace output could not be created or retained.", file=sys.stderr)
         return 1
     finally:
         if output_created and not complete:
@@ -124,11 +124,11 @@ def main() -> int:
                 try:
                     path.unlink()
                 except OSError:
-                    print("workspace-release: An incomplete output file could not be removed.", file=sys.stderr)
+                    print("build-workspace-release: An incomplete output file could not be removed.", file=sys.stderr)
             try:
                 output.rmdir()
             except OSError:
-                print("workspace-release: The incomplete output directory was retained.", file=sys.stderr)
+                print("build-workspace-release: The incomplete output directory was retained.", file=sys.stderr)
     print(json.dumps({
         "file": BUILD_RECORD, "sha256": hashlib.sha256(raw).hexdigest(),
         "workspaces": len(workspaces), "provenance": "not-established",

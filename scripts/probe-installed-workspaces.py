@@ -184,8 +184,8 @@ def qualify(spec: dict) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--spec", required=True, type=Path)
-    parser.add_argument("--expected-spec-sha", required=True)
+    parser.add_argument("--spec", required=True, type=Path, metavar="FILE", help="Qualification specification from the engine installation controller.")
+    parser.add_argument("--expected-spec-sha", required=True, metavar="SHA256", help="Independent SHA-256 of --spec.")
     args = parser.parse_args()
     try:
         raw = _read(args.spec, 2 * 1024 * 1024)
@@ -210,7 +210,7 @@ def main() -> int:
         result = qualify(spec)
     except (ImportError, AttributeError):
         print(
-            "workspace-qualification: The selected installed engine lacks the required workspace interfaces.",
+            "probe-installed-workspaces: The selected installed engine lacks the required workspace interfaces.",
             file=sys.stderr,
         )
         return 1
@@ -220,7 +220,7 @@ def main() -> int:
             if isinstance(error, ValueError)
             else "Qualification inputs could not be consumed."
         )
-        print(f"workspace-qualification: {message}", file=sys.stderr)
+        print(f"probe-installed-workspaces: {message}", file=sys.stderr)
         return 1
     print(json.dumps(result, sort_keys=True))
     return 0

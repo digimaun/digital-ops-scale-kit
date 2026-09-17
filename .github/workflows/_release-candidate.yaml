@@ -58,6 +58,8 @@ on:
         value: ${{ jobs.workspace-assets.outputs.artifact-id }}
       workspace-inventory-sha:
         value: ${{ jobs.workspace-assets.outputs.inventory-sha }}
+      engine-selection-sha:
+        value: ${{ jobs.engine-input.outputs.selection-sha }}
 
 permissions:
   contents: read
@@ -444,15 +446,349 @@ jobs:
           compression-level: 0
           retention-days: 30
 
+  engine-input:
+    name: Select workspace qualification engine
+    needs: [prepare, distribution]
+    if: >-
+      always() && needs.prepare.result == 'success' && needs.prepare.outputs.workspaces == 'true' &&
+      ((needs.prepare.outputs.bundle == 'true' && needs.distribution.result == 'success') ||
+       (needs.prepare.outputs.bundle == 'false' && needs.distribution.result == 'skipped'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      selection-sha: ${{ steps.select.outputs.selection-sha }}
+      matrix: ${{ steps.select.outputs.matrix }}
+    env:
+      HOME: ${{ runner.temp }}/engine-selection-home
+      INTENT_PATH: ${{ needs.prepare.outputs.intent-path }}
+      EXPECTED_PLAN_SHA: ${{ needs.prepare.outputs.plan-sha }}
+      BUILT_ENGINE: ${{ needs.prepare.outputs.bundle }}
+      ARCHIVE_SHA: ${{ needs.distribution.outputs.archive-sha256 }}
+      WHEEL_SHA: ${{ needs.distribution.outputs.wheel-sha256 }}
+      BUILDER_REF: ${{ github.workflow_ref }}
+    steps:
+      - name: Checkout engine selection tools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Download the prepared plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.artifact-id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/engine-plan
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Download the completed engine build
+        if: needs.prepare.outputs.bundle == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.distribution.outputs.staging-artifact-id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/built-engine
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Setup selection Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Prepare selection tooling and roots
+        shell: bash
+        env:
+          PIP_CONFIG_FILE: /dev/null
+          PIP_INDEX_URL: https://packagefeedproxy.microsoft.io/pypi/simple/
+          PIP_EXTRA_INDEX_URL: ""
+          PIP_NO_INPUT: "1"
+          PIP_KEYRING_PROVIDER: disabled
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$HOME"
+          python -m venv "$RUNNER_TEMP/engine-tools"
+          "$RUNNER_TEMP/engine-tools/bin/python" -m pip install --require-hashes --only-binary=:all: --no-cache-dir \
+            -r scripts/siteops-build-requirements.txt -r scripts/siteops-runtime-requirements.txt \
+            > "$RUNNER_TEMP/engine-tooling.log" 2>&1
+          gh attestation trusted-root > "$RUNNER_TEMP/engine-roots.json" 2> "$RUNNER_TEMP/engine-roots.err"
+
+      - name: Freeze the selected engine
+        id: select
+        shell: bash
+        run: |
+          set -euo pipefail
+          arguments=()
+          if [[ "$DRY_RUN" == "true" ]]; then arguments+=(--dry-run); fi
+          if [[ "$BUILT_ENGINE" == "true" ]]; then
+            arguments+=(--built-assets "$RUNNER_TEMP/built-engine" --archive-sha "$ARCHIVE_SHA" --wheel-sha "$WHEEL_SHA")
+          fi
+          builder="${BUILDER_REF#"$GITHUB_REPOSITORY/"}"
+          builder="${builder%"@$SOURCE_REF"}"
+          if ! "$RUNNER_TEMP/engine-tools/bin/python" -B scripts/prepare-workspace-engine.py \
+            --root "$GITHUB_WORKSPACE" --repository "$GITHUB_REPOSITORY" \
+            --source-sha "$SOURCE_SHA" --source-ref "$SOURCE_REF" --release-file "$INTENT_PATH" \
+            --prepared-plan "$RUNNER_TEMP/engine-plan/plan.json" --expected-plan-sha "$EXPECTED_PLAN_SHA" \
+            --trusted-root "$RUNNER_TEMP/engine-roots.json" --control "$RUNNER_TEMP/engine-control" \
+            --output "$RUNNER_TEMP/selected-engine" --builder-workflow "$builder" \
+            --build-number "$GITHUB_RUN_ID" --build-attempt "$GITHUB_RUN_ATTEMPT" \
+            "${arguments[@]}" > "$RUNNER_TEMP/engine-selection.json" 2> "$RUNNER_TEMP/engine-selection.err"; then
+            echo "::error::The exact selected engine could not be acquired and verified."
+            exit 1
+          fi
+          python3 -c '
+          import json, os
+          from pathlib import Path
+          result = json.loads((Path(os.environ["RUNNER_TEMP"]) / "engine-selection.json").read_bytes())
+          print("selection-sha=" + result["selectionSha256"])
+          print("matrix=" + json.dumps(result["matrix"], separators=(",", ":")))
+          ' >> "$GITHUB_OUTPUT"
+
+      - name: Retain selected engine inputs
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: workspace-engine-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/selected-engine
+          overwrite: false
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  workspace-qualify:
+    name: Qualify workspace engine (${{ matrix.os }}, Python ${{ matrix.python }})
+    needs: [prepare, engine-input, workspace-assets]
+    if: >-
+      always() && needs.prepare.outputs.workspaces == 'true' &&
+      needs.engine-input.result == 'success' && needs.workspace-assets.result == 'success'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.engine-input.outputs.matrix) }}
+    env:
+      EXPECTED_ENGINE_SHA: ${{ needs.engine-input.outputs.selection-sha }}
+      EXPECTED_WORKSPACE_SHA: ${{ needs.workspace-assets.outputs.inventory-sha }}
+      EXPECTED_PLAN_SHA: ${{ needs.prepare.outputs.plan-sha }}
+      QUALIFICATION_PLATFORM: ${{ matrix.platform }}
+      BUILDER_REF: ${{ github.workflow_ref }}
+    steps:
+      - name: Checkout qualification tools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Setup target Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Download selected engine inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.engine-input.outputs.artifact-id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/qualification-engine
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Download frozen workspace assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.workspace-assets.outputs.artifact-id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/qualification-workspaces
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Qualify through the installed engine
+        shell: bash
+        env:
+          PIP_INDEX_URL: https://packagefeedproxy.microsoft.io/pypi/simple/
+          PIP_EXTRA_INDEX_URL: ""
+          PIP_NO_INPUT: "1"
+          PIP_KEYRING_PROVIDER: disabled
+        run: |
+          set -euo pipefail
+          umask 077
+          unset PYTHONPATH PYTHONHOME
+          temp="${RUNNER_TEMP//\\//}"
+          export PIP_CONFIG_FILE="$(python -c 'import os; print(os.devnull)')"
+          export HOME="$temp/qualification-home"
+          export GH_CONFIG_DIR="$HOME/github"
+          mkdir -p "$HOME"
+          python -m venv "$temp/qualification-tools"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            python="$temp/qualification-tools/Scripts/python.exe"
+          else
+            python="$temp/qualification-tools/bin/python"
+          fi
+          "$python" -m pip install --require-hashes --only-binary=:all: --no-cache-dir \
+            -r scripts/siteops-build-requirements.txt -r scripts/siteops-runtime-requirements.txt \
+            > "$temp/qualification-tooling.log" 2>&1
+          gh attestation trusted-root > "$temp/qualification-roots.json" 2> "$temp/qualification-roots.err"
+          gh_path="$(command -v gh)"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then gh_path="$(cygpath -w "$gh_path")"; fi
+          builder="${BUILDER_REF#"$GITHUB_REPOSITORY/"}"
+          builder="${builder%"@$SOURCE_REF"}"
+          if ! "$python" -B scripts/qualify-workspace-engine.py \
+            --engine "$temp/qualification-engine" --expected-engine-sha "$EXPECTED_ENGINE_SHA" \
+            --workspaces "$temp/qualification-workspaces" --expected-workspace-sha "$EXPECTED_WORKSPACE_SHA" \
+            --expected-plan-sha "$EXPECTED_PLAN_SHA" --trusted-root "$temp/qualification-roots.json" \
+            --state "$temp/workspace-qualification" --output "$temp/workspace-qualification.json" \
+            --gh "$gh_path" --builder-workflow "$builder" --platform "$QUALIFICATION_PLATFORM" \
+            > "$temp/workspace-qualification.out" 2> "$temp/workspace-qualification.err"; then
+            echo "::error::The selected installed engine did not qualify the frozen workspaces."
+            exit 1
+          fi
+
+      - name: Retain workspace qualification result
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: workspace-qualification-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.platform }}-${{ matrix.python }}
+          path: ${{ runner.temp }}/workspace-qualification.json
+          overwrite: false
+          if-no-files-found: error
+          retention-days: 30
+
+  workspace-qualified:
+    name: Confirm complete workspace qualification
+    needs: [prepare, engine-input, workspace-assets, workspace-qualify]
+    if: >-
+      always() && needs.prepare.outputs.workspaces == 'true' &&
+      needs.engine-input.result == 'success' && needs.workspace-assets.result == 'success' &&
+      needs.workspace-qualify.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    env:
+      EXPECTED_ENGINE_SHA: ${{ needs.engine-input.outputs.selection-sha }}
+      EXPECTED_WORKSPACE_SHA: ${{ needs.workspace-assets.outputs.inventory-sha }}
+      EXPECTED_PLAN_SHA: ${{ needs.prepare.outputs.plan-sha }}
+    steps:
+      - name: Download engine qualification identity
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.engine-input.outputs.artifact-id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/qualification-identity
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Download the exact qualification plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.artifact-id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/qualification-plan
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Download every qualification cell
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: workspace-qualification-${{ github.run_id }}-${{ github.run_attempt }}-*
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/qualification-results
+          merge-multiple: false
+          digest-mismatch: error
+
+      - name: Require the complete frozen qualification matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -c '
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"])
+          raw = (root / "qualification-identity/workspace-engine.json").read_bytes()
+          plan_raw = (root / "qualification-plan/plan.json").read_bytes()
+          if (
+              len(raw) > 2097152 or len(plan_raw) > 1048576
+              or hashlib.sha256(raw).hexdigest() != os.environ["EXPECTED_ENGINE_SHA"]
+              or hashlib.sha256(plan_raw).hexdigest() != os.environ["EXPECTED_PLAN_SHA"]
+          ):
+              raise SystemExit("::error::Qualification source identities changed.")
+          engine, plan = json.loads(raw), json.loads(plan_raw)
+          if engine["candidate"] != plan["source"] or engine["planSha256"] != os.environ["EXPECTED_PLAN_SHA"]:
+              raise SystemExit("::error::Qualification inputs describe another candidate.")
+          prefix = "workspace-qualification-" + os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"] + "-"
+          expected = {
+              prefix + target["platform"] + "-" + target["python"]: target
+              for target in engine["targets"]
+          }
+          directory = root / "qualification-results"
+          entries = list(directory.iterdir())
+          if (
+              not 1 <= len(expected) == len(engine["targets"]) <= 10
+              or len(entries) != len(expected) or {path.name for path in entries} != set(expected)
+              or any(path.is_symlink() or not path.is_dir() for path in entries)
+          ):
+              raise SystemExit("::error::The qualification matrix is missing or contains unexpected cells.")
+          counts = set()
+          for name, target in expected.items():
+              folder = directory / name
+              if {path.name for path in folder.iterdir()} != {"workspace-qualification.json"}:
+                  raise SystemExit("::error::A qualification cell has an unexpected inventory.")
+              path = folder / "workspace-qualification.json"
+              if path.is_symlink() or not path.is_file() or path.stat().st_size > 1048576:
+                  raise SystemExit("::error::A qualification cell is not a bounded regular result.")
+              result = json.loads(path.read_bytes())
+              if (
+                  result.get("apiVersion") != "siteops.release.qualification/v1"
+                  or result.get("kind") != "WorkspaceEngineQualification"
+                  or result.get("engineVersion") != engine["version"]
+                  or result.get("engineSelectionSha256") != os.environ["EXPECTED_ENGINE_SHA"]
+                  or result.get("workspaceInventorySha256") != os.environ["EXPECTED_WORKSPACE_SHA"]
+                  or result.get("planSha256") != os.environ["EXPECTED_PLAN_SHA"]
+                  or result.get("target") != target
+                  or type(result.get("packages")) is not int or result["packages"] != len(plan["workspaces"])
+                  or type(result.get("catalogManifests")) is not int or result["catalogManifests"] < 0
+                  or result.get("deployment") != "not-run" or result.get("workloadHealth") != "not-checked"
+              ):
+                  raise SystemExit("::error::A qualification result differs from the selected engine and workspaces.")
+              counts.add(result["catalogManifests"])
+          if len(counts) != 1:
+              raise SystemExit("::error::Qualification targets disagreed about the manifest catalog.")
+          print("Every declared engine target consumed the frozen workspace package set.")
+          '
+
   review:
     name: Prepare release summary
-    needs: [prepare, distribution, workspace-assets]
+    needs: [prepare, distribution, workspace-assets, workspace-qualified]
     if: >-
       always() && needs.prepare.result == 'success' &&
       needs.prepare.outputs.active == 'true' &&
       ((needs.prepare.outputs.bundle == 'true' && needs.distribution.result == 'success') ||
        (needs.prepare.outputs.bundle == 'false' && needs.distribution.result == 'skipped')) &&
-      ((needs.prepare.outputs.workspaces == 'true' && needs.workspace-assets.result == 'success') ||
+      ((needs.prepare.outputs.workspaces == 'true' && needs.workspace-assets.result == 'success' && needs.workspace-qualified.result == 'success') ||
        (needs.prepare.outputs.workspaces == 'false' && needs.workspace-assets.result == 'skipped'))
     runs-on: ubuntu-24.04
     timeout-minutes: 45

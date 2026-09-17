@@ -115,10 +115,11 @@ def bundle_factory(tmp_path, monkeypatch):
     sys.modules[spec.name] = builder
     spec.loader.exec_module(builder)
 
-    def create(number: int = 1, *, app: bool = True):
+    def create(number: int = 1, *, app: bool = True, version: str | None = None, source_sha: str = "a" * 40):
         root = tmp_path / f"bundle {number}"
         (root / "wheels").mkdir(parents=True)
-        version = f"1.0.0b1+build.{number}.1.gaaaaaaaaaaaa"
+        base_version = version or "1.0.0b1"
+        version = version or f"1.0.0b1+build.{number}.1.g{source_sha[:12]}"
         application = root / "wheels" / f"siteops-{version}-py3-none-any.whl"
         dependency = (
             root / "wheels"
@@ -161,9 +162,9 @@ def bundle_factory(tmp_path, monkeypatch):
         )
         manifest = BundleManifest(
             version=version,
-            base_version="1.0.0b1",
+            base_version=base_version,
             repository="example/publisher",
-            source_sha="a" * 40,
+            source_sha=source_sha,
             source_ref="refs/heads/main",
             build_number=number,
             build_attempt=1,

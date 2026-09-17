@@ -6,9 +6,10 @@ inspection of every ZIP or a descriptive index.
 
 [`project pin`](projects.md) acquires this source and connects its verified
 workspace to ordinary planning and deployment. Release candidate preparation
-can build workspace packages, attest them and generate this descriptor.
-Workspace publication remains gated on qualification and complete release
-integration.
+can build workspace packages, attest them, generate this descriptor and
+qualify their consumption through the selected installed engine.
+Workspace publication remains gated on complete release integration and
+the applicable release evidence.
 
 ## Descriptor
 

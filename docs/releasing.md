@@ -52,6 +52,11 @@ jobs attest each package and its build record. A read-only collector verifies
 those subjects before generating the workspace routing descriptor.
 Workspace publication additionally requires qualification of the selected
 engine and the complete approved asset inventory.
+The workspace gate installs that exact engine from its authenticated lock,
+checks package/cache and guarded catalog-loading behavior on its declared
+Windows/Linux Python targets, and requires a complete set of results bound
+to the same engine, workspaces and plan. It is separate from live workload
+qualification and from the final publisher integration.
 The final summary shows one Python/platform matrix and a link to the attested
 release assets. Individual job logs remain available for diagnosis.
 

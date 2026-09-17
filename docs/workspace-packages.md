@@ -206,8 +206,40 @@ the package against the reviewed declaration, and then generates
 
 The local build command still produces unsigned files only. The candidate's
 workspace proofs and descriptor are retained as Actions artifacts. Actual
-engine qualification and publication remain separate gates. A candidate
-must complete those gates before its workspace assets can be published.
+engine qualification and publication are separate gates.
+
+## Qualify against the selected engine
+
+Workspace qualification uses the actual selected engine installation. A
+combined release reuses the completed engine build. A content release
+acquires the exact referenced engine assets without rebuilding them from
+the current checkout. The ZIP and standalone wheel are verified before
+inspection, and their source, version and identical application wheel bytes
+are retained with the qualification inputs.
+
+The qualification transfer path is anonymous and bounded to 128 MiB per
+native engine asset and 2 MiB per detached proof. It uses the existing
+approved-origin HTTPS transfer boundary. This limit applies to workspace
+qualification, not to ordinary direct wheel installation.
+
+For each Windows/Linux and Python target declared by that engine, a new
+application environment consumes its authenticated `pylock.toml` through
+stock pip. The probe runs with isolated Python imports, confirms the exact
+installed version and module location, then exercises package compatibility,
+protected cache publication and reuse, and guarded loading of catalog
+manifests. Source checkout imports cannot satisfy this gate.
+
+The result reports package and catalog counts separately. It loads no
+operator Site values and performs no deployment. It does not claim target
+authorization, executable-plan parity, or workload health. The final matrix
+gate requires every declared target's result to name the same frozen engine,
+workspace inventory and plan.
+
+Direct `pip install <wheel-url>` and `pipx install <wheel-url>` remain
+available through the [installation guide](install-siteops.md). The isolated
+qualification environment is release tooling, not another operator installer.
+Final publisher integration and the applicable live release evidence remain
+required before publishing workspace content.
 
 ## Package identities
 

@@ -42,8 +42,6 @@ on:
         value: ${{ jobs.review.outputs.wheel-sha }}
       asset-list-sha:
         value: ${{ jobs.review.outputs.asset-list-sha }}
-      bundle-artifact-id:
-        value: ${{ jobs.distribution.outputs.staging-artifact-id }}
       payload-artifact-id:
         value: ${{ jobs.review.outputs.payload-artifact-id }}
       assets-artifact-id:

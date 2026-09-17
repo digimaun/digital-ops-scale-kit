@@ -1,0 +1,30 @@
+{
+  "tag": "v0.0.0.dev0",
+  "headline": "Workspace release preview",
+  "siteops": {
+    "build": true
+  },
+  "workspaces": [
+    {
+      "workspace": "workspaces/iot-operations",
+      "id": "azure.iot-operations",
+      "package": "iot-operations.zip",
+      "compatibility": {
+        "siteops": ">=1.0.0b1,<2",
+        "requiredFeatures": [
+          "manifest/v1",
+          "composition/v1",
+          "manifest-selection/v1"
+        ]
+      },
+      "include": [
+        "docs",
+        "README.md"
+      ],
+      "licenses": [
+        "LICENSE",
+        "ThirdPartyNotices.txt"
+      ]
+    }
+  ]
+}

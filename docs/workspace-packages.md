@@ -193,8 +193,8 @@ installed engine's version and supported features. For an individual package,
 The candidate workflow uses one reusable build/sign path per workspace, with
 bounded parallelism. Its build job has read permissions and consumes the
 prepared plan artifact from the same run. It restores the committed Python
-locks through the configured feed, provisions the selected Bicep version
-through Azure CLI, and produces the selected workspace with private
+locks through the configured feed, verifies the selected Bicep binary against
+the SHA-256 pinned in workflow source before use, and produces the workspace with private
 configuration and temporary directories.
 
 A separate signing job downloads only that workspace's build artifact.

@@ -390,20 +390,27 @@ def test_workspace_job_uses_the_prepared_candidate_with_no_signing_authority():
     assert '--prepared-plan "$RUNNER_TEMP/workspace-plan/plan.json" --expected-plan-sha "$EXPECTED_PLAN_SHA"' in production
 
 
-@pytest.mark.parametrize("failure", [None, "python", "bicep"])
+@pytest.mark.parametrize("failure", [None, "python", "bicep", "checksum"])
 def test_workspace_tooling_setup_uses_locked_feed_and_private_configuration(tmp_path, failure):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     commands = tmp_path / "commands"
-    for name in ("python", "az"):
-        write_executable(bin_dir / name, """#!/usr/bin/env bash
+    write_executable(bin_dir / "python", """#!/usr/bin/env bash
 case "$(basename "$0"):$1:$2" in
-  python:-m:venv|python:-m:pip|az:bicep:install) ;;
+  python:-m:venv|python:-m:pip) ;;
   *) exit 99 ;;
 esac
 printf '%s %s\\n' "$(basename "$0")" "$*" >> "$TOOL_CALLS"
 if [[ "$(basename "$0")" == python && "$FAIL_TOOL" == python && "$2" == pip ]]; then exit 7; fi
-if [[ "$(basename "$0")" == az && "$FAIL_TOOL" == bicep ]]; then exit 8; fi
+""")
+    write_executable(bin_dir / "curl", """#!/usr/bin/env bash
+printf 'curl %s\\n' "$*" >> "$TOOL_CALLS"
+[[ "$*" == *"https://github.com/Azure/bicep/releases/download/v0.45.15/bicep-linux-x64"* ]] || exit 99
+if [[ "$FAIL_TOOL" == bicep ]]; then exit 8; fi
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == --output ]]; then output="$2"; shift 2; else shift; fi
+done
+printf 'controlled compiler bytes' > "$output"
 """)
     runtime = tmp_path / "runtime"
     runtime.mkdir()
@@ -413,6 +420,7 @@ if [[ "$(basename "$0")" == az && "$FAIL_TOOL" == bicep ]]; then exit 8; fi
             "HOME": str(runtime / "home"), "AZURE_CONFIG_DIR": str(runtime / "azure"),
             "RUNNER_TEMP": runtime.as_posix(), "WORKSPACE_PYTHON": (bin_dir / "python").as_posix(),
             "BICEP_VERSION": WORKSPACE_WORKFLOW["jobs"]["build"]["env"]["BICEP_VERSION"],
+            "BICEP_SHA256": "d" * 64 if failure == "checksum" else hashlib.sha256(b"controlled compiler bytes").hexdigest(),
             "TOOL_CALLS": commands.as_posix(), "FAIL_TOOL": failure or "",
         },
     )
@@ -420,10 +428,33 @@ if [[ "$(basename "$0")" == az && "$FAIL_TOOL" == bicep ]]; then exit 8; fi
     calls = commands.read_text()
     assert "--require-hashes --only-binary=:all: --no-cache-dir" in calls
     assert "-r scripts/siteops-build-requirements.txt -r scripts/siteops-runtime-requirements.txt" in calls
-    assert ("az bicep install --version v0.45.15" in calls) is (failure != "python")
+    assert ("bicep-linux-x64" in calls) is (failure != "python")
+    assert (runtime / "azure" / "bin" / "bicep").exists() is (failure is None)
+    if failure == "checksum":
+        assert "differs from its approved SHA-256" in result.stdout + result.stderr
     assert _build_step("Install workspace production tools")["env"]["PIP_INDEX_URL"] == (
         "https://packagefeedproxy.microsoft.io/pypi/simple/"
     )
+
+
+def test_default_preview_declares_the_complete_workspace_path():
+    ci = yaml.safe_load((ROOT / ".github/workflows/ci.yaml").read_text())
+    selected = ci[True]["workflow_dispatch"]["inputs"]["release-file"]["default"]
+    declaration = json.loads((ROOT / selected).read_bytes())
+    assert selected == ".github/release-examples/workspace-preview/release.json"
+    assert declaration["siteops"] == {"build": True}
+    assert len(declaration["workspaces"]) == 1
+    request = WorkspaceBuild.from_document(declaration["workspaces"][0])
+    assert request.workspace == "workspaces/iot-operations"
+    assert (ROOT / request.workspace).is_dir()
+    assert all((ROOT / path).is_file() for path in request.licenses)
+    assert all((ROOT / path).exists() for path in request.includes)
+    environment = WORKSPACE_WORKFLOW["jobs"]["build"]["env"]
+    assert environment["BICEP_SHA256"] == "ff5b194b042c220df4a50d6768ed1d6c39a32894bfdc4ff83d62b115d966a7ce"
+    script = _build_step("Install workspace production tools")["run"]
+    assert script.index("sha256sum --check") < script.index('install -m 700')
+    assert "az bicep install" not in script
+    assert "--max-filesize 134217728" in script and "--tlsv1.2" in script
 
 
 def _workspace_job(repository, tmp_path, *, combined=False, dry_run=False):

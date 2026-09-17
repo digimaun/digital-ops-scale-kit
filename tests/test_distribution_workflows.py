@@ -126,7 +126,7 @@ def test_ci_rehearsal_requires_an_explicit_manual_request_and_source_commit():
     assert inputs["release-file"]["type"] == "string"
     assert inputs["release-file"]["required"] is False
     assert inputs["release-file"]["default"] == (
-        ".github/release-examples/combined-preview/release.json"
+        ".github/release-examples/workspace-preview/release.json"
     )
     job = CI["jobs"]["installer-check"]
     assert job["if"] == (

@@ -60,6 +60,7 @@ jobs:
       AZURE_CORE_COLLECT_TELEMETRY: "false"
       WORKSPACE_PYTHON: ${{ runner.temp }}/workspace-tools/bin/python
       BICEP_VERSION: v0.45.15
+      BICEP_SHA256: ff5b194b042c220df4a50d6768ed1d6c39a32894bfdc4ff83d62b115d966a7ce
     steps:
       - name: Checkout the event commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -105,11 +106,27 @@ jobs:
             echo "::error::Workspace production tooling could not be installed from the configured feed."
             exit 1
           fi
-          if ! az bicep install --version "$BICEP_VERSION" \
+          download="$RUNNER_TEMP/workspace-bicep.download"
+          if ! curl --disable --fail --silent --show-error --location \
+            --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --max-time 120 --max-redirs 3 --max-filesize 134217728 \
+            "https://github.com/Azure/bicep/releases/download/$BICEP_VERSION/bicep-linux-x64" \
+            --output "$download" \
             > "$RUNNER_TEMP/workspace-bicep.log" 2>&1; then
-            echo "::error::The selected Bicep compiler could not be provisioned."
+            echo "::error::The selected Bicep compiler could not be downloaded."
             exit 1
           fi
+          if ! printf '%s  %s\n' "$BICEP_SHA256" "$download" | sha256sum --check --status; then
+            echo "::error::The Bicep compiler differs from its approved SHA-256."
+            exit 1
+          fi
+          mkdir -p "$AZURE_CONFIG_DIR/bin"
+          if [[ -e "$AZURE_CONFIG_DIR/bin/bicep" || -L "$AZURE_CONFIG_DIR/bin/bicep" ]]; then
+            echo "::error::The compiler destination already exists."
+            exit 1
+          fi
+          install -m 700 "$download" "$AZURE_CONFIG_DIR/bin/bicep"
+          rm "$download"
 
       - name: Produce the prepared workspaces
         id: build

@@ -39,8 +39,10 @@ commit identifier. This field confirms which commit will run. It does not
 select an older commit from the branch.
 
 The default example is
-`.github/release-examples/combined-preview/release.json`. It exercises the
-combined preview path using the selected source commit. Examples are accepted
+`.github/release-examples/workspace-preview/release.json`. It exercises engine
+and workspace production using the selected source commit. Choose
+`.github/release-examples/combined-preview/release.json` for an engine-only
+artifact preview under a content tag. Examples are accepted
 only for a dry run and never trigger publication when merged.
 
 The preview runs ordinary CI, then uses the real release-file preparation,

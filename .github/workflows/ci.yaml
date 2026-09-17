@@ -46,7 +46,7 @@ on:
         description: "Release preview only. Keep the example or choose a committed releases/<name>/release.json."
         type: string
         required: false
-        default: .github/release-examples/combined-preview/release.json
+        default: .github/release-examples/workspace-preview/release.json
 
 permissions:
   contents: read

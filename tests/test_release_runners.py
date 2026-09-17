@@ -2,6 +2,7 @@
 
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -9,6 +10,8 @@ from pathlib import Path
 
 import pytest
 import yaml
+
+from tests.shell_helpers import run_script
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github" / "workflows"
@@ -296,3 +299,41 @@ def test_runner_session_comparison_reports_only_the_observed_boundary(probe_envi
         with pytest.raises(SystemExit, match="::error::"):
             exec(compile(script, "<runner-recheck>", "exec"), {})
         assert not summary.exists()
+
+
+def test_workflow_job_environment_does_not_use_a_direct_runner_context():
+    for path in WORKFLOWS.glob("*.yaml"):
+        document = workflow(path.name)
+        for name, job in document.get("jobs", {}).items():
+            for key, value in job.get("env", {}).items():
+                assert not re.search(r"\$\{\{\s*runner\.", str(value)), f"{path.name}:{name}:{key}"
+
+
+@pytest.mark.parametrize("file,job,step,expected", [
+    ("_release-candidate.yaml", "workspace-assets", "Initialize private collection home", {
+        "HOME": "workspace-verification-home",
+    }),
+    ("_release-candidate.yaml", "engine-input", "Initialize private engine selection home", {
+        "HOME": "engine-selection-home",
+    }),
+    ("_workspace-distribution.yaml", "build", "Initialize private workspace paths", {
+        "HOME": "workspace-home", "AZURE_CONFIG_DIR": "workspace-azure",
+        "WORKSPACE_PYTHON": "workspace-tools/bin/python",
+    }),
+])
+def test_private_runtime_paths_are_initialized_before_source_steps(tmp_path, file, job, step, expected):
+    selected = workflow(file)["jobs"][job]
+    assert selected["steps"][0]["name"] == step
+    environment_file = tmp_path / "environment"
+    runtime = tmp_path / "runner temp"
+    runtime.mkdir()
+    result = run_script(
+        selected["steps"][0]["run"], tmp_path,
+        {"RUNNER_TEMP": runtime.as_posix(), "GITHUB_ENV": environment_file.as_posix()},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    values = dict(line.split("=", 1) for line in environment_file.read_text().splitlines())
+    assert values == {key: runtime.as_posix() + "/" + path for key, path in expected.items()}
+    assert (runtime / expected["HOME"]).is_dir()
+    if "AZURE_CONFIG_DIR" in expected:
+        assert (runtime / expected["AZURE_CONFIG_DIR"]).is_dir()

@@ -334,11 +334,19 @@ jobs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
       inventory-sha: ${{ steps.collect.outputs.inventory-sha }}
     env:
-      HOME: ${{ runner.temp }}/workspace-verification-home
       INTENT_PATH: ${{ needs.prepare.outputs.intent-path }}
       EXPECTED_PLAN_SHA: ${{ needs.prepare.outputs.plan-sha }}
       BUILDER_REF: ${{ github.workflow_ref }}
     steps:
+      - name: Initialize private collection home
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          home="$RUNNER_TEMP/workspace-verification-home"
+          mkdir -p "$home"
+          printf 'HOME=%s\n' "$home" >> "$GITHUB_ENV"
+
       - name: Checkout the event commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -483,7 +491,6 @@ jobs:
       selection-sha: ${{ steps.select.outputs.selection-sha }}
       matrix: ${{ steps.select.outputs.matrix }}
     env:
-      HOME: ${{ runner.temp }}/engine-selection-home
       INTENT_PATH: ${{ needs.prepare.outputs.intent-path }}
       EXPECTED_PLAN_SHA: ${{ needs.prepare.outputs.plan-sha }}
       BUILT_ENGINE: ${{ needs.prepare.outputs.bundle }}
@@ -491,6 +498,15 @@ jobs:
       WHEEL_SHA: ${{ needs.distribution.outputs.wheel-sha256 }}
       BUILDER_REF: ${{ github.workflow_ref }}
     steps:
+      - name: Initialize private engine selection home
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          home="$RUNNER_TEMP/engine-selection-home"
+          mkdir -p "$home"
+          printf 'HOME=%s\n' "$home" >> "$GITHUB_ENV"
+
       - name: Checkout engine selection tools
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

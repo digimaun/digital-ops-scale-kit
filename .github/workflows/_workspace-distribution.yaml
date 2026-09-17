@@ -64,14 +64,23 @@ jobs:
       package-name: ${{ steps.build.outputs.package-name }}
       package-sha: ${{ steps.build.outputs.package-sha }}
     env:
-      HOME: ${{ runner.temp }}/workspace-home
-      AZURE_CONFIG_DIR: ${{ runner.temp }}/workspace-azure
       AZURE_CORE_OUTPUT: none
       AZURE_CORE_COLLECT_TELEMETRY: "false"
-      WORKSPACE_PYTHON: ${{ runner.temp }}/workspace-tools/bin/python
       BICEP_VERSION: v0.45.15
       BICEP_SHA256: ff5b194b042c220df4a50d6768ed1d6c39a32894bfdc4ff83d62b115d966a7ce
     steps:
+      - name: Initialize private workspace paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/workspace-home" "$RUNNER_TEMP/workspace-azure"
+          {
+            printf 'HOME=%s\n' "$RUNNER_TEMP/workspace-home"
+            printf 'AZURE_CONFIG_DIR=%s\n' "$RUNNER_TEMP/workspace-azure"
+            printf 'WORKSPACE_PYTHON=%s\n' "$RUNNER_TEMP/workspace-tools/bin/python"
+          } >> "$GITHUB_ENV"
+
       - name: Checkout the event commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

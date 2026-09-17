@@ -8,6 +8,9 @@ Site Ops and Scale Kit have independent version streams in the same repository.
 A content release can reference an existing engine release without rebuilding
 it or changing its version.
 
+A detached attestation proof is a separate file containing signed provenance
+evidence for an artifact. Each signed artifact has its own proof.
+
 ## Choose the right workflow
 
 | Workflow | Use it for | Can it publish? |
@@ -39,41 +42,52 @@ commit identifier. This field confirms which commit will run. It does not
 select an older commit from the branch.
 
 The default example is
-`.github/release-examples/workspace-preview/release.json`. It exercises engine
-and workspace production using the selected source commit. Choose
-`.github/release-examples/combined-preview/release.json` for an engine-only
-artifact preview under a content tag. Examples are accepted
-only for a dry run and never trigger publication when merged.
+`.github/release-examples/workspace-preview/release.json`. It builds one
+complete IoT Operations workspace and the selected engine from the chosen
+source commit. Choose
+`.github/release-examples/combined-preview/release.json` to preview engine
+artifacts under a content tag. Examples are accepted only for a dry run and
+never trigger publication when merged.
 
-The preview runs ordinary CI, then uses the real release-file preparation,
-wheel and bundle production, independent attestation, and installation
-qualification.
-Declared workspace builds run separately with read permissions. Each consumes
-the exact prepared plan and checks committed index freshness. Separate signing
-jobs attest each package and its build record. A read-only collector verifies
-those subjects before generating the workspace routing descriptor.
-Workspace publication additionally requires qualification of the selected
-engine and the complete approved asset inventory.
-The workspace gate installs that exact engine from its authenticated lock,
-checks package/cache and guarded catalog-loading behavior on its declared
-Windows/Linux Python targets, and requires a complete set of results bound
-to the same engine, workspaces and plan. It is separate from live workload
-qualification and from the final publisher integration.
-The final summary shows one Python/platform matrix and a link to the attested
-release assets. Individual job logs remain available for diagnosis.
+For the default example, the CI preview performs real builds and signing, but
+it cannot publish and cannot be promoted into a release. After ordinary CI, it:
 
-This path needs no `siteops-release` environment. Its jobs have no repository
-content-write permission, request no publishing approval, and create no tag or
-GitHub Release. A generated dry-run plan cannot be used by the publisher.
+1. Prepares the exact release plan and requested engine assets.
+2. Builds each declared workspace with read permissions, using that release
+   plan and checking any committed indexes for freshness.
+3. Creates a proof for each workspace package and build record. A collector
+   with read permissions verifies those subjects before creating the public
+   workspace routing descriptor.
+4. Installs the selected engine from its authenticated lock and checks package
+   compatibility, protected cache use, and guarded catalog loading on every
+   declared Windows or Linux Python target.
+5. Requires all qualification results to identify the same engine, workspace
+   inventory, and release plan, then freezes the complete publication
+   inventory.
+
+Workspace qualification does not compare executable deployment plans,
+authorize targets, deploy resources, or evaluate workload health. Publication
+remains a separate approval step.
+
+The default preview's final summary shows one matrix of Python versions and
+platforms, plus a link to the attested release assets. Individual job logs
+remain available for diagnosis.
+
+This path needs no `siteops-release` environment. Its jobs have no permission
+to write repository contents, request no publishing approval, and
+create no tag or GitHub Release. A release plan from a preview cannot be used
+by the publisher.
 
 The other `run-mode` choices are `installer-check` for CI plus bundle and
 installation checks, and `ci-only` for ordinary CI. `ci-only` uses neither
 additional input. `installer-check` uses the SHA but ignores `release-file`.
 None of these modes publishes a release.
 
-Successful dry runs establish preparation and installation behavior. The
-approval UI and actual release upload still require a configured environment
-and an explicitly approved publication.
+A successful CI release preview exercises preparation and the builds, signing,
+and qualification required by its declaration. Script commands that accept
+`--dry-run` can instead perform unsigned local preparation. The flag alone
+does not imply signing. The approval UI and release upload still require a
+configured environment and explicit approval.
 
 ## Prepare the real release files
 
@@ -104,10 +118,10 @@ title.
 Write the changes and release-specific guidance in `notes.md`. The workflow
 adds **Install Site Ops** automatically. It includes the exact versioned wheel
 URL for the simple online pipx path, the configured package index policy, the
-four release asset links, and the source-pinned verified installation guide.
-A content-only release links to its independently published engine. There is no
-need to copy installation commands, source hashes, or download URLs into the
-authored notes.
+four release asset links, and the verified installation guide pinned to the
+source commit. A content release that references an existing engine links to
+that independently published release. There is no need to copy installation
+commands, source hashes, or download URLs into the authored notes.
 
 | Location | Purpose |
 |---|---|
@@ -128,10 +142,10 @@ Choose the components through the release tag and engine selection:
 | Content only | A `v...` tag and `siteops.release` naming an existing engine release |
 | Both | A prerelease `v...` tag and `siteops.build: true` |
 
-The generated plan and approval summary show that resolved choice, the content
-version, and whether the engine is built or referenced. The workflow uses that
-reviewed choice directly. The examples below illustrate formats, not scheduled
-releases.
+The generated release plan and approval summary show that resolved choice, the
+content version, and whether the engine is built or referenced. The workflow
+uses that reviewed choice directly. The examples below illustrate formats, not
+scheduled releases.
 
 ### Release Site Ops independently
 
@@ -172,11 +186,11 @@ the release evidence.
 The reference is an exact engine release, not a minimum-version range.
 Stable content requires a stable referenced engine release. Candidate
 preparation requires its complete native asset set: the ZIP, standalone wheel,
-and one detached proof for each. It freezes their GitHub digests and rejects an
-older ZIP-only release.
+and one proof for each. It freezes their GitHub digests and rejects an older
+release that contains only a ZIP.
 
 Add reviewed `workspaces` records to publish complete workspace packages
-and their detached proofs with the content release. Their kit version comes
+and their proofs with the content release. Their kit version comes
 from the content tag, while the referenced engine retains its own version
 and assets. See [workspace production](workspace-packages.md#build-workspaces-declared-by-a-release).
 
@@ -199,7 +213,7 @@ engine receives a distinguishable build version such as
 
 It creates one content release with the Site Ops ZIP and standalone wheel,
 plus any declared workspace packages and their proofs. Each signed subject
-has its own detached attestation. It does not create another Site Ops tag.
+has its own proof. It does not create another Site Ops tag.
 This option requires a prerelease content version. Stable content references
 a separately released engine instead.
 
@@ -210,7 +224,7 @@ a separately released engine instead.
 | `tag` | Required version identity. `v...` releases Scale Kit content, while `siteops/v...` releases the engine independently. |
 | `headline` | Required short description used with the tag to form the release title. |
 | `siteops` | Required for a content release. Choose `{"build": true}` or `{"release": "siteops/v<version>"}`. Omit it for an independent engine release. |
-| `workspaces` | Optional reviewed workspace build inputs for a content release. See [workspace production](workspace-packages.md#build-workspaces-declared-by-a-release). Publication requires every declared package, proof and the routing descriptor. |
+| `workspaces` | Optional reviewed workspace build inputs for a content release. See [workspace production](workspace-packages.md#build-workspaces-declared-by-a-release). Publication requires every declared package, its proof, and the routing descriptor. |
 | `latest` | Optional, defaults to `false`. Set `true` only to designate a stable Scale Kit release as GitHub's Latest release. |
 
 `siteops.build` is a selection, not an on/off switch. `true` includes a fresh
@@ -248,7 +262,8 @@ Merge to main at commit A
           v
 Read release files from A
 Run CI for A
-Build, attest, and qualify the engine ZIP and standalone wheel when requested
+Build and attest the requested engine and workspace assets
+Qualify native installation and workspace consumption as applicable
           |
           v
 Review the candidate summary and applicable content evidence
@@ -284,17 +299,19 @@ when applicable, tag action, and final release notes.
 The summary nests the note headings beneath **Release notes**. Published notes
 retain their authored Markdown heading levels. Installation commands are
 included in the final notes before approval and remain bound to that approval.
-You may download the attested release artifact for a hands-on trial. It contains
-exactly the ZIP, wheel, and one detached proof for each. The pipeline
-authenticates both subjects and confirms their application wheel bytes match.
+Download the complete candidate payload from the summary for a local trial.
+It includes the declared workspace assets and, when an engine is built, its
+installation ZIP, standalone wheel, and one proof for each. The pipeline
+authenticates both engine artifacts and confirms their application wheel bytes match.
 For a verified installation, consume only the ZIP and its proof by following
 [the installation guide](install-siteops.md).
 The generated online command is for the published release.
 For a candidate preview, use the Actions artifact above the notes and the
 installation guide's steps for manually downloaded files.
 
-The frozen asset inventory separates files to publish from an existing engine
-release. Every asset records its filename, byte size, and SHA-256 digest.
+The frozen asset inventory separates files to publish from assets that remain
+in an existing engine release. Every asset records its filename, byte size, and
+SHA-256 digest.
 Referenced engine assets retain their own release identity and tag target.
 They are not uploaded to the content release again. The publisher consumes
 the approved publication list and compares the uploaded identities with that
@@ -310,10 +327,11 @@ This approval inventory is distinct from the public `siteops-workspaces.json`
 routing descriptor. Workspace package delivery is described in
 [workspace release sources](workspace-sources.md).
 
-CI and engine installation qualification are automated. For content releases,
-the reviewer must also confirm the applicable content/AIO evidence and any
-valid carry-forward from earlier qualification. The release workflow does not
-deploy Azure resources or infer workload health from installation success.
+The workflow runs CI and applicable engine and workspace qualification. For
+content releases, the reviewer must also confirm the applicable content/AIO
+evidence and any valid evidence carried forward from earlier qualification.
+The release workflow does not deploy Azure resources or infer workload health
+from installation success.
 
 ## Approve publication
 

@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Install the selected authenticated engine and probe its workspace consumption."""
+"""Install the selected authenticated engine and qualify workspace consumption."""
 
 from __future__ import annotations
 
@@ -138,8 +138,8 @@ def run(argv: list[str], *, root: Path, log: Path, environment=None, timeout=180
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     for name, metavar, help_text in (
-        ("engine", "DIRECTORY", "Prepared engine assets and workspace-engine.json selection record."),
-        ("workspaces", "DIRECTORY", "Verified workspace assets and release-assets.json inventory."),
+        ("engine", "DIRECTORY", "Directory containing prepared engine assets and workspace-engine.json."),
+        ("workspaces", "DIRECTORY", "Directory containing verified workspace assets and release-assets.json."),
         ("trusted-root", "FILE", "Independently provisioned signing roots."),
         ("state", "DIRECTORY", "New private directory outside the assets for installation, policy and logs."),
         ("output", "FILE", "New qualification result file."),
@@ -147,10 +147,10 @@ def main() -> int:
     ):
         parser.add_argument("--" + name, required=True, type=Path, metavar=metavar, help=help_text)
     for name, metavar, help_text in (
-        ("expected-engine-selection-sha256", "SHA256", "Independent SHA-256 of workspace-engine.json in --engine."),
-        ("expected-workspace-inventory-sha256", "SHA256", "Independent SHA-256 of release-assets.json in --workspaces."),
-        ("expected-plan-sha", "SHA256", "Independent SHA-256 of the prepared release plan."),
-        ("builder-workflow", "PATH", "Repository path of the calling workflow approved for candidate provenance."),
+        ("expected-engine-selection-sha256", "SHA256", "Independent SHA-256 digest of workspace-engine.json in --engine."),
+        ("expected-workspace-inventory-sha256", "SHA256", "Independent SHA-256 digest of release-assets.json in --workspaces."),
+        ("expected-plan-sha", "SHA256", "Independent SHA-256 digest of the prepared release plan."),
+        ("builder-workflow", "PATH", "Calling workflow path expected by candidate provenance verification."),
         ("platform", "PLATFORM", "Platform from the verified engine matrix: linux-x86_64 or windows-x86_64."),
     ):
         parser.add_argument("--" + name, required=True, metavar=metavar, help=help_text)

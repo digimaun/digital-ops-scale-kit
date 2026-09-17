@@ -50,7 +50,7 @@ class ReleaseIntentError(ValueError):
 
 
 def serialize_release_plan(plan: dict[str, Any]) -> bytes:
-    """Serialize the prepared plan consistently for artifact identity."""
+    """Serialize the prepared release plan consistently for artifact identity."""
     return (json.dumps(plan, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
 
 
@@ -81,7 +81,7 @@ class ReleaseIntent:
 
     @property
     def components(self) -> Literal["siteops", "content", "both"]:
-        """Resolve component selection from the reviewed stream and engine choice."""
+        """Return the components selected by the reviewed stream and engine choice."""
         if self.stream == "siteops":
             return "siteops"
         return "both" if self.bundle else "content"
@@ -125,7 +125,7 @@ class ReleaseIntent:
         return result
 
     def engine_version(self, build_number: int | None = None, build_attempt: int | None = None) -> str:
-        """Resolve the selected engine identity without consulting the current checkout."""
+        """Resolve the selected engine version without reading the current checkout."""
         if not self.bundle:
             if self.release_tag is None:
                 raise ReleaseIntentError("The selected engine release is missing.")
@@ -145,7 +145,7 @@ class ReleaseIntent:
 def bind_prepared_plan(
     intent: ReleaseIntent, path: Path | None = None, expected_sha256: str | None = None,
 ) -> str:
-    """Bind an independently identified prepared plan to the committed declaration."""
+    """Bind an independently identified release plan to the committed declaration."""
     if (path is None) != (expected_sha256 is None):
         raise ReleaseIntentError("The prepared plan and expected SHA-256 must be supplied together.")
     raw = serialize_release_plan(intent.to_dict())

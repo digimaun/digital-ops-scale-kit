@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Freeze native engine identities for workspace qualification."""
+"""Prepare native engine identities for workspace qualification."""
 
 from __future__ import annotations
 
@@ -271,7 +271,7 @@ def inspect_engine_bundle(
 def extract_engine_bundle(
     archive_path: Path, destination: Path, selection: EngineSelection
 ) -> BundleManifest:
-    """Extract already authenticated native bytes, then check the complete manifest payload."""
+    """Extract verified native bytes, then validate the complete manifest and payload."""
     archive_id = next(asset for asset in selection.native.assets if asset.name == ARCHIVE_NAME)
     files: list[Path] = []
     directories: list[Path] = []
@@ -337,7 +337,7 @@ def prepare_engine(
     release_client: GitHubClient | None = None,
     downloader=download_release_asset,
 ) -> EngineSelection:
-    """Freeze built or published native assets without rebuilding an existing engine."""
+    """Freeze built or published native assets without rebuilding a referenced engine."""
     if not intent.workspaces:
         raise ArtifactError("Engine selection requires a workspace candidate.")
     version = intent.engine_version(build_number, build_attempt)

@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Create invocation-owned policy from trusted release context, never package metadata."""
+"""Create policy for one invocation from trusted release context, not package metadata."""
 
 import hashlib
 import json

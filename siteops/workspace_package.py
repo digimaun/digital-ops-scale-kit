@@ -1154,10 +1154,10 @@ def inspect_package(path: Path, expected_sha256: str) -> PackageInspection:
 def inspect_produced_package(
     path: Path, expected_sha256: str, *, engine_version: str,
 ) -> PackageInspection:
-    """Inspect producer output against a declared target version, without authorizing use.
+    """Inspect producer output against a target engine version without authorizing use.
 
-    Consumer inspection and extraction always use the installed engine version.
-    This producer check does not establish support by an independently released engine.
+    Consumers still inspect and extract with the installed engine version. This
+    producer check does not establish support by an independently released engine.
     """
     return _inspect_for_engine(path, expected_sha256, engine_version)
 

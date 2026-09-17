@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Produce workspace bytes from an exact Git revision for local or release use."""
+"""Build workspace packages from an exact Git revision for local or release use."""
 
 from __future__ import annotations
 
@@ -77,7 +77,7 @@ def build_committed_workspace(
     bicep_path: Path | None = None,
     check_index: bool = False,
 ) -> tuple[PackageInspection, str | None]:
-    """Build from committed blobs after the caller validates the source checkout."""
+    """Build from committed blobs after the caller validates the checkout."""
     companions = tuple(dict.fromkeys((*includes, *licenses)))
     paths = (workspace, *companions)
     with tempfile.TemporaryDirectory(prefix="siteops-package-source-") as temporary:

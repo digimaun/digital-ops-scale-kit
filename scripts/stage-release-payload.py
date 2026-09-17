@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Freeze one complete publication payload from qualified native and workspace inputs."""
+"""Stage one complete publication payload from qualified engine and workspace inputs."""
 
 import argparse
 import hashlib
@@ -108,13 +108,13 @@ def main() -> int:
         ("output-inventory", "FILE", "Final inventory file within a new parent directory."),
     ):
         parser.add_argument("--" + name, required=True, type=Path, metavar=metavar, help=help_text)
-    parser.add_argument("--expected-plan-sha", required=True, metavar="SHA256", help="Independent SHA-256 of --plan.")
-    parser.add_argument("--expected-engine-inventory-sha256", required=True, metavar="SHA256", help="Independent SHA-256 of --engine-inventory.")
-    parser.add_argument("--engine-directory", type=Path, metavar="DIRECTORY", help="Built engine assets to publish. Referenced engine assets stay in their release.")
+    parser.add_argument("--expected-plan-sha", required=True, metavar="SHA256", help="Independent SHA-256 digest of --plan.")
+    parser.add_argument("--expected-engine-inventory-sha256", required=True, metavar="SHA256", help="Independent SHA-256 digest of --engine-inventory.")
+    parser.add_argument("--engine-directory", type=Path, metavar="DIRECTORY", help="Built engine assets to publish. Referenced engine assets remain in their own release.")
     parser.add_argument("--workspace-directory", type=Path, metavar="DIRECTORY", help="Qualified workspace assets and their release-assets.json inventory.")
-    parser.add_argument("--expected-workspace-inventory-sha256", metavar="SHA256", help="Independent SHA-256 of release-assets.json in --workspace-directory.")
+    parser.add_argument("--expected-workspace-inventory-sha256", metavar="SHA256", help="Independent SHA-256 digest of release-assets.json in --workspace-directory.")
     parser.add_argument("--engine-selection", type=Path, metavar="FILE", help="Engine selection record used to qualify the workspaces.")
-    parser.add_argument("--expected-engine-selection-sha256", metavar="SHA256", help="Independent SHA-256 of --engine-selection.")
+    parser.add_argument("--expected-engine-selection-sha256", metavar="SHA256", help="Independent SHA-256 digest of --engine-selection.")
     args = parser.parse_args()
     try:
         plan = json.loads(read_expected(args.plan, args.expected_plan_sha))

@@ -1,7 +1,11 @@
 ## Highlights
 
-Preview a complete workspace release with its identified Site Ops engine,
-workspace package, detached proofs and routing descriptor. The preview includes
-installed-engine qualification and the complete publication inventory.
+Preview a complete IoT Operations workspace release. The preview builds the
+workspace package and selected Site Ops engine, creates a detached attestation
+proof for each signed artifact, and freezes the publication inventory. A proof
+is a separate file containing signed provenance evidence.
 
-This committed example is accepted only by the non-publishing preview path.
+Installed engine qualification checks package compatibility, protected cache
+use, and guarded catalog loading. It does not authorize targets, deploy
+resources, or evaluate workload health. This committed example is accepted
+only in preview mode. The CI preview cannot publish.

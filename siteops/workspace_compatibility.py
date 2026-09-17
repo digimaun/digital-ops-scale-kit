@@ -31,7 +31,7 @@ def validate_engine_range(value: str) -> str:
 
 
 def require_engine_version(siteops_range: str, engine_version: str) -> None:
-    """Require a valid target version within the workspace's bounded declaration."""
+    """Require the target engine version to satisfy the bounded workspace declaration."""
     validate_engine_range(siteops_range)
     try:
         compatible = SpecifierSet(siteops_range).contains(Version(engine_version), prereleases=True)

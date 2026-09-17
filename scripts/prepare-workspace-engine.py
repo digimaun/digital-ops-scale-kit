@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Freeze a verified built or published engine for workspace qualification."""
+"""Freeze the selected built or published engine for workspace qualification."""
 
 import argparse
 import hashlib
@@ -21,28 +21,28 @@ from siteops.cache_filesystem import make_private_directory  # noqa: E402
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     for name, metavar, help_text in (
-        ("repository", "REPOSITORY", "Source repository as owner/repository."),
+        ("repository", "REPOSITORY", "Source repository in owner/repository form."),
         ("source-sha", "COMMIT", "Exact reviewed Git commit."),
         ("source-ref", "REF", "Full Git ref for the reviewed source."),
-        ("release-file", "PATH", "Committed release.json path relative to the repository."),
-        ("expected-plan-sha", "SHA256", "Independent SHA-256 of --prepared-plan."),
-        ("builder-workflow", "PATH", "Repository path of the calling workflow approved for built engine provenance."),
+        ("release-file", "PATH", "Path to the committed release.json, relative to the repository."),
+        ("expected-plan-sha", "SHA256", "Independent SHA-256 digest of --prepared-plan."),
+        ("builder-workflow", "PATH", "Workflow path expected by provenance verification for the built engine."),
     ):
         parser.add_argument("--" + name, required=True, metavar=metavar, help=help_text)
     for name, metavar, help_text in (
-        ("root", "DIRECTORY", "Source repository containing the reviewed commit."),
-        ("prepared-plan", "FILE", "Prepared release plan selecting the engine and workspaces."),
+        ("root", "DIRECTORY", "Source repository that contains the reviewed commit."),
+        ("prepared-plan", "FILE", "Prepared release plan that selects the engine and workspaces."),
         ("output", "DIRECTORY", "New directory for verified engine assets and their selection record."),
-        ("control", "DIRECTORY", "Private directory for verification policy snapshots and downloads."),
+        ("control", "DIRECTORY", "New private directory for verification policy snapshots and downloads."),
         ("trusted-root", "FILE", "Independently provisioned signing roots."),
     ):
         parser.add_argument("--" + name, required=True, type=Path, metavar=metavar, help=help_text)
     parser.add_argument("--built-assets", type=Path, metavar="DIRECTORY", help="Completed engine build assets. Omit for a referenced engine release.")
-    parser.add_argument("--archive-sha", metavar="SHA256", help="Independent SHA-256 of siteops-install.zip in --built-assets.")
-    parser.add_argument("--wheel-sha", metavar="SHA256", help="Independent SHA-256 of the standalone engine wheel in --built-assets.")
+    parser.add_argument("--archive-sha", metavar="SHA256", help="Independent SHA-256 digest of siteops-install.zip in --built-assets.")
+    parser.add_argument("--wheel-sha", metavar="SHA256", help="Independent SHA-256 digest of the standalone engine wheel in --built-assets.")
     parser.add_argument("--build-number", required=True, type=int, help="Candidate workflow run number.")
     parser.add_argument("--build-attempt", required=True, type=int, help="Candidate workflow run attempt.")
-    parser.add_argument("--dry-run", action="store_true", help="Require preview identities and allow a committed release example.")
+    parser.add_argument("--dry-run", action="store_true", help="Require preview identities and permit a committed release example.")
     args = parser.parse_args()
     try:
         intent = load_release_intent(

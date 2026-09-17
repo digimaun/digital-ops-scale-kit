@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Assemble workspace routing only from complete, verified per-workspace subjects."""
+"""Assemble public workspace routing from complete, verified subjects."""
 
 from __future__ import annotations
 
@@ -110,10 +110,10 @@ def assemble_workspace_assets(
     build_attempt: int,
     verifier: Verifier,
 ) -> FrozenReleaseAssets:
-    """Verify record/package proofs, inspect bytes, then create a new publication set.
+    """Verify build record and package proofs, then create a new publication set.
 
     The caller supplies trusted verification code and a plan already bound to its
-    independently expected digest. No receipt, package or build record selects policy.
+    independently expected digest. No receipt, package, or build record selects trust policy.
     """
     if not intent.workspaces:
         raise ArtifactError("The candidate has no declared workspace assets.")

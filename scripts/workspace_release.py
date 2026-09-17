@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Read reviewed workspace build inputs without compiling or loading Site values."""
+"""Read reviewed workspace build inputs without compiling content or loading Site values."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ BUILD_RECORD = "workspace-builds.json"
 
 
 class WorkspaceReleaseError(ValueError):
-    """The declaration cannot produce an unambiguous complete workspace asset set."""
+    """The declaration does not define one complete, unambiguous workspace asset set."""
 
 
 def _record(

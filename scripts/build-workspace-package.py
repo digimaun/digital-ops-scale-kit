@@ -31,8 +31,8 @@ def main() -> int:
     parser.add_argument("--requires-siteops", required=True, help="Bounded PEP 440 engine range")
     parser.add_argument(
         "--target-engine-version", default=__version__, metavar="VERSION",
-        help="Compatibility target checked against --requires-siteops. Defaults to the producer's "
-        "Site Ops version. Does not acquire an engine or authorize consumer use.",
+        help="Site Ops version used to check --requires-siteops. Defaults to the producer's "
+        "version. This option does not acquire an engine or authorize consumer use.",
     )
     parser.add_argument("--require-feature", action="append", default=[], help="Required engine feature")
     parser.add_argument("--include", action="append", default=[], help="Approved companion file or directory")

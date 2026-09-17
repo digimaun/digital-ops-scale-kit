@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Render installation notes and an approval preview from a verified candidate."""
+"""Render installation notes and a release candidate summary."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ def render_notes(
     archive_name: str,
     attestation_suffix: str,
 ) -> str:
-    """Append release-specific installation guidance to the authored notes."""
+    """Append installation guidance for this release to the authored notes."""
     source, engine = plan["source"], plan["siteops"]
     native, workspace = publication_assets(plan, assets)
     if assets.source != source:
@@ -48,13 +48,22 @@ def render_notes(
     workspace_notes = ""
     if workspace:
         downloads = home + "/releases/download/" + urllib.parse.quote(plan["release"]["tag"], safe="") + "/"
+        project_guide = (
+            home + "/blob/" + source["commit"] + "/docs/projects.md#run-project-pin"
+        )
         workspace_notes = (
             "\n\n## Workspace content\n\n"
-            "This release contains complete workspace packages and their detached proofs. "
-            "Use `project pin` with this release and independently supplied trust policy and roots.\n\n"
+            "This release contains complete workspace packages. Each package has a detached "
+            "attestation proof containing signed provenance evidence. "
+            f"Follow the [workspace pin guidance]({project_guide}) to run "
+            "`siteops project pin` with `--release` for this release. Supply the trust "
+            "policy and trusted roots independently. The routing descriptor cannot select "
+            "them.\n\n"
             + "\n".join(f"- [{asset.name}]({downloads}{asset.name})" for asset in workspace)
-            + "\n\nPackage compatibility and catalog loading are qualified through the selected engine. "
-            "Deployment permissions and workload outcomes remain specific to your environment.\n"
+            + "\n\nWorkspace qualification used the selected installed engine to check package "
+            "compatibility, protected cache use, and guarded catalog loading. It did not compare "
+            "executable deployment plans, authorize targets, deploy resources, or evaluate "
+            "workload health.\n"
         )
     if not engine["bundle"]:
         tag = engine["releaseTag"]
@@ -86,8 +95,11 @@ def render_notes(
         f"```console\n{command}\n```",
         "To replace an existing online installation, review any pipx pin and rerun the command with `--force`. "
         "Confirm the result with `siteops --version` and `siteops --help`.",
-        "pipx does not automatically verify GitHub attestations for the online command. "
-        "For external verification before extraction and a hash-locked native install from stable private storage, "
+        "The installation ZIP and standalone wheel each have a detached attestation proof "
+        "containing signed provenance evidence. pipx does not automatically verify GitHub "
+        "attestations for the online command. "
+        "For external verification before extraction and a native installation locked to hashes "
+        "from stable private storage, "
         f"follow the [verified installation guide]({guide}). "
         "That path downloads only the ZIP and its detached proof, authenticates the ZIP before extraction, "
         "then installs from the authenticated `pylock.toml` with stock pipx.",
@@ -145,7 +157,7 @@ def embedded_notes(text: str) -> str:
 
 
 def render_summary(plan: dict[str, Any], notes: str, values: Mapping[str, str]) -> str:
-    """Render the complete approval preview before publishing any summary text."""
+    """Render the complete candidate summary before publishing any summary text."""
     release, engine = plan["release"], plan["siteops"]
     dry_run = values.get("DRY_RUN") == "true"
     components = {"siteops": "Site Ops only", "content": "Content only", "both": "Both"}
@@ -173,7 +185,7 @@ def render_summary(plan: dict[str, Any], notes: str, values: Mapping[str, str]) 
     if plan.get("workspaces"):
         lines.extend([
             "\n## Workspace builds\n",
-            "| Workspace | Kit | Package | Required Site Ops |",
+            "| Workspace | Kit ID | Package | Required Site Ops |",
             "|---|---|---|---|",
         ])
         for request in plan["workspaces"]:
@@ -188,8 +200,13 @@ def render_summary(plan: dict[str, Any], notes: str, values: Mapping[str, str]) 
             ]
             lines.append("| " + " | ".join(cells) + " |")
         lines.extend([
-            "\nThe selected installed engine consumed the frozen workspace packages on its declared targets. "
-            "This covers package/cache compatibility and guarded catalog loading, not deployment or workload health.\n",
+            "\nEach workspace package has a proof containing signed provenance evidence. "
+            "The public routing descriptor routes packages and proofs. "
+            "It does not select trust policy or trusted roots.\n",
+            "The selected installed engine consumed the frozen workspace packages on every "
+            "declared target. Qualification checked package compatibility, protected cache use, "
+            "and guarded catalog loading. It did not compare executable deployment plans, "
+            "authorize targets, deploy resources, or evaluate workload health.\n",
             f"[Download the complete release payload]({values['ARTIFACT_URL']})\n",
             f"Frozen publication inventory SHA-256: `{values['ASSET_LIST_SHA']}`",
         ])
@@ -210,8 +227,9 @@ def render_summary(plan: dict[str, Any], notes: str, values: Mapping[str, str]) 
             lines.append(f"| {row['python']} | {row['linux']} | {row['windows']} |")
         lines.extend([
             f"\n[Download the attested release assets]({values['ARTIFACT_URL']})\n",
-            "The Actions download contains the installation ZIP, standalone wheel, and a detached proof for each"
-            + (", together with the declared workspace assets. " if plan.get("workspaces") else ". ")
+            "The Actions download contains the installation ZIP and standalone wheel. Each has "
+            "a detached attestation proof containing signed provenance evidence."
+            + (" It also contains the declared workspace assets. " if plan.get("workspaces") else " ")
             +
             "For a verified installation, use the ZIP and its proof.\n",
             "<details><summary>Artifact identity</summary>\n",
@@ -244,7 +262,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("notes", "summary"))
     parser.add_argument("--root", type=Path, required=True)
-    parser.add_argument("--inventory", type=Path, help="The final frozen publication inventory")
+    parser.add_argument(
+        "--inventory",
+        type=Path,
+        metavar="FILE",
+        help="Final frozen publication inventory. Defaults to release-assets/release-assets.json under --root.",
+    )
     args = parser.parse_args(argv)
     root = args.root
     try:

@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Consume verified candidate workspaces through the selected installed engine."""
+"""Qualify verified workspace packages with the selected installed engine."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from pathlib import Path
 
 
 class QualificationError(ValueError):
-    """The selected installed engine did not satisfy the qualification boundary."""
+    """The selected installed engine did not satisfy workspace qualification."""
 
 
 def _read(path: Path, limit: int) -> bytes:
@@ -43,7 +43,7 @@ def _json(raw: bytes):
 
 
 def qualify(spec: dict) -> dict:
-    # Imports intentionally occur in this process, never through the controller's checkout.
+    # Import Site Ops only in this isolated process, never from the controller checkout.
     import siteops
 
     prefix = Path(sys.prefix).resolve()
@@ -184,8 +184,8 @@ def qualify(spec: dict) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--spec", required=True, type=Path, metavar="FILE", help="Qualification specification from the engine installation controller.")
-    parser.add_argument("--expected-spec-sha", required=True, metavar="SHA256", help="Independent SHA-256 of --spec.")
+    parser.add_argument("--spec", required=True, type=Path, metavar="FILE", help="Qualification specification created by the engine installation controller.")
+    parser.add_argument("--expected-spec-sha", required=True, metavar="SHA256", help="Independent SHA-256 digest of --spec.")
     args = parser.parse_args()
     try:
         raw = _read(args.spec, 2 * 1024 * 1024)

@@ -1461,6 +1461,8 @@ def test_complete_workspace_candidate_reaches_only_the_approved_publication_set(
     assert result.returncode == 0, result.stdout + result.stderr
     notes = (root / "publish-notes.md").read_text()
     assert "## Workspace content" in notes and "siteops-workspaces.json" in notes
+    assert f"https://github.com/{REPO}/blob/{SHA}/docs/projects.md#run-project-pin" in notes
+    assert "`siteops project pin` with `--release`" in notes
     (root / "release-bundle").rename(root / "review-native")
     candidate["native_directory"] = "review-native"
     shutil.copytree(root / "release-payload", root / "release-bundle")

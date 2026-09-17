@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Describe frozen publication assets separately from an existing engine release."""
+"""Model the frozen publication inventory separately from an existing engine release."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ class ReleaseAssetsError(ValueError):
 
 
 def validate_asset_name(name: str) -> str:
-    """Validate a portable leaf name before any release bytes have been produced."""
+    """Validate a portable filename before producing release bytes."""
     _text(name, r"[0-9A-Za-z][0-9A-Za-z.!+_~-]*", 255)
     if (
         ".." in name or name.endswith(".")
@@ -54,7 +54,7 @@ def _text(value: Any, pattern: str, limit: int) -> str:
 
 @dataclass(frozen=True)
 class ReleaseAsset:
-    """One portable publication filename and the identity of its exact bytes."""
+    """One portable publication filename and its exact byte identity."""
 
     name: str
     size: int
@@ -94,7 +94,7 @@ def _unique_assets(values: tuple[ReleaseAsset, ...]) -> None:
 
 
 def native_engine_wheel(assets: tuple[ReleaseAsset, ...]) -> ReleaseAsset:
-    """Require the engine ZIP, standalone wheel and a detached proof for each."""
+    """Require the engine ZIP and wheel, each with a detached attestation proof."""
     _unique_assets(assets)
     wheels = [asset for asset in assets if _WHEEL.fullmatch(asset.name)]
     if len(wheels) != 1 or {asset.name for asset in assets} != {
@@ -134,7 +134,7 @@ class ReferencedEngine:
 
 @dataclass(frozen=True)
 class FrozenReleaseAssets:
-    """Approval data bound to one candidate, separate from public workspace routing."""
+    """Internal frozen inventory for one candidate, separate from public routing."""
 
     repository: str
     commit: str
@@ -225,7 +225,7 @@ class FrozenReleaseAssets:
 
 
 def publication_assets(plan: dict[str, Any], inventory: FrozenReleaseAssets) -> tuple[tuple[ReleaseAsset, ...], tuple[ReleaseAsset, ...]]:
-    """Partition the exact approved publication set by declared engine/workspace roles."""
+    """Partition the exact approved publication set into engine and workspace assets."""
     if inventory.source != plan["source"]:
         raise ReleaseAssetsError("The publication inventory describes another candidate.")
     requests = plan.get("workspaces", [])

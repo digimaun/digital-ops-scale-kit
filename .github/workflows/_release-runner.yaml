@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   select:
-    name: Confirm release runner configuration
+    name: Admit
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
@@ -76,7 +76,7 @@ jobs:
           print("The configured 1ES pool was selected for this request. Test runners are unchanged.")
 
   probe:
-    name: Check runner tools
+    name: Tools
     needs: select
     if: inputs.mode == 'check'
     runs-on:
@@ -151,7 +151,7 @@ jobs:
               output.write("\nNo source was checked out, no artifact was built or signed, and no cloud resources were requested.\n")
 
   recheck:
-    name: Check a separate worker session
+    name: Session
     needs: [select, probe]
     if: inputs.mode == 'check'
     runs-on:

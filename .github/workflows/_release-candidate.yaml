@@ -84,7 +84,7 @@ env:
 
 jobs:
   prepare:
-    name: Read the release file
+    name: Prepare
     if: >-
       inputs.release-pool != '' && inputs.release-pool == vars.SITEOPS_RELEASE_POOL &&
       (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
@@ -277,7 +277,7 @@ jobs:
           retention-days: 30
 
   distribution:
-    name: Candidate installation
+    name: Engine
     needs: prepare
     if: needs.prepare.outputs.active == 'true' && needs.prepare.outputs.bundle == 'true'
     uses: ./.github/workflows/_siteops-distribution.yaml
@@ -293,7 +293,7 @@ jobs:
       attestations: write
 
   workspace-build:
-    name: Produce workspace (${{ matrix.workspace }})
+    name: Workspace (${{ matrix.workspace }})
     needs: prepare
     if: needs.prepare.outputs.active == 'true' && needs.prepare.outputs.workspaces == 'true'
     strategy:
@@ -317,7 +317,7 @@ jobs:
       attestations: write
 
   workspace-assets:
-    name: Collect verified workspace assets
+    name: Collect workspaces
     needs: [prepare, workspace-build]
     if: >-
       always() && needs.prepare.result == 'success' &&
@@ -472,7 +472,7 @@ jobs:
           retention-days: 30
 
   engine-input:
-    name: Select workspace qualification engine
+    name: Select engine
     needs: [prepare, distribution]
     if: >-
       always() && needs.prepare.result == 'success' && needs.prepare.outputs.workspaces == 'true' &&
@@ -708,7 +708,7 @@ jobs:
           retention-days: 30
 
   workspace-qualified:
-    name: Confirm complete workspace qualification
+    name: Workspace results
     needs: [prepare, engine-input, workspace-assets, workspace-qualify]
     if: >-
       always() && needs.prepare.outputs.workspaces == 'true' &&
@@ -817,7 +817,7 @@ jobs:
           '
 
   review:
-    name: Prepare release summary
+    name: Assemble release
     needs: [prepare, distribution, workspace-assets, engine-input, workspace-qualified]
     if: >-
       always() && needs.prepare.result == 'success' &&

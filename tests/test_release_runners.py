@@ -131,7 +131,7 @@ def test_production_admission_keeps_the_provenance_gate_closed(tmp_path):
     ("_siteops-distribution.yaml", {"build", "attest"}, {"qualify", "summary"}),
     ("_workspace-distribution.yaml", {"build", "attest"}, set()),
     ("release.yaml", {"publish"}, set()),
-    ("ci.yaml", set(), {"lint", "test", "validate"}),
+    ("ci.yaml", set(), {"lint", "test", "validate", "overview"}),
 ])
 def test_runner_placement_follows_artifact_authority(name, secured, public):
     document = workflow(name)
@@ -337,3 +337,59 @@ def test_private_runtime_paths_are_initialized_before_source_steps(tmp_path, fil
     assert (runtime / expected["HOME"]).is_dir()
     if "AZURE_CONFIG_DIR" in expected:
         assert (runtime / expected["AZURE_CONFIG_DIR"]).is_dir()
+
+
+@pytest.mark.parametrize("mode,visible,hidden", [
+    ("ci-only", (), ("Runner admission", "Installer", "Preview")),
+    ("runner-check", ("Runner admission and diagnostics",), ("Installer", "Preview")),
+    ("installer-check", ("Runner admission", "Installer"), ("Preview",)),
+    ("release-preview", ("Runner admission", "Preview"), ("Installer",)),
+])
+def test_ci_overview_reports_only_the_selected_path(tmp_path, monkeypatch, mode, visible, hidden):
+    job = workflow("ci.yaml")["jobs"]["overview"]
+    assert job["if"] == "always()"
+    assert job["permissions"] == {}
+    assert job["runs-on"] == "ubuntu-latest"
+    assert job["needs"] == ["lint", "test", "validate", "release-runner", "installer-check", "release-preview"]
+    assert len(job["steps"]) == 1 and "uses" not in job["steps"][0]
+    summary = tmp_path / "summary"
+    values = {
+        "CI_MODE": mode, "SOURCE_SHA": "a" * 40,
+        "LINT_RESULT": "success", "TEST_RESULT": "failure", "VALIDATE_RESULT": "success",
+        "RUNNER_RESULT": "success", "INSTALLER_RESULT": "skipped", "PREVIEW_RESULT": "cancelled",
+        "GITHUB_STEP_SUMMARY": str(summary),
+    }
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+    exec(compile(job["steps"][0]["run"], "<ci-overview>", "exec"), {})
+    text = summary.read_text()
+    assert "| Lint | Passed |" in text and "| Unit tests | Failed |" in text
+    assert "| Manifests | Passed |" in text
+    for label in visible:
+        assert "| " + label + " |" in text
+    for label in hidden:
+        assert "| " + label + " |" not in text
+    if mode == "installer-check":
+        assert "| Installer | Skipped |" in text
+    if mode == "release-preview":
+        assert "| Preview | Cancelled |" in text
+
+
+@pytest.mark.parametrize("changes", [
+    {"CI_MODE": "unreviewed"},
+    {"SOURCE_SHA": "unsafe | source"},
+    {"TEST_RESULT": "untrusted | result"},
+])
+def test_ci_overview_does_not_publish_unsupported_values(tmp_path, monkeypatch, changes):
+    summary = tmp_path / "summary"
+    summary.write_text("existing\n")
+    values = {
+        "CI_MODE": "ci-only", "SOURCE_SHA": "a" * 40,
+        "LINT_RESULT": "success", "TEST_RESULT": "success", "VALIDATE_RESULT": "success",
+        "GITHUB_STEP_SUMMARY": str(summary), **changes,
+    }
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+    with pytest.raises(SystemExit, match="::error::"):
+        exec(compile(workflow("ci.yaml")["jobs"]["overview"]["steps"][0]["run"], "<ci-overview>", "exec"), {})
+    assert summary.read_text() == "existing\n"

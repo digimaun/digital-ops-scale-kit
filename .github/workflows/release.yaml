@@ -33,7 +33,7 @@ env:
 
 jobs:
   release-runner:
-    name: Select release artifact runners
+    name: Runner
     uses: ./.github/workflows/_release-runner.yaml
     with:
       expected-source-sha: ${{ github.event_name != 'workflow_dispatch' && github.sha || inputs.expected-source-sha }}

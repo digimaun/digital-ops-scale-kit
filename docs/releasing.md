@@ -22,6 +22,11 @@ These entry points share candidate preparation. A CI preview is not a pending
 release and cannot be promoted. A real release prepares its own candidate from
 the reviewed files on `main`.
 
+CI run titles identify the selected mode and branch. The **Overview** summary
+shows ordinary checks and only the optional path selected for that run.
+The graph still contains the workflow's other branches because GitHub controls
+its layout. Detailed installation and release reports remain in their jobs.
+
 If **Release (approval required)** is not available in Actions, its workflow
 file must first exist on the repository's default branch. Use the already
 registered CI workflow to preview feature-branch changes. Changing the default

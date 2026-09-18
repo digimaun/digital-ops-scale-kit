@@ -37,6 +37,7 @@ def admit(tmp_path, **changes):
     environment = {
         "RELEASE_PROVENANCE_READY": "true",
         "RELEASE_POOL": "example-release-pool",
+        "RELEASE_IMAGE": "example-image",
         "RELEASE_MODE": "preview",
         "EXPECTED_SOURCE_SHA": "a" * 40,
         "SOURCE_SHA": "a" * 40,
@@ -105,6 +106,7 @@ def test_admission_has_no_source_or_privileged_capability():
     assert len(SELECT["steps"]) == 1
     assert STEP["shell"] == "python"
     assert STEP["env"]["RELEASE_POOL"] == "${{ vars.SITEOPS_RELEASE_POOL }}"
+    assert STEP["env"]["RELEASE_IMAGE"] == "${{ vars.SITEOPS_RELEASE_IMAGE }}"
     assert all("uses" not in step for step in SELECT["steps"])
     assert "RELEASE_POOL" not in ADMISSION[True]["workflow_call"]["inputs"]
 
@@ -195,6 +197,17 @@ def test_runner_check_is_the_only_nonsigning_gate_exception(tmp_path, event, all
     )
     assert (result.returncode == 0) is allowed, result.stderr
     assert ("pool=" in output) is allowed
+    assert ("image=example-image\n" in output) is allowed
+
+
+@pytest.mark.parametrize("image", ["", "image\npool=other", "image,other", "owner/image", "$(touch injected)", "a" * 101])
+def test_runner_check_rejects_invalid_image_selection_before_allocation(tmp_path, image):
+    result, output = admit(
+        tmp_path, RELEASE_MODE="check", RELEASE_PROVENANCE_READY="false", RELEASE_IMAGE=image,
+    )
+    assert result.returncode != 0 and "SITEOPS_RELEASE_IMAGE" in result.stderr
+    assert output == "existing=value\n"
+    assert not (tmp_path / "injected").exists()
 
 
 def test_runner_check_jobs_have_no_source_or_signing_permissions():
@@ -206,6 +219,7 @@ def test_runner_check_jobs_have_no_source_or_signing_permissions():
         assert all("uses" not in step for step in job["steps"])
         assert job["runs-on"] == [
             "self-hosted", "${{ format('1ES.Pool={0}', needs.select.outputs.pool) }}",
+            "${{ format('1ES.ImageOverride={0}', needs.select.outputs.image) }}",
         ]
     assert ADMISSION["jobs"]["probe"]["needs"] == "select"
     assert ADMISSION["jobs"]["recheck"]["needs"] == ["select", "probe"]

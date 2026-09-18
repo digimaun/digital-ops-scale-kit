@@ -79,8 +79,11 @@ permissions, artifact production or deployment. The first records baseline
 Python, Git, GitHub CLI and Azure CLI versions using temporary empty profiles.
 The second requires a different boot session. The summary contains tool
 versions and the comparison outcome, not machine identities or credentials.
-The diagnostic jobs request only `self-hosted` and the configured pool label.
-The pool supplies its default image.
+Set the repository Actions variable `SITEOPS_RELEASE_IMAGE` to the approved
+image name configured in that pool before using this mode. The diagnostic
+requests `self-hosted`, the configured pool label and an explicit
+`1ES.ImageOverride` label. Missing or malformed image configuration stops
+admission before allocation. The image choice is not a dispatch override.
 
 This mode leaves the release artifact gate closed. Different boot sessions
 do not establish complete machine isolation, Trusted Launch or provenance.

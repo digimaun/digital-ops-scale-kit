@@ -24,6 +24,7 @@ jobs:
     permissions: {}
     outputs:
       pool: ${{ steps.select.outputs.pool }}
+      image: ${{ steps.select.outputs.image }}
     steps:
       - name: Admit the release runner request
         id: select
@@ -32,6 +33,7 @@ jobs:
           # Enable only with the reviewed 1ES provenance implementation and qualification.
           RELEASE_PROVENANCE_READY: "false"
           RELEASE_POOL: ${{ vars.SITEOPS_RELEASE_POOL }}
+          RELEASE_IMAGE: ${{ vars.SITEOPS_RELEASE_IMAGE }}
           RELEASE_MODE: ${{ inputs.mode }}
           EXPECTED_SOURCE_SHA: ${{ inputs.expected-source-sha }}
           SOURCE_SHA: ${{ github.sha }}
@@ -65,6 +67,9 @@ jobs:
           pool = os.environ["RELEASE_POOL"]
           if not re.fullmatch("[A-Za-z0-9][A-Za-z0-9._-]{0,99}", pool):
               reject("Configure SITEOPS_RELEASE_POOL with this repository's dedicated 1ES pool name.")
+          image = os.environ["RELEASE_IMAGE"]
+          if mode == "check" and not re.fullmatch("[A-Za-z0-9][A-Za-z0-9._-]{0,99}", image):
+              reject("Configure SITEOPS_RELEASE_IMAGE with an approved image name in the selected pool.")
           if mode != "check" and os.environ["RELEASE_PROVENANCE_READY"] != "true":
               reject(
                   "1ES release artifact execution is not enabled. Current provenance verification "
@@ -73,6 +78,8 @@ jobs:
               )
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write("pool=" + pool + "\n")
+              if mode == "check":
+                  output.write("image=" + image + "\n")
           print("The configured 1ES pool was selected for this request. Test runners are unchanged.")
 
   probe:
@@ -82,6 +89,7 @@ jobs:
     runs-on:
       - self-hosted
       - ${{ format('1ES.Pool={0}', needs.select.outputs.pool) }}
+      - ${{ format('1ES.ImageOverride={0}', needs.select.outputs.image) }}
     timeout-minutes: 10
     permissions: {}
     outputs:
@@ -156,6 +164,7 @@ jobs:
     runs-on:
       - self-hosted
       - ${{ format('1ES.Pool={0}', needs.select.outputs.pool) }}
+      - ${{ format('1ES.ImageOverride={0}', needs.select.outputs.image) }}
     timeout-minutes: 5
     permissions: {}
     steps:

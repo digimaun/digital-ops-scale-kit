@@ -106,6 +106,7 @@ jobs:
       version-mode: ${{ steps.plan.outputs.version-mode }}
       workspaces: ${{ steps.plan.outputs.workspaces }}
       workspace-matrix: ${{ steps.plan.outputs.workspace-matrix }}
+      single-workspace-artifact: ${{ steps.plan.outputs.single-workspace-artifact }}
       intent-path: ${{ steps.plan.outputs.intent-path }}
       plan-sha: ${{ steps.plan.outputs.plan-sha }}
       tag-exists: ${{ steps.target.outputs.tag-exists }}
@@ -199,6 +200,10 @@ jobs:
               {"slot": slot, "workspace": request["workspace"]}
               for slot, request in enumerate(plan.get("workspaces", []), 1)
           ]}, separators=(",", ":")))
+          print("single-workspace-artifact=" + (
+              "workspace-attested-" + os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"] + "-1"
+              if len(plan.get("workspaces", [])) == 1 else ""
+          ))
           print("plan-sha=" + hashlib.sha256(raw).hexdigest())
           if plan["active"]:
               print("intent-path=" + plan["intent"]["path"])
@@ -396,11 +401,12 @@ jobs:
       - name: Download attested workspace subjects
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          name: ${{ needs.prepare.outputs.single-workspace-artifact }}
           pattern: workspace-attested-${{ github.run_id }}-${{ github.run_attempt }}-*
           repository: ${{ github.repository }}
           run-id: ${{ github.run_id }}
           github-token: ${{ github.token }}
-          path: ${{ runner.temp }}/workspace-staging
+          path: ${{ runner.temp }}/workspace-staging/${{ needs.prepare.outputs.single-workspace-artifact }}
           merge-multiple: false
           digest-mismatch: error
 
@@ -511,6 +517,7 @@ jobs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
       selection-sha: ${{ steps.select.outputs.selection-sha }}
       matrix: ${{ steps.select.outputs.matrix }}
+      single-qualification-artifact: ${{ steps.select.outputs.single-qualification-artifact }}
     env:
       INTENT_PATH: ${{ needs.prepare.outputs.intent-path }}
       EXPECTED_PLAN_SHA: ${{ needs.prepare.outputs.plan-sha }}
@@ -621,6 +628,12 @@ jobs:
           result = json.loads((Path(os.environ["RUNNER_TEMP"]) / "engine-selection.json").read_bytes())
           print("selection-sha=" + result["selectionSha256"])
           print("matrix=" + json.dumps(result["matrix"], separators=(",", ":")))
+          targets = result["matrix"]["include"]
+          print("single-qualification-artifact=" + (
+              "workspace-qualification-" + os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+              + "-" + targets[0]["platform"] + "-" + targets[0]["python"]
+              if len(targets) == 1 else ""
+          ))
           ' >> "$GITHUB_OUTPUT"
 
       - name: Retain selected engine inputs
@@ -781,11 +794,12 @@ jobs:
       - name: Download every qualification cell
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          name: ${{ needs.engine-input.outputs.single-qualification-artifact }}
           pattern: workspace-qualification-${{ github.run_id }}-${{ github.run_attempt }}-*
           repository: ${{ github.repository }}
           run-id: ${{ github.run_id }}
           github-token: ${{ github.token }}
-          path: ${{ runner.temp }}/qualification-results
+          path: ${{ runner.temp }}/qualification-results/${{ needs.engine-input.outputs.single-qualification-artifact }}
           merge-multiple: false
           digest-mismatch: error
 

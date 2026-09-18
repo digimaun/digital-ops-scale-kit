@@ -118,7 +118,7 @@ def _all_steps(document: dict):
 def test_ci_rehearsal_requires_an_explicit_manual_request_and_source_commit():
     inputs = CI[ON]["workflow_dispatch"]["inputs"]
     assert inputs["run-mode"]["type"] == "choice"
-    assert inputs["run-mode"]["options"] == ["ci-only", "runner-check", "installer-check", "release-preview"]
+    assert inputs["run-mode"]["options"] == ["ci-only", "runner-check", "attestation-check", "installer-check", "release-preview"]
     assert inputs["run-mode"]["default"] == "ci-only"
     assert inputs["expected-source-sha"]["type"] == "string"
     assert inputs["expected-source-sha"]["required"] is False

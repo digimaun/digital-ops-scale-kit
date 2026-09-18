@@ -33,13 +33,13 @@ on:
   workflow_dispatch:
     inputs:
       run-mode:
-        description: "CI always runs. Runner checks, installer checks and release previews never publish."
+        description: "CI always runs. attestation-check creates a permanent public signing record. No mode publishes a release."
         type: choice
         required: false
-        options: [ci-only, runner-check, installer-check, release-preview]
+        options: [ci-only, runner-check, attestation-check, installer-check, release-preview]
         default: ci-only
       expected-source-sha:
-        description: "For runner-check, installer-check or release-preview: full commit SHA of the selected branch."
+        description: "Required for any mode except ci-only: full commit SHA of the selected branch."
         type: string
         required: false
         default: ""
@@ -87,6 +87,19 @@ jobs:
       intent: ${{ inputs.release-file }}
       dry-run: true
       release-pool: ${{ needs.release-runner.outputs.pool }}
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+
+  attestation-check:
+    name: Attestation
+    needs: [lint, test, validate]
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run-mode == 'attestation-check' }}
+    uses: ./.github/workflows/_attestation-check.yaml
+    with:
+      expected-source-sha: ${{ inputs.expected-source-sha }}
     permissions:
       contents: read
       actions: read
@@ -305,7 +318,7 @@ jobs:
 
   overview:
     name: Overview
-    needs: [lint, test, validate, release-runner, installer-check, release-preview]
+    needs: [lint, test, validate, release-runner, installer-check, release-preview, attestation-check]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -322,6 +335,7 @@ jobs:
           RUNNER_RESULT: ${{ needs.release-runner.result }}
           INSTALLER_RESULT: ${{ needs.installer-check.result }}
           PREVIEW_RESULT: ${{ needs.release-preview.result }}
+          ATTESTATION_RESULT: ${{ needs.attestation-check.result }}
         run: |
           import os
           import re
@@ -331,6 +345,10 @@ jobs:
               "runner-check": (
                   "Runner check", (("Runner admission and diagnostics", "RUNNER_RESULT"),),
                   "This mode does not build, sign or publish release artifacts.",
+              ),
+              "attestation-check": (
+                  "Attestation check", (("Non-release attestation", "ATTESTATION_RESULT"),),
+                  "This mode signs public, non-release evidence and creates a permanent public signing record. It does not publish a release.",
               ),
               "installer-check": (
                   "Installer check", (("Runner admission", "RUNNER_RESULT"), ("Installer", "INSTALLER_RESULT")),

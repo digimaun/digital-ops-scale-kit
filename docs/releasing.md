@@ -13,9 +13,9 @@ evidence for an artifact. Each signed artifact has its own proof.
 
 ## Choose the right workflow
 
-| Workflow | Use it for | Can it publish? |
+| Workflow | Use it for | Can it publish a release? |
 |---|---|---|
-| **CI** | Code checks, installer checks, or a release preview | No |
+| **CI** | Code and runner checks, attestation diagnostics, installer checks, or a release preview | No |
 | **Release (approval required)** | Preparing and publishing a reviewed release | Only after the configured reviewer approves |
 
 These entry points share candidate preparation. A CI preview is not a pending
@@ -42,7 +42,7 @@ separate from the upstream repository.
 Release artifact execution is currently gated before worker allocation.
 The existing provenance verifier requires `github-hosted` evidence, while
 1ES GitHub runners are classified as `self-hosted`. Configuring a pool does
-not enable builds or signing. Enabling this path requires a reviewed provenance
+not enable release builds or signing. Enabling this path requires a reviewed provenance
 implementation and qualification of the runner configuration and actual
 attestation evidence. A pool label is not proof of 1ES membership, and the
 current verification requirements remain unchanged.
@@ -97,12 +97,45 @@ Configure a single image on that pool before using this preview.
 The variable must agree with the pool's integration mode. It does not
 reconfigure the pool. Other repositories retain their own routing settings.
 
-Scale Set preview routing is available only for `runner-check`.
+Scale Set preview routing is available for `runner-check` and the separate
+`attestation-check` diagnostic below.
 Preview support limitations apply.
 
 This mode leaves the release artifact gate closed. Different boot sessions
 do not establish complete machine isolation, Trusted Launch or provenance.
 Ordinary CI still runs on public runners, and `release-file` is ignored.
+
+### Inspect an attestation from the fork runner
+
+After `runner-check` succeeds on a fork's Scale Set pool, choose
+`attestation-check` for `run-mode` and enter the reviewed branch's full
+`expected-source-sha`. This mode requires a fork, a manual branch dispatch,
+and `SITEOPS_RELEASE_RUNNER_MODE=scaleset`. It waits for ordinary CI to pass.
+The `release-file` input is ignored.
+
+This is real signing. It creates a public attestation and permanent
+transparency record identifying the fork, workflow and commit, even if later
+verification fails. Deleting the run or its temporary artifacts does not remove
+that record. Approve those consequences before dispatching.
+
+The 1ES job creates only `runner-check.txt` with fixed diagnostic text and
+attests it without checking out repository source. A public runner downloads
+the exact evidence artifact, uses stock GitHub CLI verification, and compares
+the observed certificate with the expected repository, branch, source commit,
+reusable signer, caller workflow and `self-hosted` class. This diagnostic uses
+the CLI's online trust roots. Release consumers retain their separate policy
+and trusted root requirements.
+
+The subject and detached proof are retained as a workflow artifact for seven
+days. If signature verification succeeds, its bounded JSON result is also
+retained, including when the later certificate comparison fails. A failed
+comparison requires investigation rather than wider identity matching.
+
+This mode creates no tag or release and leaves the production verification
+policy and release gate unchanged. A `self-hosted` certificate does not identify
+a particular pool or establish Trusted Launch, complete worker isolation or
+release authority. The upstream pool and installed engine compatibility require
+their own qualification.
 
 ## Preview a release without publishing
 

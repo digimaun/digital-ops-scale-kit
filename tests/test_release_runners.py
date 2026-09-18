@@ -45,6 +45,7 @@ def admit(tmp_path, **changes):
         "SOURCE_SHA": "a" * 40,
         "SOURCE_REF": "refs/heads/preview",
         "SOURCE_REPOSITORY": "example/content",
+        "SOURCE_IS_FORK": "false",
         "CALLER_WORKFLOW": "example/content/.github/workflows/ci.yaml@refs/heads/preview",
         "CALLER_EVENT": "workflow_dispatch",
         "GITHUB_OUTPUT": str(output),
@@ -110,6 +111,7 @@ def test_admission_has_no_source_or_privileged_capability():
     assert STEP["env"]["RELEASE_POOL"] == "${{ vars.SITEOPS_RELEASE_POOL }}"
     assert STEP["env"]["RELEASE_IMAGE"] == "${{ vars.SITEOPS_RELEASE_IMAGE }}"
     assert STEP["env"]["RUNNER_MODE"] == "${{ vars.SITEOPS_RELEASE_RUNNER_MODE }}"
+    assert STEP["env"]["SOURCE_IS_FORK"] == "${{ github.event.repository.fork }}"
     assert "RUNNER_MODE" not in ADMISSION[True]["workflow_call"]["inputs"]
     assert all("uses" not in step for step in SELECT["steps"])
     assert "RELEASE_POOL" not in ADMISSION[True]["workflow_call"]["inputs"]
@@ -281,6 +283,38 @@ def test_scale_set_check_cannot_inject_additional_labels(tmp_path, pool):
     assert output == "existing=value\n"
 
 
+def test_attestation_admission_emits_only_the_fork_scale_set_label(tmp_path):
+    result, output = admit(
+        tmp_path, RELEASE_MODE="attestation", SOURCE_IS_FORK="true",
+        RUNNER_MODE="scaleset", RELEASE_PROVENANCE_READY="false", RELEASE_IMAGE="unused",
+    )
+    assert result.returncode == 0, result.stderr
+    assert output == 'existing=value\npool=example-release-pool\nlabels=["example-release-pool"]\n'
+    assert ADMISSION[True]["workflow_call"]["outputs"]["labels"]["value"] == "${{ jobs.select.outputs.labels }}"
+    assert SELECT["outputs"]["labels"] == "${{ steps.select.outputs.labels }}"
+
+
+@pytest.mark.parametrize("changes", [
+    {"SOURCE_IS_FORK": "false"}, {"SOURCE_IS_FORK": ""}, {"SOURCE_IS_FORK": "True"},
+    {"CALLER_EVENT": "pull_request"}, {"CALLER_EVENT": "pull_request_target"},
+    {"CALLER_EVENT": "push"}, {"CALLER_EVENT": "workflow_run"},
+    {"RUNNER_MODE": "legacy"}, {"RUNNER_MODE": ""}, {"RUNNER_MODE": "automatic"},
+    {"EXPECTED_SOURCE_SHA": "b" * 40}, {"SOURCE_SHA": "b" * 40},
+    {"RELEASE_POOL": ""}, {"RELEASE_POOL": 'pool","self-hosted'},
+    {"SOURCE_REPOSITORY": "other/content"},
+    {"CALLER_WORKFLOW": "example/content/.github/workflows/other.yaml@refs/heads/preview"},
+    {"SOURCE_REF": "refs/tags/v1", "CALLER_WORKFLOW": "example/content/.github/workflows/ci.yaml@refs/tags/v1"},
+])
+def test_attestation_admission_rejects_before_allocating_or_signing(tmp_path, changes):
+    environment = {
+        "RELEASE_MODE": "attestation", "SOURCE_IS_FORK": "true",
+        "RUNNER_MODE": "scaleset", "RELEASE_PROVENANCE_READY": "false", **changes,
+    }
+    result, output = admit(tmp_path, **environment)
+    assert result.returncode != 0 and "::error::" in result.stderr
+    assert output == "existing=value\n"
+
+
 def test_runner_check_jobs_have_no_source_or_signing_permissions():
     for key in ("probe", "recheck"):
         job = ADMISSION["jobs"][key]
@@ -422,23 +456,25 @@ def test_private_runtime_paths_are_initialized_before_source_steps(tmp_path, fil
 
 
 @pytest.mark.parametrize("mode,visible,hidden", [
-    ("ci-only", (), ("Runner admission", "Installer", "Preview")),
-    ("runner-check", ("Runner admission and diagnostics",), ("Installer", "Preview")),
-    ("installer-check", ("Runner admission", "Installer"), ("Preview",)),
-    ("release-preview", ("Runner admission", "Preview"), ("Installer",)),
+    ("ci-only", (), ("Runner admission", "Installer", "Preview", "Non-release attestation")),
+    ("runner-check", ("Runner admission and diagnostics",), ("Installer", "Preview", "Non-release attestation")),
+    ("attestation-check", ("Non-release attestation",), ("Runner admission", "Installer", "Preview")),
+    ("installer-check", ("Runner admission", "Installer"), ("Preview", "Non-release attestation")),
+    ("release-preview", ("Runner admission", "Preview"), ("Installer", "Non-release attestation")),
 ])
 def test_ci_overview_reports_only_the_selected_path(tmp_path, monkeypatch, mode, visible, hidden):
     job = workflow("ci.yaml")["jobs"]["overview"]
     assert job["if"] == "always()"
     assert job["permissions"] == {}
     assert job["runs-on"] == "ubuntu-latest"
-    assert job["needs"] == ["lint", "test", "validate", "release-runner", "installer-check", "release-preview"]
+    assert job["needs"] == ["lint", "test", "validate", "release-runner", "installer-check", "release-preview", "attestation-check"]
     assert len(job["steps"]) == 1 and "uses" not in job["steps"][0]
     summary = tmp_path / "summary"
     values = {
         "CI_MODE": mode, "SOURCE_SHA": "a" * 40,
         "LINT_RESULT": "success", "TEST_RESULT": "failure", "VALIDATE_RESULT": "success",
         "RUNNER_RESULT": "success", "INSTALLER_RESULT": "skipped", "PREVIEW_RESULT": "cancelled",
+        "ATTESTATION_RESULT": "failure",
         "GITHUB_STEP_SUMMARY": str(summary),
     }
     for key, value in values.items():
@@ -455,6 +491,9 @@ def test_ci_overview_reports_only_the_selected_path(tmp_path, monkeypatch, mode,
         assert "| Installer | Skipped |" in text
     if mode == "release-preview":
         assert "| Preview | Cancelled |" in text
+    if mode == "attestation-check":
+        assert "| Non-release attestation | Failed |" in text
+        assert "signs public, non-release evidence" in text
 
 
 @pytest.mark.parametrize("changes", [

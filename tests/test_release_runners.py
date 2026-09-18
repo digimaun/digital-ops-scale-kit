@@ -1,6 +1,7 @@
 """Keep release artifact work on admitted 1ES pools and ordinary checks on public runners."""
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -38,6 +39,7 @@ def admit(tmp_path, **changes):
         "RELEASE_PROVENANCE_READY": "true",
         "RELEASE_POOL": "example-release-pool",
         "RELEASE_IMAGE": "example-image",
+        "RUNNER_MODE": "",
         "RELEASE_MODE": "preview",
         "EXPECTED_SOURCE_SHA": "a" * 40,
         "SOURCE_SHA": "a" * 40,
@@ -107,6 +109,8 @@ def test_admission_has_no_source_or_privileged_capability():
     assert STEP["shell"] == "python"
     assert STEP["env"]["RELEASE_POOL"] == "${{ vars.SITEOPS_RELEASE_POOL }}"
     assert STEP["env"]["RELEASE_IMAGE"] == "${{ vars.SITEOPS_RELEASE_IMAGE }}"
+    assert STEP["env"]["RUNNER_MODE"] == "${{ vars.SITEOPS_RELEASE_RUNNER_MODE }}"
+    assert "RUNNER_MODE" not in ADMISSION[True]["workflow_call"]["inputs"]
     assert all("uses" not in step for step in SELECT["steps"])
     assert "RELEASE_POOL" not in ADMISSION[True]["workflow_call"]["inputs"]
 
@@ -197,7 +201,7 @@ def test_runner_check_is_the_only_nonsigning_gate_exception(tmp_path, event, all
     )
     assert (result.returncode == 0) is allowed, result.stderr
     assert ("pool=" in output) is allowed
-    assert ("image=example-image\n" in output) is allowed
+    assert ("labels=" in output) is allowed
 
 
 @pytest.mark.parametrize("image", ["", "image\npool=other", "image,other", "owner/image", "$(touch injected)", "a" * 101])
@@ -210,6 +214,73 @@ def test_runner_check_rejects_invalid_image_selection_before_allocation(tmp_path
     assert not (tmp_path / "injected").exists()
 
 
+@pytest.mark.parametrize("routing,expected", [
+    ("", ["self-hosted", "1ES.Pool=example-release-pool", "1ES.ImageOverride=example-image"]),
+    ("legacy", ["self-hosted", "1ES.Pool=example-release-pool", "1ES.ImageOverride=example-image"]),
+    ("scaleset", ["example-release-pool"]),
+])
+def test_runner_check_emits_exact_labels_for_the_configured_integration(tmp_path, routing, expected):
+    result, output = admit(
+        tmp_path, RELEASE_MODE="check", RELEASE_PROVENANCE_READY="false", RUNNER_MODE=routing,
+    )
+    assert result.returncode == 0, result.stderr
+    values = dict(line.split("=", 1) for line in output.splitlines())
+    assert values == {
+        "existing": "value", "pool": "example-release-pool",
+        "labels": json.dumps(expected, separators=(",", ":")),
+    }
+    assert json.loads(values["labels"]) == expected
+
+
+def test_scale_set_check_uses_the_pool_image_without_demand_labels(tmp_path):
+    result, output = admit(
+        tmp_path, RELEASE_MODE="check", RELEASE_PROVENANCE_READY="false",
+        RUNNER_MODE="scaleset", RELEASE_IMAGE="unused\nPRIVATE_SENTINEL",
+    )
+    assert result.returncode == 0, result.stderr
+    assert 'labels=["example-release-pool"]\n' in output
+    assert "PRIVATE_SENTINEL" not in output + result.stdout + result.stderr
+    assert "configured image" in result.stdout
+
+
+@pytest.mark.parametrize("routing", ["true", "ScaleSet", "automatic", "scaleset\npool=other"])
+def test_invalid_runner_mode_fails_without_fallback_or_output(tmp_path, routing):
+    result, output = admit(tmp_path, RELEASE_MODE="check", RUNNER_MODE=routing)
+    assert result.returncode != 0 and "SITEOPS_RELEASE_RUNNER_MODE" in result.stderr
+    assert output == "existing=value\n"
+
+
+@pytest.mark.parametrize("mode", ["preview", "release"])
+def test_scale_set_preview_cannot_enable_release_artifact_jobs(tmp_path, mode):
+    caller = "ci.yaml" if mode == "preview" else "release.yaml"
+    result, output = admit(
+        tmp_path, RELEASE_MODE=mode, RUNNER_MODE="scaleset", RELEASE_PROVENANCE_READY="true",
+        SOURCE_REF="refs/heads/main",
+        CALLER_WORKFLOW=f"example/content/.github/workflows/{caller}@refs/heads/main",
+    )
+    assert result.returncode != 0 and "restricted to runner-check" in result.stderr
+    assert output == "existing=value\n"
+
+
+@pytest.mark.parametrize("event", ["pull_request", "pull_request_target", "push", "workflow_run"])
+def test_scale_set_check_preserves_event_admission(tmp_path, event):
+    result, output = admit(
+        tmp_path, RELEASE_MODE="check", RUNNER_MODE="scaleset",
+        RELEASE_PROVENANCE_READY="false", CALLER_EVENT=event,
+    )
+    assert result.returncode != 0 and "explicit dispatch" in result.stderr
+    assert output == "existing=value\n"
+
+
+@pytest.mark.parametrize("pool", ["", 'pool","self-hosted', "pool\nother", "pool,other"])
+def test_scale_set_check_cannot_inject_additional_labels(tmp_path, pool):
+    result, output = admit(
+        tmp_path, RELEASE_MODE="check", RUNNER_MODE="scaleset", RELEASE_POOL=pool,
+    )
+    assert result.returncode != 0 and "SITEOPS_RELEASE_POOL" in result.stderr
+    assert output == "existing=value\n"
+
+
 def test_runner_check_jobs_have_no_source_or_signing_permissions():
     for key in ("probe", "recheck"):
         job = ADMISSION["jobs"][key]
@@ -217,10 +288,7 @@ def test_runner_check_jobs_have_no_source_or_signing_permissions():
         assert job["if"] == "inputs.mode == 'check'"
         assert job["timeout-minutes"] <= 10
         assert all("uses" not in step for step in job["steps"])
-        assert job["runs-on"] == [
-            "self-hosted", "${{ format('1ES.Pool={0}', needs.select.outputs.pool) }}",
-            "${{ format('1ES.ImageOverride={0}', needs.select.outputs.image) }}",
-        ]
+        assert job["runs-on"] == "${{ fromJSON(needs.select.outputs.labels) }}"
     assert ADMISSION["jobs"]["probe"]["needs"] == "select"
     assert ADMISSION["jobs"]["recheck"]["needs"] == ["select", "probe"]
     assert ADMISSION["jobs"]["probe"]["name"] != ADMISSION["jobs"]["recheck"]["name"]

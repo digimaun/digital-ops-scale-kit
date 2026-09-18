@@ -79,11 +79,26 @@ permissions, artifact production or deployment. The first records baseline
 Python, Git, GitHub CLI and Azure CLI versions using temporary empty profiles.
 The second requires a different boot session. The summary contains tool
 versions and the comparison outcome, not machine identities or credentials.
-Set the repository Actions variable `SITEOPS_RELEASE_IMAGE` to the approved
-image name configured in that pool before using this mode. The diagnostic
+For legacy routing, set the repository Actions variable `SITEOPS_RELEASE_IMAGE`
+to the approved image name configured in that pool before using this mode. The diagnostic
 requests `self-hosted`, the configured pool label and an explicit
 `1ES.ImageOverride` label. Missing or malformed image configuration stops
 admission before allocation. The image choice is not a dispatch override.
+
+For a pool explicitly enrolled in the 1ES Scale Set API preview, set the
+repository variable `SITEOPS_RELEASE_RUNNER_MODE` to `scaleset`.
+An unset variable or `legacy` retains the existing routing. Other values
+stop admission rather than choosing a fallback.
+
+The Scale Set diagnostic requests only the admitted pool name. It uses the
+pool's configured image, rather than `SITEOPS_RELEASE_IMAGE`, and sends no
+`self-hosted`, `1ES.Pool`, `ImageOverride` or `JobId` demand labels.
+Configure a single image on that pool before using this preview.
+The variable must agree with the pool's integration mode. It does not
+reconfigure the pool. Other repositories retain their own routing settings.
+
+Scale Set preview routing is available only for `runner-check`.
+Preview support limitations apply.
 
 This mode leaves the release artifact gate closed. Different boot sessions
 do not establish complete machine isolation, Trusted Launch or provenance.

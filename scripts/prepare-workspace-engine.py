@@ -43,6 +43,10 @@ def main() -> int:
     parser.add_argument("--build-number", required=True, type=int, help="Candidate workflow run number.")
     parser.add_argument("--build-attempt", required=True, type=int, help="Candidate workflow run attempt.")
     parser.add_argument("--dry-run", action="store_true", help="Require preview identities and permit a committed release example.")
+    parser.add_argument(
+        "--expected-runner-environment", required=True, choices=("github-hosted", "self-hosted"),
+        help="Trusted expected signing runner class, supplied independently of the engine assets.",
+    )
     args = parser.parse_args()
     try:
         intent = load_release_intent(
@@ -68,6 +72,7 @@ def main() -> int:
                         source,
                         signer=".github/workflows/_siteops-distribution.yaml",
                         builder=builder,
+                        runner_environment=args.expected_runner_environment,
                     )
                 )
             if checks[0].source != source:

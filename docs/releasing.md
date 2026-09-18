@@ -39,13 +39,20 @@ In each publishing or rehearsal repository, set the Actions repository variable
 the pool for that exact repository. A fork has its own configuration and pool,
 separate from the upstream repository.
 
-Release artifact execution is currently gated before worker allocation.
-The existing provenance verifier requires `github-hosted` evidence, while
-1ES GitHub runners are classified as `self-hosted`. Configuring a pool does
-not enable release builds or signing. Enabling this path requires a reviewed provenance
-implementation and qualification of the runner configuration and actual
-attestation evidence. A pool label is not proof of 1ES membership, and the
-current verification requirements remain unchanged.
+Use `runner-check` to confirm the pool's baseline. A fork can also run the
+attestation diagnostic below. Review the repository registration, maintained
+image, isolation controls and verification policy, then
+set `SITEOPS_RELEASE_PROVENANCE_READY` to `true` to enable artifact execution
+in that repository. An absent or different value keeps admission closed
+before worker allocation. Configuring the fork does not enable the upstream
+repository. Run an approved release preview to qualify the actual artifact
+path before publication.
+
+Artifact execution requires `SITEOPS_RELEASE_RUNNER_MODE=scaleset` and an
+enrolled Scale Set pool. Each artifact job checks its Linux `self-hosted`
+runtime before source or artifact work. Verification separately requires
+that exact signing class and the selected repository, source and workflow
+identities. A pool label or runner class does not establish 1ES membership.
 
 | Work | Runner |
 |---|---|
@@ -61,9 +68,9 @@ Missing or malformed pool configuration fails explicitly, with no fallback to
 public runners.
 
 The pool comes from repository configuration, not a release declaration or
-dispatch override. Artifact jobs use the pool label and distinct `JobId` labels for the
-run, attempt and workspace slot. Keep source builds separate from signing and
-publishing jobs. Their permissions and publication approval remain independent
+dispatch override. Artifact jobs request only the admitted pool name.
+Keep source builds separate from signing and publishing jobs. Their
+permissions and publication approval remain independent
 of runner placement.
 
 Use the maintained runner image for baseline tools. Existing workflow steps
@@ -87,8 +94,9 @@ admission before allocation. The image choice is not a dispatch override.
 
 For a pool explicitly enrolled in the 1ES Scale Set API preview, set the
 repository variable `SITEOPS_RELEASE_RUNNER_MODE` to `scaleset`.
-An unset variable or `legacy` retains the existing routing. Other values
-stop admission rather than choosing a fallback.
+An unset variable or `legacy` retains legacy routing for `runner-check`.
+Artifact execution requires `scaleset`. Other values stop admission rather
+than choosing a fallback.
 
 The Scale Set diagnostic requests only the admitted pool name. It uses the
 pool's configured image, rather than `SITEOPS_RELEASE_IMAGE`, and sends no
@@ -97,11 +105,10 @@ Configure a single image on that pool before using this preview.
 The variable must agree with the pool's integration mode. It does not
 reconfigure the pool. Other repositories retain their own routing settings.
 
-Scale Set preview routing is available for `runner-check` and the separate
-`attestation-check` diagnostic below.
-Preview support limitations apply.
+Scale Set routing supports the diagnostics and explicitly enabled artifact
+jobs. Preview support limitations apply.
 
-This mode leaves the release artifact gate closed. Different boot sessions
+This mode does not change release admission. Different boot sessions
 do not establish complete machine isolation, Trusted Launch or provenance.
 Ordinary CI still runs on public runners, and `release-file` is ignored.
 
@@ -160,8 +167,9 @@ artifacts under a content tag. Examples are accepted only for a dry run and
 never trigger publication when merged.
 
 For the default example, the CI preview performs real builds and signing, but
-it cannot publish and cannot be promoted into a release. Once the runner and
-provenance gate above is enabled, it follows ordinary CI with these steps:
+it cannot publish and cannot be promoted into a release. Once the repository
+opts in to artifact execution as described above, it follows ordinary CI with
+these steps:
 
 1. Prepares the exact release plan and requested engine assets.
 2. Builds each declared workspace with read permissions, using that release

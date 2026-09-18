@@ -1,5 +1,6 @@
 """Exercise the declaration-driven publisher through its actual workflow steps."""
 
+import copy
 import hashlib
 import importlib.util
 import json
@@ -18,6 +19,7 @@ from tests.release_helpers import CLI, _commit, _write_record, _write_source_ver
 from tests.release_helpers import repository as repository
 from tests.shell_helpers import bash_path, write_executable
 from tests.shell_helpers import run_script as _run_script
+from tests.verification_helpers import verified_observation
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = yaml.safe_load((ROOT / ".github" / "workflows" / "release.yaml").read_text())
@@ -244,11 +246,14 @@ with open(os.environ["FAKE_CALLS"], "a") as output:
     output.write(json.dumps(args) + "\\n")
 if args[:2] == ["attestation", "verify"]:
     expected = os.environ.get("EXPECTED_SIGNER_IDENTITY")
+    if Path(args[2]).name in json.loads(os.environ.get("WORKSPACE_SUBJECTS", "[]")):
+        expected = "https://github.com/" + os.environ["GITHUB_REPOSITORY"] + "/.github/workflows/_workspace-distribution.yaml@" + os.environ["SOURCE_REF"]
     if expected and args[args.index("--cert-identity") + 1] != expected:
         raise SystemExit(9)
     failed_subject = os.environ.get("FAIL_ATTESTATION_SUBJECT")
     if failed_subject and Path(args[2]).name == failed_subject:
         raise SystemExit(9)
+    print(json.dumps(json.loads(Path(os.environ["FAKE_VERIFICATIONS"]).read_text())[Path(args[2]).name]))
     raise SystemExit(int(os.environ.get("FAIL_ATTESTATION", "0")))
 if args[0] == "release":
     raise SystemExit(int(os.environ.get("FAIL_RELEASE", "0")))
@@ -343,12 +348,11 @@ else:
             "GITHUB_REPOSITORY": REPO, "SOURCE_SHA": candidate.get("source_sha", SHA),
             "SOURCE_REF": "refs/heads/main",
             "DRY_RUN": "false",
+            "EXPECTED_RUNNER_ENVIRONMENT": "self-hosted",
             "GITHUB_RUN_ID": "42", "GITHUB_RUN_ATTEMPT": "1",
             "PYTHONIOENCODING": WORKFLOW["env"]["PYTHONIOENCODING"],
             "RUNNER_TEMP": candidate["root"].as_posix(),
             "ARCHIVE_NAME": ARCHIVE, "ATTESTATION_SUFFIX": ".attestation.jsonl",
-            "SIGNER_IDENTITY": f"https://github.com/{REPO}/.github/workflows/_siteops-distribution.yaml@refs/heads/main",
-            "EXPECTED_SIGNER_IDENTITY": f"https://github.com/{REPO}/.github/workflows/_siteops-distribution.yaml@refs/heads/main",
             "BUILD_NUMBER": "42", "BUILD_ATTEMPT": "1",
             "OIDC_ISSUER": "https://token.actions.githubusercontent.com",
             "PREDICATE_TYPE": "https://slsa.dev/provenance/v1",
@@ -375,6 +379,28 @@ else:
             "TAG": candidate["plan"]["release"]["tag"],
         }
         environment.update(extra or {})
+        signer_identity = f"https://github.com/{REPO}/.github/workflows/_siteops-distribution.yaml@{environment['SOURCE_REF']}"
+        environment.setdefault("SIGNER_IDENTITY", signer_identity)
+        environment.setdefault("EXPECTED_SIGNER_IDENTITY", signer_identity)
+        builder = ".github/workflows/" + ("ci.yaml" if environment["DRY_RUN"] == "true" else "release.yaml")
+        environment.setdefault("BUILDER_IDENTITY", f"https://github.com/{REPO}/{builder}@{environment['SOURCE_REF']}")
+        packages = [request["package"] for request in candidate["plan"].get("workspaces", [])]
+        environment["WORKSPACE_SUBJECTS"] = json.dumps(packages)
+        observations = {}
+        for subject in (ARCHIVE, wheel_path.name, *packages):
+            signer = ".github/workflows/" + ("_workspace-distribution.yaml" if subject in packages else "_siteops-distribution.yaml")
+            observation = verified_observation(
+                REPO, environment["SOURCE_SHA"], environment["SOURCE_REF"], signer,
+                builder,
+            )
+            observations[subject] = [observation]
+            if environment.get("CERTIFICATE_FAULT"):
+                changed = copy.deepcopy(observation)
+                changed["verificationResult"]["signature"]["certificate"][environment["CERTIFICATE_FAULT"]] = "PRIVATE_WRONG"
+                observations[subject].append(changed)
+        evidence = tmp_path / "verifications.json"
+        evidence.write_text(json.dumps(observations), encoding="utf-8")
+        environment["FAKE_VERIFICATIONS"] = evidence.as_posix()
         result = _run_script(step(job, name)["run"], tmp_path, environment)
         values = dict(
             line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines()
@@ -389,6 +415,9 @@ else:
 
 def test_publication_uses_only_the_completed_candidate_and_required_approval():
     assert WORKFLOW["permissions"] == {"contents": "read"}
+    for document in (WORKFLOW, CANDIDATE_WORKFLOW):
+        assert document["env"]["BUILDER_IDENTITY"] == "https://github.com/${{ github.workflow_ref }}"
+    assert CANDIDATE_WORKFLOW["env"]["EXPECTED_RUNNER_ENVIRONMENT"] == "self-hosted"
     assert "head_sha=" in step("review", "Require successful CI for the candidate")["run"]
     assert JOBS["distribution"]["uses"] == "./.github/workflows/_siteops-distribution.yaml"
     assert JOBS["distribution"]["with"]["version-mode"] == "${{ needs.prepare.outputs.version-mode }}"
@@ -430,6 +459,22 @@ def test_shared_verification_runs_again_before_any_publication_write():
     )
     assert step("publish", "Download the frozen asset list")["with"]["artifact-ids"] == "${{ needs.candidate.outputs.assets-artifact-id }}"
     assert not any("checkout@" in item.get("uses", "") for item in JOBS["publish"]["steps"])
+
+
+@pytest.mark.parametrize("job,name", [
+    ("review", "Verify the pinned candidate"), ("publish", "Verify the approved release assets"),
+])
+@pytest.mark.parametrize("field", [
+    "subjectAlternativeName", "issuer", "sourceRepositoryURI", "sourceRepositoryDigest",
+    "sourceRepositoryRef", "buildSignerDigest", "buildConfigURI", "buildConfigDigest", "runnerEnvironment",
+])
+def test_candidate_and_publisher_reject_each_mismatched_verified_claim(runner, job, name, field):
+    result, _, calls = runner(job, name, extra={"CERTIFICATE_FAULT": field})
+    assert result.returncode != 0
+    assert "certificate does not match release policy" in result.stdout + result.stderr
+    assert "PRIVATE_WRONG" not in result.stdout + result.stderr
+    assert len([call for call in calls if call[:2] == ["attestation", "verify"]]) == 1
+    assert not any("--method" in call or call[:2] == ["release", "create"] for call in calls)
 
 
 def test_rendering_source_is_pinned_and_only_executed_in_read_only_preparation():
@@ -714,7 +759,8 @@ def test_valid_preview_bundle_keeps_its_exact_source_and_artifact(candidate, run
     for verify in verifies:
         assert verify[verify.index("--source-digest") + 1] == SHA
         assert verify[verify.index("--signer-digest") + 1] == SHA
-        assert "--deny-self-hosted-runners" in verify
+        assert "--deny-self-hosted-runners" not in verify
+        assert verify[verify.index("--format") + 1] == "json"
         assert "--signer-repo" not in verify
     assert not any("--method" in call for call in calls)
     asset_list = json.loads(
@@ -1250,6 +1296,17 @@ def _render_install_notes(candidate, runner):
     return notes
 
 
+def test_install_notes_require_explicit_supported_runner_policy(candidate, runner):
+    result, _, _ = runner(
+        "review", "Render the final release notes",
+        extra={"ENGINE_VERSION": "1.0.0b1", "EXPECTED_RUNNER_ENVIRONMENT": "PRIVATE_UNKNOWN"},
+    )
+    assert result.returncode != 0
+    assert "expected provenance runner class is unsupported" in result.stdout + result.stderr
+    assert "PRIVATE_UNKNOWN" not in result.stdout + result.stderr
+    assert not (candidate["root"] / "publish-notes.md").exists()
+
+
 def _installation_block(notes):
     match = re.search(r"```console\n(.*?)\n```", notes, re.DOTALL)
     assert match is not None
@@ -1288,6 +1345,8 @@ def test_install_notes_bind_downloads_and_commands_to_the_selected_release(candi
     assert f"Expected publisher: `{REPO}`" in notes
     assert f"Source commit: `{SHA}`" in notes
     assert f'Source ref: `{candidate["plan"]["source"]["ref"]}`' in notes
+    assert "Expected provenance runner class: `self-hosted`" in notes
+    assert "runner class does not identify a particular pool" in notes
     assert "switching between online and locked installations" in notes
     assert "authenticated `pylock.toml` with stock pipx" in notes
     assert "shared pip 26.2.1" in notes and "experimental" in notes
@@ -1471,9 +1530,7 @@ def test_complete_workspace_candidate_reaches_only_the_approved_publication_set(
     for name in ("Verify the approved candidate", "Verify the approved release assets"):
         result, _, _ = runner("publish", name, extra=extra)
         assert result.returncode == 0, result.stdout + result.stderr
-    workspace_signer = f"https://github.com/{REPO}/.github/workflows/_workspace-distribution.yaml@refs/heads/main"
-    result, _, calls = runner("publish", "Verify the approved workspace subjects and descriptor",
-                              extra={**extra, "EXPECTED_SIGNER_IDENTITY": workspace_signer})
+    result, _, calls = runner("publish", "Verify the approved workspace subjects and descriptor", extra=extra)
     assert result.returncode == 0, result.stdout + result.stderr
     assert any(call[:2] == ["attestation", "verify"] and Path(call[2]).name == "workspace.zip" for call in calls)
     result, _, calls = runner("publish", "Publish the approved release", extra={
@@ -1531,9 +1588,13 @@ def test_workspace_publisher_rechecks_routing_and_verified_metadata(candidate, r
                     raw = json.dumps(metadata).encode()
                 archive.writestr(entry, raw)
     inventory_path.write_text(json.dumps(native))
-    extra = {"EXPECTED_SIGNER_IDENTITY": f"https://github.com/{REPO}/.github/workflows/_workspace-distribution.yaml@refs/heads/main"}
+    extra = {}
     if fault == "proof":
         extra["FAIL_ATTESTATION_SUBJECT"] = "workspace.zip"
+        result, _, calls = runner("publish", "Verify the approved release assets", extra=extra)
+        assert result.returncode != 0
+        assert any(call[:2] == ["attestation", "verify"] and Path(call[2]).name == "workspace.zip" for call in calls)
+        return
     result, _, calls = runner("publish", "Verify the approved workspace subjects and descriptor", extra=extra)
     assert result.returncode != 0
     if fault in {"source", "kit"}:

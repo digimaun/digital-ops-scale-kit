@@ -26,6 +26,7 @@ class ReleaseVerifier:
         *,
         signer: str,
         builder: str,
+        runner_environment: str,
     ):
         if set(source) != {"repository", "commit", "ref"}:
             raise ArtifactError(
@@ -56,6 +57,7 @@ class ReleaseVerifier:
                         "sourceRef": source["ref"],
                         "signerWorkflow": signer,
                         "builderWorkflow": builder,
+                        "runnerEnvironment": runner_environment,
                     },
                 }
             ).encode("utf-8"),

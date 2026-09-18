@@ -27,6 +27,10 @@ SELECT = ADMISSION["jobs"]["select"]
 STEP = SELECT["steps"][0]
 ENTRY_GUARD = (
     "inputs.release-pool != '' && inputs.release-pool == vars.SITEOPS_RELEASE_POOL && "
+    "inputs.expected-source-sha == github.sha && "
+    "vars.SITEOPS_RELEASE_PROVENANCE_READY == 'true' && vars.SITEOPS_RELEASE_RUNNER_MODE == 'scaleset' && "
+    "(github.workflow_ref == format('{0}/.github/workflows/ci.yaml@{1}', github.repository, github.ref) || "
+    "github.workflow_ref == format('{0}/.github/workflows/release.yaml@{1}', github.repository, github.ref)) && "
     "(github.event_name == 'workflow_dispatch' || "
     "(github.event_name == 'push' && github.ref == 'refs/heads/main'))"
 )
@@ -70,6 +74,7 @@ def test_admission_selects_only_the_configured_pool(tmp_path, mode, event, ref, 
     caller = "ci.yaml" if mode == "preview" else "release.yaml"
     result, output = admit(
         tmp_path, RELEASE_MODE=mode, CALLER_EVENT=event, SOURCE_REF=ref, RELEASE_POOL=pool,
+        RUNNER_MODE="scaleset",
         CALLER_WORKFLOW=f"example/content/.github/workflows/{caller}@{ref}",
     )
     assert result.returncode == 0, result.stderr
@@ -121,14 +126,14 @@ def test_admission_has_no_source_or_privileged_capability():
 def test_pending_provenance_qualification_blocks_before_worker_allocation(tmp_path, ready):
     result, output = admit(tmp_path, RELEASE_PROVENANCE_READY=ready)
     assert result.returncode != 0
-    assert "Current provenance verification requires github-hosted runners" in result.stderr
+    assert "SITEOPS_RELEASE_PROVENANCE_READY=true" in result.stderr
     assert output == "existing=value\n"
 
 
-def test_production_admission_keeps_the_provenance_gate_closed(tmp_path):
-    assert STEP["env"]["RELEASE_PROVENANCE_READY"] == "false"
+def test_production_admission_requires_explicit_repository_opt_in(tmp_path):
+    assert STEP["env"]["RELEASE_PROVENANCE_READY"] == "${{ vars.SITEOPS_RELEASE_PROVENANCE_READY }}"
     result, output = admit(
-        tmp_path, RELEASE_PROVENANCE_READY=STEP["env"]["RELEASE_PROVENANCE_READY"],
+        tmp_path, RELEASE_PROVENANCE_READY="", RUNNER_MODE="scaleset",
     )
     assert result.returncode != 0 and "not enabled" in result.stderr
     assert output == "existing=value\n"
@@ -149,15 +154,28 @@ def test_runner_placement_follows_artifact_authority(name, secured, public):
         job = document["jobs"][key]
         labels = job["runs-on"]
         pool = "needs.release-runner.outputs.pool" if name == "release.yaml" else "inputs.release-pool"
-        assert labels[:2] == ["self-hosted", "${{ format('1ES.Pool={0}', " + pool + ") }}"]
-        assert len(labels) == 3 and labels[2].startswith("${{ format('JobId=siteops-")
-        assert "github.run_id" in labels[2] and "github.run_attempt" in labels[2]
-        if name == "_workspace-distribution.yaml":
-            assert "inputs.slot" in labels[2]
-        assert not any("ubuntu-" in label or "windows-" in label for label in labels)
+        assert labels == ["${{ " + pool + " }}"]
+        assert job["steps"][0] == workflow("_siteops-distribution.yaml")["jobs"]["build"]["steps"][0]
     for key in public:
         assert document["jobs"][key]["runs-on"] in {"ubuntu-latest", "ubuntu-24.04", "${{ matrix.os }}"}
-    assert len({document["jobs"][key]["runs-on"][2] for key in secured}) == len(secured)
+
+
+@pytest.mark.parametrize("platform,runner,allowed", [
+    ("linux", "self-hosted", True), ("linux", "github-hosted", False), ("win32", "self-hosted", False),
+])
+def test_artifact_runtime_guard_precedes_source_and_signing(tmp_path, platform, runner, allowed):
+    guard = workflow("_siteops-distribution.yaml")["jobs"]["build"]["steps"][0]
+    assert guard["name"] == "Require the admitted runner class"
+    assert guard["shell"] == "python"
+    assert guard["env"] == {"RUNNER_CLASS": "${{ runner.environment }}"}
+    script = f"import sys\nsys.platform = {platform!r}\n" + guard["run"]
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script], cwd=tmp_path,
+        env={"RUNNER_CLASS": runner, **{key: os.environ[key] for key in ("SYSTEMROOT", "WINDIR") if key in os.environ}},
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15,
+    )
+    assert (result.returncode == 0) is allowed, result.stderr
+    assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.parametrize("name,entry", [
@@ -253,14 +271,21 @@ def test_invalid_runner_mode_fails_without_fallback_or_output(tmp_path, routing)
 
 
 @pytest.mark.parametrize("mode", ["preview", "release"])
-def test_scale_set_preview_cannot_enable_release_artifact_jobs(tmp_path, mode):
+def test_scale_set_mode_alone_cannot_enable_release_artifact_jobs(tmp_path, mode):
     caller = "ci.yaml" if mode == "preview" else "release.yaml"
     result, output = admit(
-        tmp_path, RELEASE_MODE=mode, RUNNER_MODE="scaleset", RELEASE_PROVENANCE_READY="true",
+        tmp_path, RELEASE_MODE=mode, RUNNER_MODE="scaleset", RELEASE_PROVENANCE_READY="false",
         SOURCE_REF="refs/heads/main",
         CALLER_WORKFLOW=f"example/content/.github/workflows/{caller}@refs/heads/main",
     )
-    assert result.returncode != 0 and "restricted to runner-check" in result.stderr
+    assert result.returncode != 0 and "not enabled" in result.stderr
+    assert output == "existing=value\n"
+
+
+@pytest.mark.parametrize("routing", ["", "legacy"])
+def test_release_artifacts_require_the_qualified_routing(tmp_path, routing):
+    result, output = admit(tmp_path, RUNNER_MODE=routing, RELEASE_PROVENANCE_READY="true")
+    assert result.returncode != 0 and "requires SITEOPS_RELEASE_RUNNER_MODE=scaleset" in result.stderr
     assert output == "existing=value\n"
 
 
@@ -439,12 +464,13 @@ def test_workflow_job_environment_does_not_use_a_direct_runner_context():
 ])
 def test_private_runtime_paths_are_initialized_before_source_steps(tmp_path, file, job, step, expected):
     selected = workflow(file)["jobs"][job]
-    assert selected["steps"][0]["name"] == step
+    assert selected["steps"][0]["name"] == "Require the admitted runner class"
+    assert selected["steps"][1]["name"] == step
     environment_file = tmp_path / "environment"
     runtime = tmp_path / "runner temp"
     runtime.mkdir()
     result = run_script(
-        selected["steps"][0]["run"], tmp_path,
+        selected["steps"][1]["run"], tmp_path,
         {"RUNNER_TEMP": runtime.as_posix(), "GITHUB_ENV": environment_file.as_posix()},
     )
     assert result.returncode == 0, result.stdout + result.stderr

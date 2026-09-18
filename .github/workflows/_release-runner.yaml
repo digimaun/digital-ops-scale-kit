@@ -32,8 +32,7 @@ jobs:
         id: select
         shell: python
         env:
-          # Enable only with the reviewed 1ES provenance implementation and qualification.
-          RELEASE_PROVENANCE_READY: "false"
+          RELEASE_PROVENANCE_READY: ${{ vars.SITEOPS_RELEASE_PROVENANCE_READY }}
           RELEASE_POOL: ${{ vars.SITEOPS_RELEASE_POOL }}
           RELEASE_IMAGE: ${{ vars.SITEOPS_RELEASE_IMAGE }}
           RUNNER_MODE: ${{ vars.SITEOPS_RELEASE_RUNNER_MODE }}
@@ -77,8 +76,6 @@ jobs:
           runner_mode = os.environ["RUNNER_MODE"] or "legacy"
           if runner_mode not in {"legacy", "scaleset"}:
               reject("SITEOPS_RELEASE_RUNNER_MODE must be legacy or scaleset.")
-          if runner_mode == "scaleset" and mode not in {"check", "attestation"}:
-              reject("Scale Set preview routing is restricted to runner-check or attestation-check.")
           if mode == "attestation" and runner_mode != "scaleset":
               reject("The attestation diagnostic requires the qualified Scale Set routing.")
           labels = [pool]
@@ -89,10 +86,12 @@ jobs:
               labels = ["self-hosted", "1ES.Pool=" + pool, "1ES.ImageOverride=" + image]
           if mode not in {"check", "attestation"} and os.environ["RELEASE_PROVENANCE_READY"] != "true":
               reject(
-                  "1ES release artifact execution is not enabled. Current provenance verification "
-                  "requires github-hosted runners. Complete the 1ES runner and provenance "
-                  "qualification before enabling release builds, signing or publication."
+                  "1ES release artifact execution is not enabled. Configure "
+                  "SITEOPS_RELEASE_PROVENANCE_READY=true after reviewing this repository's "
+                  "runner configuration and provenance policy."
               )
+          if mode not in {"check", "attestation"} and runner_mode != "scaleset":
+              reject("Release artifact execution requires SITEOPS_RELEASE_RUNNER_MODE=scaleset.")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write("pool=" + pool + "\n")
               if mode in {"check", "attestation"}:
@@ -207,5 +206,5 @@ jobs:
               output.write(
                   "## Worker session check\n\nThe two jobs used different boot sessions.\n\n"
                   "This observation is not attestation evidence and does not establish Trusted Launch, "
-                  "complete machine isolation or release readiness. Artifact execution remains gated.\n"
+                  "complete machine isolation or release readiness. This diagnostic does not change release admission.\n"
               )

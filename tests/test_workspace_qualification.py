@@ -24,12 +24,12 @@ from siteops_release_assets import FrozenReleaseAssets, ReferencedEngine, Releas
 from workspace_engine import EngineSelection  # noqa: E402
 
 
-def checked(argv, *, root, env=None):
+def checked(argv, *, root, env=None, expected=0):
     result = subprocess.run(
         list(map(str, argv)), cwd=root, env=env, stdin=subprocess.DEVNULL,
         capture_output=True, text=True, timeout=180,
     )
-    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.returncode == expected, result.stdout + result.stderr
     return result
 
 
@@ -125,11 +125,13 @@ def qualification_inputs(tmp_path_factory):
             "digest": asset.sha256, "proof": hashlib.sha256(proof.read_bytes()).hexdigest(),
             "root": root_sha, "revision": "b" * 40,
             "signer": ".github/workflows/_siteops-distribution.yaml", "builder": ".github/workflows/release.yaml",
+            "runner": "self-hosted",
         }
     verifications[source.source.entry.package.sha256] = {
         "digest": source.source.entry.package.sha256, "proof": source.source.entry.proof.sha256,
         "root": root_sha, "revision": "a" * 40,
         "signer": ".github/workflows/_workspace-distribution.yaml", "builder": ".github/workflows/ci.yaml",
+        "runner": "self-hosted",
     }
     context = root / "tool-context.json"
     context.write_text(json.dumps({"verifications": verifications}))
@@ -158,19 +160,39 @@ raise SystemExit(module.main())
     }
 
 
-def test_controller_installs_authenticated_lock_then_uses_selected_engine(qualification_inputs):
+@pytest.mark.parametrize("rejected", [None, "engine", "workspace"])
+def test_controller_installs_authenticated_lock_then_uses_selected_engine(qualification_inputs, rejected):
     values = qualification_inputs
-    report = values["root"] / "qualified.json"
+    name = rejected or "valid"
+    report = values["root"] / (name + "-qualified.json")
+    state = values["root"] / (name + "-qualification")
+    context = values["context"]
+    if rejected:
+        document = json.loads(context.read_bytes())
+        for observation in document["verifications"].values():
+            if ("_siteops-distribution.yaml" in observation["signer"]) == (rejected == "engine"):
+                observation["observedRunner"] = "github-hosted"
+        context = values["root"] / (name + "-context.json")
+        context.write_text(json.dumps(document), encoding="utf-8")
     result = checked([
         values["python"], "-I", values["harness"], ROOT,
         "--engine", values["engine"], "--expected-engine-selection-sha256", values["engine_sha"],
         "--workspaces", values["workspaces"], "--expected-workspace-inventory-sha256", values["workspace_sha"],
         "--trusted-root", values["roots"], "--expected-plan-sha", "e" * 64,
         "--builder-workflow", ".github/workflows/ci.yaml", "--platform", values["platform"],
-        "--state", values["root"] / "qualification", "--output", report, "--gh", values["gh"],
+        "--expected-runner-environment", "self-hosted",
+        "--state", state, "--output", report, "--gh", values["gh"],
     ], root=values["root"], env={
-        **values["environment"], "SITEOPS_TEST_TOOL_CONTEXT": str(values["context"]),
-    })
+        **values["environment"], "SITEOPS_TEST_TOOL_CONTEXT": str(context),
+    }, expected=1 if rejected else 0)
+    if rejected:
+        assert not report.exists()
+        if rejected == "engine":
+            assert "certificate" in result.stderr and not (state / "application").exists()
+        else:
+            assert (state / "application").is_dir()
+            assert "certificate" in (state / "probe.log").read_text(encoding="utf-8")
+        return
     data = json.loads(report.read_bytes())
     assert data["engineVersion"] == __version__
     assert data["packages"] == 1 and data["catalogManifests"] == 1

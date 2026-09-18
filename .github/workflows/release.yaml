@@ -30,6 +30,7 @@ env:
   OIDC_ISSUER: https://token.actions.githubusercontent.com
   PREDICATE_TYPE: https://slsa.dev/provenance/v1
   SIGNER_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/_siteops-distribution.yaml@${{ github.ref }}
+  BUILDER_IDENTITY: https://github.com/${{ github.workflow_ref }}
 
 jobs:
   release-runner:
@@ -62,9 +63,7 @@ jobs:
     needs: [release-runner, candidate]
     if: needs.candidate.result == 'success' && needs.candidate.outputs.active == 'true'
     runs-on:
-      - self-hosted
-      - ${{ format('1ES.Pool={0}', needs.release-runner.outputs.pool) }}
-      - ${{ format('JobId=siteops-publish-{0}-{1}', github.run_id, github.run_attempt) }}
+      - ${{ needs.release-runner.outputs.pool }}
     concurrency:
       group: release-${{ needs.candidate.outputs.tag }}
       cancel-in-progress: false
@@ -84,6 +83,16 @@ jobs:
       APPROVED_ENGINE_ID: ${{ needs.candidate.outputs.engine-id }}
       APPROVED_ENGINE_REF: ${{ needs.candidate.outputs.engine-ref }}
     steps:
+      - name: Require the admitted runner class
+        shell: python
+        env:
+          RUNNER_CLASS: ${{ runner.environment }}
+        run: |
+          import os
+          import sys
+          if sys.platform != "linux" or os.environ["RUNNER_CLASS"] != "self-hosted":
+              raise SystemExit("::error::Release artifacts require the admitted Linux self-hosted runner.")
+
       - name: Download the pinned declaration
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -327,9 +336,7 @@ jobs:
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/release-bundle/$ARCHIVE_NAME"
-          archive_proof="${archive}${ATTESTATION_SUFFIX}"
           wheel="$RUNNER_TEMP/release-bundle/$WHEEL_NAME"
-          wheel_proof="${wheel}${ATTESTATION_SUFFIX}"
           python3 -c '
           import hashlib, json, os, sys
           from pathlib import Path
@@ -363,16 +370,58 @@ jobs:
               or expected[os.environ["WHEEL_NAME"]] != os.environ["APPROVED_WHEEL_SHA"]
           ):
               raise SystemExit("::error::The approved release asset digests are inconsistent.")
-          ' "$RUNNER_TEMP/release-bundle" "$RUNNER_TEMP/release-assets/release-assets.json"
+          if os.environ["BUNDLE"] == "true":
+              for name in (os.environ["ARCHIVE_NAME"], os.environ["WHEEL_NAME"]):
+                  sys.stdout.buffer.write((name + "\t_siteops-distribution.yaml\n").encode("utf-8"))
+          plan = json.loads(Path(sys.argv[3]).read_bytes())
+          for request in plan.get("workspaces", []):
+              sys.stdout.buffer.write((request["package"] + "\t_workspace-distribution.yaml\n").encode("utf-8"))
+          ' "$RUNNER_TEMP/release-bundle" "$RUNNER_TEMP/release-assets/release-assets.json" \
+            "$RUNNER_TEMP/release-plan/plan.json" > "$RUNNER_TEMP/release-subjects.txt"
+          while IFS=$'\t' read -r name workflow; do
+            asset="$RUNNER_TEMP/release-bundle/$name"
+            signer="https://github.com/$GITHUB_REPOSITORY/.github/workflows/$workflow@$SOURCE_REF"
+            if ! timeout --kill-after=5 120 gh attestation verify "$asset" \
+              --bundle "${asset}${ATTESTATION_SUFFIX}" --repo "$GITHUB_REPOSITORY" --cert-identity "$signer" \
+              --signer-digest "$SOURCE_SHA" --source-digest "$SOURCE_SHA" --source-ref "$SOURCE_REF" \
+              --cert-oidc-issuer "$OIDC_ISSUER" --predicate-type "$PREDICATE_TYPE" \
+              --hostname github.com --digest-alg sha256 --format json 2>/dev/null \
+              | head -c 8388609 > "$RUNNER_TEMP/release-verification.json"; then
+              echo "::error::An approved asset did not pass signature verification."
+              exit 1
+            fi
+            python3 -c '
+          import json, os, sys
+          from pathlib import Path
+          raw = Path(sys.argv[1]).read_bytes()
+          if len(raw) > 8388608:
+              raise SystemExit("::error::Verification evidence exceeds its byte limit.")
+          expected = {
+              "subjectAlternativeName": sys.argv[2], "issuer": os.environ["OIDC_ISSUER"],
+              "sourceRepositoryURI": "https://github.com/" + os.environ["GITHUB_REPOSITORY"],
+              "sourceRepositoryDigest": os.environ["SOURCE_SHA"],
+              "sourceRepositoryRef": os.environ["SOURCE_REF"],
+              "buildSignerDigest": os.environ["SOURCE_SHA"],
+              "buildConfigURI": os.environ["BUILDER_IDENTITY"],
+              "buildConfigDigest": os.environ["SOURCE_SHA"], "runnerEnvironment": "self-hosted",
+          }
+          try:
+              results = json.loads(raw.decode("utf-8"))
+              if not isinstance(results, list) or not 1 <= len(results) <= 128:
+                  raise ValueError()
+              for result in results:
+                  verified = result["verificationResult"]
+                  certificate = verified["signature"]["certificate"]
+                  if (
+                      verified["mediaType"] != "application/vnd.dev.sigstore.verificationresult+json;version=0.1"
+                      or any(certificate.get(key) != value for key, value in expected.items())
+                  ):
+                      raise ValueError()
+          except (ValueError, KeyError, TypeError, AttributeError, RecursionError):
+              raise SystemExit("::error::The verified publication certificate does not match release policy.") from None
+          ' "$RUNNER_TEMP/release-verification.json" "$signer"
+          done < "$RUNNER_TEMP/release-subjects.txt"
           if [[ "$BUNDLE" == "true" ]]; then
-          gh attestation verify "$archive" --bundle "$archive_proof" \
-            --repo "$GITHUB_REPOSITORY" --cert-identity "$SIGNER_IDENTITY" \
-            --signer-digest "$SOURCE_SHA" --source-digest "$SOURCE_SHA" --source-ref "$SOURCE_REF" \
-            --cert-oidc-issuer "$OIDC_ISSUER" --predicate-type "$PREDICATE_TYPE" --deny-self-hosted-runners
-          gh attestation verify "$wheel" --bundle "$wheel_proof" \
-            --repo "$GITHUB_REPOSITORY" --cert-identity "$SIGNER_IDENTITY" \
-            --signer-digest "$SOURCE_SHA" --source-digest "$SOURCE_SHA" --source-ref "$SOURCE_REF" \
-            --cert-oidc-issuer "$OIDC_ISSUER" --predicate-type "$PREDICATE_TYPE" --deny-self-hosted-runners
           python3 -c '
           import json, os, sys, zipfile
           from pathlib import Path
@@ -394,7 +443,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 -c '
-          import json, os, subprocess, zipfile
+          import json, os, zipfile
           from pathlib import Path
           root = Path(os.environ["RUNNER_TEMP"])
           plan = json.loads((root / "release-plan/plan.json").read_bytes())
@@ -416,7 +465,6 @@ jobs:
           rows = {entry["workspace"]: entry for entry in descriptor["workspaces"]}
           if len(rows) != len(descriptor["workspaces"]):
               raise SystemExit("::error::The workspace descriptor contains ambiguous selections.")
-          signer = "https://github.com/" + os.environ["GITHUB_REPOSITORY"] + "/.github/workflows/_workspace-distribution.yaml@" + os.environ["SOURCE_REF"]
           for request in plan["workspaces"]:
               package = request["package"]
               proof = package + ".attestation.jsonl"
@@ -429,13 +477,6 @@ jobs:
                   or entry["package"] != assets[package] or entry["proof"] != assets[proof]
               ):
                   raise SystemExit("::error::The workspace routing differs from the approved assets.")
-              subprocess.run([
-                  "gh", "attestation", "verify", str(payload / package), "--bundle", str(payload / proof),
-                  "--repo", os.environ["GITHUB_REPOSITORY"], "--cert-identity", signer,
-                  "--signer-digest", os.environ["SOURCE_SHA"], "--source-digest", os.environ["SOURCE_SHA"],
-                  "--source-ref", os.environ["SOURCE_REF"], "--cert-oidc-issuer", os.environ["OIDC_ISSUER"],
-                  "--predicate-type", os.environ["PREDICATE_TYPE"], "--deny-self-hosted-runners",
-              ], check=True)
               with zipfile.ZipFile(payload / package) as archive:
                   entries = [item for item in archive.infolist() if item.filename == "siteops-package.json"]
                   if len(entries) != 1 or not 0 < entries[0].file_size <= 4194304:

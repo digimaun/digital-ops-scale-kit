@@ -16,9 +16,9 @@ install from the authenticated bundle. Both paths install with stock
 script, and no private package store.
 
 A Site Ops release installs the engine only. Workspace content has its own
-source and version. The included IoT Operations workspace is currently
-obtained from a matching Scale Kit repository checkout. This release does not
-provide verified remote workspace packages or guided workspace discovery.
+source and version. Acquire a compatible workspace from an approved content
+release through a [workspace pin](projects.md#run-project-pin), or use a local
+checkout. Installing the engine does not acquire or authorize that content.
 
 A release without these assets uses the
 [linked Site Ops release](releasing.md#release-content-against-an-existing-engine)
@@ -37,7 +37,7 @@ keep downloaded files in a private directory.
 | pipx | Version 1.17.2, available as `pipx` | Both paths |
 | Package feed | An approved index that serves the runtime dependencies as wheels | Release wheel path |
 | pipx backend pip | Version 26.2.1 | Verified bundle path |
-| GitHub CLI | Version 2.95.0 or newer, providing `gh attestation verify` with the flags used below | Downloading and verifying assets |
+| GitHub CLI | Version 2.95.0 or newer in the 2.x release line | Downloading and verifying assets |
 
 Obtain these tools through your organization's managed software channel or their
 official instructions:
@@ -152,7 +152,7 @@ its own settings.
 
 Confirm the release tag and its full source commit in the official repository
 first, and keep that commit as the expected identity. The repository, signing
-workflow, and expected commit are trust decisions: take them from the official
+workflow, calling workflow, runner class and expected commit are trust decisions: take them from the official
 repository and this guidance, never from a downloaded manifest or a command
 supplied inside the archive.
 
@@ -166,19 +166,56 @@ pipx records the lock and wheel paths for later repair and replacement.
     $ErrorActionPreference = "Stop"
     $download = "<download directory>"
     $sourceSha = "<full source commit from the selected official release>"
+    $repository = "Azure/digital-ops-scale-kit"
+    $sourceRef = "refs/heads/main"
+    $signer = "https://github.com/$repository/.github/workflows/_siteops-distribution.yaml@$sourceRef"
+    $builder = "https://github.com/$repository/.github/workflows/release.yaml@$sourceRef"
     $archive = Join-Path $download "siteops-install.zip"
-
+    $lines = [Collections.Generic.List[string]]::new()
+    $bytes = 0
     gh attestation verify $archive `
       --bundle "$archive.attestation.jsonl" `
-      --repo Azure/digital-ops-scale-kit `
-      --cert-identity "https://github.com/Azure/digital-ops-scale-kit/.github/workflows/_siteops-distribution.yaml@refs/heads/main" `
-      --source-ref refs/heads/main `
+      --repo $repository --cert-identity $signer --source-ref $sourceRef `
       --source-digest $sourceSha `
       --signer-digest $sourceSha `
       --cert-oidc-issuer "https://token.actions.githubusercontent.com" `
       --predicate-type "https://slsa.dev/provenance/v1" `
-      --deny-self-hosted-runners
+      --hostname github.com --digest-alg sha256 --format json | ForEach-Object {
+        $bytes += [Text.Encoding]::UTF8.GetByteCount($_) + 1
+        if ($bytes -gt 8388608) { throw "Verification evidence exceeds its byte limit." }
+        $lines.Add($_)
+      }
     if ($LASTEXITCODE -ne 0) { throw "Verification failed. Do not extract this archive." }
+    $raw = $lines -join "`n"
+    if (-not $raw.TrimStart().StartsWith("[")) { throw "Expected an array of verified observations." }
+    $results = @($raw | ConvertFrom-Json)
+    if ($results.Count -lt 1 -or $results.Count -gt 128) { throw "Verification evidence is empty or oversized." }
+    $expected = @{
+        subjectAlternativeName = $signer
+        issuer = "https://token.actions.githubusercontent.com"
+        sourceRepositoryURI = "https://github.com/$repository"
+        sourceRepositoryDigest = $sourceSha
+        sourceRepositoryRef = $sourceRef
+        buildSignerDigest = $sourceSha
+        buildConfigURI = $builder
+        buildConfigDigest = $sourceSha
+        runnerEnvironment = "self-hosted"
+    }
+    foreach ($result in $results) {
+        $verified = $result.verificationResult
+        $certificate = $verified.signature.certificate
+        if ($verified -isnot [pscustomobject] -or $certificate -isnot [pscustomobject] -or
+            $verified.mediaType -isnot [string] -or
+            $verified.mediaType -cne "application/vnd.dev.sigstore.verificationresult+json;version=0.1") {
+            throw "Unsupported verified observation."
+        }
+        foreach ($key in $expected.Keys) {
+            $value = $certificate.PSObject.Properties[$key].Value
+            if ($value -isnot [string] -or $value -cne $expected[$key]) {
+                throw "The verified certificate does not match the selected release policy."
+            }
+        }
+    }
     $bundleId = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
     $bundle = Join-Path $env:LOCALAPPDATA "siteops\bundles\$bundleId"
     if (Test-Path -LiteralPath $bundle) { throw "That bundle directory already exists. Use the retained bundle or choose a new private location." }
@@ -198,18 +235,51 @@ pipx records the lock and wheel paths for later repair and replacement.
   umask 077
   download="<download directory>"
   source_sha="<full source commit from the selected official release>"
+  repository="Azure/digital-ops-scale-kit"
+  source_ref="refs/heads/main"
+  signer="https://github.com/$repository/.github/workflows/_siteops-distribution.yaml@$source_ref"
+  builder="https://github.com/$repository/.github/workflows/release.yaml@$source_ref"
   archive="$download/siteops-install.zip"
-
-  gh attestation verify "$archive" \
+  verification="$(mktemp)"
+  trap 'rm -f "$verification"' EXIT
+  timeout --kill-after=5 120 gh attestation verify "$archive" \
     --bundle "$archive.attestation.jsonl" \
-    --repo Azure/digital-ops-scale-kit \
-    --cert-identity "https://github.com/Azure/digital-ops-scale-kit/.github/workflows/_siteops-distribution.yaml@refs/heads/main" \
-    --source-ref refs/heads/main \
+    --repo "$repository" --cert-identity "$signer" --source-ref "$source_ref" \
     --source-digest "$source_sha" \
     --signer-digest "$source_sha" \
     --cert-oidc-issuer "https://token.actions.githubusercontent.com" \
     --predicate-type "https://slsa.dev/provenance/v1" \
-    --deny-self-hosted-runners
+    --hostname github.com --digest-alg sha256 --format json \
+    | head -c 8388609 > "$verification"
+  python3 -B -c '
+import json, sys
+from pathlib import Path
+raw = Path(sys.argv[1]).read_bytes()
+if len(raw) > 8388608:
+    raise SystemExit("Verification evidence exceeds its byte limit.")
+expected = {
+    "subjectAlternativeName": sys.argv[5],
+    "issuer": "https://token.actions.githubusercontent.com",
+    "sourceRepositoryURI": "https://github.com/" + sys.argv[2],
+    "sourceRepositoryDigest": sys.argv[3], "sourceRepositoryRef": sys.argv[4],
+    "buildSignerDigest": sys.argv[3], "buildConfigURI": sys.argv[6],
+    "buildConfigDigest": sys.argv[3], "runnerEnvironment": "self-hosted",
+}
+try:
+    results = json.loads(raw.decode("utf-8"))
+    if not isinstance(results, list) or not 1 <= len(results) <= 128:
+        raise ValueError()
+    for result in results:
+        verified = result["verificationResult"]
+        certificate = verified["signature"]["certificate"]
+        if (
+            verified["mediaType"] != "application/vnd.dev.sigstore.verificationresult+json;version=0.1"
+            or any(certificate.get(key) != value for key, value in expected.items())
+        ):
+            raise ValueError()
+except (ValueError, KeyError, TypeError, AttributeError, RecursionError):
+    raise SystemExit("The verified certificate does not match the selected release policy.") from None
+' "$verification" "$repository" "$source_sha" "$source_ref" "$signer" "$builder"
   bundle_id="$(sha256sum "$archive" | cut -d ' ' -f 1)"
   bundle="${XDG_DATA_HOME:-$HOME/.local/share}/siteops/bundles/$bundle_id"
   mkdir -p "$(dirname "$bundle")"
@@ -222,12 +292,16 @@ pipx records the lock and wheel paths for later repair and replacement.
 These commands authenticate the ZIP and all of its contents. You do not need
 the standalone wheel or its proof for this path. The commands enforce official
 builds from `main`, so a build from a fork does not satisfy that policy. For an
-explicitly selected preview, use its repository, source ref, and source commit
-consistently in the verifier policy. Use the engine release's source commit
+explicitly selected preview, use its repository, source ref, source commit
+and calling workflow consistently. CI previews use `ci.yaml` as the caller,
+while published releases use `release.yaml`. Use the engine release's source commit
 when a content release links to a separate Site Ops release.
 
 GitHub CLI validates the signing chain, the expected workflow and repository
-identity, the source and signer commits, and the file digest. `--bundle` reads
+identity, the source and signer commits, and the file digest. The commands
+also compare each verified certificate with the exact caller and `self-hosted`
+runner class required by this publisher. That class does not identify a pool
+or establish its image and isolation controls. `--bundle` reads
 the downloaded proof instead of the attestation API, although the default
 trusted-root refresh can still use the network. Verification establishes origin
 and integrity. It does not promise that the selected build is free of defects,

@@ -34,6 +34,7 @@ def main():
     source_ref = context.get("ref", "refs/heads/main")
     signer = context.get("signer", ".github/workflows/sign.yml")
     builder = context.get("builder", ".github/workflows/release.yml")
+    runner = context.get("runner", "github-hosted")
     signer_identity = f"https://github.com/{repository}/{signer}@{source_ref}"
     assert hashlib.sha256(artifact.read_bytes()).hexdigest() == context["digest"]
     assert hashlib.sha256(proof.read_bytes()).hexdigest() == context["proof"]
@@ -51,7 +52,8 @@ def main():
         "--source-ref", source_ref, "--cert-oidc-issuer",
         "https://token.actions.githubusercontent.com",
         "--predicate-type", "https://slsa.dev/provenance/v1",
-        "--deny-self-hosted-runners", "--digest-alg", "sha256", "--format", "json",
+        *(["--deny-self-hosted-runners"] if runner == "github-hosted" else []),
+        "--digest-alg", "sha256", "--format", "json",
     ]
     assert args == expected, "Only the exact local verification contract is permitted."
     print(json.dumps([{"verificationResult": {
@@ -69,7 +71,7 @@ def main():
             "sourceRepositoryDigest": context["revision"],
             "sourceRepositoryRef": source_ref,
             "buildSignerDigest": context["revision"],
-            "runnerEnvironment": "github-hosted",
+            "runnerEnvironment": context.get("observedRunner", runner),
             "buildConfigURI": f"https://github.com/{repository}/{builder}@{source_ref}",
             "buildConfigDigest": context["revision"],
         }},

@@ -44,10 +44,14 @@ def _build_step(name):
     ("build-workspace-package.py", ("--target-engine-version VERSION",)),
     ("build-workspace-release.py", ("--root DIRECTORY", "--release-workspace PATH", "--expected-plan-sha SHA256")),
     ("assemble-workspace-release.py", ("--staging DIRECTORY", "--trusted-root FILE", "--expected-plan-sha SHA256")),
-    ("prepare-workspace-engine.py", ("--control DIRECTORY", "--built-assets DIRECTORY", "--archive-sha SHA256")),
+    ("prepare-workspace-engine.py", (
+        "--control DIRECTORY", "--built-assets DIRECTORY", "--archive-sha SHA256",
+        "--expected-runner-environment {github-hosted,self-hosted}",
+    )),
     ("qualify-workspace-engine.py", (
         "--engine DIRECTORY", "--expected-engine-selection-sha256 SHA256",
         "--expected-workspace-inventory-sha256 SHA256", "--state DIRECTORY", "--gh FILE",
+        "--expected-runner-environment {github-hosted,self-hosted}",
     )),
     ("stage-release-payload.py", (
         "--engine-inventory FILE", "--engine-selection FILE", "--expected-engine-inventory-sha256 SHA256",

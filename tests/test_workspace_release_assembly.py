@@ -249,6 +249,7 @@ def test_collection_cli_binds_independent_policy_to_selected_source(staged, tmp_
             "sourceRef": "refs/heads/other" if fault == "ref" else intent.source_ref,
             "signerWorkflow": ".github/workflows/_workspace-distribution.yaml",
             "builderWorkflow": ".github/workflows/release.yaml",
+            "runnerEnvironment": "self-hosted",
         },
     }
     policy_path = tmp_path / "policy.json"

@@ -101,11 +101,13 @@ jobs:
     name: Build bundle
     if: >-
       inputs.release-pool != '' && inputs.release-pool == vars.SITEOPS_RELEASE_POOL &&
+      inputs.expected-source-sha == github.sha &&
+      vars.SITEOPS_RELEASE_PROVENANCE_READY == 'true' && vars.SITEOPS_RELEASE_RUNNER_MODE == 'scaleset' &&
+      (github.workflow_ref == format('{0}/.github/workflows/ci.yaml@{1}', github.repository, github.ref) ||
+       github.workflow_ref == format('{0}/.github/workflows/release.yaml@{1}', github.repository, github.ref)) &&
       (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on:
-      - self-hosted
-      - ${{ format('1ES.Pool={0}', inputs.release-pool) }}
-      - ${{ format('JobId=siteops-build-{0}-{1}', github.run_id, github.run_attempt) }}
+      - ${{ inputs.release-pool }}
 
     # The build job executes repository source. It holds no OIDC, attestation, or
     # release capability.
@@ -131,6 +133,16 @@ jobs:
       BUILD_ATTEMPT: ${{ github.run_attempt }}
 
     steps:
+      - name: Require the admitted runner class
+        shell: python
+        env:
+          RUNNER_CLASS: ${{ runner.environment }}
+        run: |
+          import os
+          import sys
+          if sys.platform != "linux" or os.environ["RUNNER_CLASS"] != "self-hosted":
+              raise SystemExit("::error::Release artifacts require the admitted Linux self-hosted runner.")
+
       - name: Assert the expected source commit
         shell: bash
         run: |
@@ -299,9 +311,7 @@ jobs:
     name: Attest bundle
     needs: build
     runs-on:
-      - self-hosted
-      - ${{ format('1ES.Pool={0}', inputs.release-pool) }}
-      - ${{ format('JobId=siteops-attest-{0}-{1}', github.run_id, github.run_attempt) }}
+      - ${{ inputs.release-pool }}
 
     # The signing job downloads staged bytes. It never checks out or executes
     # repository source.
@@ -322,6 +332,16 @@ jobs:
       WHEEL_NAME: ${{ needs.build.outputs.wheel-name }}
 
     steps:
+      - name: Require the admitted runner class
+        shell: python
+        env:
+          RUNNER_CLASS: ${{ runner.environment }}
+        run: |
+          import os
+          import sys
+          if sys.platform != "linux" or os.environ["RUNNER_CLASS"] != "self-hosted":
+              raise SystemExit("::error::Release artifacts require the admitted Linux self-hosted runner.")
+
       - name: Resolve the staging artifact name
         id: names
         shell: bash
@@ -455,6 +475,7 @@ jobs:
       SOURCE_REF: ${{ github.ref }}
       SIGNER_DIGEST: ${{ github.sha }}
       SIGNER_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/_siteops-distribution.yaml@${{ github.ref }}
+      BUILDER_IDENTITY: https://github.com/${{ github.workflow_ref }}
       BUILD_NUMBER: ${{ github.run_id }}
       BUILD_ATTEMPT: ${{ github.run_attempt }}
       WHEEL_NAME: ${{ needs.build.outputs.wheel-name }}
@@ -471,7 +492,7 @@ jobs:
           gh --version
           help_text="$(gh attestation verify --help 2>&1)"
           for flag in --bundle --repo --cert-identity --signer-digest --source-digest \
-            --source-ref --cert-oidc-issuer --predicate-type --deny-self-hosted-runners; do
+            --source-ref --cert-oidc-issuer --predicate-type --format; do
             if ! printf '%s' "$help_text" | grep -q -- "$flag"; then
               echo "::error::The runner GitHub CLI does not support $flag, which this policy requires."
               exit 1
@@ -511,7 +532,7 @@ jobs:
           done
 
           for asset in "$archive" "$wheel"; do
-            gh attestation verify "$asset" \
+            if ! timeout --kill-after=5 120 gh attestation verify "$asset" \
               --bundle "${asset}${ATTESTATION_SUFFIX}" \
               --repo "$SOURCE_REPOSITORY" \
               --cert-identity "$SIGNER_IDENTITY" \
@@ -520,7 +541,42 @@ jobs:
               --source-ref "$SOURCE_REF" \
               --cert-oidc-issuer "$OIDC_ISSUER" \
               --predicate-type "$PREDICATE_TYPE" \
-              --deny-self-hosted-runners
+              --hostname github.com --digest-alg sha256 --format json 2>/dev/null \
+              | head -c 8388609 > "$temp/siteops-verification.json"; then
+              echo "::error::An installation asset did not pass signature verification."
+              exit 1
+            fi
+            python -c '
+          import json, os, sys
+          from pathlib import Path
+          raw = Path(sys.argv[1]).read_bytes()
+          if len(raw) > 8388608:
+              raise SystemExit("::error::Verification evidence exceeds its byte limit.")
+          expected = {
+              "subjectAlternativeName": os.environ["SIGNER_IDENTITY"],
+              "issuer": os.environ["OIDC_ISSUER"],
+              "sourceRepositoryURI": "https://github.com/" + os.environ["SOURCE_REPOSITORY"],
+              "sourceRepositoryDigest": os.environ["SOURCE_SHA"],
+              "sourceRepositoryRef": os.environ["SOURCE_REF"],
+              "buildSignerDigest": os.environ["SIGNER_DIGEST"],
+              "buildConfigURI": os.environ["BUILDER_IDENTITY"],
+              "buildConfigDigest": os.environ["SOURCE_SHA"], "runnerEnvironment": "self-hosted",
+          }
+          try:
+              results = json.loads(raw.decode("utf-8"))
+              if not isinstance(results, list) or not 1 <= len(results) <= 128:
+                  raise ValueError()
+              for result in results:
+                  verified = result["verificationResult"]
+                  certificate = verified["signature"]["certificate"]
+                  if (
+                      verified["mediaType"] != "application/vnd.dev.sigstore.verificationresult+json;version=0.1"
+                      or any(certificate.get(key) != value for key, value in expected.items())
+                  ):
+                      raise ValueError()
+          except (ValueError, KeyError, TypeError, AttributeError, RecursionError):
+              raise SystemExit("::error::The verified installation certificate does not match release policy.") from None
+          ' "$temp/siteops-verification.json"
           done
 
           echo "Both attested assets satisfy the exact source and signer policy."

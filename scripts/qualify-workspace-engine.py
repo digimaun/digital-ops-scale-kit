@@ -154,6 +154,10 @@ def main() -> int:
         ("platform", "PLATFORM", "Platform from the verified engine matrix: linux-x86_64 or windows-x86_64."),
     ):
         parser.add_argument("--" + name, required=True, metavar=metavar, help=help_text)
+    parser.add_argument(
+        "--expected-runner-environment", required=True, choices=("github-hosted", "self-hosted"),
+        help="Trusted expected signing runner class for the selected engine and workspaces.",
+    )
     args = parser.parse_args()
     try:
         if importlib.metadata.version("pip") != "26.2.1":
@@ -193,6 +197,7 @@ def main() -> int:
             builder=".github/workflows/release.yaml"
             if selection.reference is not None
             else args.builder_workflow,
+            runner_environment=args.expected_runner_environment,
         )
         wheel = native_engine_wheel(selection.native.assets)
         for asset in selection.native.assets:
@@ -229,6 +234,7 @@ def main() -> int:
             selection.candidate,
             signer=".github/workflows/_workspace-distribution.yaml",
             builder=args.builder_workflow,
+            runner_environment=args.expected_runner_environment,
         )
         app = args.state / "application"
         python = app / ("Scripts/python.exe" if os.name == "nt" else "bin/python")

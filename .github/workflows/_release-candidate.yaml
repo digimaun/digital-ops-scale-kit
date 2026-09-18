@@ -78,6 +78,8 @@ env:
   OIDC_ISSUER: https://token.actions.githubusercontent.com
   PREDICATE_TYPE: https://slsa.dev/provenance/v1
   SIGNER_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/_siteops-distribution.yaml@${{ github.ref }}
+  BUILDER_IDENTITY: https://github.com/${{ github.workflow_ref }}
+  EXPECTED_RUNNER_ENVIRONMENT: self-hosted
   PYTHONDONTWRITEBYTECODE: "1"
   PYTHONIOENCODING: utf-8
   DRY_RUN: ${{ inputs.dry-run }}
@@ -87,11 +89,13 @@ jobs:
     name: Prepare
     if: >-
       inputs.release-pool != '' && inputs.release-pool == vars.SITEOPS_RELEASE_POOL &&
+      inputs.expected-source-sha == github.sha &&
+      vars.SITEOPS_RELEASE_PROVENANCE_READY == 'true' && vars.SITEOPS_RELEASE_RUNNER_MODE == 'scaleset' &&
+      (github.workflow_ref == format('{0}/.github/workflows/ci.yaml@{1}', github.repository, github.ref) ||
+       github.workflow_ref == format('{0}/.github/workflows/release.yaml@{1}', github.repository, github.ref)) &&
       (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on:
-      - self-hosted
-      - ${{ format('1ES.Pool={0}', inputs.release-pool) }}
-      - ${{ format('JobId=siteops-prepare-{0}-{1}', github.run_id, github.run_attempt) }}
+      - ${{ inputs.release-pool }}
     permissions:
       contents: read
       actions: read
@@ -107,6 +111,16 @@ jobs:
       tag-exists: ${{ steps.target.outputs.tag-exists }}
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
+      - name: Require the admitted runner class
+        shell: python
+        env:
+          RUNNER_CLASS: ${{ runner.environment }}
+        run: |
+          import os
+          import sys
+          if sys.platform != "linux" or os.environ["RUNNER_CLASS"] != "self-hosted":
+              raise SystemExit("::error::Release artifacts require the admitted Linux self-hosted runner.")
+
       - name: Confirm the source request
         shell: bash
         env:
@@ -323,9 +337,7 @@ jobs:
       always() && needs.prepare.result == 'success' &&
       needs.prepare.outputs.workspaces == 'true' && needs.workspace-build.result == 'success'
     runs-on:
-      - self-hosted
-      - ${{ format('1ES.Pool={0}', inputs.release-pool) }}
-      - ${{ format('JobId=siteops-workspace-assets-{0}-{1}', github.run_id, github.run_attempt) }}
+      - ${{ inputs.release-pool }}
     timeout-minutes: 30
     permissions:
       contents: read
@@ -338,6 +350,16 @@ jobs:
       EXPECTED_PLAN_SHA: ${{ needs.prepare.outputs.plan-sha }}
       BUILDER_REF: ${{ github.workflow_ref }}
     steps:
+      - name: Require the admitted runner class
+        shell: python
+        env:
+          RUNNER_CLASS: ${{ runner.environment }}
+        run: |
+          import os
+          import sys
+          if sys.platform != "linux" or os.environ["RUNNER_CLASS"] != "self-hosted":
+              raise SystemExit("::error::Release artifacts require the admitted Linux self-hosted runner.")
+
       - name: Initialize private collection home
         shell: bash
         run: |
@@ -426,6 +448,7 @@ jobs:
                   "kind": "github-attestation/v1", "repository": repository, "sourceRef": ref,
                   "signerWorkflow": ".github/workflows/_workspace-distribution.yaml",
                   "builderWorkflow": builder.removeprefix(repository + "/").removesuffix("@" + ref),
+                  "runnerEnvironment": "self-hosted",
               },
           }
           (root / "policy.json").write_text(json.dumps(policy), encoding="utf-8")
@@ -479,9 +502,7 @@ jobs:
       ((needs.prepare.outputs.bundle == 'true' && needs.distribution.result == 'success') ||
        (needs.prepare.outputs.bundle == 'false' && needs.distribution.result == 'skipped'))
     runs-on:
-      - self-hosted
-      - ${{ format('1ES.Pool={0}', inputs.release-pool) }}
-      - ${{ format('JobId=siteops-engine-input-{0}-{1}', github.run_id, github.run_attempt) }}
+      - ${{ inputs.release-pool }}
     timeout-minutes: 30
     permissions:
       contents: read
@@ -498,6 +519,16 @@ jobs:
       WHEEL_SHA: ${{ needs.distribution.outputs.wheel-sha256 }}
       BUILDER_REF: ${{ github.workflow_ref }}
     steps:
+      - name: Require the admitted runner class
+        shell: python
+        env:
+          RUNNER_CLASS: ${{ runner.environment }}
+        run: |
+          import os
+          import sys
+          if sys.platform != "linux" or os.environ["RUNNER_CLASS"] != "self-hosted":
+              raise SystemExit("::error::Release artifacts require the admitted Linux self-hosted runner.")
+
       - name: Initialize private engine selection home
         shell: bash
         run: |
@@ -578,6 +609,7 @@ jobs:
             --prepared-plan "$RUNNER_TEMP/engine-plan/plan.json" --expected-plan-sha "$EXPECTED_PLAN_SHA" \
             --trusted-root "$RUNNER_TEMP/engine-roots.json" --control "$RUNNER_TEMP/engine-control" \
             --output "$RUNNER_TEMP/selected-engine" --builder-workflow "$builder" \
+            --expected-runner-environment "$EXPECTED_RUNNER_ENVIRONMENT" \
             --build-number "$GITHUB_RUN_ID" --build-attempt "$GITHUB_RUN_ATTEMPT" \
             "${arguments[@]}" > "$RUNNER_TEMP/engine-selection.json" 2> "$RUNNER_TEMP/engine-selection.err"; then
             echo "::error::The exact selected engine could not be acquired and verified."
@@ -693,6 +725,7 @@ jobs:
             --expected-plan-sha "$EXPECTED_PLAN_SHA" --trusted-root "$temp/qualification-roots.json" \
             --state "$temp/workspace-qualification" --output "$temp/workspace-qualification.json" \
             --gh "$gh_path" --builder-workflow "$builder" --platform "$QUALIFICATION_PLATFORM" \
+            --expected-runner-environment "$EXPECTED_RUNNER_ENVIRONMENT" \
             > "$temp/workspace-qualification.out" 2> "$temp/workspace-qualification.err"; then
             echo "::error::The selected installed engine did not qualify the frozen workspaces."
             exit 1
@@ -827,9 +860,7 @@ jobs:
       ((needs.prepare.outputs.workspaces == 'true' && needs.workspace-assets.result == 'success' && needs.workspace-qualified.result == 'success') ||
        (needs.prepare.outputs.workspaces == 'false' && needs.workspace-assets.result == 'skipped'))
     runs-on:
-      - self-hosted
-      - ${{ format('1ES.Pool={0}', inputs.release-pool) }}
-      - ${{ format('JobId=siteops-review-{0}-{1}', github.run_id, github.run_attempt) }}
+      - ${{ inputs.release-pool }}
     timeout-minutes: 45
     permissions:
       contents: read
@@ -854,6 +885,16 @@ jobs:
       assets-artifact-id: ${{ steps.assets-upload.outputs.artifact-id }}
       payload-artifact-id: ${{ steps.payload-upload.outputs.artifact-id }}
     steps:
+      - name: Require the admitted runner class
+        shell: python
+        env:
+          RUNNER_CLASS: ${{ runner.environment }}
+        run: |
+          import os
+          import sys
+          if sys.platform != "linux" or os.environ["RUNNER_CLASS"] != "self-hosted":
+              raise SystemExit("::error::Release artifacts require the admitted Linux self-hosted runner.")
+
       - name: Require successful CI for the candidate
         id: ci
         shell: bash
@@ -1066,23 +1107,54 @@ jobs:
           mkdir -p "$assets"
           if [[ "$bundle" == "true" ]]; then
             archive="$RUNNER_TEMP/release-bundle/$ARCHIVE_NAME"
-            archive_proof="${archive}${ATTESTATION_SUFFIX}"
             if [[ ! "$BUILD_WHEEL_NAME" =~ ^siteops-[0-9A-Za-z][0-9A-Za-z.!+_~-]*-py3-none-any\.whl$ || "$BUILD_WHEEL_NAME" == *".."* ]]; then
               echo "::error::The standalone wheel filename is invalid."
               exit 1
             fi
             wheel="$RUNNER_TEMP/release-bundle/$BUILD_WHEEL_NAME"
-            wheel_proof="${wheel}${ATTESTATION_SUFFIX}"
-            gh attestation verify "$archive" --bundle "$archive_proof" --repo "$GITHUB_REPOSITORY" \
-              --cert-identity "$SIGNER_IDENTITY" --signer-digest "$SOURCE_SHA" \
-              --source-digest "$SOURCE_SHA" --source-ref "$SOURCE_REF" \
-              --cert-oidc-issuer "$OIDC_ISSUER" \
-              --predicate-type "$PREDICATE_TYPE" --deny-self-hosted-runners
-            gh attestation verify "$wheel" --bundle "$wheel_proof" --repo "$GITHUB_REPOSITORY" \
-              --cert-identity "$SIGNER_IDENTITY" --signer-digest "$SOURCE_SHA" \
-              --source-digest "$SOURCE_SHA" --source-ref "$SOURCE_REF" \
-              --cert-oidc-issuer "$OIDC_ISSUER" \
-              --predicate-type "$PREDICATE_TYPE" --deny-self-hosted-runners
+            for asset in "$archive" "$wheel"; do
+              if ! timeout --kill-after=5 120 gh attestation verify "$asset" \
+                --bundle "${asset}${ATTESTATION_SUFFIX}" --repo "$GITHUB_REPOSITORY" \
+                --cert-identity "$SIGNER_IDENTITY" --signer-digest "$SOURCE_SHA" \
+                --source-digest "$SOURCE_SHA" --source-ref "$SOURCE_REF" \
+                --cert-oidc-issuer "$OIDC_ISSUER" --predicate-type "$PREDICATE_TYPE" \
+                --hostname github.com --digest-alg sha256 --format json 2>/dev/null \
+                | head -c 8388609 > "$RUNNER_TEMP/engine-verification.json"; then
+                echo "::error::A candidate asset did not pass signature verification."
+                exit 1
+              fi
+              python3 -c '
+          import json, os, sys
+          from pathlib import Path
+          raw = Path(sys.argv[1]).read_bytes()
+          if len(raw) > 8388608:
+              raise SystemExit("::error::Verification evidence exceeds its byte limit.")
+          expected = {
+              "subjectAlternativeName": os.environ["SIGNER_IDENTITY"],
+              "issuer": os.environ["OIDC_ISSUER"],
+              "sourceRepositoryURI": "https://github.com/" + os.environ["GITHUB_REPOSITORY"],
+              "sourceRepositoryDigest": os.environ["SOURCE_SHA"],
+              "sourceRepositoryRef": os.environ["SOURCE_REF"],
+              "buildSignerDigest": os.environ["SOURCE_SHA"],
+              "buildConfigURI": os.environ["BUILDER_IDENTITY"],
+              "buildConfigDigest": os.environ["SOURCE_SHA"], "runnerEnvironment": "self-hosted",
+          }
+          try:
+              results = json.loads(raw.decode("utf-8"))
+              if not isinstance(results, list) or not 1 <= len(results) <= 128:
+                  raise ValueError()
+              for result in results:
+                  verified = result["verificationResult"]
+                  certificate = verified["signature"]["certificate"]
+                  if (
+                      verified["mediaType"] != "application/vnd.dev.sigstore.verificationresult+json;version=0.1"
+                      or any(certificate.get(key) != value for key, value in expected.items())
+                  ):
+                      raise ValueError()
+          except (ValueError, KeyError, TypeError, AttributeError, RecursionError):
+              raise SystemExit("::error::The verified candidate certificate does not match release policy.") from None
+          ' "$RUNNER_TEMP/engine-verification.json"
+            done
             python3 -c '
           import hashlib, json, os, re, sys, zipfile
           from pathlib import Path

@@ -36,8 +36,11 @@ def render_notes(
     engine_version: str,
     archive_name: str,
     attestation_suffix: str,
+    runner_environment: str,
 ) -> str:
     """Append installation guidance for this release to the authored notes."""
+    if runner_environment not in ("github-hosted", "self-hosted"):
+        raise RenderingError("The expected provenance runner class is unsupported.")
     source, engine = plan["source"], plan["siteops"]
     native, workspace = publication_assets(plan, assets)
     if assets.source != source:
@@ -106,6 +109,8 @@ def render_notes(
         f"Expected publisher: `{repository}`. Source commit: `{source['commit']}`. "
         f"Source ref: `{source['ref']}`. Use these values with the guide verification policy. "
         "The guide also describes switching between online and locked installations.",
+        f"Expected provenance runner class: `{runner_environment}`. "
+        "The runner class does not identify a particular pool.",
         "The locked path is qualified with pipx 1.17.2 and its shared pip 26.2.1. "
         "pip support for `pylock.toml` remains experimental.",
         f"Release assets: [{wheel}]({downloads}{wheel}), "
@@ -278,6 +283,7 @@ def main(argv: list[str] | None = None) -> int:
             raw = render_notes(
                 plan, authored, assets, engine_version=os.environ.get("ENGINE_VERSION", ""),
                 archive_name=os.environ["ARCHIVE_NAME"], attestation_suffix=os.environ["ATTESTATION_SUFFIX"],
+                runner_environment=os.environ["EXPECTED_RUNNER_ENVIRONMENT"],
             ).encode("utf-8")
             (root / "publish-notes.md").write_bytes(raw)
             print("sha256=" + hashlib.sha256(raw).hexdigest())

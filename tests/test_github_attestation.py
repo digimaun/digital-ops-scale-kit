@@ -27,6 +27,7 @@ def _policy(root_digest):
             "sourceRef": SOURCE_REF,
             "signerWorkflow": ".github/workflows/sign.yml",
             "builderWorkflow": ".github/workflows/release.yml",
+            "runnerEnvironment": "github-hosted",
         },
     }
 
@@ -124,6 +125,42 @@ def test_verifier_binds_exact_policy_root_artifact_and_observations(inputs):
     assert "--cert-identity-regex" not in argv
     assert "--no-public-good" not in argv
     assert not list(artifact.parent.glob("siteops-verification-*"))
+
+
+@pytest.mark.parametrize("expected", ["github-hosted", "self-hosted"])
+@pytest.mark.parametrize("observed", ["github-hosted", "self-hosted", None, "unknown"])
+def test_runner_class_requires_an_exact_policy_match(inputs, expected, observed):
+    policy_path, state = inputs[3], inputs[-1]
+    policy = json.loads(policy_path.read_bytes())
+    policy["provider"]["runnerEnvironment"] = expected
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    state["results"][0]["verificationResult"]["signature"]["certificate"]["runnerEnvironment"] = observed
+    if expected == observed:
+        receipt = _verify(inputs)
+        assert receipt.document()["evidence"]["matches"][0]["certificate"]["runnerEnvironment"] == expected
+    else:
+        with pytest.raises(verification.VerificationError, match="certificate"):
+            _verify(inputs)
+    assert ("--deny-self-hosted-runners" in state["calls"][-1]) is (expected == "github-hosted")
+
+
+@pytest.mark.parametrize("value", ["", "*", "Self-Hosted", "1ES", ["self-hosted"], None, True])
+def test_unsupported_runner_policy_fails_before_tool_execution(inputs, value):
+    policy = json.loads(inputs[3].read_bytes())
+    policy["provider"]["runnerEnvironment"] = value
+    inputs[3].write_text(json.dumps(policy), encoding="utf-8")
+    with pytest.raises(verification.VerificationError, match="runnerEnvironment"):
+        _verify(inputs)
+    assert inputs[-1]["calls"] == []
+
+
+def test_runner_policy_is_required_rather_than_inferred_from_the_proof(inputs):
+    policy = json.loads(inputs[3].read_bytes())
+    del policy["provider"]["runnerEnvironment"]
+    inputs[3].write_text(json.dumps(policy), encoding="utf-8")
+    with pytest.raises(verification.VerificationError, match="missing fields"):
+        _verify(inputs)
+    assert inputs[-1]["calls"] == []
 
 
 @pytest.mark.parametrize("field", [

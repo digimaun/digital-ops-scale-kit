@@ -204,12 +204,12 @@ def test_runner_check_jobs_have_no_source_or_signing_permissions():
         assert job["if"] == "inputs.mode == 'check'"
         assert job["timeout-minutes"] <= 10
         assert all("uses" not in step for step in job["steps"])
-        assert job["runs-on"][:2] == [
+        assert job["runs-on"] == [
             "self-hosted", "${{ format('1ES.Pool={0}', needs.select.outputs.pool) }}",
         ]
     assert ADMISSION["jobs"]["probe"]["needs"] == "select"
     assert ADMISSION["jobs"]["recheck"]["needs"] == ["select", "probe"]
-    assert ADMISSION["jobs"]["probe"]["runs-on"][2] != ADMISSION["jobs"]["recheck"]["runs-on"][2]
+    assert ADMISSION["jobs"]["probe"]["name"] != ADMISSION["jobs"]["recheck"]["name"]
     ci = workflow("ci.yaml")
     for job in ("installer-check", "release-preview"):
         assert ci["jobs"][job]["if"] == (

@@ -61,7 +61,7 @@ Missing or malformed pool configuration fails explicitly, with no fallback to
 public runners.
 
 The pool comes from repository configuration, not a release declaration or
-dispatch override. Jobs use the pool label and distinct `JobId` labels for the
+dispatch override. Artifact jobs use the pool label and distinct `JobId` labels for the
 run, attempt and workspace slot. Keep source builds separate from signing and
 publishing jobs. Their permissions and publication approval remain independent
 of runner placement.
@@ -79,6 +79,8 @@ permissions, artifact production or deployment. The first records baseline
 Python, Git, GitHub CLI and Azure CLI versions using temporary empty profiles.
 The second requires a different boot session. The summary contains tool
 versions and the comparison outcome, not machine identities or credentials.
+The diagnostic jobs request only `self-hosted` and the configured pool label.
+The pool supplies its default image.
 
 This mode leaves the release artifact gate closed. Different boot sessions
 do not establish complete machine isolation, Trusted Launch or provenance.

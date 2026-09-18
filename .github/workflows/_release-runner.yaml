@@ -82,7 +82,6 @@ jobs:
     runs-on:
       - self-hosted
       - ${{ format('1ES.Pool={0}', needs.select.outputs.pool) }}
-      - ${{ format('JobId=siteops-runner-check-first-{0}-{1}', github.run_id, github.run_attempt) }}
     timeout-minutes: 10
     permissions: {}
     outputs:
@@ -157,7 +156,6 @@ jobs:
     runs-on:
       - self-hosted
       - ${{ format('1ES.Pool={0}', needs.select.outputs.pool) }}
-      - ${{ format('JobId=siteops-runner-check-second-{0}-{1}', github.run_id, github.run_attempt) }}
     timeout-minutes: 5
     permissions: {}
     steps:

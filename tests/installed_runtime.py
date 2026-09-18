@@ -106,6 +106,7 @@ class InstalledEngine:
     python: Path
     command: Path
     environment: dict[str, str]
+    runtime_wheelhouse: Path
 
     def run(self, *arguments: str, expected: int = 0) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
@@ -159,4 +160,4 @@ def install_engine(root: Path, wheel: Path) -> InstalledEngine:
     identity = json.loads(imported.stdout)
     assert Path(identity["module"]).is_relative_to(application)
     assert str(ROOT) not in identity["path"]
-    return InstalledEngine(root, python, binary / f"siteops{suffix}", environment)
+    return InstalledEngine(root, python, binary / f"siteops{suffix}", environment, wheels)

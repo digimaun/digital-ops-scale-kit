@@ -12,7 +12,7 @@ import zipfile
 import pytest
 
 from siteops import __version__
-from tests.installed_runtime import build_engine_wheel, install_engine, runtime_wheels
+from tests.installed_runtime import build_engine_wheel, install_engine
 from tests.native_bundle import _backend_wheelhouse, pinned_backend
 from tests.release_helpers import ROOT, SCRIPTS
 from tests.workspace_acquisition_helpers import make_source
@@ -39,7 +39,7 @@ def qualification_inputs(tmp_path_factory):
     wheel = build_engine_wheel(root)
     tools = install_engine(root / "native-tools", wheel)
     root = tools.root
-    wheels = runtime_wheels(root)
+    wheels = tools.runtime_wheelhouse
     backend = _backend_wheelhouse(root / "backend")
     tooling = root / "tooling"
     checked([sys.executable, "-m", "venv", "--without-pip", tooling], root=root, env=tools.environment)

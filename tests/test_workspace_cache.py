@@ -137,6 +137,15 @@ def test_windows_cache_reuses_native_declarations_and_process_identity(tmp_path)
     assert cache_filesystem._current_windows_sid.cache_info().hits >= 2
 
 
+@pytest.mark.parametrize("principal,allowed", [
+    ("CURRENT", True), ("S-1-5-18", True), ("S-1-3-4", True), ("S-1-5-32-545", False),
+])
+def test_windows_owner_rights_is_a_trusted_ace_principal(principal, allowed):
+    assert cache_filesystem._trusted_windows_ace(
+        principal, {"CURRENT", "S-1-5-18", "S-1-5-32-544"},
+    ) is allowed
+
+
 def test_publication_keeps_original_archive_and_exact_materialization(populated):
     cache, archive, digest, verifier, inspection = populated
     root = cache.root / "objects" / "sha256" / digest

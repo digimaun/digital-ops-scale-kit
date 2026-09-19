@@ -16,10 +16,11 @@ import zipfile
 import zlib
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from siteops import package_builder
+from siteops import artifacts, package_builder
 from siteops import workspace_package as package
 from siteops.artifacts import (
     ArtifactError,
@@ -1233,6 +1234,24 @@ def test_file_context_preserves_errors_from_its_caller(tmp_path):
         with open_regular_file(path):
             raise failure
     assert raised.value is failure
+
+
+def test_windows_file_identity_uses_birth_time_while_posix_keeps_change_time(monkeypatch):
+    def identity(**changes):
+        values = {
+            "st_dev": 1, "st_ino": 2, "st_size": 7, "st_mtime_ns": 3,
+            "st_ctime_ns": 4, "st_birthtime_ns": 5, "st_nlink": 1,
+        }
+        values.update(changes)
+        return SimpleNamespace(**values)
+
+    monkeypatch.setattr(artifacts.os, "name", "nt")
+    before = artifacts._identity(identity())
+    assert artifacts._identity(identity(st_ctime_ns=99)) == before
+    for changed in (identity(st_birthtime_ns=99), identity(st_ino=99), identity(st_mtime_ns=99)):
+        assert artifacts._identity(changed) != before
+    monkeypatch.setattr(artifacts.os, "name", "posix")
+    assert artifacts._identity(identity(st_ctime_ns=99)) != artifacts._identity(identity())
 
 
 def test_encrypted_zip_flags_are_rejected_before_materialization(tmp_path):

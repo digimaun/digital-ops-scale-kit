@@ -131,9 +131,14 @@ def checked_path(root: Path, relative: str, *, directory: bool = False) -> Path:
 
 
 def _identity(info: os.stat_result) -> tuple[int, ...]:
+    created_or_changed = (
+        getattr(info, "st_birthtime_ns", info.st_ctime_ns)
+        if os.name == "nt"
+        else info.st_ctime_ns
+    )
     return (
-        info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns,
-        info.st_nlink,
+        info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+        created_or_changed, info.st_nlink,
     )
 
 

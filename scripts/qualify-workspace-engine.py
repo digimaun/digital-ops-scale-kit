@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -29,12 +30,34 @@ from siteops_release_assets import (  # noqa: E402
 from workspace_engine import SELECTION_NAME, EngineSelection, extract_engine_bundle  # noqa: E402
 
 from siteops.artifacts import ArtifactError, hash_file  # noqa: E402
+from siteops.cache_filesystem import check_cache_ancestors, make_private_directory  # noqa: E402
 from siteops.process_capture import BoundedCapture  # noqa: E402
 from siteops.workspace_source import (  # noqa: E402
     WORKSPACE_RELEASE_NAME,
     ArtifactIdentity,
     WorkspaceReleaseAssets,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def create_qualification_state(path: Path, protected_inputs: tuple[Path, ...]) -> None:
+    """Create private state whose ancestors can safely hold the workspace cache."""
+    if path.exists() or any(
+        path.resolve().is_relative_to(value.resolve())
+        or value.resolve().is_relative_to(path.resolve())
+        for value in protected_inputs
+    ):
+        raise ArtifactError("Qualification requires new private state outside the selected assets.")
+    make_private_directory(path)
+    try:
+        check_cache_ancestors(path / "probe-state")
+    except ArtifactError:
+        try:
+            path.rmdir()
+        except OSError:
+            logger.warning("The rejected qualification state directory could not be removed.")
+        raise
 
 
 def application_environment(root: Path, python: Path, gh: Path) -> dict[str, str]:
@@ -168,14 +191,6 @@ def main() -> int:
             setattr(args, name, getattr(args, name).absolute())
         if os.path.lexists(args.output):
             raise ArtifactError("Select a new qualification result file.")
-        if args.state.exists() or any(
-            args.state.resolve().is_relative_to(path.resolve())
-            or path.resolve().is_relative_to(args.state.resolve())
-            for path in (args.engine, args.workspaces)
-        ):
-            raise ArtifactError(
-                "Qualification requires new private state outside the selected assets."
-            )
         selection = EngineSelection.read(args.engine / SELECTION_NAME, args.expected_engine_selection_sha256)
         raw = (args.workspaces / "release-assets.json").read_bytes()
         if hashlib.sha256(raw).hexdigest() != args.expected_workspace_inventory_sha256:
@@ -188,7 +203,7 @@ def main() -> int:
             or selection.plan_sha256 != args.expected_plan_sha
         ):
             raise ArtifactError("The selected engine and workspaces describe different candidates.")
-        args.state.mkdir(mode=0o700)
+        create_qualification_state(args.state, (args.engine, args.workspaces))
         engine_verifier = ReleaseVerifier(
             args.state / "engine-policy",
             args.trusted_root,

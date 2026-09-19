@@ -667,6 +667,7 @@ jobs:
       EXPECTED_WORKSPACE_SHA: ${{ needs.workspace-assets.outputs.inventory-sha }}
       EXPECTED_PLAN_SHA: ${{ needs.prepare.outputs.plan-sha }}
       QUALIFICATION_PLATFORM: ${{ matrix.platform }}
+      QUALIFICATION_PYTHON: ${{ matrix.python }}
       BUILDER_REF: ${{ github.workflow_ref }}
     steps:
       - name: Checkout qualification tools
@@ -702,6 +703,33 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
 
+      - name: Select private qualification state
+        shell: python
+        run: |
+          import os
+          import re
+          from pathlib import Path
+
+          runner = os.environ["RUNNER_OS"]
+          key = "LOCALAPPDATA" if runner == "Windows" else "RUNNER_TEMP"
+          values = (
+              os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_RUN_ATTEMPT"],
+              os.environ["QUALIFICATION_PLATFORM"], os.environ["QUALIFICATION_PYTHON"],
+          )
+          if (
+              runner not in {"Windows", "Linux"}
+              or not all(re.fullmatch(r"[A-Za-z0-9._-]+", value) for value in values)
+          ):
+              raise SystemExit("::error::The qualification state identity is unsupported.")
+          root = Path(os.environ.get(key, ""))
+          if not root.is_absolute():
+              raise SystemExit("::error::The qualification state root must be an absolute path.")
+          state = root / ("siteops-qualification-" + "-".join(values))
+          if os.path.lexists(state):
+              raise SystemExit("::error::Select a new private qualification state directory.")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+              output.write("QUALIFICATION_STATE=" + str(state) + "\n")
+
       - name: Qualify through the installed engine
         shell: bash
         env:
@@ -736,7 +764,7 @@ jobs:
             --engine "$temp/qualification-engine" --expected-engine-selection-sha256 "$EXPECTED_ENGINE_SHA" \
             --workspaces "$temp/qualification-workspaces" --expected-workspace-inventory-sha256 "$EXPECTED_WORKSPACE_SHA" \
             --expected-plan-sha "$EXPECTED_PLAN_SHA" --trusted-root "$temp/qualification-roots.json" \
-            --state "$temp/workspace-qualification" --output "$temp/workspace-qualification.json" \
+            --state "$QUALIFICATION_STATE" --output "$temp/workspace-qualification.json" \
             --gh "$gh_path" --builder-workflow "$builder" --platform "$QUALIFICATION_PLATFORM" \
             --expected-runner-environment "$EXPECTED_RUNNER_ENVIRONMENT" \
             > "$temp/workspace-qualification.out" 2> "$temp/workspace-qualification.err"; then

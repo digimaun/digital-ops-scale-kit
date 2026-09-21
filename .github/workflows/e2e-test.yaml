@@ -289,9 +289,9 @@ jobs:
           if published_mode:
               if len(rs) != 1:
                   sys.exit("Published E2E requires exactly one aio-releases entry.")
-              if persistent or cl_in:
+              if not persistent or cl_in:
                   sys.exit(
-                      "Published E2E requires an ephemeral resource group and an "
+                      "Published E2E requires an existing resource group and an "
                       "auto-generated cluster name."
                   )
               if secret_sync_modes != ["disabled"]:
@@ -407,39 +407,19 @@ jobs:
           github-token: ${{ github.token }}
           state: ${{ runner.temp }}/published-siteops
 
-      - name: Render the published-package operator Site
-        if: needs.prep.outputs.published-mode == 'true'
-        shell: bash
-        env:
-          E2E_SITE_NAME: ${{ steps.names.outputs.site_name }}
-          E2E_SUBSCRIPTION: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          E2E_RESOURCE_GROUP: ${{ steps.names.outputs.rg }}
-          E2E_LOCATION: ${{ inputs.location }}
-          E2E_CLUSTER_NAME: ${{ steps.names.outputs.cluster }}
-          E2E_AIO_RELEASE: ${{ matrix.aio-release }}
-          E2E_ENABLE_SECRET_SYNC: "false"
-        run: |
-          set -euo pipefail
-          python scripts/render-e2e-site.py \
-            --template tests/e2e/sites/e2e-published.yaml.tmpl \
-            --output-dir "$RUNNER_TEMP/e2e-sites"
-
       - name: Prepare the published workspace project
         if: needs.prep.outputs.published-mode == 'true'
         shell: bash
         env:
           RELEASE: ${{ needs.prep.outputs.published-release }}
           SOURCE_SHA: ${{ needs.prep.outputs.published-source-sha }}
-          SITE_NAME: ${{ steps.names.outputs.site_name }}
         run: |
           set -euo pipefail
           umask 077
           project="$RUNNER_TEMP/published-project"
           cache="$RUNNER_TEMP/published-cache"
           gh_config="$RUNNER_TEMP/published-gh"
-          mkdir "$project" "$project/sites" "$gh_config"
-          cp "$RUNNER_TEMP/e2e-sites/$SITE_NAME.yaml" "$project/sites/$SITE_NAME.yaml"
-          site_before="$(sha256sum "$project/sites/$SITE_NAME.yaml" | cut -d ' ' -f 1)"
+          mkdir "$project" "$gh_config"
           unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
           export SITEOPS_CACHE_DIR="$cache"
           export GH_CONFIG_DIR="$gh_config"
@@ -455,9 +435,8 @@ jobs:
             echo "::error::The published workspace could not be pinned."
             exit 1
           fi
-          site_after="$(sha256sum "$project/sites/$SITE_NAME.yaml" | cut -d ' ' -f 1)"
-          if [[ "$site_before" != "$site_after" ]]; then
-            echo "::error::Project pin changed the operator Site."
+          if [[ -e "$project/sites" ]]; then
+            echo "::error::Project pin created operator Site content."
             exit 1
           fi
           if ! SITEOPS_REDACT_OUTPUT=0 siteops project show "$project" --output json \
@@ -488,44 +467,6 @@ jobs:
               != "iot-operations.zip.attestation.jsonl"
           ):
               raise SystemExit("The project pin does not match the selected release.")
-          PY
-          if ! siteops \
-            --project "$project" \
-            --trust-policy "$SITEOPS_E2E_POLICY" \
-            --trusted-root "$SITEOPS_E2E_TRUSTED_ROOT" \
-            validate aio-install \
-            --plan \
-            --offline \
-            -l "name=$SITE_NAME" \
-            --output json \
-            > "$RUNNER_TEMP/published-plan-output.txt" \
-            2> "$RUNNER_TEMP/published-plan.err"; then
-            echo "::error::The published package cannot prepare the selected AIO install."
-            cat "$RUNNER_TEMP/published-plan.err"
-            exit 1
-          fi
-          python - "$RUNNER_TEMP/published-plan-output.txt" \
-            "$SITEOPS_E2E_ENGINE_VERSION" <<'PY'
-          import json
-          import sys
-          from pathlib import Path
-
-          raw = Path(sys.argv[1]).read_text(encoding="utf-8")
-          start = raw.find("{")
-          if start < 0:
-              raise SystemExit("The published package returned no plan result.")
-          result = json.loads(raw[start:])
-          summary = result.get("summary", {})
-          if (
-              result.get("apiVersion") != "siteops/v1alpha1"
-              or result.get("kind") != "DeploymentPlan"
-              or result.get("status") != "planned"
-              or result.get("executable") is not False
-              or result.get("engine", {}).get("version") != sys.argv[2]
-              or summary.get("targetCount") != 1
-              or summary.get("operationCount") != 9
-          ):
-              raise SystemExit("The published package plan is incomplete.")
           PY
           {
             echo "SITEOPS_E2E_PROJECT=$project"
@@ -644,6 +585,69 @@ jobs:
             LOC="$AUTO_LOC"
           fi
           echo "location=$LOC" >> "$GITHUB_OUTPUT"
+
+      - name: Render and plan the published-package operator Site
+        if: needs.prep.outputs.published-mode == 'true'
+        shell: bash
+        env:
+          E2E_SITE_NAME: ${{ steps.names.outputs.site_name }}
+          E2E_SUBSCRIPTION: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          E2E_RESOURCE_GROUP: ${{ steps.names.outputs.rg }}
+          E2E_LOCATION: ${{ steps.loc.outputs.location }}
+          E2E_CLUSTER_NAME: ${{ steps.names.outputs.cluster }}
+          E2E_AIO_RELEASE: ${{ matrix.aio-release }}
+          E2E_ENABLE_SECRET_SYNC: "false"
+        run: |
+          set -euo pipefail
+          mkdir "$SITEOPS_E2E_PROJECT/sites"
+          python scripts/render-e2e-site.py \
+            --template tests/e2e/sites/e2e-published.yaml.tmpl \
+            --output-dir "$SITEOPS_E2E_PROJECT/sites"
+          site="$SITEOPS_E2E_PROJECT/sites/$E2E_SITE_NAME.yaml"
+          site_before="$(sha256sum "$site" | cut -d ' ' -f 1)"
+          if ! siteops \
+            --project "$SITEOPS_E2E_PROJECT" \
+            --trust-policy "$SITEOPS_E2E_POLICY" \
+            --trusted-root "$SITEOPS_E2E_TRUSTED_ROOT" \
+            validate aio-install \
+            --plan \
+            --offline \
+            -l "name=$E2E_SITE_NAME" \
+            --output json \
+            > "$RUNNER_TEMP/published-plan-output.txt" \
+            2> "$RUNNER_TEMP/published-plan.err"; then
+            echo "::error::The published package cannot prepare the selected AIO install."
+            cat "$RUNNER_TEMP/published-plan.err"
+            exit 1
+          fi
+          site_after="$(sha256sum "$site" | cut -d ' ' -f 1)"
+          if [[ "$site_before" != "$site_after" ]]; then
+            echo "::error::Published package planning changed the operator Site."
+            exit 1
+          fi
+          python - "$RUNNER_TEMP/published-plan-output.txt" \
+            "$SITEOPS_E2E_ENGINE_VERSION" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          raw = Path(sys.argv[1]).read_text(encoding="utf-8")
+          start = raw.find("{")
+          if start < 0:
+              raise SystemExit("The published package returned no plan result.")
+          result = json.loads(raw[start:])
+          summary = result.get("summary", {})
+          if (
+              result.get("apiVersion") != "siteops/v1alpha1"
+              or result.get("kind") != "DeploymentPlan"
+              or result.get("status") != "planned"
+              or result.get("executable") is not False
+              or result.get("engine", {}).get("version") != sys.argv[2]
+              or summary.get("targetCount") != 1
+              or summary.get("operationCount") != 9
+          ):
+              raise SystemExit("The published package plan is incomplete.")
+          PY
 
       - name: Preflight Arc cluster name is unused (persistent mode)
         if: env.PERSISTENT_RG == 'true'

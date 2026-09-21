@@ -81,7 +81,7 @@ def test_published_mode_is_explicit_and_bounded():
         "published-source-sha:",
         "published-release and published-source-sha must be supplied together.",
         "Published E2E requires exactly one aio-releases entry.",
-        "Published E2E requires an ephemeral resource group",
+        "Published E2E requires an existing resource group",
         "Published E2E requires secret-sync-modes=disabled.",
         "Published E2E requires tests=aio-install.",
         "Published E2E cannot skip teardown.",
@@ -96,6 +96,7 @@ def test_published_input_contract_accepts_only_the_bounded_shape():
         INPUT_TESTS="aio-install",
         INPUT_PUBLISHED_RELEASE="v0.0.4.dev20260919",
         INPUT_PUBLISHED_SOURCE_SHA="a" * 40,
+        INPUT_RG="paymauntarget3",
     )
 
     assert result.returncode == 0, result.stderr
@@ -103,6 +104,8 @@ def test_published_input_contract_accepts_only_the_bounded_shape():
     assert "published_release=v0.0.4.dev20260919" in result.stdout
     assert f"published_source_sha={'a' * 40}" in result.stdout
     assert "max_parallel=1" in result.stdout
+    assert "persistent=true" in result.stdout
+    assert "rg_in=paymauntarget3" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -117,12 +120,12 @@ def test_published_input_contract_accepts_only_the_bounded_shape():
             "requires exactly one aio-releases entry",
         ),
         (
-            {"INPUT_RG": "existing"},
-            "requires an ephemeral resource group",
+            {"INPUT_RG": ""},
+            "requires an existing resource group",
         ),
         (
             {"INPUT_CLUSTER": "named"},
-            "requires an ephemeral resource group",
+            "requires an existing resource group",
         ),
         (
             {"INPUT_UPGRADE_TO": "2607"},
@@ -152,6 +155,7 @@ def test_published_input_contract_rejects_scope_expansion(changes, message):
         "INPUT_TESTS": "aio-install",
         "INPUT_PUBLISHED_RELEASE": "v0.0.4.dev20260919",
         "INPUT_PUBLISHED_SOURCE_SHA": "a" * 40,
+        "INPUT_RG": "paymauntarget3",
         **changes,
     }
     result = _parse_inputs(**values)
@@ -198,7 +202,9 @@ def test_published_setup_finishes_before_azure_provisioning():
     project = workflow.index("- name: Prepare the published workspace project")
     cluster = workflow.index("uses: ./.github/actions/create-k3s-cluster")
     login = workflow.index("uses: azure/login@")
-    assert setup < project < cluster < login
+    plan = workflow.index("- name: Render and plan the published-package operator Site")
+    connect = workflow.index("uses: ./.github/actions/connect-arc")
+    assert setup < project < cluster < login < plan < connect
 
 
 def test_published_workspace_uses_project_pin_and_separate_sites():
@@ -209,21 +215,31 @@ def test_published_workspace_uses_project_pin_and_separate_sites():
         workflow.index("uses: ./.github/actions/create-k3s-cluster")
     ]
     for value in (
-        'mkdir \"$project\" \"$project/sites\" \"$gh_config\"',
-        'cp \"$RUNNER_TEMP/e2e-sites/$SITE_NAME.yaml\" \"$project/sites/$SITE_NAME.yaml\"',
+        'mkdir \"$project\" \"$gh_config\"',
         "unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN",
         "project pin \"$project\"",
         "SITEOPS_REDACT_OUTPUT=0 siteops",
         '--source \"github:$GITHUB_REPOSITORY\"',
         '--release \"$RELEASE\"',
         "--release-workspace workspaces/iot-operations",
-        "Project pin changed the operator Site.",
+        "Project pin created operator Site content.",
+    ):
+        assert value in step
+    assert 'mkdir "$project" "$cache"' not in step
+
+    plan_step = workflow[
+        workflow.index("- name: Render and plan the published-package operator Site"):
+        workflow.index("- name: Preflight Arc cluster name is unused")
+    ]
+    for value in (
+        "--template tests/e2e/sites/e2e-published.yaml.tmpl",
+        'mkdir \"$SITEOPS_E2E_PROJECT/sites\"',
         "validate aio-install",
         "--plan",
         "--offline",
+        "Published package planning changed the operator Site.",
     ):
-        assert value in step
-    assert 'mkdir "$project" "$project/sites" "$cache"' not in step
+        assert value in plan_step
 
 
 def test_published_deploy_uses_only_the_pin_offline():
@@ -353,9 +369,9 @@ def test_published_readiness_is_bounded_and_existing_teardown_is_retained():
         'condition.get("type") == "Ready"',
         "AIO instance projection and operator readiness did not converge within five minutes.",
         "PublishedPackageReadiness",
-        "Teardown (ephemeral mode, delete RG)",
-        "managedBy=siteops-e2e",
-        'TAG_RUN_ID\" != \"$EXPECTED_RUN_ID',
-        'TAG_RUN_ATTEMPT\" != \"$EXPECTED_RUN_ATTEMPT',
+        "Snapshot RG resources (persistent mode)",
+        "Teardown (persistent mode, delta cleanup, keep RG)",
+        "comm -23",
+        "operator-owned",
     ):
         assert value in workflow

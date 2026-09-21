@@ -37,10 +37,11 @@ pre-teardown inspection hold.
  │                                                            │
  │  prep  ──►  e2e (matrix over aio-releases)                 │
  │                  │                                         │
- │                  ├─ setup-published-siteops + pin/plan      │
+ │                  ├─ setup-published-siteops + project pin   │
  │                  │       (published-package mode)          │
  │                  ├─ create-k3s-cluster  (composite action) │
  │                  ├─ azure/login         (OIDC)             │
+ │                  ├─ render Site + offline plan (published) │
  │                  ├─ connect-arc         (composite action) │
  │                  ├─ setup-siteops       (source mode)      │
  │                  ├─ render-e2e-site.py  ──►  $RUNNER_TEMP/ │
@@ -180,8 +181,8 @@ The workflow:
    offline, then checks the redacted deployment summary, expected Azure
    resource types, AIO instance custom resource and at least one running,
    Ready operator pod. Completed AIO job pods are not required to become Ready.
-8. Uploads only bounded count/status receipts and runs the existing
-   provenance-guarded ephemeral RG teardown.
+8. Uploads only bounded count/status receipts and runs the existing persistent
+   snapshot-delta teardown, preserving the operator-supplied RG.
 
 This first slice is deliberately constrained:
 
@@ -192,14 +193,18 @@ This first slice is deliberately constrained:
 | `aio-releases` | One release, normally `2608` |
 | `tests` | `aio-install` |
 | `secret-sync-modes` | `disabled` |
-| `resource-group` / `cluster-name` | empty |
+| `resource-group` | Existing dedicated RG |
+| `cluster-name` | empty; the workflow creates a unique Arc registration |
 | `upgrade-to` | empty |
 | `skip-teardown` | `false` |
 | `keep-cluster-alive-minutes` | `0` |
 
-The mode creates a fresh ephemeral RG and Arc-connected k3s cluster, deploys
-the selected AIO release and can incur Azure charges until deletion completes.
-It establishes the published engine/package deployment route and bounded AIO
+The mode snapshots an existing RG, creates a fresh Arc-connected k3s
+registration and deploys the selected AIO release. It can incur Azure charges
+until snapshot-delta cleanup completes. The RG itself is preserved. Anything
+another actor adds after the snapshot can enter the deletion delta, so use a
+dedicated RG and do not make concurrent changes during the run. The mode
+establishes the published engine/package deployment route and bounded AIO
 readiness observations. It does not establish Secret Sync, upgrade, workload
 data movement or general production health.
 
@@ -211,6 +216,7 @@ gh workflow run e2e-test.yaml \
   -f published-release=v0.0.4.dev20260919 \
   -f published-source-sha=<full-main-commit> \
   -f aio-releases=2608 \
+  -f resource-group=<dedicated-existing-rg> \
   -f tests=aio-install \
   -f secret-sync-modes=disabled
 ```

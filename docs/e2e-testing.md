@@ -37,15 +37,19 @@ pre-teardown inspection hold.
  │                                                            │
  │  prep  ──►  e2e (matrix over aio-releases)                 │
  │                  │                                         │
+ │                  ├─ setup-published-siteops + pin/plan      │
+ │                  │       (published-package mode)          │
  │                  ├─ create-k3s-cluster  (composite action) │
  │                  ├─ azure/login         (OIDC)             │
  │                  ├─ connect-arc         (composite action) │
- │                  ├─ setup-siteops       (composite action) │
+ │                  ├─ setup-siteops       (source mode)      │
  │                  ├─ render-e2e-site.py  ──►  $RUNNER_TEMP/ │
  │                  │                           e2e-sites/    │
- │                  ├─ pytest tests/integration               │
+ │                  ├─ pytest tests/integration (source)      │
  │                  │    (SITEOPS_EXTRA_SITES_DIRS points to  │
  │                  │     the rendered-site dir above)        │
+ │                  ├─ project pin + offline aio-install      │
+ │                  │    (published-package mode)             │
  │                  ├─ upload e2e-results-<release>.xml       │
  │                  │                                         │
  │                  │  ── if upgrade-to set and != cell ──    │
@@ -137,6 +141,8 @@ From the **Actions** tab, dispatch **E2E Tests** with the defaults to run a sing
 | `tests` | empty (run all) or `aio-install,enable-secretsync` | Comma-separated allowlist of test phases to deploy and run. Valid values: `aio-install`, `enable-secretsync`, `sync-secrets`, `opc-ua-solution`, `dataflow-sample`, `aio-resources`, `resource-set-samples`, `aio-upgrade`. Useful for demos and focused debugging when paired with `keep-cluster-alive-minutes`. |
 | `upgrade-to` | empty or `2608` | Optional AIO release to upgrade to after install-phase tests pass. Empty skips the upgrade phase. Per-cell skip when equal to the cell's `aio-releases` value. Requires `aio-upgrade` to be in the `tests` allowlist (or `tests` empty). |
 | `secret-sync-modes` | `enabled` or `enabled,disabled` | Matrix modes for Secret Sync and workload identity. Use `enabled,disabled` with `tests=aio-upgrade` to qualify upgrade behavior with and without the OIDC profile. |
+| `published-release` | empty or an exact tag | Empty keeps the checkout-source integration suite. A tag selects the bounded verified published-package mode below. |
+| `published-source-sha` | empty or a full commit | Required with `published-release`. Must be the exact commit targeted by the published tag. |
 
 Qualify both AIO upgrade optionality paths in one dispatch:
 
@@ -146,6 +152,67 @@ gh workflow run e2e-test.yaml \
   -f upgrade-to=2608 \
   -f tests=aio-upgrade \
   -f secret-sync-modes=enabled,disabled
+```
+
+### Qualify a published engine and workspace
+
+Published-package mode proves a different boundary from the ordinary source
+suite. It does not install `-e .`, import Site Ops from checkout, or use the
+checkout workspace as deployment content.
+
+The workflow:
+
+1. Checks the published tag targets the exact supplied `main` commit.
+2. Downloads the installation ZIP and detached proof from the current
+   repository and compares both with GitHub's published size and SHA-256.
+3. Verifies the exact `_siteops-distribution.yaml` signer, `release.yaml`
+   caller, source/signer/caller commit, GitHub OIDC issuer, `main` ref and
+   `self-hosted` runner class with stock GitHub CLI.
+4. Provisions pipx 1.17.2 and its hash-pinned pip 26.2.1 backend, installs the
+   authenticated `pylock.toml` with no index or source build, then rejects any
+   Site Ops import rooted in checkout.
+5. Creates an independent workspace signer policy and trusted-root snapshot.
+6. Before Azure provisioning, renders a self-contained operator Site outside
+   the package, anonymously pins the published IoT Operations workspace into
+   that project, confirms pinning did not change the Site and prepares an
+   offline compile-free `aio-install` plan.
+7. Runs `aio-install` through the same project with package acquisition
+   offline, then checks the redacted deployment summary, expected Azure
+   resource types, AIO instance custom resource and at least one running,
+   Ready operator pod. Completed AIO job pods are not required to become Ready.
+8. Uploads only bounded count/status receipts and runs the existing
+   provenance-guarded ephemeral RG teardown.
+
+This first slice is deliberately constrained:
+
+| Input | Required value |
+|---|---|
+| `published-release` | Exact approved published tag |
+| `published-source-sha` | Exact full source commit |
+| `aio-releases` | One release, normally `2608` |
+| `tests` | `aio-install` |
+| `secret-sync-modes` | `disabled` |
+| `resource-group` / `cluster-name` | empty |
+| `upgrade-to` | empty |
+| `skip-teardown` | `false` |
+| `keep-cluster-alive-minutes` | `0` |
+
+The mode creates a fresh ephemeral RG and Arc-connected k3s cluster, deploys
+the selected AIO release and can incur Azure charges until deletion completes.
+It establishes the published engine/package deployment route and bounded AIO
+readiness observations. It does not establish Secret Sync, upgrade, workload
+data movement or general production health.
+
+Example:
+
+```bash
+gh workflow run e2e-test.yaml \
+  --ref <reviewed-branch> \
+  -f published-release=v0.0.4.dev20260919 \
+  -f published-source-sha=<full-main-commit> \
+  -f aio-releases=2608 \
+  -f tests=aio-install \
+  -f secret-sync-modes=disabled
 ```
 
 ### What `skip-teardown` leaves behind
@@ -167,7 +234,13 @@ Persistent teardown deletes the Arc cluster only if it was not present in the pr
 
 **Use a dedicated RG for persistent mode.** Anything added to the RG between the snapshot and teardown (by operators, automation, or a `keep-cluster-alive-minutes` hold) appears in the delta and is deleted.
 
-A JUnit XML artifact is uploaded per matrix cell (`e2e-results-<release>-secretsync-<mode>.xml`). When `upgrade-to` is set and the cell exercises the upgrade phase, a second artifact (`e2e-results-<release>-to-<upgrade-to>-secretsync-<mode>.xml`) is uploaded with the upgrade-only test results.
+A JUnit XML artifact is uploaded per source-mode matrix cell
+(`e2e-results-<release>-secretsync-<mode>.xml`). When `upgrade-to` is set and
+the cell exercises the upgrade phase, a second artifact
+(`e2e-results-<release>-to-<upgrade-to>-secretsync-<mode>.xml`) is uploaded
+with the upgrade-only test results. Published-package mode instead uploads
+only `published-deployment.json` and `published-readiness.json`; they contain
+public release identities and aggregate counts, not Azure resource IDs.
 
 ## Running locally
 

@@ -135,12 +135,31 @@ jobs:
           RUN_ID: "${{ github.run_id }}"
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import json, os, re, sys
+          import json, os, re, sys, unicodedata
           from pathlib import Path
+
+          def output_token(value, label, maximum=256):
+              if value and (
+                  len(value) > maximum
+                  or any(
+                      character.isspace()
+                      or unicodedata.category(character).startswith("C")
+                      for character in value
+                  )
+              ):
+                  sys.exit(f"{label} must be bounded text without whitespace or controls.")
+              return value
+
           rs = [r.strip() for r in os.environ["INPUT_RELEASES"].split(",") if r.strip()]
           if not rs:
               sys.exit("aio-releases must be non-empty")
-          published_release = os.environ["INPUT_PUBLISHED_RELEASE"].strip()
+          for release in rs:
+              output_token(release, "aio-releases entry", maximum=64)
+          published_release = output_token(
+              os.environ["INPUT_PUBLISHED_RELEASE"].strip(),
+              "published-release",
+              maximum=128,
+          )
           published_source_sha = os.environ["INPUT_PUBLISHED_SOURCE_SHA"].strip()
           published_mode = bool(published_release)
           if bool(published_source_sha) != published_mode:
@@ -163,9 +182,11 @@ jobs:
                       f"{releases_dir}/<release>.yaml: {missing}. "
                       f"Available: {available}."
                   )
-          rg_in = os.environ["INPUT_RG"].strip()
-          cl_in = os.environ["INPUT_CLUSTER"].strip()
-          upgrade_to = os.environ["INPUT_UPGRADE_TO"].strip()
+          rg_in = output_token(os.environ["INPUT_RG"].strip(), "resource-group")
+          cl_in = output_token(os.environ["INPUT_CLUSTER"].strip(), "cluster-name")
+          upgrade_to = output_token(
+              os.environ["INPUT_UPGRADE_TO"].strip(), "upgrade-to", maximum=64,
+          )
           if published_mode and upgrade_to:
               sys.exit("Published E2E does not support the upgrade phase.")
           secret_sync_modes = [

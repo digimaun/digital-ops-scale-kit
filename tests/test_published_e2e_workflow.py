@@ -116,6 +116,22 @@ def test_published_input_contract_accepts_only_the_bounded_shape():
             "published-release and published-source-sha must be supplied together",
         ),
         (
+            {"INPUT_PUBLISHED_RELEASE": "v0.0.4.dev20260919\npersistent=false"},
+            "published-release must be bounded text without whitespace or controls",
+        ),
+        (
+            {"INPUT_RELEASES": "2608\npersistent=false"},
+            "aio-releases entry must be bounded text without whitespace or controls",
+        ),
+        (
+            {"INPUT_RG": "paymauntarget3\npersistent=false"},
+            "resource-group must be bounded text without whitespace or controls",
+        ),
+        (
+            {"INPUT_CLUSTER": "name\npersistent=false"},
+            "cluster-name must be bounded text without whitespace or controls",
+        ),
+        (
             {"INPUT_RELEASES": "2607,2608"},
             "requires exactly one aio-releases entry",
         ),

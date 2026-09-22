@@ -9,7 +9,8 @@ commands.
 
 `--project DIRECTORY` selects an operator project directory, not a registered
 project name. Site Ops has no global project registry. The project supplies
-your Site configuration. An explicit `-w PATH` selects local content.
+your configured Sites when you use them. [Guided inputs](guided-inputs.md)
+can construct one Site in memory instead. An explicit `-w PATH` selects local content.
 Otherwise, the project's workspace pin selects packaged content.
 
 | Selection | Deployment content | Site configuration |
@@ -64,6 +65,10 @@ Prepare these inputs:
   and [workspace release descriptor](workspace-sources.md).
 - A local consumer policy and independently provisioned trusted root.
 - Your configured Sites in the project directory.
+
+Configured Sites are optional for entries with a typed input contract. You
+can inspect `siteops inputs`, then supply one explicit target with
+`--input-file`, `--input`, or a complete `--site-file`.
 
 The [content release workflow](releasing.md) can publish the workspace asset
 set from reviewed declarations after qualification and approval. Choose a
@@ -121,7 +126,7 @@ pin. An altered release reports this error rather than updating the selection:
 The published source differs from the workspace pin. Repin explicitly to change the selection.
 ```
 
-Add `--offline` after `browse`, `validate`, `plan` or `deploy` to require the
+Add `--offline` after `browse`, `inputs`, `validate`, `plan` or `deploy` to require the
 package and proof already in cache. Offline use still requires valid local
 policy and roots. Expired policy, corrupt objects and invalid source
 expectations fail without automatic repair.

@@ -16,6 +16,10 @@ siteops -w workspaces/iot-operations browse --category sample --search "resource
 load Sites or overlays, expand includes, read parameter values, compile
 templates, probe deployment tools, contact services or perform deployment.
 It works with an explicitly selected workspace that has no configured Sites.
+For an entry with an executable typed input contract, use
+`siteops -w workspaces/iot-operations inputs aio-install` after browsing
+to see the required answers. [Guided inputs](guided-inputs.md) describes
+the separate Site construction and planning step.
 
 For a published remote catalog, use `browse --source`. See
 [remote browsing](remote-content.md) for pinned GitHub sources, authorized

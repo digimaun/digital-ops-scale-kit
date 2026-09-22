@@ -48,12 +48,15 @@ from environment-specific configuration.
 
 ## Quick start
 
-**[Start with AIO on one site](docs/getting-started.md).**
+**[Start with AIO on one Site](docs/guided-inputs.md).**
 
-The quickstart takes an existing Arc-connected Kubernetes cluster through
-installing the CLI, filling in one site file, reviewing a plan, and deploying.
-It keeps prerequisites and commands together, so you can follow one path
-without first reading the reference documentation.
+With an approved workspace package, inspect required inputs, supply one
+target inline or by file, review a plan, and deploy to an existing
+Arc-connected Kubernetes cluster without cloning this repository.
+The [local checkout guide](docs/getting-started.md) keeps the configured-Site
+route for development or fleet preparation.
+
+Configured Sites remain available for repeated and fleet deployments.
 
 Deployment creates or updates Azure resources and can incur charges.
 Once that first site is working, expand the selector to deploy the same

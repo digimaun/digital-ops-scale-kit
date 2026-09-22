@@ -50,9 +50,69 @@ siteops deploy manifest.yaml -l name=munich-dev,name=seattle-dev
 ```
 
 A manifest with neither `sites:` nor `selector:` is a library or partial.
-It can be checked with `validate`, while `plan` and `deploy` require `-l`.
+It can be checked with `validate`, while `plan` and `deploy` require `-l`
+or an explicit Site supplied with `--site-file`, `--input-file`, or `--input`.
 See [targeting.md](targeting.md) for the full grammar, the no-match diagnostic,
 and validation rules.
+
+## Typed input contract
+
+A deployment that supports [guided single-Site inputs](guided-inputs.md)
+places `inputs.yaml` next to `manifest.yaml` or `manifest.yml`. A flat manifest
+such as `manifests/storage.yaml` uses `manifests/storage.inputs.yaml` so
+several flat manifests cannot share one contract. The file is packaged with
+the workspace and checked against the acquired package's file inventory
+before Site Ops reads it. It is not a manifest, a browsing card, or a source
+of permission to deploy. Existing entry guidance remains descriptive.
+
+```yaml
+apiVersion: siteops.inputs/v1
+kind: SiteInputContract
+siteDefaults:
+  properties:
+    release: "1"
+inputs:
+  - name: siteName
+    type: string
+    description: Name for the explicit Site.
+    sitePath: name
+  - name: subscription
+    type: string
+    description: Subscription where the resources will be created.
+    sitePath: subscription
+  - name: location
+    type: string
+    description: Azure deployment region.
+    sitePath: location
+  - name: featureEnabled
+    type: boolean
+    description: Include the optional feature.
+    sitePath: properties.featureEnabled
+    default: false
+```
+
+`siteDefaults` may hold only `labels`, `properties`, and `parameters`.
+Each `inputs` row declares one semantic name, a `string` or `boolean` type,
+description, and a destination under `name`, `subscription`,
+`resourceGroup`, `location`, `labels`, `parameters`, or `properties`.
+An input without a default is required. Defaults, then answer files, then
+inline answers contribute values. A conditional row may use
+`when: {input: featureEnabled, equals: true}` to require it only when a
+previously declared unconditional controller has that value. Contracts
+declaring `sensitive: true` are rejected in this initial route until protected
+values can be preserved across planning and reporting without disclosure.
+Author only mappings that ordinary Site parsing and actual deployment
+preparation accept. Do not map two inputs onto the same Site field.
+
+`siteops inputs <manifest>` shows the contract and can write an incomplete
+answer file for the operator. Conditional fields are omitted from the example
+until their controller activates them. A completed file has kind
+`SiteInputValues` and a `values:` mapping. No Site is written or altered
+by `plan` or `deploy` with typed answers. Use
+`siteops inputs <manifest> --save-site FILE` after
+supplying complete non-protected answers to retain an ordinary Site. A
+manifest without a contract continues to accept complete Site files and
+configured Sites.
 
 ## Manifest-level parameters
 

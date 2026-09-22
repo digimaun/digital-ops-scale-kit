@@ -1,4 +1,9 @@
-# Deploy AIO to your first site
+# Deploy AIO from a local checkout
+
+For an approved workspace package with a typed input contract, use the
+[single-Site guided path](guided-inputs.md). It needs no repository clone or
+handwritten Site file. This page retains the local checkout route for
+operators who want a reusable configured Site and fleet targeting.
 
 Use one existing Arc-connected Kubernetes cluster to learn the workflow:
 configure a site, review a plan, then deploy Azure IoT Operations.

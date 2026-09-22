@@ -18,11 +18,12 @@ Replace the paths and release in the [project pin example](projects.md#run-proje
 with your approved source and policy. The following commands use that project:
 
 ```text
-siteops --project ./factory --trust-policy policy.json --trusted-root trusted-root.json inputs aio-install
 siteops --project ./factory --trust-policy policy.json --trusted-root trusted-root.json inputs aio-install --example ./aio-inputs.yaml
 ```
 
-The generated answer file has null values for the required answers. It
+This one command lists the required and defaulted inputs and writes the
+example. Omit `--example` to inspect without writing anything. The
+generated answer file has null values for the required answers. It
 cannot be used to plan or deploy until you supply every required value in
 the file or override it with `--input`. For an existing Arc-connected
 Kubernetes cluster, fill these fields with your own target information:
@@ -61,6 +62,15 @@ resources or incur charges. Authenticate explicitly with the identity
 authorized for the target. A successful deployment result is not evidence of
 AIO component health or a working application.
 
+For an optional preview before planning, run
+`siteops inputs aio-install --input-file ./aio-inputs.yaml` with the same
+project and trust options.
+It resolves and structurally validates one Site without writing it,
+compiling templates or reading Azure resources. Plain and local JSON output
+include a private display of the Site and its defaults. In CI and other
+redacted destinations, the command reports readiness without publishing
+the Site values.
+
 For a short non-secret command, supply the same named answers with repeated
 `--input NAME=VALUE` options on `plan` or `deploy`. Inline answers override
 the input file. Strings and strict `true` or `false` booleans are parsed
@@ -79,8 +89,8 @@ siteops --project ./factory --trust-policy policy.json --trusted-root trusted-ro
 ```
 
 The saved document is an ordinary Site. Site Ops does not overwrite an
-existing file. An
-inline target remains in memory unless you explicitly choose `--save-site`.
+existing file. An inline target remains in memory unless you explicitly
+choose `--save-site`.
 Keep Site and answer files outside the content cache and verified package.
 To reuse a complete standalone Site without saving it into a project, pass
 `--site-file ./plant-one.yaml` to `plan`, `validate`, or `deploy`. A standalone

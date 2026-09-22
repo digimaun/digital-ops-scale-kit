@@ -87,6 +87,31 @@ def _input_file(path: Path, *, name: str = "one") -> Path:
     return path
 
 
+def test_top_level_help_leads_with_single_site_answers(capsys):
+    with patch.object(sys, "argv", ["siteops", "--help"]):
+        with pytest.raises(SystemExit) as stopped:
+            main()
+    assert stopped.value.code == 0
+    help_text = capsys.readouterr().out
+    assert help_text.index("inputs aio-install --example") < help_text.index(
+        "plan aio-install --input-file"
+    )
+    assert help_text.index("plan aio-install --input-file") < help_text.index(
+        "plan aio-install -l environment=prod"
+    )
+
+
+def test_inputs_help_explains_read_only_preview(capsys):
+    with patch.object(sys, "argv", ["siteops", "inputs", "--help"]):
+        with pytest.raises(SystemExit) as stopped:
+            main()
+    assert stopped.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "preview" in help_text.lower()
+    assert "without writing" in help_text.lower()
+    assert "--save-site" in help_text
+
+
 def test_inputs_inspection_and_example_are_not_executable(
     guided_workspace, tmp_path, capsys,
 ):
@@ -112,6 +137,66 @@ def test_inputs_inspection_and_example_are_not_executable(
     assert "required" in capsys.readouterr().out.lower()
     assert _invoke(args) == 1
     assert "exists" in capsys.readouterr().err.lower()
+
+
+def test_inputs_preview_from_complete_answers_is_read_only(
+    guided_workspace, tmp_path, capsys,
+):
+    answers = _input_file(tmp_path / "answers.yaml")
+    original = answers.read_bytes()
+    with patch(
+        "siteops.cli.write_yaml_exclusive",
+        side_effect=AssertionError("Inspection cannot write files."),
+    ):
+        assert _invoke([
+            "-w", str(guided_workspace), "inputs", _manifest(guided_workspace),
+            "--input-file", str(answers), "--input", "siteName=preview",
+            "--output", "json",
+        ]) == 0
+
+    document = json.loads(capsys.readouterr().out)
+    assert document["resolution"]["status"] == "ready"
+    assert document["resolution"]["site"]["name"] == "preview"
+    assert document["resolution"]["site"]["location"] == "eastus"
+    assert answers.read_bytes() == original
+    assert not (guided_workspace / "sites" / "preview.yaml").exists()
+
+
+def test_inputs_preview_redacts_site_in_automation(
+    guided_workspace, tmp_path, monkeypatch, capsys,
+):
+    answers = _input_file(tmp_path / "answers.yaml", name="PRIVATE_TARGET_NAME")
+    monkeypatch.setenv("SITEOPS_REDACT_OUTPUT", "1")
+    assert _invoke([
+        "-w", str(guided_workspace), "inputs", _manifest(guided_workspace),
+        "--input-file", str(answers), "--output", "json",
+    ]) == 0
+
+    output = capsys.readouterr()
+    document = json.loads(output.out)
+    assert document["resolution"] == {"status": "ready", "site": None}
+    assert "PRIVATE_TARGET_NAME" not in output.out + output.err
+    assert "00000000-0000-0000-0000-000000000001" not in output.out + output.err
+
+
+def test_incomplete_input_preview_fails_without_writing(
+    guided_workspace, tmp_path, capsys,
+):
+    site_file = tmp_path / "one.yaml"
+    with patch(
+        "siteops.cli.write_yaml_exclusive",
+        side_effect=AssertionError("An incomplete Site must not be saved."),
+    ):
+        assert _invoke([
+            "-w", str(guided_workspace), "inputs", _manifest(guided_workspace),
+            "--input", "siteName=one", "--output", "json",
+        ]) == 1
+        assert _invoke([
+            "-w", str(guided_workspace), "inputs", _manifest(guided_workspace),
+            "--input", "siteName=one", "--save-site", str(site_file),
+        ]) == 1
+    assert not site_file.exists()
+    assert "subscription" in capsys.readouterr().err
 
 
 def test_plain_input_inspection_escapes_authored_terminal_controls(
@@ -416,6 +501,26 @@ def test_aio_boolean_defaults_use_answer_file_spelling(capsys):
     output = capsys.readouterr().out
     assert "Default: true" in output
     assert "Default: True" not in output
+
+
+def test_aio_plain_preview_shows_effective_defaults(capsys):
+    root = Path(__file__).resolve().parents[1]
+    workspace = root / "workspaces" / "iot-operations"
+    assert _invoke([
+        "-w", str(workspace), "inputs", "aio-install",
+        "--input", "siteName=plant-one",
+        "--input", "subscription=00000000-0000-0000-0000-000000000001",
+        "--input", "resourceGroup=rg-existing",
+        "--input", "location=eastus",
+        "--input", "clusterName=existing-arc",
+        "--input", "environment=dev",
+        "--input", "country=US",
+    ]) == 0
+    output = capsys.readouterr().out
+    assert "name: plant-one" in output
+    assert "enableSecretSync: false" in output
+    assert "enableCertManager: true" in output
+    assert "siteName (string, required)" not in output
 
 
 def test_aio_inputs_prepare_one_explicit_target_without_example_site(capsys):

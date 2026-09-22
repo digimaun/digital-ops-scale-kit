@@ -582,10 +582,41 @@ def cmd_inputs(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
             )
         if args.example and (args.save_site or args.input_file or args.input_values):
             raise GuidedInputError("--example cannot be combined with answers or --save-site.")
-        if (args.input_file or args.input_values) and not args.save_site:
-            raise GuidedInputError("Answers on `siteops inputs` require --save-site.")
         if args.example:
             _require_operator_file_path(args.example, args)
+        resolved_site: Site | None = None
+        if args.input_file or args.input_values or args.save_site:
+            if args.input_file is not None:
+                _require_operator_file_path(args.input_file, args)
+            resolved_site = contract.resolve(
+                values_file=args.input_file,
+                inline=args.input_values,
+            )
+            errors = orchestrator.validate(
+                manifest_path,
+                sites=[resolved_site],
+            )
+            if errors:
+                raise ValueError("Site validation failed: " + "; ".join(errors))
+        description = contract.describe()
+        preview: str | None = None
+        if resolved_site is not None:
+            description["resolution"] = {
+                "status": "ready",
+                "site": None if is_redaction_enabled() else _site_document(resolved_site),
+            }
+            if args.output == "plain" and not is_redaction_enabled():
+                document = yaml.safe_dump(
+                    description["resolution"]["site"],
+                    sort_keys=False,
+                    allow_unicode=True,
+                ).rstrip()
+                preview = "\n".join(_content_text(line) for line in document.splitlines())
+        if args.output == "json":
+            rendered_json = json.dumps(description, ensure_ascii=False, indent=2, allow_nan=False)
+        else:
+            manifest_name = _content_text(orchestrator.load_manifest(manifest_path).name)
+        if args.example:
             write_yaml_exclusive(args.example, contract.example())
             destination = (
                 "a private file"
@@ -594,44 +625,40 @@ def cmd_inputs(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
             )
             print(f"Incomplete answer file written: {destination}", file=sys.stderr)
         if args.save_site:
-            if args.input_file is not None:
-                _require_operator_file_path(args.input_file, args)
-            site = contract.resolve(
-                values_file=args.input_file,
-                inline=args.input_values,
-            )
-            errors = orchestrator.validate(
-                manifest_path,
-                sites=[site],
-            )
-            if errors:
-                raise ValueError("Site validation failed: " + "; ".join(errors))
+            if resolved_site is None:
+                raise GuidedInputError("Complete typed answers are required to save a Site.")
             _require_operator_file_path(args.save_site, args)
-            write_yaml_exclusive(args.save_site, _site_for_file(site))
+            write_yaml_exclusive(args.save_site, _site_for_file(resolved_site))
             destination = (
                 "a private file"
                 if is_redaction_enabled()
                 else _content_text(str(args.save_site))
             )
             print(f"Site written: {destination}", file=sys.stderr)
-        description = contract.describe()
         if args.output == "json":
-            print(json.dumps(description, ensure_ascii=False, indent=2))
+            print(rendered_json)
         else:
-            manifest_name = orchestrator.load_manifest(manifest_path).name
-            print(f"Inputs for {_content_text(manifest_name)}:")
-            for field in description["inputs"]:
-                print(
-                    f"  {_content_text(field['name'])} "
-                    f"({_content_text(field['type'])}, {_content_text(field['status'])})"
-                    f": {_content_text(field['description'])}"
-                )
-                if "default" in field:
-                    value = field["default"]
-                    shown = json.dumps(value) if isinstance(value, bool) else str(value)
-                    print(f"    Default: {_content_text(shown)}")
-            if not args.example and not args.save_site:
-                print("Use --example FILE to write an incomplete answer file.")
+            if resolved_site is not None:
+                if preview is not None:
+                    print(f"Effective Site for {manifest_name} (private preview):\n{preview}")
+                else:
+                    print(f"One Site resolved for {manifest_name}. Private Site values are withheld.")
+                if not args.save_site:
+                    print("No Site file written. Use --save-site FILE to keep it.")
+            else:
+                print(f"Inputs for {manifest_name}:")
+                for field in description["inputs"]:
+                    print(
+                        f"  {_content_text(field['name'])} "
+                        f"({_content_text(field['type'])}, {_content_text(field['status'])})"
+                        f": {_content_text(field['description'])}"
+                    )
+                    if "default" in field:
+                        value = field["default"]
+                        shown = json.dumps(value) if isinstance(value, bool) else str(value)
+                        print(f"    Default: {_content_text(shown)}")
+                if not args.example:
+                    print("Use --example FILE to write an incomplete answer file.")
             print("Review prerequisites and effects with `siteops browse`.")
     except (OSError, ValueError, yaml.YAMLError) as error:
         print(f"Error: {_guided_error_detail(error)}", file=sys.stderr)
@@ -1387,15 +1414,15 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  siteops -w workspaces/iot-operations browse
   siteops -w workspaces/iot-operations browse aio-install
+  siteops -w workspaces/iot-operations inputs aio-install --example ./aio-inputs.yaml
+  # Fill required answers in aio-inputs.yaml before planning or deploying.
+  siteops -w workspaces/iot-operations plan aio-install --input-file ./aio-inputs.yaml
+  siteops -w workspaces/iot-operations deploy aio-install --input-file ./aio-inputs.yaml
+  siteops -w workspaces/iot-operations browse
   siteops -w workspaces/iot-operations sites
   siteops -w workspaces/iot-operations sites munich-dev --output yaml
-  siteops -w workspaces/iot-operations inputs aio-install
   siteops -w workspaces/iot-operations validate aio-install
-  siteops -w workspaces/iot-operations plan aio-install
-  siteops -w workspaces/iot-operations plan aio-install --input-file ./aio-inputs.yaml
-  siteops -w workspaces/iot-operations deploy aio-install
   siteops -w workspaces/iot-operations plan aio-install -l environment=prod
   siteops --project ./factory sites
   siteops --project ./factory -w ./clone plan storage -l name=one
@@ -1432,7 +1459,7 @@ Examples:
     )
     parser.add_argument(
         "--project", type=Path, metavar="DIRECTORY",
-        help="Operator project directory containing Sites and an optional workspace pin (a path, not a name)",
+        help="Operator project directory for Sites and an optional workspace pin (a path, not a name)",
     )
     parser.add_argument(
         "--trust-policy", type=Path, metavar="FILE",
@@ -1721,28 +1748,32 @@ Examples:
     p_inputs = subparsers.add_parser(
         "inputs",
         help="Inspect typed inputs for a selected deployment",
-        description="Inspect required inputs or write an incomplete answer file or complete Site.",
+        description=(
+            "Inspect the declared input contract. Complete answers preview "
+            "one resolved Site without writing it. --example writes an "
+            "incomplete answer file, and --save-site explicitly keeps a Site."
+        ),
     )
     p_inputs.add_argument("manifest", help="Exact manifest name or explicit manifest path")
     p_inputs.add_argument(
         "--output", choices=("plain", "json"), default="plain",
-        help="Input contract display format (default: plain)",
+        help="Input contract and optional private Site preview format (default: plain)",
     )
     p_inputs.add_argument(
         "--example", type=Path, metavar="FILE",
         help="Write an incomplete answer file with required inputs left empty",
     )
     p_inputs.add_argument(
-        "--save-site", type=Path, metavar="FILE",
-        help="Write a complete validated Site from supplied typed answers",
-    )
-    p_inputs.add_argument(
         "--input-file", type=Path, metavar="FILE",
-        help="Typed answers for the selected manifest's input contract",
+        help="Typed answers to preview or save one Site (no file written without --save-site)",
     )
     p_inputs.add_argument(
         "--input", dest="input_values", action="append", metavar="NAME=VALUE",
         help="Typed non-secret answer (repeatable, overrides --input-file)",
+    )
+    p_inputs.add_argument(
+        "--save-site", type=Path, metavar="FILE",
+        help="Write a validated Site to a new file after resolving complete typed answers",
     )
     p_inputs.add_argument(
         "--offline", action="store_true",

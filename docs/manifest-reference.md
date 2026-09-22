@@ -106,13 +106,20 @@ preparation accept. Do not map two inputs onto the same Site field.
 
 `siteops inputs <manifest>` shows the contract and can write an incomplete
 answer file for the operator. Conditional fields are omitted from the example
-until their controller activates them. A completed file has kind
-`SiteInputValues` and a `values:` mapping. No Site is written or altered
-by `plan` or `deploy` with typed answers. Use
+until their controller activates them. Complete typed answers let `inputs`
+preview the structurally validated Site without writing it. A completed
+file has kind `SiteInputValues` and a `values:` mapping. No Site is written
+or altered by `plan` or `deploy` with typed answers. Use
 `siteops inputs <manifest> --save-site FILE` after
 supplying complete non-protected answers to retain an ordinary Site. A
 manifest without a contract continues to accept complete Site files and
 configured Sites.
+
+`inputs --output json` returns the contract fields. With complete answers,
+it also includes `resolution.status: ready` and `resolution.site` for
+authorized private output. Redacted destinations set `resolution.site` to
+`null`, meaning the Site was resolved but its values were withheld. This
+inspection output is not public gallery metadata or an executable plan.
 
 ## Manifest-level parameters
 

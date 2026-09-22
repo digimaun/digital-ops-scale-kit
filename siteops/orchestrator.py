@@ -4851,6 +4851,7 @@ class Orchestrator:
         Both intents validate the same loaded inputs. Executable intent
         additionally acquires template schemas and local capabilities.
         """
+        explicit_target = sites is not None
         try:
             self._validate_materialized_package()
             manifest_path = self._require_manifest_path(manifest_path)
@@ -5114,9 +5115,10 @@ class Orchestrator:
                 if self._materialized_package is not None
                 else CompilationBinding.OBSERVED_NOT_ENFORCED
             ),
-            cli_selector=selector,
-            manifest_selector=manifest.site_selector,
+            cli_selector=None if explicit_target else selector,
+            manifest_selector=None if explicit_target else manifest.site_selector,
             composition_enabled=bool(manifest.parameter_compositions),
+            target_selection="explicit-site" if explicit_target else None,
         )
         has_errors = any(
             diagnostic.severity is DiagnosticSeverity.ERROR

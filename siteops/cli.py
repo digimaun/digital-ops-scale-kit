@@ -7,6 +7,7 @@ Commands:
     browse   - Discover and inspect deployment content
     index    - Build approved public descriptions and source bindings
     sites    - Inspect sites as plain text, YAML, or JSON
+    inputs   - Inspect typed answers for a selected deployment
     validate - Validate manifest structure and references
     plan     - Prepare and preflight a deployment plan
     deploy   - Deploy a manifest to target sites
@@ -44,6 +45,12 @@ from siteops.browse_output import _text as _content_text
 from siteops.browse_output import render_browse_plain, serialize_browse_json
 from siteops.command_context import open_command_context, require_trust_inputs
 from siteops.composition import CompositionError, report_composition_error
+from siteops.guided_inputs import (
+    GuidedInputError,
+    load_contract,
+    load_direct_site,
+    write_yaml_exclusive,
+)
 from siteops.manifest_selection import (
     ManifestSelectionError,
     explicit_manifest_reference,
@@ -394,6 +401,9 @@ def _validation_failure_result(
     errors: list[str],
     *,
     intent: PlanIntent,
+    code: str = "validation.failed",
+    summary: str = "Manifest validation failed.",
+    public_summary: str | None = None,
 ) -> PlanBuildResult:
     return PlanBuildResult(
         status=PlanStatus.INVALID,
@@ -401,10 +411,11 @@ def _validation_failure_result(
         plan=None,
         diagnostics=tuple(
             PlanDiagnostic(
-                code="validation.failed",
+                code=code,
                 severity=DiagnosticSeverity.ERROR,
-                summary="Manifest validation failed.",
+                summary=summary,
                 detail=error,
+                public_summary=public_summary,
             )
             for error in errors
         ),
@@ -446,6 +457,188 @@ def _write_plan_result(
     )
 
 
+class ExplicitSiteConflict(GuidedInputError):
+    """An explicit Site conflicts with another target-selection form."""
+
+
+def _guided_error_detail(error: Exception) -> str:
+    return str(error) if isinstance(error, GuidedInputError) else report_site_load_error(error)
+
+
+def _explicit_site_failure(
+    args: argparse.Namespace,
+    error: Exception,
+    *,
+    intent: PlanIntent,
+) -> PlanBuildResult:
+    if isinstance(error, ExplicitSiteConflict):
+        code = "plan.targeting.conflict"
+        summary = str(error)
+    elif getattr(args, "site_file", None):
+        code = "site.invalid"
+        summary = (
+            str(error) if isinstance(error, GuidedInputError)
+            else "The supplied Site file is invalid. Check its structure and required fields."
+        )
+    else:
+        code = "inputs.invalid"
+        summary = (
+            f"{error} Run `siteops inputs` for required values."
+            if isinstance(error, GuidedInputError)
+            else "Typed Site inputs are unavailable or invalid. Inspect this "
+            "manifest with `siteops inputs` and correct the answers."
+        )
+    return _validation_failure_result(
+        [_guided_error_detail(error)],
+        intent=intent,
+        code=code,
+        summary=summary,
+        public_summary=summary if isinstance(error, GuidedInputError) else None,
+    )
+
+
+def _explicit_site(args: argparse.Namespace, manifest_path: Path) -> Site | None:
+    site_file = getattr(args, "site_file", None)
+    input_file = getattr(args, "input_file", None)
+    inline = getattr(args, "input_values", None)
+    if not (site_file or input_file or inline):
+        return None
+    if getattr(args, "selector", None):
+        raise ExplicitSiteConflict("An explicit Site cannot be combined with -l/--selector.")
+    if site_file:
+        if input_file or inline:
+            raise ExplicitSiteConflict(
+                "--site-file cannot be combined with --input-file or --input."
+            )
+        _require_operator_file_path(site_file, args)
+        return load_direct_site(site_file)
+    if input_file is not None:
+        _require_operator_file_path(input_file, args)
+    contract = load_contract(
+        manifest_path,
+        binding=getattr(args, "package_binding", None),
+    )
+    if contract is None:
+        raise GuidedInputError(
+            "This manifest has no typed input contract. Use --site-file with "
+            "a complete Site, or configure Sites in your project."
+        )
+    return contract.resolve(values_file=input_file, inline=inline)
+
+
+def _announce_explicit_site(args: argparse.Namespace, site: Site) -> None:
+    identity = "a private Site" if is_redaction_enabled() else _content_text(site.name)
+    source = "a Site file" if getattr(args, "site_file", None) else "typed inputs"
+    print(
+        f"Target: {identity} from {source} (replaces manifest targeting).",
+        file=sys.stderr,
+    )
+
+
+def _site_for_file(site: Site) -> dict[str, Any]:
+    document: dict[str, Any] = {
+        "apiVersion": "siteops/v1",
+        "kind": "Site",
+        "name": site.name,
+        "subscription": site.subscription,
+    }
+    if site.resource_group:
+        document["resourceGroup"] = site.resource_group
+    document["location"] = site.location
+    if site.labels:
+        document["labels"] = site.labels
+    if site.parameters:
+        document["parameters"] = site.parameters
+    if site.properties:
+        document["properties"] = site.properties
+    return document
+
+
+def _require_operator_file_path(path: Path, args: argparse.Namespace) -> None:
+    from siteops.workspace_cache import default_cache_root
+
+    destination = path.resolve()
+    if destination.is_relative_to(default_cache_root().resolve()):
+        raise GuidedInputError("Keep operator Site and answer files outside the Site Ops content cache.")
+    binding = getattr(args, "package_binding", None)
+    if binding is not None and destination.is_relative_to(binding.package_root.resolve()):
+        raise GuidedInputError("Do not write operator files into a verified workspace package.")
+
+
+def cmd_inputs(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
+    """Inspect an authored input contract or emit a completed ordinary Site."""
+    manifest_path = _command_manifest(args)
+    if manifest_path is None:
+        return 1
+    try:
+        contract = load_contract(
+            manifest_path,
+            binding=getattr(args, "package_binding", None),
+        )
+        if contract is None:
+            raise GuidedInputError(
+                "This manifest has no typed input contract. Use a complete "
+                "Site file or inspect the manifest's authored guidance."
+            )
+        if args.example and (args.save_site or args.input_file or args.input_values):
+            raise GuidedInputError("--example cannot be combined with answers or --save-site.")
+        if (args.input_file or args.input_values) and not args.save_site:
+            raise GuidedInputError("Answers on `siteops inputs` require --save-site.")
+        if args.example:
+            _require_operator_file_path(args.example, args)
+            write_yaml_exclusive(args.example, contract.example())
+            destination = (
+                "a private file"
+                if is_redaction_enabled()
+                else _content_text(str(args.example))
+            )
+            print(f"Incomplete answer file written: {destination}", file=sys.stderr)
+        if args.save_site:
+            if args.input_file is not None:
+                _require_operator_file_path(args.input_file, args)
+            site = contract.resolve(
+                values_file=args.input_file,
+                inline=args.input_values,
+            )
+            errors = orchestrator.validate(
+                manifest_path,
+                sites=[site],
+            )
+            if errors:
+                raise ValueError("Site validation failed: " + "; ".join(errors))
+            _require_operator_file_path(args.save_site, args)
+            write_yaml_exclusive(args.save_site, _site_for_file(site))
+            destination = (
+                "a private file"
+                if is_redaction_enabled()
+                else _content_text(str(args.save_site))
+            )
+            print(f"Site written: {destination}", file=sys.stderr)
+        description = contract.describe()
+        if args.output == "json":
+            print(json.dumps(description, ensure_ascii=False, indent=2))
+        else:
+            manifest_name = orchestrator.load_manifest(manifest_path).name
+            print(f"Inputs for {_content_text(manifest_name)}:")
+            for field in description["inputs"]:
+                print(
+                    f"  {_content_text(field['name'])} "
+                    f"({_content_text(field['type'])}, {_content_text(field['status'])})"
+                    f": {_content_text(field['description'])}"
+                )
+                if "default" in field:
+                    value = field["default"]
+                    shown = json.dumps(value) if isinstance(value, bool) else str(value)
+                    print(f"    Default: {_content_text(shown)}")
+            if not args.example and not args.save_site:
+                print("Use --example FILE to write an incomplete answer file.")
+            print("Review prerequisites and effects with `siteops browse`.")
+    except (OSError, ValueError, yaml.YAMLError) as error:
+        print(f"Error: {_guided_error_detail(error)}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_plan(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
     """Validate and prepare a deployment plan without executing it."""
     manifest_path = _command_manifest(args)
@@ -465,16 +658,26 @@ def cmd_plan(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
         else PlanIntent.EXECUTABLE
     )
     try:
+        explicit_site = _explicit_site(args, manifest_path)
+    except (OSError, ValueError, yaml.YAMLError) as error:
+        result = _explicit_site_failure(args, error, intent=intent)
+        _write_plan_result(result, json_output=json_output, projection=projection)
+        return 1
+    if explicit_site is not None:
+        _announce_explicit_site(args, explicit_site)
+    try:
         if intent is PlanIntent.EXECUTABLE:
             print(
                 "Preparing executable deployment plan...",
                 file=sys.stderr,
             )
+        site_options = {"sites": [explicit_site]} if explicit_site is not None else {}
         result = orchestrator.build_plan(
             manifest_path,
             selector,
             intent=intent,
             parallel_override=getattr(args, "parallel", None),
+            **site_options,
         )
     except (CompositionError, ParameterSelectionError) as error:
         detail = (
@@ -578,6 +781,19 @@ def cmd_deploy(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
         print(f"Error: {error}", file=sys.stderr)
         return 1
 
+    try:
+        explicit_site = _explicit_site(args, manifest_path)
+    except (OSError, ValueError, yaml.YAMLError) as error:
+        if json_output:
+            failed = _explicit_site_failure(args, error, intent=PlanIntent.EXECUTABLE)
+            result = preparation_failure_result(failed)
+            _write_run_result(result, json_output=True, projection=projection)
+            return result.exit_code
+        print(f"Error: {_guided_error_detail(error)}", file=sys.stderr)
+        return 1
+    if explicit_site is not None:
+        _announce_explicit_site(args, explicit_site)
+
     stop_requested = threading.Event()
     restore_signal_handler = _install_stop_handler(stop_requested)
     try:
@@ -585,6 +801,7 @@ def cmd_deploy(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
             "Preparing executable deployment plan...",
             file=sys.stderr,
         )
+        site_options = {"sites": [explicit_site]} if explicit_site is not None else {}
         result = orchestrator.deploy(
             manifest_path,
             selector=getattr(args, "selector", None),
@@ -594,6 +811,7 @@ def cmd_deploy(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
                 redacted=is_redaction_enabled(),
             ),
             stop_requested=stop_requested,
+            **site_options,
         )
     except (CompositionError, ParameterSelectionError) as e:
         detail = (
@@ -690,14 +908,17 @@ def cmd_validate(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
         return 1
     try:
         manifest = orchestrator.load_manifest(manifest_path)
+        explicit_site = _explicit_site(args, manifest_path)
     except (ValueError, OSError, yaml.YAMLError) as error:
-        _write_plain_validation_errors([report_site_load_error(error)])
+        _write_plain_validation_errors([_guided_error_detail(error)])
         return 1
 
+    site_options = {"sites": [explicit_site]} if explicit_site is not None else {}
     errors = orchestrator.validate(
         manifest_path,
         selector=selector,
         manifest=manifest,
+        **site_options,
     )
     if errors:
         _write_plain_validation_errors(errors)
@@ -1170,8 +1391,10 @@ Examples:
   siteops -w workspaces/iot-operations browse aio-install
   siteops -w workspaces/iot-operations sites
   siteops -w workspaces/iot-operations sites munich-dev --output yaml
+  siteops -w workspaces/iot-operations inputs aio-install
   siteops -w workspaces/iot-operations validate aio-install
   siteops -w workspaces/iot-operations plan aio-install
+  siteops -w workspaces/iot-operations plan aio-install --input-file ./aio-inputs.yaml
   siteops -w workspaces/iot-operations deploy aio-install
   siteops -w workspaces/iot-operations plan aio-install -l environment=prod
   siteops --project ./factory sites
@@ -1479,9 +1702,52 @@ Examples:
     )
     for command in (p_plan, p_deploy, p_validate):
         command.add_argument(
+            "--site-file", type=Path, metavar="FILE",
+            help="Complete standalone Site file selecting exactly one target",
+        )
+        command.add_argument(
+            "--input-file", type=Path, metavar="FILE",
+            help="Typed answers for the selected manifest's input contract",
+        )
+        command.add_argument(
+            "--input", dest="input_values", action="append", metavar="NAME=VALUE",
+            help="Typed non-secret answer (repeatable, overrides --input-file)",
+        )
+        command.add_argument(
             "--offline", action="store_true",
             help="Use the pinned package and proof already in cache, without source requests",
         )
+
+    p_inputs = subparsers.add_parser(
+        "inputs",
+        help="Inspect typed inputs for a selected deployment",
+        description="Inspect required inputs or write an incomplete answer file or complete Site.",
+    )
+    p_inputs.add_argument("manifest", help="Exact manifest name or explicit manifest path")
+    p_inputs.add_argument(
+        "--output", choices=("plain", "json"), default="plain",
+        help="Input contract display format (default: plain)",
+    )
+    p_inputs.add_argument(
+        "--example", type=Path, metavar="FILE",
+        help="Write an incomplete answer file with required inputs left empty",
+    )
+    p_inputs.add_argument(
+        "--save-site", type=Path, metavar="FILE",
+        help="Write a complete validated Site from supplied typed answers",
+    )
+    p_inputs.add_argument(
+        "--input-file", type=Path, metavar="FILE",
+        help="Typed answers for the selected manifest's input contract",
+    )
+    p_inputs.add_argument(
+        "--input", dest="input_values", action="append", metavar="NAME=VALUE",
+        help="Typed non-secret answer (repeatable, overrides --input-file)",
+    )
+    p_inputs.add_argument(
+        "--offline", action="store_true",
+        help="Use the pinned package and proof already in cache, without source requests",
+    )
 
     # sites command
     p_sites = subparsers.add_parser(
@@ -1555,6 +1821,7 @@ Examples:
         "deploy": cmd_deploy,
         "plan": cmd_plan,
         "validate": cmd_validate,
+        "inputs": cmd_inputs,
         "sites": cmd_sites,
     }
     if args.command in {"plan", "deploy", "validate"}:

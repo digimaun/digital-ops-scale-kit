@@ -148,6 +148,32 @@ def test_installed_project_cache_and_offline_plan_surface(installed_engine):
     assert (site.read_bytes(), (project / "siteops.pin").read_bytes()) == before
 
 
+def test_installed_engine_prepares_a_guided_aio_target(installed_engine):
+    import json
+
+    workspace = ROOT / "workspaces" / "iot-operations"
+    app = installed_engine
+    command = ("-w", str(workspace))
+    inspected = json.loads(app.run(*command, "inputs", "aio-install", "--output", "json").stdout)
+    assert next(field for field in inspected["inputs"] if field["name"] == "clusterName")[
+        "status"
+    ] == "required"
+
+    planned = json.loads(app.run(
+        *command, "plan", "aio-install", "--describe",
+        "--input", "siteName=plant-one",
+        "--input", "subscription=00000000-0000-0000-0000-000000000001",
+        "--input", "resourceGroup=rg-existing",
+        "--input", "location=eastus",
+        "--input", "clusterName=existing-arc",
+        "--input", "environment=dev",
+        "--input", "country=US",
+        "--output", "json",
+    ).stdout)
+    assert planned["status"] == "planned"
+    assert [target["name"] for target in planned["plan"]["targets"]] == ["plant-one"]
+
+
 def test_installed_worker_is_present_and_uses_its_fixed_protocol(installed_engine):
     import json
 

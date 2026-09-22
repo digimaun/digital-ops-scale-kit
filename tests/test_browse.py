@@ -89,6 +89,38 @@ def test_explicit_empty_guidance_remains_an_author_statement(tmp_path):
     assert "not an environment assessment" in render_browse_plain(result)
 
 
+def test_typed_input_companion_is_not_another_deployment_entry(tmp_path):
+    manifest = _entry(tmp_path)
+    manifest.with_name("inputs.yaml").write_text(
+        "apiVersion: siteops.inputs/v1\nkind: SiteInputContract\ninputs: []\n",
+        encoding="utf-8",
+    )
+
+    result = inspect_content(tmp_path, include_partials=True)
+
+    assert [entry.name for entry in result.entries] == ["example"]
+    assert result.status == "complete"
+
+
+def test_root_manifest_named_inputs_remains_discoverable(tmp_path):
+    _entry(tmp_path, "inputs", relative="manifests/inputs.yaml")
+    result = inspect_content(tmp_path)
+    assert [entry.name for entry in result.entries] == ["inputs"]
+    assert result.status == "complete"
+
+
+def test_flat_manifest_input_companion_preserves_name_lookup(tmp_path):
+    manifest = _entry(tmp_path, "storage", relative="manifests/storage.yaml")
+    manifest.with_name("storage.inputs.yaml").write_text(
+        "apiVersion: siteops.inputs/v1\nkind: SiteInputContract\ninputs: []\n",
+        encoding="utf-8",
+    )
+    result = inspect_content(tmp_path, "storage")
+    assert result.status == "complete"
+    assert result.selected
+    assert [entry.name for entry in result.entries] == ["storage"]
+
+
 def test_category_never_hides_unclassified_or_partial_role(tmp_path):
     _entry(tmp_path, "unknown", guidance={"category": "core", "role": "unclassified"})
     _entry(tmp_path, "fragment", guidance={"category": "core", "role": "partial"})

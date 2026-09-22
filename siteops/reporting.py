@@ -147,6 +147,14 @@ def _reason_document(reason: OutcomeReason) -> dict[str, Any]:
 def _publishable_diagnostic_document(
     diagnostic: RunDiagnostic,
 ) -> dict[str, str]:
+    if diagnostic.public_summary is not None and diagnostic.code in {
+        "inputs.invalid", "site.invalid", "plan.targeting.conflict",
+    }:
+        return {
+            "code": diagnostic.code,
+            "severity": diagnostic.severity.value,
+            "summary": diagnostic.public_summary,
+        }
     code, summary = _PUBLISHABLE_RUN_DIAGNOSTICS.get(
         diagnostic.code,
         _GENERIC_RUN_DIAGNOSTIC,

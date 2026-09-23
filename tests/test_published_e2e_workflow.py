@@ -314,6 +314,9 @@ def test_published_workspace_uses_project_pin_and_separate_sites():
     assert 'export XDG_CONFIG_HOME="$RUNNER_TEMP/published-source-config"' in step
     assert '"XDG_CONFIG_HOME=$XDG_CONFIG_HOME" >> "$GITHUB_ENV"' in step
     assert 'source enroll guided --source "github:$GITHUB_REPOSITORY"' in step
+    assert "if ! siteops \\\n" in step.split(
+        'source enroll guided --source "github:$GITHUB_REPOSITORY"'
+    )[0]
     assert 'trust_args=(--approved-source guided)' in step
     assert 'trust_args=(--trust-policy "$SITEOPS_E2E_POLICY"' in step
     assert '"${trust_args[@]}"' in step

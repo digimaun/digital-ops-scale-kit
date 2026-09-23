@@ -279,3 +279,60 @@ def test_source_enroll_does_not_copy_approval_from_the_package_cache(
     assert stopped.value.code == 1
     assert "outside the content cache" in capsys.readouterr().err
     assert not storage.exists()
+
+
+@pytest.mark.parametrize("redacted", [False, True])
+def test_source_enroll_and_remove_have_private_safe_success(
+    inputs, monkeypatch, capsys, redacted,
+):
+    storage, policy_file, root_file, _ = inputs
+    monkeypatch.setenv("SITEOPS_REDACT_OUTPUT", "1" if redacted else "0")
+    monkeypatch.setattr(sys, "argv", [
+        "siteops", "--trust-policy", str(policy_file), "--trusted-root", str(root_file),
+        "source", "enroll", "private-name", "--source", "github:example/content",
+    ])
+    with pytest.raises(SystemExit) as stopped:
+        cli.main()
+    output = capsys.readouterr()
+    assert stopped.value.code == 0, output.err
+    assert read_source("private-name").reference == "github:example/content"
+    if redacted:
+        assert output.out.strip() == "Approved source enrolled."
+        assert "private-name" not in output.out + output.err
+        assert "example/content" not in output.out + output.err
+    else:
+        assert "private-name" in output.out and "github:example/content" in output.out
+
+    monkeypatch.setattr(sys, "argv", ["siteops", "source", "remove", "private-name"])
+    with pytest.raises(SystemExit) as stopped:
+        cli.main()
+    output = capsys.readouterr()
+    assert stopped.value.code == 0, output.err
+    assert not (storage / "private-name").exists()
+    assert "private-name" not in output.out if redacted else "private-name" in output.out
+
+
+def test_redacted_source_inspection_and_invalid_enrollment_are_safe(
+    inputs, monkeypatch, capsys,
+):
+    storage, policy_file, root_file, _ = inputs
+    monkeypatch.setenv("SITEOPS_REDACT_OUTPUT", "1")
+    for command in (("list",), ("show", "private-name")):
+        monkeypatch.setattr(sys, "argv", ["siteops", "source", *command])
+        with pytest.raises(SystemExit) as stopped:
+            cli.main()
+        output = capsys.readouterr()
+        assert stopped.value.code == 1
+        assert "private-name" not in output.out + output.err
+
+    monkeypatch.setattr(sys, "argv", [
+        "siteops", "--trust-policy", str(policy_file), "--trusted-root", str(root_file),
+        "source", "enroll", "private-name", "--source", "github:private-rejected/content",
+    ])
+    with pytest.raises(SystemExit) as stopped:
+        cli.main()
+    output = capsys.readouterr()
+    assert stopped.value.code == 1
+    assert "private-name" not in output.out + output.err
+    assert "private-rejected" not in output.out + output.err
+    assert not storage.exists()

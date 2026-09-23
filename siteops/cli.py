@@ -237,7 +237,8 @@ def cmd_source(args: argparse.Namespace) -> int:
     from siteops.github_attestation import load_github_policy
     from siteops.source_profiles import enroll_source, list_sources, read_source, remove_source
 
-    if is_redaction_enabled():
+    redacted = is_redaction_enabled()
+    if redacted and args.source_command in {"show", "list"}:
         print("Source approval details are private. Use an authorized private destination.", file=sys.stderr)
         return 1
     try:
@@ -252,7 +253,10 @@ def cmd_source(args: argparse.Namespace) -> int:
                 default_cache_root(), args.trust_policy, args.trusted_root,
             )
             result = enroll_source(args.name, args.source, policy_file, root_file)
-            print(f"Approved source {_content_text(result.name)}: {_content_text(result.reference)}.")
+            if redacted:
+                print("Approved source enrolled.")
+            else:
+                print(f"Approved source {_content_text(result.name)}: {_content_text(result.reference)}.")
             return 0
         if args.trust_policy is not None or args.trusted_root is not None:
             raise ProjectError("Trust file options apply to source enroll, not inspection or removal.")
@@ -274,10 +278,12 @@ def cmd_source(args: argparse.Namespace) -> int:
             print("Package use checks current policy validity and artifact provenance.")
         else:
             remove_source(args.name)
-            print(f"Removed approved source {_content_text(args.name)}.")
+            print("Approved source removed." if redacted else
+                  f"Removed approved source {_content_text(args.name)}.")
         return 0
     except (ArtifactError, BrowseError) as error:
-        print(f"Error: {error}", file=sys.stderr)
+        print("Error: Approved source operation failed. Check private source configuration."
+              if redacted else f"Error: {error}", file=sys.stderr)
         return 1
     except OSError:
         print("Error: The approved source files could not be accessed.", file=sys.stderr)

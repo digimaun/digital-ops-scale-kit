@@ -469,7 +469,7 @@ jobs:
           if [[ "$PUBLISHED_JOURNEY" == "guided" ]]; then
             export XDG_CONFIG_HOME="$RUNNER_TEMP/published-source-config"
             echo "XDG_CONFIG_HOME=$XDG_CONFIG_HOME" >> "$GITHUB_ENV"
-            if ! SITEOPS_REDACT_OUTPUT=0 siteops \
+            if ! siteops \
               --trust-policy "$SITEOPS_E2E_POLICY" \
               --trusted-root "$SITEOPS_E2E_TRUSTED_ROOT" \
               source enroll guided --source "github:$GITHUB_REPOSITORY" \

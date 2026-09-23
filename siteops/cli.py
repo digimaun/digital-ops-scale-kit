@@ -1568,16 +1568,21 @@ def _parse_parallel(value: str) -> int:
     return n
 
 
-class _SingleFileOption(argparse.Action):
+class _SingleValueOption(argparse.Action):
     def __call__(
         self,
         parser: argparse.ArgumentParser,
         namespace: argparse.Namespace,
-        values: Path,
+        values: Any,
         option_string: str | None = None,
     ) -> None:
-        if getattr(namespace, self.dest, None) is not None:
+        seen = getattr(namespace, "_single_values_seen", None)
+        if seen is None:
+            seen = set()
+            namespace._single_values_seen = seen
+        if self.dest in seen:
             raise argparse.ArgumentError(self, "may be supplied only once")
+        seen.add(self.dest)
         setattr(namespace, self.dest, values)
 
 
@@ -1635,21 +1640,18 @@ def main() -> None:
         description="Azure Site Ops: multi-site Azure IaC orchestration.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Global options such as --project and --approved-source precede the command.
+
 Examples:
   siteops -w workspaces/iot-operations browse aio-install
   siteops -w workspaces/iot-operations inputs aio-install --example ./aio-inputs.yaml
-  # Fill required answers in aio-inputs.yaml before planning or deploying.
-  siteops -w workspaces/iot-operations plan aio-install --input-file ./aio-inputs.yaml
-  siteops -w workspaces/iot-operations deploy aio-install --input-file ./aio-inputs.yaml
-  siteops -w workspaces/iot-operations browse
-  siteops -w workspaces/iot-operations sites
-  siteops -w workspaces/iot-operations sites munich-dev --output yaml
-  siteops -w workspaces/iot-operations validate aio-install
-  siteops -w workspaces/iot-operations plan aio-install -l environment=prod
-  siteops --project ./factory sites
-  siteops --project ./factory -w ./clone plan storage -l name=one
-  siteops --trust-policy policy.json --trusted-root trusted-root.json project pin ./factory --source github:OWNER/REPO --release RELEASE
-  siteops project show ./factory
+  # Fill siteName, environment, country and cluster in aio-inputs.yaml.
+  siteops -w workspaces/iot-operations plan aio-install --input-file ./aio-inputs.yaml --read-resources
+  siteops -w workspaces/iot-operations deploy aio-install --input-file ./aio-inputs.yaml --read-resources
+  # After source enrollment, pin an identified release and select only new fleet Sites.
+  siteops --approved-source NAME project pin ./factory --release RELEASE
+  siteops --approved-source NAME --project ./factory plan aio-install -l name=plant-two,name=plant-three
+  siteops --approved-source NAME --project ./factory deploy aio-install -l name=plant-two,name=plant-three
 """,
     )
     parser.add_argument("--version", action="version", version=f"siteops {__version__}")
@@ -1657,6 +1659,7 @@ Examples:
         "-w",
         "--workspace",
         type=Path,
+        action=_SingleValueOption,
         metavar="PATH",
         default=None,
         help=(
@@ -1680,19 +1683,19 @@ Examples:
         ),
     )
     parser.add_argument(
-        "--project", type=Path, metavar="DIRECTORY",
+        "--project", type=Path, action=_SingleValueOption, metavar="DIRECTORY",
         help="Operator project directory for Sites and an optional workspace pin (a path, not a name)",
     )
     parser.add_argument(
-        "--trust-policy", type=Path, metavar="FILE",
+        "--trust-policy", type=Path, action=_SingleValueOption, metavar="FILE",
         help="Independent local artifact verification policy, required to create or use a workspace pin",
     )
     parser.add_argument(
-        "--trusted-root", type=Path, metavar="FILE",
+        "--trusted-root", type=Path, action=_SingleValueOption, metavar="FILE",
         help="Independent local trusted root snapshot, required to create or use a workspace pin",
     )
     parser.add_argument(
-        "--approved-source", metavar="NAME",
+        "--approved-source", action=_SingleValueOption, metavar="NAME",
         help="Explicitly selected consumer source enrollment for a project pin or packaged command",
     )
 
@@ -1707,57 +1710,6 @@ Examples:
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
-
-    p_cache = subparsers.add_parser("cache", help="Inspect cached storage or remove a selected entry")
-    cache_commands = p_cache.add_subparsers(dest="cache_command", required=True)
-    for name, help_text in (
-        ("list", "List cached storage without verifying content or contacting sources"),
-        ("remove", "Remove one cached entry, refusing active use and preserving project configuration"),
-    ):
-        command = cache_commands.add_parser(name, help=help_text, description=help_text)
-        command.add_argument("--output", choices=("plain", "json"), default="plain")
-        if name == "list":
-            command.add_argument("--kind", choices=("package", "proof", "metadata"),
-                                 help="Limit inspection to one cache entry kind")
-            command.add_argument("--id", help="Complete cache entry ID, used with --kind")
-            command.add_argument("--limit", type=int, default=100, help="Maximum rows to inspect (default: 100)")
-        else:
-            command.add_argument("kind", choices=("package", "proof", "metadata"))
-            command.add_argument("id", help="Complete lowercase entry ID from cache list")
-
-    p_project = subparsers.add_parser("project", help="Inspect or explicitly pin a project's workspace source")
-    project_commands = p_project.add_subparsers(dest="project_command", required=True)
-    for name, help_text in (
-        ("pin", "Acquire an explicit release and atomically record its workspace selection"),
-        ("show", "Show the recorded workspace selection without acquiring or verifying package content"),
-    ):
-        description = help_text
-        if name == "pin":
-            description = (
-                "Acquire and verify an explicit workspace release, then atomically create or "
-                "replace DIRECTORY/siteops.pin without changing Sites. Supply global "
-                "--approved-source NAME, or independent global --trust-policy FILE and "
-                "--trusted-root FILE options before 'project pin'."
-            )
-        command = project_commands.add_parser(name, help=help_text, description=description)
-        command.add_argument("directory", nargs="?", type=Path, default=Path("."),
-                             metavar="DIRECTORY", help="Operator project directory (default: current directory)")
-        command.add_argument("--output", choices=("plain", "json"), default="plain")
-        if name == "pin":
-            command.add_argument("--source",
-                                 help="Workspace release source: github:OWNER/REPO")
-            command.add_argument("--release", metavar="RELEASE", help="Explicit published release tag")
-            command.add_argument("--release-workspace", metavar="PATH",
-                                 help="Workspace path listed in the release descriptor, required when several are listed")
-
-    p_source = subparsers.add_parser("source", help="Inspect, enroll or remove consumer-approved sources")
-    source_commands = p_source.add_subparsers(dest="source_command", required=True)
-    for name in ("enroll", "show", "list", "remove"):
-        command = source_commands.add_parser(name)
-        if name != "list":
-            command.add_argument("name", metavar="NAME")
-        if name == "enroll":
-            command.add_argument("--source", required=True, help="Approved repository: github:OWNER/REPO")
 
     p_browse = subparsers.add_parser(
         "browse",
@@ -1781,11 +1733,15 @@ Examples:
         "--output", choices=("plain", "json"), default="plain", help="Private output format"
     )
     p_browse.add_argument(
-        "--source", help="Published descriptive index source: github:OWNER/REPO[@REF] or repository URL"
+        "--source", action=_SingleValueOption,
+        help="Published descriptive index source: github:OWNER/REPO[@REF] or repository URL"
     )
-    p_browse.add_argument("--ref", help="Source branch, tag or commit (default: repository default branch)")
     p_browse.add_argument(
-        "--auth", choices=("anonymous", "cli"), default="anonymous",
+        "--ref", action=_SingleValueOption,
+        help="Source branch, tag or commit (default: repository default branch)",
+    )
+    p_browse.add_argument(
+        "--auth", choices=("anonymous", "cli"), action=_SingleValueOption, default="anonymous",
         help="Remote read access: anonymous or configured GitHub CLI authentication",
     )
     cache_mode = p_browse.add_mutually_exclusive_group()
@@ -1796,41 +1752,63 @@ Examples:
         "--offline", action="store_true",
         help="Make no source requests: use cached index metadata with --source, or a cached project package and proof",
     )
-    p_index = subparsers.add_parser(
-        "index", help="Build a public content index and separate source bindings",
-        description="Generate deterministic index files in the selected workspace. No remote publication.",
+    p_inputs = subparsers.add_parser(
+        "inputs",
+        help="Inspect typed inputs for a selected deployment",
+        description=(
+            "Inspect the declared input contract. Complete answers preview "
+            "one resolved Site without writing it. --example writes an "
+            "incomplete answer file, and --save-site explicitly keeps a Site."
+        ),
     )
-    p_index.add_argument(
-        "--public", action="store_true",
-        help="Approve the selected authored descriptions for public indexing (required)",
+    p_inputs.add_argument("manifest", help="Exact manifest name or explicit manifest path")
+    p_inputs.add_argument(
+        "--output", choices=("plain", "json"), default="plain",
+        help="Input contract and optional private Site preview format (default: plain)",
     )
-    p_index.add_argument(
-        "--for-source", choices=("github",), help="Include optional freshness identities for a source adapter"
+    p_inputs.add_argument(
+        "--example", type=Path, action=_SingleValueOption, metavar="FILE",
+        help="Write incomplete required answers and any resource ID that can derive them",
     )
-    p_index.add_argument(
-        "--check", action="store_true", help="Compare generated files without writing them"
+    p_inputs.add_argument(
+        "--input-file", type=Path, action=_SingleValueOption, metavar="FILE",
+        help="Typed answers to preview or save one Site (no file written without --save-site)",
+    )
+    p_inputs.add_argument(
+        "--input", dest="input_values", action="append", metavar="NAME=VALUE",
+        help="Typed non-secret answer (repeatable, overrides --input-file)",
+    )
+    p_inputs.add_argument(
+        "--save-site", type=Path, action=_SingleValueOption, metavar="FILE",
+        help="Write a validated Site to a new file, checking selected Site identities before saving",
+    )
+    p_inputs.add_argument(
+        "--read-resources", action="store_true",
+        help="Read only supplied, declared ARM resource IDs with the selected Azure provider before previewing the Site",
+    )
+    p_inputs.add_argument(
+        "--offline", action="store_true",
+        help="Use the pinned package and proof already in cache, without source requests",
     )
 
-    # deploy command
-    p_deploy = subparsers.add_parser(
-        "deploy",
-        help="Deploy manifest to target sites",
+    p_sites = subparsers.add_parser(
+        "sites",
+        help="List available sites",
         description=(
-            "Execute deployment of a manifest to one or more sites. "
-            "Ctrl-C asks the run to stop and waits for the calls already in "
-            "progress to return or reach their own timeout."
+            "List selected Site configuration from the operator project or local workspace. Pass a positional name "
+            "(filename or internal `name:`) to scope to one site."
         ),
     )
-    p_deploy.add_argument("manifest", help="Exact manifest name or explicit manifest path")
-    p_deploy.add_argument(
-        "--dry-run",
-        action="store_true",
+    p_sites.add_argument(
+        "name",
+        nargs="?",
+        default=None,
         help=(
-            "Compatibility alias for executable planning. Prepares and shows "
-            "the plan without executing it (default: false)."
+            "Optional site name to scope to (filename without extension, "
+            "or the internal `name:` field). Equivalent to `-l name=<NAME>`."
         ),
     )
-    p_deploy.add_argument(
+    p_sites.add_argument(
         "-l",
         "--selector",
         action="append",
@@ -1838,85 +1816,22 @@ Examples:
         metavar="KEY=VALUE",
         help=_SELECTOR_HELP,
     )
-    p_deploy.add_argument(
-        "-p",
-        "--parallel",
-        type=_parse_parallel,
-        default=None,
-        metavar="N",
-        help=(
-            "Max concurrent sites. Accepts a positive integer, or 'max' / "
-            "'auto' / '0' for unlimited. Overrides the manifest setting."
-        ),
-    )
-    p_deploy.add_argument(
-        "--output",
-        choices=("plain", "json"),
-        default="plain",
-        help="Final result format. A dry run emits a plan instead (default: plain).",
-    )
-    p_deploy.add_argument(
-        "--projection",
-        choices=("local-private", "publishable"),
-        default=None,
-        help=(
-            "JSON projection, valid with --output json. Defaults to publishable "
-            "when output redaction is enabled, otherwise local-private."
-        ),
-    )
-
-    # plan command
-    p_plan = subparsers.add_parser(
-        "plan",
-        help="Prepare and preflight a deployment plan",
-        description=(
-            "Validate, resolve, compile, and preflight a deployment plan "
-            "without executing it."
-        ),
-    )
-    p_plan.add_argument("manifest", help="Exact manifest name or explicit manifest path")
-    p_plan.add_argument(
-        "-l",
-        "--selector",
-        action="append",
-        default=None,
-        metavar="KEY=VALUE",
-        help=_SELECTOR_HELP,
-    )
-    p_plan.add_argument(
-        "--describe",
+    p_sites.add_argument(
+        "--show-sources",
         action="store_true",
         help=(
-            "Show the compile-free plan shape without executable preflight "
-            "(default: false)."
+            "Annotate every leaf with the source file the value came from "
+            "after inheritance and overlays. Plain output only (default: false)."
         ),
     )
-    p_plan.add_argument(
-        "-p",
-        "--parallel",
-        type=_parse_parallel,
-        default=None,
-        metavar="N",
-        help=(
-            "Max concurrent sites recorded in the plan. Accepts a positive "
-            "integer, or 'max' / 'auto' / '0' for unlimited. Overrides the "
-            "manifest setting."
-        ),
-    )
-    p_plan.add_argument(
+    p_sites.add_argument(
         "--output",
-        choices=("plain", "json"),
+        choices=("plain", "yaml", "json"),
         default="plain",
-        help="Plan output format (default: plain).",
-    )
-    p_plan.add_argument(
-        "--projection",
-        choices=("local-private", "publishable"),
-        default=None,
         help=(
-            "JSON plan projection, valid with --output json. Defaults to "
-            "publishable when output redaction is enabled, otherwise "
-            "local-private."
+            "Private inspection format: plain display, YAML Site documents, or "
+            "a JSON array. Sensitive-key masking is not publication safety "
+            "(default: plain)."
         ),
     )
 
@@ -1963,13 +1878,124 @@ Examples:
             "local-private."
         ),
     )
+
+    # plan command
+    p_plan = subparsers.add_parser(
+        "plan",
+        help="Prepare and preflight a deployment plan",
+        description=(
+            "Validate, resolve, compile, and preflight a deployment plan "
+            "without executing it."
+        ),
+    )
+    p_plan.add_argument("manifest", help="Exact manifest name or explicit manifest path")
+    p_plan.add_argument(
+        "-l",
+        "--selector",
+        action="append",
+        default=None,
+        metavar="KEY=VALUE",
+        help=_SELECTOR_HELP,
+    )
+    p_plan.add_argument(
+        "--describe",
+        action="store_true",
+        help=(
+            "Show the compile-free plan shape without executable preflight "
+            "(default: false)."
+        ),
+    )
+    p_plan.add_argument(
+        "-p",
+        "--parallel",
+        type=_parse_parallel,
+        action=_SingleValueOption,
+        default=None,
+        metavar="N",
+        help=(
+            "Max concurrent sites recorded in the plan. Accepts a positive "
+            "integer, or 'max' / 'auto' / '0' for unlimited. Overrides the "
+            "manifest setting."
+        ),
+    )
+    p_plan.add_argument(
+        "--output",
+        choices=("plain", "json"),
+        default="plain",
+        help="Plan output format (default: plain).",
+    )
+    p_plan.add_argument(
+        "--projection",
+        choices=("local-private", "publishable"),
+        default=None,
+        help=(
+            "JSON plan projection, valid with --output json. Defaults to "
+            "publishable when output redaction is enabled, otherwise "
+            "local-private."
+        ),
+    )
+
+    # deploy command
+    p_deploy = subparsers.add_parser(
+        "deploy",
+        help="Deploy manifest to target sites",
+        description=(
+            "Execute deployment of a manifest to one or more sites. "
+            "Ctrl-C asks the run to stop and waits for the calls already in "
+            "progress to return or reach their own timeout."
+        ),
+    )
+    p_deploy.add_argument("manifest", help="Exact manifest name or explicit manifest path")
+    p_deploy.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Compatibility alias for executable planning. Prepares and shows "
+            "the plan without executing it (default: false)."
+        ),
+    )
+    p_deploy.add_argument(
+        "-l",
+        "--selector",
+        action="append",
+        default=None,
+        metavar="KEY=VALUE",
+        help=_SELECTOR_HELP,
+    )
+    p_deploy.add_argument(
+        "-p",
+        "--parallel",
+        type=_parse_parallel,
+        action=_SingleValueOption,
+        default=None,
+        metavar="N",
+        help=(
+            "Max concurrent sites. Accepts a positive integer, or 'max' / "
+            "'auto' / '0' for unlimited. Overrides the manifest setting."
+        ),
+    )
+    p_deploy.add_argument(
+        "--output",
+        choices=("plain", "json"),
+        default="plain",
+        help="Final result format. A dry run emits a plan instead (default: plain).",
+    )
+    p_deploy.add_argument(
+        "--projection",
+        choices=("local-private", "publishable"),
+        default=None,
+        help=(
+            "JSON projection, valid with --output json. Defaults to publishable "
+            "when output redaction is enabled, otherwise local-private."
+        ),
+    )
     for command in (p_plan, p_deploy, p_validate):
         command.add_argument(
-            "--site-file", type=Path, action=_SingleFileOption, metavar="FILE",
+            "--site-file", type=Path, action=_SingleValueOption, metavar="FILE",
             help="Complete standalone Site file selecting exactly one target",
         )
         command.add_argument(
-            "--input-file", type=Path, action=_SingleFileOption, metavar="FILE",
+            "--input-file", type=Path, action=_SingleValueOption, metavar="FILE",
             help="Typed answers for the selected manifest's input contract",
         )
         command.add_argument(
@@ -1986,91 +2012,95 @@ Examples:
             help="Read only supplied, declared ARM resource IDs with the selected Azure provider before preparing the Site",
         )
 
-    p_inputs = subparsers.add_parser(
-        "inputs",
-        help="Inspect typed inputs for a selected deployment",
-        description=(
-            "Inspect the declared input contract. Complete answers preview "
-            "one resolved Site without writing it. --example writes an "
-            "incomplete answer file, and --save-site explicitly keeps a Site."
-        ),
+    p_project = subparsers.add_parser("project", help="Inspect or explicitly pin a project's workspace source")
+    project_commands = p_project.add_subparsers(dest="project_command", required=True)
+    for name, help_text in (
+        ("pin", "Acquire an explicit release and atomically record its workspace selection"),
+        ("show", "Show the recorded workspace selection without acquiring or verifying package content"),
+    ):
+        description = help_text
+        if name == "pin":
+            description = (
+                "Acquire and verify an explicit workspace release, then atomically create or "
+                "replace DIRECTORY/siteops.pin without changing Sites. Supply global "
+                "--approved-source NAME, or independent global --trust-policy FILE and "
+                "--trusted-root FILE options before 'project pin'."
+            )
+        command = project_commands.add_parser(name, help=help_text, description=description)
+        command.add_argument("directory", nargs="?", type=Path, default=Path("."),
+                             metavar="DIRECTORY", help="Operator project directory (default: current directory)")
+        command.add_argument("--output", choices=("plain", "json"), default="plain")
+        if name == "pin":
+            command.add_argument("--source",
+                                 action=_SingleValueOption,
+                                 help="Workspace source: github:OWNER/REPO[@RELEASE]. Omit when global --approved-source NAME selects it")
+            command.add_argument("--release", metavar="RELEASE",
+                                 action=_SingleValueOption,
+                                 help="Published release tag (or include @RELEASE in --source)")
+            command.add_argument("--release-workspace", metavar="PATH",
+                                 action=_SingleValueOption,
+                                 help="Workspace path listed in the release descriptor, required when several are listed")
+
+    p_source = subparsers.add_parser(
+        "source", help="Inspect, enroll or remove consumer-approved sources",
+        description="Manage independent consumer source approval outside projects and workspace packages.",
     )
-    p_inputs.add_argument("manifest", help="Exact manifest name or explicit manifest path")
-    p_inputs.add_argument(
-        "--output", choices=("plain", "json"), default="plain",
-        help="Input contract and optional private Site preview format (default: plain)",
+    source_commands = p_source.add_subparsers(dest="source_command", required=True)
+    for name, help_text in (
+        ("enroll", "Enroll a consumer-approved source using independent trust files"),
+        ("show", "Inspect one approved source in a private destination"),
+        ("list", "List approved source names in a private destination"),
+        ("remove", "Remove one approval without changing a workspace pin"),
+    ):
+        description = help_text
+        if name == "enroll":
+            description += (
+                ". Supply global --trust-policy FILE and --trusted-root FILE "
+                "before 'source enroll'."
+            )
+        command = source_commands.add_parser(name, help=help_text, description=description)
+        if name != "list":
+            command.add_argument(
+                "name", metavar="NAME", help="Lowercase name in private user configuration",
+            )
+        if name == "enroll":
+            command.add_argument("--source", required=True, help="Approved repository: github:OWNER/REPO")
+
+    p_index = subparsers.add_parser(
+        "index", help="Build a public content index and separate source bindings",
+        description="Generate deterministic index files in the selected workspace. No remote publication.",
     )
-    p_inputs.add_argument(
-        "--example", type=Path, action=_SingleFileOption, metavar="FILE",
-        help="Write incomplete required answers and any resource ID that can derive them",
+    p_index.add_argument(
+        "--public", action="store_true",
+        help="Approve the selected authored descriptions for public indexing (required)",
     )
-    p_inputs.add_argument(
-        "--input-file", type=Path, action=_SingleFileOption, metavar="FILE",
-        help="Typed answers to preview or save one Site (no file written without --save-site)",
+    p_index.add_argument(
+        "--for-source", choices=("github",), help="Include optional freshness identities for a source adapter"
     )
-    p_inputs.add_argument(
-        "--input", dest="input_values", action="append", metavar="NAME=VALUE",
-        help="Typed non-secret answer (repeatable, overrides --input-file)",
-    )
-    p_inputs.add_argument(
-        "--save-site", type=Path, action=_SingleFileOption, metavar="FILE",
-        help="Write a validated Site to a new file, checking selected Site identities before saving",
-    )
-    p_inputs.add_argument(
-        "--read-resources", action="store_true",
-        help="Read only supplied, declared ARM resource IDs with the selected Azure provider before previewing the Site",
-    )
-    p_inputs.add_argument(
-        "--offline", action="store_true",
-        help="Use the pinned package and proof already in cache, without source requests",
+    p_index.add_argument(
+        "--check", action="store_true", help="Compare generated files without writing them"
     )
 
-    # sites command
-    p_sites = subparsers.add_parser(
-        "sites",
-        help="List available sites",
-        description=(
-            "List selected Site configuration from the operator project or local workspace. Pass a positional name "
-            "(filename or internal `name:`) to scope to one site."
-        ),
-    )
-    p_sites.add_argument(
-        "name",
-        nargs="?",
-        default=None,
-        help=(
-            "Optional site name to scope to (filename without extension, "
-            "or the internal `name:` field). Equivalent to `-l name=<NAME>`."
-        ),
-    )
-    p_sites.add_argument(
-        "-l",
-        "--selector",
-        action="append",
-        default=None,
-        metavar="KEY=VALUE",
-        help=_SELECTOR_HELP,
-    )
-    p_sites.add_argument(
-        "--show-sources",
-        action="store_true",
-        help=(
-            "Annotate every leaf with the source file the value came from "
-            "after inheritance and overlays. Plain output only (default: false)."
-        ),
-    )
-    p_sites.add_argument(
-        "--output",
-        choices=("plain", "yaml", "json"),
-        default="plain",
-        help=(
-            "Private inspection format: plain display, YAML Site documents, or "
-            "a JSON array. Sensitive-key masking is not publication safety "
-            "(default: plain)."
-        ),
-    )
+    p_cache = subparsers.add_parser("cache", help="Inspect cached storage or remove a selected entry")
+    cache_commands = p_cache.add_subparsers(dest="cache_command", required=True)
+    for name, help_text in (
+        ("list", "List cached storage without verifying content or contacting sources"),
+        ("remove", "Remove one cached entry, refusing active use and preserving project configuration"),
+    ):
+        command = cache_commands.add_parser(name, help=help_text, description=help_text)
+        command.add_argument("--output", choices=("plain", "json"), default="plain")
+        if name == "list":
+            command.add_argument("--kind", choices=("package", "proof", "metadata"),
+                                 help="Limit inspection to one cache entry kind")
+            command.add_argument("--id", help="Complete cache entry ID, used with --kind")
+            command.add_argument("--limit", type=int, default=100, help="Maximum rows to inspect (default: 100)")
+        else:
+            command.add_argument("kind", choices=("package", "proof", "metadata"))
+            command.add_argument("id", help="Complete lowercase entry ID from cache list")
 
     args = parser.parse_args()
+    if hasattr(args, "_single_values_seen"):
+        del args._single_values_seen
 
     # Flatten repeatable -l/--selector (action="append" gives a list) into
     # a single comma-joined string. Joining is safe because parse_selector

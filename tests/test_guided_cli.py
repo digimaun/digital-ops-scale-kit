@@ -134,8 +134,14 @@ def test_top_level_help_leads_with_single_site_answers(capsys):
         "plan aio-install --input-file"
     )
     assert help_text.index("plan aio-install --input-file") < help_text.index(
-        "plan aio-install -l environment=prod"
+        "plan aio-install -l name=plant-two,name=plant-three"
     )
+    for verb in ("plan", "deploy"):
+        example = next(
+            line for line in help_text.splitlines() if f" {verb} aio-install --input-file" in line
+        )
+        assert "--read-resources" in example
+    assert "deploy aio-install -l name=plant-two,name=plant-three" in help_text
 
 
 def test_inputs_help_explains_read_only_preview(capsys):

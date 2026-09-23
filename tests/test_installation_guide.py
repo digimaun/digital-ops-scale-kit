@@ -113,6 +113,21 @@ def test_reference_distinguishes_required_inputs_from_resource_derivation():
     assert "checks Site identities before writing" in configuration
 
 
+def test_release_guide_distinguishes_bootstrap_assets_from_older_engine_references():
+    guide = (GUIDE.parent / "releasing.md").read_text(encoding="utf-8")
+    reference = guide.split("### Release content against an existing engine", 1)[1].split(
+        "### Include an engine build in a content prerelease", 1
+    )[0]
+    combined = guide.split("### Include an engine build in a content prerelease", 1)[1].split(
+        "## Release fields and defaults", 1
+    )[0]
+    combined = " ".join(combined.split())
+    assert "four asset" in reference and "bootstrap" in reference
+    assert "siteops-bootstrap.sh" in combined
+    assert "siteops-bootstrap.ps1" in combined
+    assert "a separate detached proof for each" in combined
+
+
 @pytest.mark.parametrize("download_succeeds", [False, True])
 def test_root_quickstart_waits_for_full_https_download_before_execution(tmp_path, download_succeeds):
     readme = (GUIDE.parent.parent / "README.md").read_text(encoding="utf-8")

@@ -786,6 +786,7 @@ def cmd_inputs(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
             if resolved_site is None:
                 raise GuidedInputError("Complete typed answers are required to save a Site.")
             _require_operator_file_path(args.save_site, args)
+            orchestrator.ensure_new_site_identity(resolved_site.name, args.save_site)
             write_yaml_exclusive(args.save_site, _site_for_file(resolved_site))
             destination = (
                 "a private file"
@@ -805,6 +806,21 @@ def cmd_inputs(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
                     print("No Site file written. Use --save-site FILE to keep it.")
             else:
                 print(f"Inputs for {manifest_name}:")
+                required = [
+                    field["name"] for field in description["inputs"]
+                    if field["status"] == "required"
+                ]
+                example_values = contract.example()["values"]
+                for resource in description["inputs"]:
+                    derived = set(resource.get("derive", {}).values())
+                    if not derived.intersection(required) or resource["name"] not in example_values:
+                        continue
+                    supplied = [name for name in required if name not in derived] + [resource["name"]]
+                    print(
+                        f"Resource route: fill {_content_text(', '.join(supplied))}. "
+                        f"Leave {_content_text(', '.join(name for name in required if name in derived))} "
+                        "empty. Use --read-resources to read the ID."
+                    )
                 for field in description["inputs"]:
                     status = field["status"]
                     if field.get("derivableFrom"):
@@ -1552,6 +1568,19 @@ def _parse_parallel(value: str) -> int:
     return n
 
 
+class _SingleFileOption(argparse.Action):
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Path,
+        option_string: str | None = None,
+    ) -> None:
+        if getattr(namespace, self.dest, None) is not None:
+            raise argparse.ArgumentError(self, "may be supplied only once")
+        setattr(namespace, self.dest, values)
+
+
 def _auto_discover_workspace(start: Path) -> Path | None:
     """Auto-discover a workspace from `start` when -w was not supplied.
 
@@ -1936,11 +1965,11 @@ Examples:
     )
     for command in (p_plan, p_deploy, p_validate):
         command.add_argument(
-            "--site-file", type=Path, metavar="FILE",
+            "--site-file", type=Path, action=_SingleFileOption, metavar="FILE",
             help="Complete standalone Site file selecting exactly one target",
         )
         command.add_argument(
-            "--input-file", type=Path, metavar="FILE",
+            "--input-file", type=Path, action=_SingleFileOption, metavar="FILE",
             help="Typed answers for the selected manifest's input contract",
         )
         command.add_argument(
@@ -1972,11 +2001,11 @@ Examples:
         help="Input contract and optional private Site preview format (default: plain)",
     )
     p_inputs.add_argument(
-        "--example", type=Path, metavar="FILE",
-        help="Write an incomplete answer file with required inputs left empty",
+        "--example", type=Path, action=_SingleFileOption, metavar="FILE",
+        help="Write incomplete required answers and any resource ID that can derive them",
     )
     p_inputs.add_argument(
-        "--input-file", type=Path, metavar="FILE",
+        "--input-file", type=Path, action=_SingleFileOption, metavar="FILE",
         help="Typed answers to preview or save one Site (no file written without --save-site)",
     )
     p_inputs.add_argument(
@@ -1984,8 +2013,8 @@ Examples:
         help="Typed non-secret answer (repeatable, overrides --input-file)",
     )
     p_inputs.add_argument(
-        "--save-site", type=Path, metavar="FILE",
-        help="Write a validated Site to a new file after resolving complete typed answers",
+        "--save-site", type=Path, action=_SingleFileOption, metavar="FILE",
+        help="Write a validated Site to a new file, checking selected Site identities before saving",
     )
     p_inputs.add_argument(
         "--read-resources", action="store_true",

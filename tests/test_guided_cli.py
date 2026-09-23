@@ -162,6 +162,37 @@ def test_resource_reads_are_explicit_optional_command_options(capsys):
     assert "--read-resources" not in capsys.readouterr().out
 
 
+@pytest.mark.parametrize(("command", "option"), [
+    ("inputs", "--example"),
+    ("inputs", "--input-file"),
+    ("inputs", "--save-site"),
+    ("plan", "--input-file"),
+    ("plan", "--site-file"),
+    ("deploy", "--input-file"),
+    ("deploy", "--site-file"),
+    ("validate", "--input-file"),
+    ("validate", "--site-file"),
+])
+def test_single_file_options_reject_repetition_before_content_use(
+    guided_workspace, tmp_path, capsys, command, option,
+):
+    first = tmp_path / "first.yaml"
+    second = tmp_path / "second.yaml"
+    with (
+        patch("siteops.cli.resolve_manifest_path", side_effect=AssertionError("No content read")),
+        patch("siteops.cli.write_yaml_exclusive", side_effect=AssertionError("No file write")),
+    ):
+        assert _invoke([
+            "-w", str(guided_workspace), command, _manifest(guided_workspace),
+            option, str(first), option, str(second),
+        ]) == 2
+    output = capsys.readouterr()
+    assert option in output.err
+    assert "only once" in output.err
+    assert str(first) not in output.err and str(second) not in output.err
+    assert not first.exists() and not second.exists()
+
+
 def test_inputs_inspection_and_example_are_not_executable(
     guided_workspace, tmp_path, capsys,
 ):
@@ -187,6 +218,30 @@ def test_inputs_inspection_and_example_are_not_executable(
     assert "required" in capsys.readouterr().out.lower()
     assert _invoke(args) == 1
     assert "exists" in capsys.readouterr().err.lower()
+
+
+def test_aio_example_exposes_resource_first_route_without_a_read(tmp_path, capsys):
+    workspace = Path(__file__).resolve().parents[1] / "workspaces" / "iot-operations"
+    example = tmp_path / "aio-inputs.yaml"
+    with patch("siteops.cli.new_arm_reader", side_effect=AssertionError("No Azure read")):
+        assert _invoke([
+            "-w", str(workspace), "inputs", "aio-install", "--example", str(example),
+        ]) == 0
+    plain = capsys.readouterr().out
+    assert "Resource route:" in plain and "--read-resources" in plain
+    assert plain.index("Resource route:") < plain.index("  siteName")
+    values = yaml.safe_load(example.read_text(encoding="utf-8"))["values"]
+    assert set(values) == {
+        "siteName", "subscription", "resourceGroup", "location",
+        "clusterName", "environment", "country", "cluster",
+    }
+    assert all(value is None for value in values.values())
+    with patch("siteops.cli.new_arm_reader", side_effect=AssertionError("No Azure read")):
+        assert _invoke([
+            "-w", str(workspace), "plan", "aio-install",
+            "--describe", "--input-file", str(example),
+        ]) == 1
+    assert "required" in capsys.readouterr().out.lower()
 
 
 def test_inputs_preview_from_complete_answers_is_read_only(
@@ -579,18 +634,95 @@ def test_saved_site_is_normal_config_and_not_overwritten(
     assert "exists" in capsys.readouterr().err.lower()
 
 
+@pytest.mark.parametrize(("name", "filename"), [
+    ("taken", "fresh.yaml"),
+    ("fresh", "taken.yaml"),
+    ("fresh", "existing.yml"),
+])
+@pytest.mark.parametrize("project_mode", [False, True])
+@pytest.mark.parametrize("redacted", [False, True])
+def test_save_site_rejects_inventory_identity_collisions_before_writing(
+    guided_workspace, tmp_path, capsys, monkeypatch, name, filename, project_mode, redacted,
+):
+    monkeypatch.setenv("SITEOPS_REDACT_OUTPUT", "1" if redacted else "0")
+    root = tmp_path / "factory" if project_mode else guided_workspace
+    sites_dir = root / "sites"
+    sites_dir.mkdir(exist_ok=True, parents=True)
+    existing = sites_dir / "existing.yaml"
+    existing.write_text(yaml.safe_dump({
+        "apiVersion": "siteops/v1", "kind": "Site", "name": "taken",
+        "subscription": "00000000-0000-0000-0000-000000000001",
+        "location": "eastus",
+    }), encoding="utf-8")
+    answers = _input_file(tmp_path / "answers.yaml", name=name)
+    destination = sites_dir / filename
+    selection = (["--project", str(root)] if project_mode else []) + [
+        "-w", str(guided_workspace),
+    ]
+    assert _invoke([
+        *selection, "inputs", _manifest(guided_workspace),
+        "--input-file", str(answers), "--save-site", str(destination),
+    ]) == 1
+    assert not destination.exists()
+    output = capsys.readouterr()
+    if redacted:
+        assert "Site configuration could not be loaded" in output.err
+        assert "taken" not in output.out + output.err
+        assert str(existing) not in output.out + output.err
+    else:
+        assert "another configured Site" in output.err
+    available = _input_file(tmp_path / "available.yaml", name="available")
+    assert _invoke([
+        *selection, "inputs", _manifest(guided_workspace),
+        "--input-file", str(available), "--save-site", str(sites_dir / "available.yaml"),
+    ]) == 0
+    capsys.readouterr()
+    assert _invoke([
+        *selection, "plan", _manifest(guided_workspace), "-l", "name=available", "--describe",
+    ]) == 0
+
+
+def test_save_site_rejects_relative_path_matching_existing_internal_name(
+    guided_workspace, tmp_path, capsys,
+):
+    sites_dir = guided_workspace / "sites"
+    (sites_dir / "regions" / "eu").mkdir(parents=True)
+    (sites_dir / "existing.yaml").write_text(yaml.safe_dump({
+        "apiVersion": "siteops/v1", "kind": "Site", "name": "regions/eu/plant",
+        "subscription": "00000000-0000-0000-0000-000000000001",
+        "location": "eastus",
+    }), encoding="utf-8")
+    destination = sites_dir / "regions" / "eu" / "plant.yaml"
+    answers = _input_file(tmp_path / "answers.yaml", name="plant-new")
+    assert _invoke([
+        "-w", str(guided_workspace), "inputs", _manifest(guided_workspace),
+        "--input-file", str(answers), "--save-site", str(destination),
+    ]) == 1
+    assert not destination.exists()
+    assert "another configured Site" in capsys.readouterr().err
+
+
 def test_guided_secret_sync_does_not_carry_into_fresh_fleet_sites(tmp_path, capsys):
     workspace = Path(__file__).resolve().parents[1] / "workspaces" / "iot-operations"
     project = tmp_path / "factory"
     (project / "sites").mkdir(parents=True)
     answers = tmp_path / "aio-inputs.yaml"
+    vault_id = (
+        "/subscriptions/00000000-0000-0000-0000-000000000001/"
+        "resourceGroups/rg-vault/providers/Microsoft.KeyVault/vaults/vault-example"
+    )
     answers.write_text(yaml.safe_dump({
         "apiVersion": "siteops.inputs/v1", "kind": "SiteInputValues",
         "values": {
             "siteName": "plant-one", "subscription": None, "resourceGroup": None,
             "location": None, "clusterName": None, "environment": "dev", "country": "US",
-            "cluster": _CLUSTER_ID, "enableSecretSync": True,
+            "cluster": _CLUSTER_ID, "enableSecretSync": True, "existingVault": vault_id,
         },
+    }), encoding="utf-8")
+    fleet_answers = tmp_path / "fleet-inputs.yaml"
+    fleet_answers.write_text(yaml.safe_dump({
+        "apiVersion": "siteops.inputs/v1", "kind": "SiteInputValues",
+        "values": {"environment": "dev", "country": "US", "enableSecretSync": False},
     }), encoding="utf-8")
     second_id = _CLUSTER_ID.replace("rg-first", "rg-second").replace("arc-first", "arc-second")
     third_id = _CLUSTER_ID.replace("rg-first", "rg-third").replace("arc-first", "arc-third")
@@ -606,9 +738,11 @@ def test_guided_secret_sync_does_not_carry_into_fresh_fleet_sites(tmp_path, caps
 
         def read(self, ref, *, facts=frozenset()):
             calls.append((ref.resource_id, facts))
-            assert ref.resource_id in {_CLUSTER_ID, second_id, third_id, fourth_id}
+            assert ref.resource_id in {_CLUSTER_ID, second_id, third_id, fourth_id, vault_id}
             return ArmResourceObservation(
-                ref.resource_id, "Microsoft.Kubernetes/connectedClusters",
+                ref.resource_id,
+                "Microsoft.KeyVault/vaults" if ref.resource_id == vault_id
+                else "Microsoft.Kubernetes/connectedClusters",
                 "eastus", ref.resource_id.rsplit("/", 1)[-1],
                 {key: True for key in facts},
             )
@@ -620,19 +754,20 @@ def test_guided_secret_sync_does_not_carry_into_fresh_fleet_sites(tmp_path, caps
         ):
             command = [
                 "--project", str(project), "-w", str(workspace),
-                "inputs", "aio-install", "--input-file", str(answers),
+                "inputs", "aio-install",
+                "--input-file", str(answers if name == "plant-one" else fleet_answers),
                 "--read-resources", "--save-site", str(project / "sites" / f"{name}.yaml"),
             ]
             if name != "plant-one":
                 command.extend([
                     "--input", f"siteName={name}", "--input", f"cluster={resource}",
-                    "--input", "enableSecretSync=false",
                 ])
             assert _invoke(command) == 0
             capsys.readouterr()
 
     assert calls == [
-        (_CLUSTER_ID, sync_facts), (second_id, frozenset()), (third_id, frozenset()),
+        (_CLUSTER_ID, sync_facts), (vault_id, frozenset()),
+        (second_id, frozenset()), (third_id, frozenset()),
         (fourth_id, frozenset()),
     ]
     for name, cluster in (
@@ -644,6 +779,7 @@ def test_guided_secret_sync_does_not_carry_into_fresh_fleet_sites(tmp_path, caps
         assert site.labels["environment"] == "dev"
         assert site.parameters["clusterName"] == cluster
         assert site.properties["deployOptions"]["enableSecretSync"] is (name == "plant-one")
+        assert ("existingKeyVaultResourceId" in site.parameters) is (name == "plant-one")
 
     assert _invoke([
         "--project", str(project), "-w", str(workspace),

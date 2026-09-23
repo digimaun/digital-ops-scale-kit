@@ -1011,6 +1011,28 @@ class Orchestrator:
                 self._rel_path_index = rel_path
                 self._internal_name_index = internal
 
+    def ensure_new_site_identity(self, name: str, destination: Path) -> None:
+        """Check that a new file will not make the selected Site inventory ambiguous."""
+        destination = Path(destination).resolve()
+        for sites_dir in self._trusted_sites_dirs:
+            root = sites_dir.resolve()
+            if destination.is_relative_to(root):
+                relative = destination.relative_to(root).with_suffix("").as_posix()
+                break
+        else:
+            return
+        if destination.exists() or destination.is_symlink():
+            return
+        indexes = self._build_site_indexes()
+        for identity in (destination.stem, relative, name):
+            for index in indexes:
+                existing = index.get(identity)
+                if existing is not None and existing.resolve() != destination:
+                    raise ValueError(
+                        "The new Site name or file path matches another configured Site. "
+                        "Choose a distinct name and file."
+                    )
+
     def _iter_trusted_site_files(
         self, include_templates: bool = False
     ) -> Iterator[tuple[Path, Path]]:

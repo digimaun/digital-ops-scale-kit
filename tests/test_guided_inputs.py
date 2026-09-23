@@ -201,7 +201,15 @@ def test_optional_cluster_reference_preserves_manual_answer_route(tmp_path):
         "resourceGroup": None,
         "location": None,
         "clusterName": None,
+        "cluster": None,
     }
+    manual = dict(contract.example()["values"])
+    manual.update(
+        subscription="00000000-0000-0000-0000-000000000001",
+        resourceGroup="rg-first", location="eastus", clusterName="arc-first",
+    )
+    manual_file = _values(tmp_path, manual)
+    assert not contract.bind(values_file=manual_file).resources
     site = contract.resolve(inline=[
         "subscription=00000000-0000-0000-0000-000000000001",
         "resourceGroup=rg-first",
@@ -210,6 +218,7 @@ def test_optional_cluster_reference_preserves_manual_answer_route(tmp_path):
     ])
     assert site.subscription == "00000000-0000-0000-0000-000000000001"
     assert site.parameters["clusterName"] == "arc-first"
+    assert contract.resolve(values_file=manual_file) == site
 
 
 def test_resource_answer_requires_explicit_read_even_with_complete_manual_values(tmp_path):

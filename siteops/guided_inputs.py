@@ -501,12 +501,21 @@ class InputContract:
 
     def example(self) -> dict[str, Any]:
         """Provide incomplete answers, never a deployable placeholder Site."""
+        required = {
+            field.name for field in self.fields
+            if field.required and not field.has_default and field.when is None
+        }
         return {
             "apiVersion": _VERSION,
             "kind": "SiteInputValues",
             "values": {
                 field.name: None for field in self.fields
-                if field.required and not field.has_default and field.when is None
+                if field.name in required
+                or (
+                    field.resource is not None and not field.required
+                    and field.when is None
+                    and any(target in required for _, target in field.resource.derive)
+                )
             },
         }
 
@@ -553,7 +562,9 @@ class InputContract:
                 if name not in fields:
                     raise GuidedInputError("Input values contain an unknown input name.")
                 field = fields[name]
-                if value is None and field.required:
+                if value is None and (
+                    field.required or (field.resource is not None and field.when is None)
+                ):
                     continue
                 _typed_value(value, field.type, f"Input '{name}'", required=field.required)
 

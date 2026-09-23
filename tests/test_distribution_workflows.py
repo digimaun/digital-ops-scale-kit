@@ -60,6 +60,8 @@ GUIDE_PATH = REPO_ROOT / "docs" / "install-siteops.md"
 
 ON = True
 ARCHIVE_NAME = "siteops-install.zip"
+BOOTSTRAP_PS1 = "siteops-bootstrap.ps1"
+BOOTSTRAP_SH = "siteops-bootstrap.sh"
 ATTESTATION_SUFFIX = ".attestation.jsonl"
 OIDC_ISSUER = "https://token.actions.githubusercontent.com"
 PREDICATE_TYPE = "https://slsa.dev/provenance/v1"
@@ -194,6 +196,9 @@ if [[ "$1 $2" == "attestation verify" ]]; then
   if [[ "$3" == *.whl ]]; then
     exit "${FAKE_GH_WHEEL_EXIT:-${FAKE_GH_ATTESTATION_EXIT:-0}}"
   fi
+  if [[ "$3" == *.ps1 || "$3" == *.sh ]]; then
+    exit "${FAKE_GH_BOOTSTRAP_EXIT:-${FAKE_GH_ATTESTATION_EXIT:-0}}"
+  fi
   exit "${FAKE_GH_ATTESTATION_EXIT:-0}"
 fi
 if [[ "$1" == "api" ]]; then
@@ -309,17 +314,21 @@ def test_build_job_passes_the_event_identity_to_the_producer():
     assert "--download-dependencies" in script
 
 
-def test_the_build_publishes_exactly_two_assets_from_one_wheel_build():
+def test_the_build_publishes_wheel_bundle_and_exact_bootstrap_scripts():
     build = REUSABLE["jobs"]["build"]
     assert build["outputs"]["wheel-name"] == "${{ steps.build.outputs.wheel-name }}"
     assert build["outputs"]["wheel-sha256"] == "${{ steps.build.outputs.wheel-sha256 }}"
     script = _script(build, "Build the installation bundle")
-    assert "${#produced[@]} -ne 2" in script
+    assert "${#produced[@]} -ne 4" in script
+    assert 'git show "$SOURCE_SHA:scripts/bootstrap/$script"' in script
     assert '"wheels/" + wheel.name' in script
     assert "is not the archive member byte for byte" in script
     assert 'document["package"]["wheel"] != member' in script
     assert "^siteops-[A-Za-z0-9._+!-]+-py3-none-any\\.whl$" in script
-    for output in ("archive-sha256", "wheel-name", "wheel-sha256", "staging-path"):
+    for output in (
+        "archive-sha256", "wheel-name", "wheel-sha256",
+        "bootstrap-ps1-sha256", "bootstrap-sh-sha256", "staging-path",
+    ):
         assert f'echo "{output}=' in script
     upload = _step(build, "Upload the build artifacts")["with"]
     assert upload["path"] == "${{ steps.build.outputs.staging-path }}"
@@ -337,9 +346,11 @@ def test_attestation_binds_the_exact_build_artifact_of_this_run():
     assert download["digest-mismatch"] == "error"
 
     payload = _script(attest, "Confirm the staged payload")
-    assert "${#entries[@]} -ne 2" in payload
+    assert "${#entries[@]} -ne 4" in payload
     assert "$EXPECTED_ARCHIVE_SHA256" in payload
     assert "$EXPECTED_WHEEL_SHA256" in payload
+    assert "$EXPECTED_BOOTSTRAP_PS1_SHA256" in payload
+    assert "$EXPECTED_BOOTSTRAP_SH_SHA256" in payload
 
 
 def test_each_published_asset_is_signed_independently():
@@ -350,10 +361,14 @@ def test_each_published_asset_is_signed_independently():
     assert [step["name"] for step in subjects] == [
         "Attest archive provenance",
         "Attest wheel provenance",
+        "Attest PowerShell bootstrap provenance",
+        "Attest Bash bootstrap provenance",
     ]
     assert [step["with"]["subject-path"] for step in subjects] == [
         f"${{{{ runner.temp }}}}/siteops-subject/{ARCHIVE_NAME}",
         "${{ runner.temp }}/siteops-subject/${{ needs.build.outputs.wheel-name }}",
+        f"${{{{ runner.temp }}}}/siteops-subject/{BOOTSTRAP_PS1}",
+        f"${{{{ runner.temp }}}}/siteops-subject/{BOOTSTRAP_SH}",
     ]
     for step in subjects:
         # Omitting every predicate input selects SLSA build provenance.
@@ -361,9 +376,11 @@ def test_each_published_asset_is_signed_independently():
         assert step["with"]["show-summary"] is False
 
     staging = _script(attest, "Stage the attested bytes")
-    assert "${#staged[@]} -ne 4" in staging
+    assert "${#staged[@]} -ne 8" in staging
     assert '"$ARCHIVE_BUNDLE_PATH"' in staging
     assert '"$WHEEL_BUNDLE_PATH"' in staging
+    assert '"$PS1_BUNDLE_PATH"' in staging
+    assert '"$SH_BUNDLE_PATH"' in staging
 
 
 def test_staging_uploads_never_overwrite_and_fail_on_empty_input():
@@ -408,7 +425,7 @@ def test_qualification_runs_on_hosted_windows_and_linux_without_write_access():
 
 def test_qualification_verifies_before_it_extracts():
     names = _step_names(REUSABLE["jobs"]["qualify"])
-    assert names.index("Verify both assets before use") < names.index(
+    assert names.index(    "Verify installation assets before use") < names.index(
         "Extract the verified bundle"
     )
     assert names.index("Extract the verified bundle") < names.index(
@@ -440,7 +457,9 @@ def test_qualification_policy_pins_the_caller_source_and_local_signer():
     assert environment["SIGNER_IDENTITY"] == (
         f"https://github.com/${{{{ github.repository }}}}/{SIGNER_WORKFLOW}@${{{{ github.ref }}}}"
     )
-    script = _script(qualify, "Verify both assets before use")
+    script = _script(qualify, "Verify installation assets before use")
+    assert '"$download/$BOOTSTRAP_PS1"' in script
+    assert '"$download/$BOOTSTRAP_SH"' in script
     for flag in VERIFY_FLAGS:
         assert flag in script
 
@@ -541,11 +560,13 @@ def test_the_qualification_tooling_pins_pipx_and_its_lock_reading_backend():
         assert wider not in guide, wider
 
 
-def test_the_bundle_ships_no_installation_program():
-    """The published paths are stock pipx commands, with no program of our own."""
+def test_the_bundle_keeps_native_installation_separate_from_bootstrap_scripts():
+    """The authenticated bundle uses stock pipx, not an embedded installer."""
     scripts = REPO_ROOT / "scripts"
     assert not (scripts / "install-siteops.py").exists()
     assert not list(scripts.glob("install*.py"))
+    assert (scripts / "bootstrap" / BOOTSTRAP_PS1).is_file()
+    assert (scripts / "bootstrap" / BOOTSTRAP_SH).is_file()
     retired = ("install.py", "siteops_distribution", "--store-dir", "SiteOpsInstallationResult")
     for path in (REUSABLE_PATH, GUIDE_PATH):
         text = path.read_text(encoding="utf-8")
@@ -992,6 +1013,8 @@ def _qualification_exports(tmp_path: Path, log: Path) -> dict[str, str]:
         "ARCHIVE_NAME": ARCHIVE_NAME,
         "ATTESTATION_SUFFIX": ATTESTATION_SUFFIX,
         "WHEEL_NAME": WHEEL_NAME,
+        "BOOTSTRAP_PS1": BOOTSTRAP_PS1,
+        "BOOTSTRAP_SH": BOOTSTRAP_SH,
         "SOURCE_REPOSITORY": "example/publisher",
         "SOURCE_SHA": "c" * 40,
         "SOURCE_REF": "refs/heads/main",
@@ -1014,6 +1037,10 @@ def _staged_download(tmp_path: Path, *, missing: str | None = None) -> Path:
         ARCHIVE_NAME + ATTESTATION_SUFFIX: b"{}\n",
         WHEEL_NAME: b"wheel bytes",
         WHEEL_NAME + ATTESTATION_SUFFIX: b"{}\n",
+        BOOTSTRAP_PS1: b"PowerShell script bytes",
+        BOOTSTRAP_PS1 + ATTESTATION_SUFFIX: b"{}\n",
+        BOOTSTRAP_SH: b"Bash script bytes",
+        BOOTSTRAP_SH + ATTESTATION_SUFFIX: b"{}\n",
     }
     for name, content in staged.items():
         if name != missing:
@@ -1049,25 +1076,33 @@ def _expected_verification(asset: str) -> list[str]:
 def test_qualification_verification_passes_the_exact_policy_to_the_runner_cli(tmp_path):
     _, log = _fake_tools(tmp_path)
     download = _staged_download(tmp_path)
-    script = _script(REUSABLE["jobs"]["qualify"], "Verify both assets before use")
+    script = _script(REUSABLE["jobs"]["qualify"], "Verify installation assets before use")
     result = _run_script(script, tmp_path, _qualification_exports(tmp_path, log))
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert _invocations(log) == [
         _expected_verification(_bash_path(download / ARCHIVE_NAME)),
         _expected_verification(_bash_path(download / WHEEL_NAME)),
+        _expected_verification(_bash_path(download / BOOTSTRAP_PS1)),
+        _expected_verification(_bash_path(download / BOOTSTRAP_SH)),
     ]
 
 
-@pytest.mark.parametrize(("failing", "attempted"), [("archive", 1), ("wheel", 2)])
+@pytest.mark.parametrize(
+    ("failing", "attempted"), [("archive", 1), ("wheel", 2), ("bootstrap", 3)],
+)
 def test_qualification_stops_when_verification_fails(tmp_path, failing, attempted):
     _, log = _fake_tools(tmp_path)
     _staged_download(tmp_path)
     # The wheel case fails only the second subject, so a partial verification
     # cannot pass, and the attempt count shows a failed subject stops the step.
-    variable = "FAKE_GH_ATTESTATION_EXIT" if failing == "archive" else "FAKE_GH_WHEEL_EXIT"
+    variable = {
+        "archive": "FAKE_GH_ATTESTATION_EXIT",
+        "wheel": "FAKE_GH_WHEEL_EXIT",
+        "bootstrap": "FAKE_GH_BOOTSTRAP_EXIT",
+    }[failing]
     exports = {**_qualification_exports(tmp_path, log), variable: "1"}
-    script = _script(REUSABLE["jobs"]["qualify"], "Verify both assets before use")
+    script = _script(REUSABLE["jobs"]["qualify"], "Verify installation assets before use")
     result = _run_script(script, tmp_path, exports)
     assert result.returncode != 0
     assert len(_invocations(log)) == attempted
@@ -1088,7 +1123,7 @@ def test_native_qualification_checks_each_observed_claim(tmp_path, field):
     observations.append(changed)
     path.write_text(json.dumps(observations))
     result = _run_script(
-        _script(REUSABLE["jobs"]["qualify"], "Verify both assets before use"), tmp_path, exports,
+        _script(REUSABLE["jobs"]["qualify"], "Verify installation assets before use"), tmp_path, exports,
     )
     assert result.returncode != 0
     assert "certificate does not match" in result.stdout + result.stderr
@@ -1098,12 +1133,14 @@ def test_native_qualification_checks_each_observed_claim(tmp_path, field):
 
 @pytest.mark.parametrize(
     "missing",
-    [ARCHIVE_NAME + ATTESTATION_SUFFIX, WHEEL_NAME, WHEEL_NAME + ATTESTATION_SUFFIX],
+    [ARCHIVE_NAME + ATTESTATION_SUFFIX, WHEEL_NAME, WHEEL_NAME + ATTESTATION_SUFFIX,
+     BOOTSTRAP_PS1, BOOTSTRAP_PS1 + ATTESTATION_SUFFIX, BOOTSTRAP_SH,
+     BOOTSTRAP_SH + ATTESTATION_SUFFIX],
 )
 def test_qualification_stops_when_an_asset_or_proof_is_missing(tmp_path, missing):
     _, log = _fake_tools(tmp_path)
     _staged_download(tmp_path, missing=missing)
-    script = _script(REUSABLE["jobs"]["qualify"], "Verify both assets before use")
+    script = _script(REUSABLE["jobs"]["qualify"], "Verify installation assets before use")
     result = _run_script(script, tmp_path, _qualification_exports(tmp_path, log))
     assert result.returncode != 0
     assert _invocations(log) == []
@@ -1496,6 +1533,16 @@ fi
 exec "$REAL_PYTHON" "$@"
 """,
     )
+    _write_executable(
+        bin_dir / "git",
+        """#!/usr/bin/env bash
+[[ "$1" == show && "$2" == "$SOURCE_SHA:scripts/bootstrap/$BOOTSTRAP_PS1" ]] &&
+  { cat "$FAKE_BOOTSTRAP_DIR/$BOOTSTRAP_PS1"; exit 0; }
+[[ "$1" == show && "$2" == "$SOURCE_SHA:scripts/bootstrap/$BOOTSTRAP_SH" ]] &&
+  { cat "$FAKE_BOOTSTRAP_DIR/$BOOTSTRAP_SH"; exit 0; }
+exit 1
+""",
+    )
     exports = {
         "REAL_PYTHON": _python_executable_path(),
         "FAKE_ARCHIVE": _bash_path(archive),
@@ -1503,6 +1550,9 @@ exec "$REAL_PYTHON" "$@"
         "FAKE_EXTRA": extra or "",
         "RUNNER_TEMP": _bash_path(tmp_path / "temp"),
         "ARCHIVE_NAME": ARCHIVE_NAME,
+        "BOOTSTRAP_PS1": BOOTSTRAP_PS1,
+        "BOOTSTRAP_SH": BOOTSTRAP_SH,
+        "FAKE_BOOTSTRAP_DIR": _bash_path(REPO_ROOT / "scripts" / "bootstrap"),
         "SOURCE_REPOSITORY": "example/publisher",
         "SOURCE_REF": "refs/heads/main",
         "SOURCE_SHA": "c" * 40,
@@ -1526,7 +1576,7 @@ def _step_outputs(tmp_path: Path) -> dict[str, str]:
     )
 
 
-def test_build_step_publishes_and_records_both_assets(tmp_path, bundle_factory):
+def test_build_step_publishes_and_records_exact_installation_assets(tmp_path, bundle_factory):
     root, manifest = bundle_factory(91)
     archive, wheel = publish_assets(root, manifest, tmp_path / "published")
 
@@ -1543,19 +1593,23 @@ def test_build_step_publishes_and_records_both_assets(tmp_path, bundle_factory):
     assert outputs["package-version"] == manifest.version
     assert outputs["archive-sha256"] == hashlib.sha256(archive.read_bytes()).hexdigest()
     assert outputs["wheel-sha256"] == hashlib.sha256(wheel.read_bytes()).hexdigest()
+    for name, key in ((BOOTSTRAP_PS1, "bootstrap-ps1-sha256"), (BOOTSTRAP_SH, "bootstrap-sh-sha256")):
+        assert outputs[key] == hashlib.sha256(
+            (REPO_ROOT / "scripts" / "bootstrap" / name).read_bytes()
+        ).hexdigest()
     assert outputs["staging-path"].endswith("/siteops-build")
     staging = Path(tmp_path / "temp" / "siteops-build")
     assert sorted(path.name for path in staging.iterdir()) == sorted(
-        [ARCHIVE_NAME, wheel.name]
+        [ARCHIVE_NAME, wheel.name, BOOTSTRAP_PS1, BOOTSTRAP_SH]
     )
 
 
 @pytest.mark.parametrize(
     ("case", "message"),
     [
-        ("missing-wheel", "content other than the archive"),
-        ("extra-file", "content other than the archive"),
-        ("unsupported-name", "supported Site Ops wheel name"),
+        ("missing-wheel", "content other than its declared installation assets"),
+        ("extra-file", "content other than its declared installation assets"),
+        ("unsupported-name", "content other than its declared installation assets"),
         ("absent-member", "does not contain the standalone wheel"),
         ("changed-bytes", "byte for byte"),
     ],
@@ -1594,21 +1648,29 @@ def _staged_subject(tmp_path: Path, wheel_name: str = WHEEL_NAME) -> dict[str, s
     subject.mkdir(parents=True)
     (subject / ARCHIVE_NAME).write_bytes(b"archive bytes")
     (subject / wheel_name).write_bytes(b"wheel bytes")
-    for name in ("archive-proof", "wheel-proof"):
+    for script in (BOOTSTRAP_PS1, BOOTSTRAP_SH):
+        (subject / script).write_bytes(script.encode("ascii"))
+    for name in ("archive-proof", "wheel-proof", "ps1-proof", "sh-proof"):
         (tmp_path / name).write_text("{}\n", encoding="utf-8")
     return {
         "RUNNER_TEMP": _bash_path(tmp_path / "temp"),
         "ARCHIVE_NAME": ARCHIVE_NAME,
         "ATTESTATION_SUFFIX": ATTESTATION_SUFFIX,
         "WHEEL_NAME": wheel_name,
+        "BOOTSTRAP_PS1": BOOTSTRAP_PS1,
+        "BOOTSTRAP_SH": BOOTSTRAP_SH,
         "EXPECTED_ARCHIVE_SHA256": hashlib.sha256(b"archive bytes").hexdigest(),
         "EXPECTED_WHEEL_SHA256": hashlib.sha256(b"wheel bytes").hexdigest(),
+        "EXPECTED_BOOTSTRAP_PS1_SHA256": hashlib.sha256(BOOTSTRAP_PS1.encode("ascii")).hexdigest(),
+        "EXPECTED_BOOTSTRAP_SH_SHA256": hashlib.sha256(BOOTSTRAP_SH.encode("ascii")).hexdigest(),
         "ARCHIVE_BUNDLE_PATH": _bash_path(tmp_path / "archive-proof"),
         "WHEEL_BUNDLE_PATH": _bash_path(tmp_path / "wheel-proof"),
+        "PS1_BUNDLE_PATH": _bash_path(tmp_path / "ps1-proof"),
+        "SH_BUNDLE_PATH": _bash_path(tmp_path / "sh-proof"),
     }
 
 
-def test_signing_stages_exactly_the_four_published_files(tmp_path):
+def test_signing_stages_exactly_the_eight_published_files(tmp_path):
     exports = _staged_subject(tmp_path)
     attest = REUSABLE["jobs"]["attest"]
 
@@ -1624,13 +1686,18 @@ def test_signing_stages_exactly_the_four_published_files(tmp_path):
                 ARCHIVE_NAME + ATTESTATION_SUFFIX,
                 WHEEL_NAME,
                 WHEEL_NAME + ATTESTATION_SUFFIX,
+                BOOTSTRAP_PS1,
+                BOOTSTRAP_PS1 + ATTESTATION_SUFFIX,
+                BOOTSTRAP_SH,
+                BOOTSTRAP_SH + ATTESTATION_SUFFIX,
             ]
         )
     )
 
 
 @pytest.mark.parametrize(
-    "case", ["extra-subject", "changed-archive", "changed-wheel", "missing-wheel"]
+    "case", ["extra-subject", "changed-archive", "changed-wheel", "missing-wheel",
+             "changed-script", "missing-script"]
 )
 def test_signing_refuses_a_payload_that_is_not_the_build_output(tmp_path, case):
     exports = _staged_subject(tmp_path)
@@ -1641,6 +1708,10 @@ def test_signing_refuses_a_payload_that_is_not_the_build_output(tmp_path, case):
         (subject / ARCHIVE_NAME).write_bytes(b"replaced archive bytes")
     elif case == "changed-wheel":
         (subject / WHEEL_NAME).write_bytes(b"replaced wheel bytes")
+    elif case == "changed-script":
+        (subject / BOOTSTRAP_SH).write_bytes(b"replaced script bytes")
+    elif case == "missing-script":
+        (subject / BOOTSTRAP_PS1).unlink()
     else:
         (subject / WHEEL_NAME).unlink()
 
@@ -1650,7 +1721,7 @@ def test_signing_refuses_a_payload_that_is_not_the_build_output(tmp_path, case):
     assert result.returncode != 0
 
 
-@pytest.mark.parametrize("empty", ["archive-proof", "wheel-proof"])
+@pytest.mark.parametrize("empty", ["archive-proof", "wheel-proof", "ps1-proof", "sh-proof"])
 def test_signing_refuses_an_empty_detached_proof(tmp_path, empty):
     exports = _staged_subject(tmp_path)
     (tmp_path / empty).write_text("", encoding="utf-8")

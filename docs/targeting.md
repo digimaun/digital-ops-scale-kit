@@ -16,6 +16,12 @@ exclusive. Resolution chooses the first present source in this order:
 2. **Manifest `sites:`** explicit list of site names.
 3. **Manifest `selector:`** label expression filter.
 
+Resource ID inputs remain an explicit single-Site route. Only
+`--read-resources` asks Site Ops to read the supplied, declared Azure
+resource IDs before constructing that Site. It cannot be combined with
+`--site-file` or `-l`. See [guided inputs](guided-inputs.md) for the
+provider read and privacy boundary.
+
 A manifest with all three configured targeting sources empty is allowed as a
 library or partial. Ordinary validation needs no target. Planning and
 deployment require `-l` or an explicit Site.

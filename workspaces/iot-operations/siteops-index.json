@@ -101,7 +101,7 @@
         ],
         "effects": [
           "Creates or updates AIO extensions, instance resources, custom location, ADR namespace, Schema Registry storage and role assignments.",
-          "Optional settings add their own effects. Subscription-scoped Edge Site work needs an applicable subscription target.",
+          "Secret Sync enablement in this same deployment creates or updates identity, federation, vault and Secret Provider Class resources. Subscription-scoped Edge Site work needs an applicable subscription target.",
           "Deployment can incur Azure charges and leave partial changes after failure or interruption.",
           "Use the upgrade entry for in-place version changes. Reapplying installation can overwrite operator-managed settings."
         ],
@@ -128,7 +128,7 @@
             "type": "string"
           },
           {
-            "description": "Existing Arc-connected Kubernetes cluster name, not the Site name.",
+            "description": "Existing Arc-connected Kubernetes cluster name, not the Site name. A declared cluster resource ID can supply this and the target subscription, resource group and location through an explicit Azure read.",
             "field": "parameters.clusterName",
             "requirement": "required",
             "sensitivity": "unknown",
@@ -173,7 +173,7 @@
             "type": "object"
           },
           {
-            "description": "Review cert-manager, Edge Site and optional Secret Sync settings. The typed defaults leave Secret Sync disabled. Host flags do not retrofit OIDC or workload identity through this entry.",
+            "description": "Review cert-manager, Edge Site and optional Secret Sync settings. The typed defaults leave Secret Sync disabled. Guided enablement requires an observed cluster reporting OIDC and workload identity before writes. Host flags do not retrofit those features.",
             "field": "properties.deployOptions",
             "requirement": "conditional",
             "sensitivity": "unknown",
@@ -184,6 +184,7 @@
         "prerequisites": [
           "An existing resource group and Arc-connected Kubernetes cluster meeting the selected AIO release's requirements.",
           "Azure CLI for ARM deployment. Source template preparation requires Bicep. Verified workspace packages contain compiled ARM JSON and need no local Bicep compiler for this entry. This manifest contains no kubectl step.",
+          "Resource-derived guided inputs require an explicit read by the selected Azure provider using the operator's already configured Azure identity. Source access and deployment authorization remain separate.",
           "An authorized deployment identity, including the required role-assignment permissions. Common guidance is Owner or User Access Administrator plus Contributor.",
           "Enabling Secret Sync requires pre-existing OIDC and workload-identity readiness on the cluster."
         ],

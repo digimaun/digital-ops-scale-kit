@@ -69,6 +69,9 @@ Prepare these inputs:
 Configured Sites are optional for entries with a typed input contract. You
 can inspect `siteops inputs`, then supply one explicit target with
 `--input-file`, `--input`, or a complete `--site-file`.
+An explicitly selected `--read-resources` request reads only declared
+resource ID inputs using the configured Azure identity. Package
+verification and source trust do not authorize that Azure read.
 
 The [content release workflow](releasing.md) can publish the workspace asset
 set from reviewed declarations after qualification and approval. Choose a

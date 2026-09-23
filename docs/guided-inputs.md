@@ -42,8 +42,8 @@ values:
 ```
 
 Replace each null with a string value, or supply the same named answer with
-`--input`, before deploying. The first AIO path
-selects release 2608, enables cert-manager, and leaves Secret Sync disabled.
+`--input`, before deploying. The default AIO path selects release 2608,
+enables cert-manager, and leaves Secret Sync disabled.
 Your existing cluster, resource group, appropriate Azure permissions, and
 Azure CLI are prerequisites. Input resolution checks types and the Site
 structure. It does not check that those Azure resources exist or that your
@@ -56,7 +56,8 @@ siteops --project ./factory --trust-policy policy.json --trusted-root trusted-ro
 siteops --project ./factory --trust-policy policy.json --trusted-root trusted-root.json deploy aio-install --input-file ./aio-inputs.yaml
 ```
 
-The plan performs local preflight and does not submit Azure deployments.
+The ordinary plan performs local preflight and does not read Azure
+resources or submit deployments.
 The deploy command prepares again before making changes and may update
 resources or incur charges. Authenticate explicitly with the identity
 authorized for the target. A successful deployment result is not evidence of
@@ -68,8 +69,44 @@ project and trust options.
 It resolves and structurally validates one Site without writing it,
 compiling templates or reading Azure resources. Plain and local JSON output
 include a private display of the Site and its defaults. In CI and other
-redacted destinations, the command reports readiness without publishing
-the Site values.
+redacted destinations, the command reports resolution status without
+publishing Site values.
+
+## Use an existing resource ID
+
+Alternatively, give the typed `cluster` input the full ARM ID of your
+existing Arc-connected Kubernetes cluster. The generated answer file
+keeps `subscription`, `resourceGroup`, `location` and `clusterName` as
+`null`. Add `cluster` with your actual ID, then explicitly allow the
+read with `--read-resources` on both `plan` and `deploy`:
+
+```text
+siteops --project ./factory --trust-policy policy.json --trusted-root trusted-root.json plan aio-install --input-file ./aio-inputs.yaml --read-resources
+siteops --project ./factory --trust-policy policy.json --trusted-root trusted-root.json deploy aio-install --input-file ./aio-inputs.yaml --read-resources
+```
+
+For this route, also fill `siteName`, `environment` and `country`.
+The ID must identify an existing
+`Microsoft.Kubernetes/connectedClusters` resource. Site Ops checks its
+type and identity, reads its region, and derives the four target values
+before calling the normal planner. A supplied manual value must agree
+with the observed resource. The read uses your existing Azure CLI
+identity and fails if that identity cannot access the target. Site Ops
+does not sign you in, change accounts or grant permissions. It reads
+again for the separate deploy invocation rather than treating a
+previous plan's observation as current.
+`--offline` applies to the pinned content source only. It does not
+prevent an Azure read explicitly requested with `--read-resources`.
+
+To enable Secret Sync during that same AIO deployment, set
+`enableSecretSync: true` in the answer file. This guided route requires
+`cluster` and `--read-resources`. Before any deployment writes, Azure
+must report an OIDC issuer and enabled workload identity on the existing
+cluster. You may supply an optional `existingVault` resource ID when
+enabled. It must be in the same subscription as the Site but may be in
+a different resource group. Omit it to create a new vault. A successful
+resource read establishes those reported settings at that moment, not
+cluster readiness, federation success or secret materialization.
 
 For a short non-secret command, supply the same named answers with repeated
 `--input NAME=VALUE` options on `plan` or `deploy`. Inline answers override
@@ -91,6 +128,8 @@ siteops --project ./factory --trust-policy policy.json --trusted-root trusted-ro
 The saved document is an ordinary Site. Site Ops does not overwrite an
 existing file. An inline target remains in memory unless you explicitly
 choose `--save-site`.
+Saving a Site built from resource observations does not store the
+observations or re-check their prerequisites on later `--site-file` use.
 Keep Site and answer files outside the content cache and verified package.
 To reuse a complete standalone Site without saving it into a project, pass
 `--site-file ./plant-one.yaml` to `plan`, `validate`, or `deploy`. A standalone

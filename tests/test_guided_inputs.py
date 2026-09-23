@@ -148,6 +148,18 @@ def test_generic_fixture_builds_an_ordinary_site_from_typed_answers(tmp_path):
     ]) == site
 
 
+def test_pure_binding_and_site_construction_match_existing_resolution(tmp_path):
+    manifest, _ = _manifest_and_contract(tmp_path)
+    contract = load_contract(manifest)
+    inline = ["subscription=sub", "location=eastus"]
+
+    bound = contract.bind(inline=inline)
+
+    assert bound.active_values["subscription"] == "sub"
+    assert bound.active_values["usePrivate"] is False
+    assert contract.build_site(bound) == contract.resolve(inline=inline)
+
+
 def test_example_supports_disabled_condition_and_requires_active_dependent(tmp_path):
     manifest, _ = _manifest_and_contract(tmp_path)
     contract = load_contract(manifest)

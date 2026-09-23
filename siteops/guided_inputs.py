@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import copy
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import yaml
@@ -237,6 +239,14 @@ def _validate_default_writers(
 
 
 @dataclass(frozen=True)
+class BoundInputs:
+    """Resolved local answers and their origins, before any provider read."""
+
+    active_values: Mapping[str, str | bool]
+    sources: Mapping[str, str]
+
+
+@dataclass(frozen=True)
 class InputContract:
     """A closed, versioned contract that resolves file and inline answers into one Site."""
 
@@ -289,10 +299,10 @@ class InputContract:
             },
         }
 
-    def resolve(
+    def bind(
         self, values_file: Path | None = None, inline: list[str] | None = None,
-    ) -> Site:
-        """Merge declared defaults, file answers, then inline answers into one Site."""
+    ) -> BoundInputs:
+        """Validate and merge local answers without constructing a Site."""
         fields = {field.name: field for field in self.fields}
         inline_values: dict[str, str | bool] = {}
         for answer in inline or []:
@@ -343,8 +353,8 @@ class InputContract:
         }
         effective.update(file_values)
         effective.update(inline_values)
-        data = copy.deepcopy(self._site_defaults)
         active_values: dict[str, str | bool] = {}
+        sources: dict[str, str] = {}
         for field in self.fields:
             if field.when is not None:
                 controller = active_values.get(field.when.input, _MISSING)
@@ -364,9 +374,26 @@ class InputContract:
                 if field.required:
                     raise GuidedInputError(f"Missing required input '{field.name}'.")
                 continue
-            _assign(data, field.site_path, value)
             active_values[field.name] = value
+            sources[field.name] = (
+                "inline" if field.name in inline_values
+                else "input file" if field.name in file_values else "default"
+            )
+        return BoundInputs(MappingProxyType(active_values), MappingProxyType(sources))
+
+    def build_site(self, bound: BoundInputs) -> Site:
+        """Construct the ordinary Site from bound answers."""
+        data = copy.deepcopy(self._site_defaults)
+        for field in self.fields:
+            if field.name in bound.active_values:
+                _assign(data, field.site_path, bound.active_values[field.name])
         return Site.from_data(data, source="guided inputs", default_name="guided-site")
+
+    def resolve(
+        self, values_file: Path | None = None, inline: list[str] | None = None,
+    ) -> Site:
+        """Build a Site from local file and inline answers."""
+        return self.build_site(self.bind(values_file=values_file, inline=inline))
 
 
 def _assign(data: dict[str, Any], path: tuple[str, ...], value: str | bool) -> None:

@@ -5,10 +5,7 @@ siteDefaults:
     deployOptions:
       enableGlobalSite: false
       enableEdgeSite: false
-      enableSecretSync: false
   parameters:
-    brokerConfig:
-      memoryProfile: Medium
     defaultDataflowInstanceCount: 1
 inputs:
   - name: siteName
@@ -39,6 +36,40 @@ inputs:
     type: string
     description: Country label applied to deployed resources.
     sitePath: labels.country
+  - name: enableSecretSync
+    type: boolean
+    description: Enable Secret Sync only when the existing cluster reports OIDC and workload identity.
+    sitePath: properties.deployOptions.enableSecretSync
+    default: false
+  - name: cluster
+    type: azureResourceId
+    required: false
+    description: Existing Arc cluster resource ID. Read it to derive the target fields.
+    resource:
+      type: Microsoft.Kubernetes/connectedClusters
+      apiVersion: 2024-07-15-preview
+    derive:
+      subscription: subscription
+      resourceGroup: resourceGroup
+      location: location
+      name: clusterName
+    requires:
+      - fact: connectedClusters.workloadIdentityEnabled
+        when: {input: enableSecretSync, equals: true}
+        description: The cluster reports workload identity enabled.
+      - fact: connectedClusters.oidcIssuerAvailable
+        when: {input: enableSecretSync, equals: true}
+        description: The cluster reports an OIDC issuer.
+  - name: existingVault
+    type: azureResourceId
+    required: false
+    when: {input: enableSecretSync, equals: true}
+    description: Existing Key Vault resource ID. Omit to create a new vault during enablement.
+    sitePath: parameters.existingKeyVaultResourceId
+    resource:
+      type: Microsoft.KeyVault/vaults
+      apiVersion: "2023-07-01"
+      subscription: site
   - name: aioRelease
     type: string
     description: AIO release configuration selected by this workspace.
@@ -49,3 +80,8 @@ inputs:
     description: Install the cert-manager Arc extension.
     sitePath: properties.deployOptions.enableCertManager
     default: true
+  - name: brokerMemoryProfile
+    type: string
+    description: AIO broker memory profile. Review cluster capacity before selecting another profile.
+    sitePath: parameters.brokerConfig.memoryProfile
+    default: Medium

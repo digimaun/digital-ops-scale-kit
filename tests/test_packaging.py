@@ -44,6 +44,8 @@ def test_wheel_contains_the_engine_not_a_workspace(built_wheel):
     with zipfile.ZipFile(built_wheel) as wheel:
         names = wheel.namelist()
     assert "siteops/cli.py" in names
+    assert "siteops/arm_resources.py" in names
+    assert "siteops/arm_resources_azure_cli.py" in names
     assert "siteops/orchestrator.py" in names
     assert "siteops/results.py" in names
     assert all(
@@ -172,6 +174,12 @@ def test_installed_engine_prepares_a_guided_aio_target(installed_engine):
     ).stdout)
     assert planned["status"] == "planned"
     assert [target["name"] for target in planned["plan"]["targets"]] == ["plant-one"]
+    invalid = app.run(
+        *command, "plan", "aio-install", "--describe",
+        "--input", "cluster=not-an-arm-id", "--read-resources", "--output", "json",
+        expected=1,
+    )
+    assert json.loads(invalid.stdout)["diagnostics"][0]["code"] == "inputs.resource.invalid-id"
 
 
 def test_installed_worker_is_present_and_uses_its_fixed_protocol(installed_engine):

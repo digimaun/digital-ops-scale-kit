@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from siteops.arm_resources import ArmResourceObservation
 from siteops.guided_inputs import (
     load_contract,
     load_direct_site,
@@ -30,6 +31,35 @@ def _field(name, site_path, **extra):
         "sitePath": site_path,
         **extra,
     }
+
+
+def _resource_role(name="cluster", **overrides):
+    return {
+        "name": name,
+        "type": "azureResourceId",
+        "description": "Existing Azure resource ID.",
+        "required": False,
+        "resource": {
+            "type": "Microsoft.Kubernetes/connectedClusters",
+            "apiVersion": "2024-07-15-preview",
+        },
+        "derive": {
+            "subscription": "subscription",
+            "resourceGroup": "resourceGroup",
+            "location": "location",
+            "name": "clusterName",
+        },
+        **overrides,
+    }
+
+
+def _manual_resource_fields():
+    return [
+        _field("subscription", "subscription"),
+        _field("resourceGroup", "resourceGroup"),
+        _field("location", "location"),
+        _field("clusterName", "parameters.clusterName"),
+    ]
 
 
 def _manifest_and_contract(tmp_path, *, fields=None, defaults=None):
@@ -158,6 +188,303 @@ def test_pure_binding_and_site_construction_match_existing_resolution(tmp_path):
     assert bound.active_values["subscription"] == "sub"
     assert bound.active_values["usePrivate"] is False
     assert contract.build_site(bound) == contract.resolve(inline=inline)
+
+
+def test_optional_cluster_reference_preserves_manual_answer_route(tmp_path):
+    fields = [*_manual_resource_fields(), _resource_role()]
+    manifest, _ = _manifest_and_contract(tmp_path, fields=fields)
+    contract = load_contract(manifest)
+
+    assert contract.describe()["inputs"][0]["derivableFrom"] == ["cluster"]
+    assert contract.example()["values"] == {
+        "subscription": None,
+        "resourceGroup": None,
+        "location": None,
+        "clusterName": None,
+    }
+    site = contract.resolve(inline=[
+        "subscription=00000000-0000-0000-0000-000000000001",
+        "resourceGroup=rg-first",
+        "location=eastus",
+        "clusterName=arc-first",
+    ])
+    assert site.subscription == "00000000-0000-0000-0000-000000000001"
+    assert site.parameters["clusterName"] == "arc-first"
+
+
+def test_resource_answer_requires_explicit_read_even_with_complete_manual_values(tmp_path):
+    manifest, _ = _manifest_and_contract(
+        tmp_path, fields=[*_manual_resource_fields(), _resource_role()],
+    )
+    reference = (
+        "/subscriptions/00000000-0000-0000-0000-000000000001/"
+        "resourceGroups/rg-first/providers/Microsoft.Kubernetes/"
+        "connectedClusters/arc-first"
+    )
+    with pytest.raises(ValueError, match="read-resources"):
+        load_contract(manifest).resolve(inline=[
+            "subscription=00000000-0000-0000-0000-000000000001",
+            "resourceGroup=rg-first",
+            "location=eastus",
+            "clusterName=arc-first",
+            f"cluster={reference}",
+        ])
+
+
+def test_resource_id_completes_null_manual_answers_after_observation(tmp_path):
+    manifest, _ = _manifest_and_contract(
+        tmp_path, fields=[*_manual_resource_fields(), _resource_role()],
+    )
+    contract = load_contract(manifest)
+    reference = (
+        "/subscriptions/00000000-0000-0000-0000-000000000001/"
+        "resourceGroups/rg-first/providers/Microsoft.Kubernetes/"
+        "connectedClusters/arc-first"
+    )
+    answers = _values(tmp_path, {
+        "subscription": None,
+        "resourceGroup": None,
+        "location": None,
+        "clusterName": None,
+        "cluster": reference,
+    })
+
+    bound = contract.bind(values_file=answers)
+
+    assert [resource.field.name for resource in bound.resources] == ["cluster"]
+    assert bound.active_values["subscription"] == "00000000-0000-0000-0000-000000000001"
+    assert bound.active_values["resourceGroup"] == "rg-first"
+    assert "location" not in bound.active_values
+    observed = ArmResourceObservation(
+        resource_id=reference,
+        resource_type="Microsoft.Kubernetes/connectedClusters",
+        location="eastus",
+        name="arc-first",
+        facts={},
+    )
+    site = contract.build_site(bound, {"cluster": observed})
+    assert site.subscription == "00000000-0000-0000-0000-000000000001"
+    assert site.resource_group == "rg-first"
+    assert site.location == "eastus"
+    assert site.parameters["clusterName"] == "arc-first"
+
+
+def test_resource_id_conflicts_with_manual_subscription_before_provider_read(tmp_path):
+    manifest, _ = _manifest_and_contract(
+        tmp_path, fields=[*_manual_resource_fields(), _resource_role()],
+    )
+    reference = (
+        "/subscriptions/00000000-0000-0000-0000-000000000001/"
+        "resourceGroups/rg-first/providers/Microsoft.Kubernetes/"
+        "connectedClusters/arc-first"
+    )
+    with pytest.raises(ValueError, match="subscription.*conflicts"):
+        load_contract(manifest).bind(inline=[
+            "subscription=00000000-0000-0000-0000-000000000002",
+            f"cluster={reference}",
+        ])
+
+
+def test_enabled_resource_requirement_needs_cluster_read_before_site_construction(tmp_path):
+    enabled = _field(
+        "enableSecretSync", "properties.deployOptions.enableSecretSync",
+        type="boolean", default=False,
+    )
+    required = [
+        {
+            "fact": "connectedClusters.workloadIdentityEnabled",
+            "when": {"input": "enableSecretSync", "equals": True},
+            "description": "Cluster workload identity is enabled.",
+        },
+        {
+            "fact": "connectedClusters.oidcIssuerAvailable",
+            "when": {"input": "enableSecretSync", "equals": True},
+            "description": "Cluster has an OIDC issuer.",
+        },
+    ]
+    manifest, _ = _manifest_and_contract(
+        tmp_path,
+        fields=[*_manual_resource_fields(), enabled, _resource_role(requires=required)],
+    )
+    contract = load_contract(manifest)
+    manual = [
+        "subscription=00000000-0000-0000-0000-000000000001",
+        "resourceGroup=rg-first", "location=eastus", "clusterName=arc-first",
+    ]
+    assert contract.resolve(inline=manual).properties["deployOptions"]["enableSecretSync"] is False
+    with pytest.raises(ValueError, match="requirement-unverified"):
+        contract.bind(inline=[*manual, "enableSecretSync=true"])
+
+
+def test_two_named_resources_bind_independently_without_forcing_same_group(tmp_path):
+    cluster_id = (
+        "/subscriptions/00000000-0000-0000-0000-000000000001/"
+        "resourceGroups/rg-cluster/providers/Microsoft.Kubernetes/"
+        "connectedClusters/arc-cluster"
+    )
+    vault_id = (
+        "/subscriptions/00000000-0000-0000-0000-000000000001/"
+        "resourceGroups/rg-vault/providers/Microsoft.KeyVault/vaults/vault-one"
+    )
+    fields = [
+        *_manual_resource_fields(),
+        _field(
+            "enableSecretSync", "properties.deployOptions.enableSecretSync",
+            type="boolean", default=False,
+        ),
+        _resource_role(),
+        {
+            "name": "existingVault", "type": "azureResourceId",
+            "description": "Existing Key Vault.", "required": False,
+            "when": {"input": "enableSecretSync", "equals": True},
+            "sitePath": "parameters.existingKeyVaultResourceId",
+            "resource": {"type": "Microsoft.KeyVault/vaults",
+                         "apiVersion": "2023-07-01", "subscription": "site"},
+        },
+    ]
+    manifest, _ = _manifest_and_contract(tmp_path, fields=fields)
+    contract = load_contract(manifest)
+    bound = contract.bind(inline=[
+        "enableSecretSync=true", f"cluster={cluster_id}", f"existingVault={vault_id}",
+    ])
+    assert [resource.field.name for resource in bound.resources] == [
+        "cluster", "existingVault",
+    ]
+    site = contract.build_site(bound, {
+        "cluster": ArmResourceObservation(
+            cluster_id, "Microsoft.Kubernetes/connectedClusters",
+            "eastus", "arc-cluster", {},
+        ),
+        "existingVault": ArmResourceObservation(
+            vault_id, "Microsoft.KeyVault/vaults", "westus", "vault-one", {},
+        ),
+    })
+    assert site.resource_group == "rg-cluster"
+    assert site.location == "eastus"
+    assert site.parameters["existingKeyVaultResourceId"] == vault_id
+
+    conflicting = vault_id.replace(
+        "00000000-0000-0000-0000-000000000001",
+        "00000000-0000-0000-0000-000000000002",
+    )
+    with pytest.raises(ValueError, match="subscription-mismatch"):
+        contract.bind(inline=[
+            "enableSecretSync=true", f"cluster={cluster_id}", f"existingVault={conflicting}",
+        ])
+    with pytest.raises(ValueError, match="inactive"):
+        contract.bind(inline=[f"cluster={cluster_id}", f"existingVault={vault_id}"])
+
+
+def test_site_subscription_constraint_uses_mapped_field_independent_of_role_order(tmp_path):
+    sub_id = "00000000-0000-0000-0000-000000000001"
+    other_id = "00000000-0000-0000-0000-000000000002"
+    cluster_id = (
+        f"/subscriptions/{sub_id}/resourceGroups/rg-cluster/"
+        "providers/Microsoft.Kubernetes/connectedClusters/arc-cluster"
+    )
+    vault_id = (
+        f"/subscriptions/{sub_id}/resourceGroups/rg-vault/"
+        "providers/Microsoft.KeyVault/vaults/vault-one"
+    )
+    fields = [
+        _field("targetSubscription", "subscription"),
+        _field("subscription", "parameters.auditSubscription", required=False),
+        _field("resourceGroup", "resourceGroup"),
+        _field("location", "location"),
+        _field("clusterName", "parameters.clusterName"),
+        _field(
+            "enableSecretSync", "properties.deployOptions.enableSecretSync",
+            type="boolean", default=False,
+        ),
+        {
+            "name": "existingVault", "type": "azureResourceId",
+            "description": "Existing Key Vault.", "required": False,
+            "when": {"input": "enableSecretSync", "equals": True},
+            "sitePath": "parameters.existingKeyVaultResourceId",
+            "resource": {"type": "Microsoft.KeyVault/vaults",
+                         "apiVersion": "2023-07-01", "subscription": "site"},
+        },
+        _resource_role(derive={
+            "subscription": "targetSubscription", "resourceGroup": "resourceGroup",
+            "location": "location", "name": "clusterName",
+        }),
+    ]
+    manifest, _ = _manifest_and_contract(tmp_path, fields=fields)
+    contract = load_contract(manifest)
+    bound = contract.bind(inline=[
+        "enableSecretSync=true", f"existingVault={vault_id}",
+        f"cluster={cluster_id}", f"subscription={other_id}",
+    ])
+    assert bound.active_values["targetSubscription"] == sub_id
+    assert [resource.field.name for resource in bound.resources] == [
+        "existingVault", "cluster",
+    ]
+
+    vault_other_sub = vault_id.replace(sub_id, other_id)
+    with pytest.raises(ValueError, match="subscription-mismatch"):
+        contract.bind(inline=[
+            "enableSecretSync=true", f"existingVault={vault_other_sub}",
+            f"cluster={cluster_id}", f"subscription={other_id}",
+        ])
+
+
+@pytest.mark.parametrize(
+    ("role_change", "error"),
+    [
+        ({"resource": {"type": "Microsoft.Kubernetes/connectedClusters",
+                       "apiVersion": "2024-07-15-preview", "provider": "arbitrary"}},
+         "unknown"),
+        ({"resource": {"type": "Microsoft.Kubernetes/connectedClusters",
+                       "apiVersion": "latest"}}, "apiVersion"),
+        ({"resource": {"type": "Microsoft.Kubernetes/connectedClusters",
+                       "apiVersion": "2024-19-91"}}, "apiVersion"),
+        ({"resource": {"type": "Microsoft.Kubernetes/connectedClusters",
+                       "apiVersion": "2024-07-15-preview", "subscription": "another"}},
+         "subscription"),
+        ({"derive": {"id": "unregistered"}}, "derive"),
+        ({"derive": {"subscription": "subscription"},
+          "resource": {"type": "Microsoft.KeyVault/vaults",
+                       "apiVersion": "2023-07-01", "subscription": "site"}},
+         "subscription"),
+        ({"default": "/subscriptions/example"}, "default"),
+        ({"requires": [{"fact": "properties.oidcIssuerProfile.issuerUrl",
+                        "description": "Do not expose issuer."}]}, "fact"),
+        ({"requires": [{"fact": "connectedClusters.oidcIssuerAvailable",
+                        "description": "Issuer is configured."}],
+          "resource": {"type": "Microsoft.KeyVault/vaults",
+                       "apiVersion": "2023-07-01"}}, "fact"),
+    ],
+)
+def test_resource_declarations_reject_open_or_inconsistent_metadata(
+    tmp_path, role_change, error,
+):
+    role = _resource_role(**role_change)
+    manifest, _ = _manifest_and_contract(
+        tmp_path, fields=[*_manual_resource_fields(), role],
+    )
+    with pytest.raises(ValueError, match=error):
+        load_contract(manifest)
+
+
+def test_resource_derivation_rejects_competing_or_defaulted_writers(tmp_path):
+    manual = _manual_resource_fields()
+    manual[0]["default"] = "sub"
+    manifest, _ = _manifest_and_contract(
+        tmp_path, fields=[*manual, _resource_role()],
+    )
+    with pytest.raises(ValueError, match="derive"):
+        load_contract(manifest)
+
+    manual[0].pop("default")
+    manifest.parent.joinpath("inputs.yaml").write_text(
+        yaml.safe_dump({
+            "apiVersion": VERSION, "kind": "SiteInputContract",
+            "inputs": [*manual, _resource_role(), _resource_role("second")],
+        }),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="derive"):
+        load_contract(manifest)
 
 
 def test_example_supports_disabled_condition_and_requires_active_dependent(tmp_path):

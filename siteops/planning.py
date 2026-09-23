@@ -1823,9 +1823,10 @@ _PUBLISHABLE_DIAGNOSTICS = {
 def _publishable_diagnostic(
     diagnostic: PlanDiagnostic,
 ) -> dict[str, str]:
-    if diagnostic.public_summary is not None and diagnostic.code in {
-        "inputs.invalid", "site.invalid", "plan.targeting.conflict",
-    }:
+    if diagnostic.public_summary is not None and (
+        diagnostic.code in {"inputs.invalid", "site.invalid", "plan.targeting.conflict"}
+        or diagnostic.code.startswith("inputs.resource.")
+    ):
         return {
             "code": diagnostic.code,
             "severity": diagnostic.severity.value,

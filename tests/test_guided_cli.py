@@ -11,6 +11,7 @@ from unittest.mock import patch
 import pytest
 import yaml
 
+from siteops.arm_resources import ArmResourceError, ArmResourceObservation
 from siteops.cli import main
 from siteops.compilation import TemplateCompilationSession
 from siteops.guided_inputs import contract_path, load_contract
@@ -87,6 +88,42 @@ def _input_file(path: Path, *, name: str = "one") -> Path:
     return path
 
 
+_CLUSTER_ID = (
+    "/subscriptions/00000000-0000-0000-0000-000000000001/"
+    "resourceGroups/rg-first/providers/Microsoft.Kubernetes/"
+    "connectedClusters/arc-first"
+)
+
+
+def _resource_workspace(workspace: Path) -> Path:
+    path = contract_path(workspace / "manifests" / "test-manifest.yaml")
+    contract = yaml.safe_load(path.read_text(encoding="utf-8"))
+    contract["inputs"].extend([
+        {"name": "resourceGroup", "type": "string", "description": "RG.", "sitePath": "resourceGroup"},
+        {"name": "clusterName", "type": "string", "description": "Arc name.",
+         "sitePath": "parameters.clusterName"},
+        {
+            "name": "cluster", "type": "azureResourceId", "required": False,
+            "description": "Existing cluster.",
+            "resource": {"type": "Microsoft.Kubernetes/connectedClusters",
+                         "apiVersion": "2024-07-15-preview"},
+            "derive": {"subscription": "subscription", "resourceGroup": "resourceGroup",
+                       "location": "location", "name": "clusterName"},
+        },
+    ])
+    path.write_text(yaml.safe_dump(contract), encoding="utf-8")
+    return workspace
+
+
+def _resource_answers(path: Path) -> Path:
+    path.write_text(yaml.safe_dump({
+        "apiVersion": "siteops.inputs/v1", "kind": "SiteInputValues",
+        "values": {"siteName": "one", "subscription": None, "location": None,
+                   "resourceGroup": None, "clusterName": None, "cluster": _CLUSTER_ID},
+    }), encoding="utf-8")
+    return path
+
+
 def test_top_level_help_leads_with_single_site_answers(capsys):
     with patch.object(sys, "argv", ["siteops", "--help"]):
         with pytest.raises(SystemExit) as stopped:
@@ -110,6 +147,19 @@ def test_inputs_help_explains_read_only_preview(capsys):
     assert "preview" in help_text.lower()
     assert "without writing" in help_text.lower()
     assert "--save-site" in help_text
+
+
+def test_resource_reads_are_explicit_optional_command_options(capsys):
+    for command in ("inputs", "plan", "deploy"):
+        with patch.object(sys, "argv", ["siteops", command, "--help"]):
+            with pytest.raises(SystemExit) as stopped:
+                main()
+        assert stopped.value.code == 0
+        assert "--read-resources" in capsys.readouterr().out
+    with patch.object(sys, "argv", ["siteops", "validate", "--help"]):
+        with pytest.raises(SystemExit) as stopped:
+            main()
+    assert "--read-resources" not in capsys.readouterr().out
 
 
 def test_inputs_inspection_and_example_are_not_executable(
@@ -177,6 +227,151 @@ def test_inputs_preview_redacts_site_in_automation(
     assert document["resolution"] == {"status": "ready", "site": None}
     assert "PRIVATE_TARGET_NAME" not in output.out + output.err
     assert "00000000-0000-0000-0000-000000000001" not in output.out + output.err
+
+
+def test_resource_plan_reads_only_selected_role_before_planning(
+    guided_workspace, tmp_path, capsys,
+):
+    workspace = _resource_workspace(guided_workspace)
+    answers = _resource_answers(tmp_path / "answers.yaml")
+    calls = []
+
+    class Reader:
+        identity = SimpleNamespace(name="azure-cli", version=None)
+
+        def read(self, ref, *, facts=frozenset()):
+            calls.append((ref.resource_id, facts))
+            return ArmResourceObservation(
+                _CLUSTER_ID, "Microsoft.Kubernetes/connectedClusters",
+                "eastus", "arc-first", {},
+            )
+
+    with patch("siteops.cli.new_arm_reader", return_value=Reader()):
+        assert _invoke([
+            "-w", str(workspace), "plan", _manifest(workspace),
+            "--describe", "--input-file", str(answers),
+            "--read-resources", "--output", "json",
+        ]) == 0
+    document = json.loads(capsys.readouterr().out)
+    assert [target["name"] for target in document["plan"]["targets"]] == ["one"]
+    assert calls == [(_CLUSTER_ID, frozenset())]
+
+
+def test_invalid_manifest_fails_before_any_resource_read(
+    guided_workspace, tmp_path, capsys,
+):
+    workspace = _resource_workspace(guided_workspace)
+    answers = _resource_answers(tmp_path / "answers.yaml")
+    (workspace / "manifests" / "test-manifest.yaml").write_text(
+        "apiVersion: siteops/v1\nkind: Manifest\nsteps: [\n",
+        encoding="utf-8",
+    )
+    with patch("siteops.cli.new_arm_reader", side_effect=AssertionError("No Azure read")):
+        assert _invoke([
+            "-w", str(workspace), "plan", _manifest(workspace),
+            "--describe", "--input-file", str(answers),
+            "--read-resources", "--output", "json",
+        ]) == 1
+    assert "invalid" in capsys.readouterr().out
+
+
+def test_resource_id_without_read_flag_cannot_use_manual_fallback(
+    guided_workspace, tmp_path, capsys,
+):
+    workspace = _resource_workspace(guided_workspace)
+    answers = _input_file(tmp_path / "answers.yaml")
+    data = yaml.safe_load(answers.read_text(encoding="utf-8"))
+    data["values"].update(
+        resourceGroup="rg-first", clusterName="arc-first", cluster=_CLUSTER_ID,
+    )
+    answers.write_text(yaml.safe_dump(data), encoding="utf-8")
+    with patch(
+        "siteops.cli.new_arm_reader",
+        side_effect=AssertionError("No ARM reader may be created."),
+    ):
+        assert _invoke([
+            "-w", str(workspace), "plan", _manifest(workspace),
+            "--describe", "--input-file", str(answers), "--output", "json",
+        ]) == 1
+    document = json.loads(capsys.readouterr().out)
+    assert "read-resources" in document["diagnostics"][0]["summary"]
+
+
+def test_validate_resource_inputs_points_to_an_actual_read_command(
+    guided_workspace, tmp_path, capsys,
+):
+    workspace = _resource_workspace(guided_workspace)
+    answers = _resource_answers(tmp_path / "answers.yaml")
+    with patch(
+        "siteops.cli.new_arm_reader",
+        side_effect=AssertionError("validate must not read Azure"),
+    ):
+        assert _invoke([
+            "-w", str(workspace), "validate", _manifest(workspace),
+            "--input-file", str(answers),
+        ]) == 1
+    error = capsys.readouterr().err
+    assert "siteops plan" in error
+    assert "--describe --read-resources" in error
+
+
+def test_read_flag_requires_a_typed_resource_target(
+    guided_workspace, tmp_path, capsys,
+):
+    answers = _input_file(tmp_path / "answers.yaml")
+    with patch(
+        "siteops.cli.new_arm_reader",
+        side_effect=AssertionError("No reader may be constructed."),
+    ):
+        assert _invoke([
+            "-w", str(guided_workspace), "plan", _manifest(guided_workspace),
+            "--describe", "--input-file", str(answers), "--read-resources",
+            "--output", "json",
+        ]) == 1
+    output = json.loads(capsys.readouterr().out)
+    assert output["diagnostics"][0]["code"] == "inputs.resource.nothing-to-read"
+
+
+def test_read_flag_alone_never_selects_manifest_fleet(
+    guided_workspace, capsys,
+):
+    with patch.object(
+        Orchestrator, "build_plan",
+        side_effect=AssertionError("No fleet plan may be built."),
+    ):
+        assert _invoke([
+            "-w", str(guided_workspace), "plan", _manifest(guided_workspace),
+            "--describe", "--read-resources", "--output", "json",
+        ]) == 1
+    output = json.loads(capsys.readouterr().out)
+    assert output["diagnostics"][0]["code"] == "inputs.resource.nothing-to-read"
+
+
+def test_redacted_resource_failure_does_not_reveal_id_or_target(
+    guided_workspace, tmp_path, monkeypatch, capsys,
+):
+    workspace = _resource_workspace(guided_workspace)
+    answers = _resource_answers(tmp_path / "answers.yaml")
+    monkeypatch.setenv("SITEOPS_REDACT_OUTPUT", "1")
+
+    class Reader:
+        identity = SimpleNamespace(name="azure-cli", version=None)
+
+        def read(self, ref, *, facts=frozenset()):
+            raise ArmResourceError("FORBIDDEN")
+
+    with patch("siteops.cli.new_arm_reader", return_value=Reader()):
+        assert _invoke([
+            "-w", str(workspace), "plan", _manifest(workspace),
+            "--describe", "--input-file", str(answers),
+            "--read-resources", "--output", "json",
+        ]) == 1
+    output = capsys.readouterr()
+    document = json.loads(output.out)
+    assert document["diagnostics"][0]["code"] == "inputs.resource.forbidden"
+    assert _CLUSTER_ID not in output.out + output.err
+    assert "00000000-0000-0000-0000-000000000001" not in output.out + output.err
+    assert "rg-first" not in output.out + output.err
 
 
 def test_incomplete_input_preview_fails_without_writing(
@@ -489,6 +684,9 @@ def test_aio_input_inspection_distinguishes_required_and_defaulted(capsys):
     assert fields["clusterName"]["status"] == "required"
     assert fields["environment"]["status"] == "required"
     assert fields["country"]["status"] == "required"
+    assert fields["cluster"]["type"] == "azureResourceId"
+    assert fields["subscription"]["derivableFrom"] == ["cluster"]
+    assert fields["enableSecretSync"]["default"] is False
     assert fields["aioRelease"]["status"] == "defaulted"
     assert fields["aioRelease"]["default"] == "2608"
     assert fields["enableCertManager"]["default"] is True
@@ -501,6 +699,18 @@ def test_aio_boolean_defaults_use_answer_file_spelling(capsys):
     output = capsys.readouterr().out
     assert "Default: true" in output
     assert "Default: True" not in output
+
+
+def test_aio_input_inspection_explains_resource_alternative(capsys):
+    root = Path(__file__).resolve().parents[1]
+    workspace = root / "workspaces" / "iot-operations"
+    assert _invoke(["-w", str(workspace), "inputs", "aio-install"]) == 0
+    output = capsys.readouterr().out
+    assert "derived from cluster" in output
+    assert "Microsoft.Kubernetes/connectedClusters" in output
+    assert "read-resources" in output
+    assert "workload identity" in output
+    assert "Active when enableSecretSync=true" in output
 
 
 def test_aio_plain_preview_shows_effective_defaults(capsys):
@@ -554,6 +764,249 @@ def test_aio_inputs_prepare_one_explicit_target_without_example_site(capsys):
     assert dispositions["secretsync"] == "skip"
 
 
+def test_aio_enabled_without_cluster_observation_fails_before_planning(capsys):
+    root = Path(__file__).resolve().parents[1]
+    workspace = root / "workspaces" / "iot-operations"
+    with (
+        patch("siteops.cli.new_arm_reader", side_effect=AssertionError("No provider read")),
+        patch.object(Orchestrator, "build_plan", side_effect=AssertionError("No plan")),
+    ):
+        assert _invoke([
+            "-w", str(workspace), "plan", "aio-install", "--describe",
+            "--input", "siteName=plant-one",
+            "--input", "subscription=00000000-0000-0000-0000-000000000001",
+            "--input", "resourceGroup=rg-first",
+            "--input", "location=eastus",
+            "--input", "clusterName=arc-first",
+            "--input", "environment=dev",
+            "--input", "country=US",
+            "--input", "enableSecretSync=true",
+            "--output", "json",
+        ]) == 1
+    document = json.loads(capsys.readouterr().out)
+    assert document["diagnostics"][0]["code"] == "inputs.resource.requirement-unverified"
+
+
+@pytest.mark.parametrize("workload_ready", [False, True])
+def test_aio_enabled_observes_prerequisites_before_one_plan(
+    capsys, workload_ready,
+):
+    root = Path(__file__).resolve().parents[1]
+    workspace = root / "workspaces" / "iot-operations"
+    facts_requested = frozenset({
+        "connectedClusters.workloadIdentityEnabled",
+        "connectedClusters.oidcIssuerAvailable",
+    })
+    calls = []
+
+    class Reader:
+        identity = SimpleNamespace(name="azure-cli", version=None)
+
+        def read(self, ref, *, facts=frozenset()):
+            calls.append((ref.resource_id, facts))
+            return ArmResourceObservation(
+                _CLUSTER_ID, "Microsoft.Kubernetes/connectedClusters",
+                "eastus", "arc-first",
+                {
+                    "connectedClusters.workloadIdentityEnabled": workload_ready,
+                    "connectedClusters.oidcIssuerAvailable": True,
+                },
+            )
+
+    with patch("siteops.cli.new_arm_reader", return_value=Reader()):
+        assert _invoke([
+            "-w", str(workspace), "plan", "aio-install", "--describe",
+            "--input", "siteName=plant-one",
+            "--input", "environment=dev",
+            "--input", "country=US",
+            "--input", "enableSecretSync=true",
+            "--input", f"cluster={_CLUSTER_ID}",
+            "--read-resources",
+            "--output", "json",
+        ]) == (0 if workload_ready else 1)
+    document = json.loads(capsys.readouterr().out)
+    assert calls == [(_CLUSTER_ID, facts_requested)]
+    if workload_ready:
+        dispositions = {
+            operation["identity"]["step"]: operation["disposition"]
+            for operation in document["plan"]["targets"][0]["operations"]
+        }
+        assert dispositions["aio-instance"] == "execute"
+        assert dispositions["resolve-aio"] == "execute"
+        assert dispositions["secretsync"] == "execute"
+    else:
+        assert document["diagnostics"][0]["code"] == "inputs.resource.requirement-unmet"
+
+
+@pytest.mark.parametrize("workload_ready", [False, True])
+def test_enabled_deploy_read_gate_precedes_executor(
+    capsys, workload_ready,
+):
+    root = Path(__file__).resolve().parents[1]
+    workspace = root / "workspaces" / "iot-operations"
+    observed = []
+
+    class Reader:
+        identity = SimpleNamespace(name="azure-cli", version=None)
+
+        def read(self, ref, *, facts=frozenset()):
+            observed.append(ref.resource_type)
+            return ArmResourceObservation(
+                _CLUSTER_ID, "Microsoft.Kubernetes/connectedClusters",
+                "eastus", "arc-first",
+                {
+                    "connectedClusters.workloadIdentityEnabled": workload_ready,
+                    "connectedClusters.oidcIssuerAvailable": True,
+                },
+            )
+
+    with (
+        patch("siteops.cli.new_arm_reader", return_value=Reader()),
+        patch.object(
+            Orchestrator, "deploy",
+            return_value=SimpleNamespace(exit_code=0),
+        ) as deploy,
+        patch("siteops.cli._write_run_result"),
+    ):
+        assert _invoke([
+            "-w", str(workspace), "deploy", "aio-install",
+            "--input", "siteName=plant-one", "--input", "environment=dev",
+            "--input", "country=US", "--input", "enableSecretSync=true",
+            "--input", f"cluster={_CLUSTER_ID}", "--read-resources",
+        ]) == (0 if workload_ready else 1)
+    capsys.readouterr()
+    assert observed == ["Microsoft.Kubernetes/connectedClusters"]
+    if workload_ready:
+        deploy.assert_called_once()
+        sites = deploy.call_args.kwargs["sites"]
+        assert len(sites) == 1
+        assert sites[0].parameters["clusterName"] == "arc-first"
+        assert sites[0].properties["deployOptions"]["enableSecretSync"] is True
+    else:
+        deploy.assert_not_called()
+
+
+def test_aio_existing_vault_reads_second_role_without_retargeting_site(capsys):
+    root = Path(__file__).resolve().parents[1]
+    workspace = root / "workspaces" / "iot-operations"
+    vault_id = (
+        "/subscriptions/00000000-0000-0000-0000-000000000001/"
+        "resourceGroups/rg-vault/providers/Microsoft.KeyVault/vaults/vault-one"
+    )
+    calls = []
+
+    class Reader:
+        identity = SimpleNamespace(name="azure-cli", version=None)
+
+        def read(self, ref, *, facts=frozenset()):
+            calls.append((ref.resource_type, facts))
+            if ref.resource_type == "Microsoft.KeyVault/vaults":
+                return ArmResourceObservation(
+                    vault_id, "Microsoft.KeyVault/vaults", "westus", "vault-one", {},
+                )
+            return ArmResourceObservation(
+                _CLUSTER_ID, "Microsoft.Kubernetes/connectedClusters",
+                "eastus", "arc-first",
+                {
+                    "connectedClusters.workloadIdentityEnabled": True,
+                    "connectedClusters.oidcIssuerAvailable": True,
+                },
+            )
+
+    with patch("siteops.cli.new_arm_reader", return_value=Reader()):
+        assert _invoke([
+            "-w", str(workspace), "inputs", "aio-install",
+            "--input", "siteName=plant-one",
+            "--input", "environment=dev",
+            "--input", "country=US",
+            "--input", "enableSecretSync=true",
+            "--input", f"cluster={_CLUSTER_ID}",
+            "--input", f"existingVault={vault_id}",
+            "--read-resources", "--output", "json",
+        ]) == 0
+    result = json.loads(capsys.readouterr().out)
+    site = result["resolution"]["site"]
+    assert site["resourceGroup"] == "rg-first"
+    assert site["location"] == "eastus"
+    assert site["parameters"]["existingKeyVaultResourceId"] == vault_id
+    assert result["resolution"]["resourceReads"]["resourceCount"] == 2
+    assert [name for name, _ in calls] == [
+        "Microsoft.Kubernetes/connectedClusters", "Microsoft.KeyVault/vaults",
+    ]
+    assert calls[1][1] == frozenset()
+
+
+def test_aio_existing_vault_sub_mismatch_stops_before_any_read(capsys):
+    root = Path(__file__).resolve().parents[1]
+    workspace = root / "workspaces" / "iot-operations"
+    vault_other_sub = (
+        "/subscriptions/00000000-0000-0000-0000-000000000002/"
+        "resourceGroups/rg-vault/providers/Microsoft.KeyVault/vaults/vault-one"
+    )
+    with patch("siteops.cli.new_arm_reader", side_effect=AssertionError("No Azure read")):
+        assert _invoke([
+            "-w", str(workspace), "plan", "aio-install", "--describe",
+            "--input", "siteName=plant-one", "--input", "environment=dev",
+            "--input", "country=US", "--input", "enableSecretSync=true",
+            "--input", f"cluster={_CLUSTER_ID}",
+            "--input", f"existingVault={vault_other_sub}",
+            "--read-resources", "--output", "json",
+        ]) == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["diagnostics"][0]["code"] == "inputs.resource.subscription-mismatch"
+
+
+def _aio_template_session(tmp_path: Path) -> TemplateCompilationSession:
+    def runner(argv: tuple[str, ...], timeout: int) -> subprocess.CompletedProcess[str]:
+        if argv[1:] == ("version", "--output", "json"):
+            return subprocess.CompletedProcess(argv, 0, '{"azure-cli":"test"}', "")
+        if argv[1:] == ("bicep", "version"):
+            return subprocess.CompletedProcess(argv, 0, "Bicep CLI version test", "")
+        if argv[1:3] != ("bicep", "build"):
+            raise AssertionError(f"Unexpected local tool invocation: {argv}")
+        source = Path(argv[argv.index("--file") + 1])
+        target = Path(argv[argv.index("--outfile") + 1])
+        parameters = (
+            {"tags": {"type": "object"}}
+            if source.name in {"schema-registry.bicep", "adr-ns.bicep"}
+            else {"existingKeyVaultResourceId": {"type": "string", "defaultValue": ""}}
+            if source.name == "enable-secretsync.bicep" else {}
+        )
+        outputs = {
+            name: {"type": "string"} for name in (
+                "customLocationId", "customLocationName", "customLocationNamespace",
+                "connectedClusterName", "oidcIssuerUrl", "instanceLocation",
+                "identityType", "schemaRegistryResourceId", "adrNamespaceResourceId",
+                "instanceDescription", "defaultSecretProviderClassResourceId",
+            )
+        }
+        outputs.update({
+            "schemaRegistry": {"type": "object"},
+            "adrNamespace": {"type": "object"},
+            "clExtensionIds": {"type": "array"},
+            "instanceTags": {"type": "object"},
+            "userAssignedIdentities": {"type": "object"},
+            "features": {"type": "object"},
+        })
+        template = {
+            "$schema": (
+                "https://schema.management.azure.com/schemas/"
+                "2019-04-01/deploymentTemplate.json#"
+            ),
+            "contentVersion": "1.0.0.0",
+            "parameters": parameters,
+            "resources": [],
+            "outputs": outputs,
+        }
+        target.write_text(json.dumps(template), encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    return TemplateCompilationSession(
+        command_runner=runner,
+        tool_resolver=lambda name: str(tmp_path / "tools" / name),
+    )
+
+
 def test_aio_executable_preparation_resolves_country_and_environment_tags(
     tmp_path,
 ):
@@ -570,39 +1023,7 @@ def test_aio_executable_preparation_resolves_country_and_environment_tags(
         "environment=dev",
         "country=US",
     ])
-
-    def runner(argv: tuple[str, ...], timeout: int) -> subprocess.CompletedProcess[str]:
-        if argv[1:] == ("version", "--output", "json"):
-            return subprocess.CompletedProcess(argv, 0, '{"azure-cli":"test"}', "")
-        if argv[1:] == ("bicep", "version"):
-            return subprocess.CompletedProcess(argv, 0, "Bicep CLI version test", "")
-        if argv[1:3] != ("bicep", "build"):
-            raise AssertionError(f"Unexpected local tool invocation: {argv}")
-        source = Path(argv[argv.index("--file") + 1])
-        target = Path(argv[argv.index("--outfile") + 1])
-        template = {
-            "$schema": (
-                "https://schema.management.azure.com/schemas/"
-                "2019-04-01/deploymentTemplate.json#"
-            ),
-            "contentVersion": "1.0.0.0",
-            "parameters": {
-                "tags": {"type": "object"},
-            } if source.name in {"schema-registry.bicep", "adr-ns.bicep"} else {},
-            "resources": [],
-            "outputs": {
-                "schemaRegistry": {"type": "object"},
-                "adrNamespace": {"type": "object"},
-                "clExtensionIds": {"type": "array"},
-            },
-        }
-        target.write_text(json.dumps(template), encoding="utf-8")
-        return subprocess.CompletedProcess(argv, 0, "", "")
-
-    session = TemplateCompilationSession(
-        command_runner=runner,
-        tool_resolver=lambda name: str(tmp_path / "tools" / name),
-    )
+    session = _aio_template_session(tmp_path)
     with patch("siteops.orchestrator.TemplateCompilationSession", return_value=session):
         result = Orchestrator(workspace).build_plan(
             manifest, sites=[site], intent=PlanIntent.EXECUTABLE,
@@ -632,3 +1053,56 @@ def test_aio_executable_preparation_resolves_country_and_environment_tags(
         )
         assert resolve_plan_value(tags, {})["environment"] == "dev"
         assert resolve_plan_value(tags, {})["country"] == "US"
+
+
+def test_aio_executable_preparation_binds_existing_vault_from_second_resource(
+    tmp_path,
+):
+    root = Path(__file__).resolve().parents[1]
+    workspace = root / "workspaces" / "iot-operations"
+    manifest = workspace / "manifests" / "aio-install" / "manifest.yaml"
+    contract = load_contract(manifest)
+    vault_id = (
+        "/subscriptions/00000000-0000-0000-0000-000000000001/"
+        "resourceGroups/rg-vault/providers/Microsoft.KeyVault/vaults/vault-one"
+    )
+    bound = contract.bind(inline=[
+        "siteName=plant-one", "environment=dev", "country=US",
+        "enableSecretSync=true", f"cluster={_CLUSTER_ID}",
+        f"existingVault={vault_id}",
+    ])
+    site = contract.build_site(bound, {
+        "cluster": ArmResourceObservation(
+            _CLUSTER_ID, "Microsoft.Kubernetes/connectedClusters",
+            "eastus", "arc-first",
+            {
+                "connectedClusters.workloadIdentityEnabled": True,
+                "connectedClusters.oidcIssuerAvailable": True,
+            },
+        ),
+        "existingVault": ArmResourceObservation(
+            vault_id, "Microsoft.KeyVault/vaults", "westus", "vault-one", {},
+        ),
+    })
+    session = _aio_template_session(tmp_path)
+    with patch("siteops.orchestrator.TemplateCompilationSession", return_value=session):
+        result = Orchestrator(workspace).build_plan(
+            manifest, sites=[site], intent=PlanIntent.EXECUTABLE,
+        )
+    assert result.status is PlanStatus.PLANNED, result.diagnostics
+    assert result.plan is not None
+    operations = {
+        operation.identity.step: operation
+        for operation in result.plan.targets[0].operations
+    }
+    assert operations["resolve-aio"].disposition is PlanDisposition.EXECUTE
+    secret_sync = operations["secretsync"]
+    assert secret_sync.disposition is PlanDisposition.EXECUTE
+    assert isinstance(secret_sync.details, DeploymentOperation)
+    assert secret_sync.details.parameters is not None
+    linked_vault = next(
+        entry.value for entry in secret_sync.details.parameters.entries
+        if isinstance(entry.key, LiteralValue)
+        and entry.key.value == "existingKeyVaultResourceId"
+    )
+    assert resolve_plan_value(linked_vault, {}) == vault_id

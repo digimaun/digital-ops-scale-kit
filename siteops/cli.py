@@ -32,6 +32,7 @@ from typing import Any, Callable
 import yaml
 
 from siteops import __version__
+from siteops.arm_resources import ArmResourceError, new_arm_reader
 from siteops.artifacts import ArtifactError
 from siteops.browse import (
     BrowseError,
@@ -47,6 +48,8 @@ from siteops.command_context import open_command_context, require_trust_inputs
 from siteops.composition import CompositionError, report_composition_error
 from siteops.guided_inputs import (
     GuidedInputError,
+    InputContract,
+    ResourceInputError,
     load_contract,
     load_direct_site,
     write_yaml_exclusive,
@@ -461,6 +464,14 @@ class ExplicitSiteConflict(GuidedInputError):
     """An explicit Site conflicts with another target-selection form."""
 
 
+class ResourceReadError(GuidedInputError):
+    """Value-safe resource admission failure with a stable public code."""
+
+    def __init__(self, code: str, message: str):
+        self.code = f"inputs.resource.{code}"
+        super().__init__(f"{self.code}: {message}")
+
+
 def _guided_error_detail(error: Exception) -> str:
     return str(error) if isinstance(error, GuidedInputError) else report_site_load_error(error)
 
@@ -471,7 +482,10 @@ def _explicit_site_failure(
     *,
     intent: PlanIntent,
 ) -> PlanBuildResult:
-    if isinstance(error, ExplicitSiteConflict):
+    if isinstance(error, (ResourceReadError, ResourceInputError)):
+        code = error.code
+        summary = str(error)
+    elif isinstance(error, ExplicitSiteConflict):
         code = "plan.targeting.conflict"
         summary = str(error)
     elif getattr(args, "site_file", None):
@@ -497,11 +511,22 @@ def _explicit_site_failure(
     )
 
 
-def _explicit_site(args: argparse.Namespace, manifest_path: Path) -> Site | None:
+def _explicit_site(
+    args: argparse.Namespace, manifest_path: Path, orchestrator: Orchestrator,
+) -> Site | None:
     site_file = getattr(args, "site_file", None)
     input_file = getattr(args, "input_file", None)
     inline = getattr(args, "input_values", None)
+    read_resources = getattr(args, "read_resources", False)
+    if read_resources and (site_file or getattr(args, "selector", None)):
+        raise ExplicitSiteConflict(
+            "--read-resources requires typed answers, not --site-file or -l/--selector."
+        )
     if not (site_file or input_file or inline):
+        if read_resources:
+            raise ResourceReadError(
+                "nothing-to-read", "Supply a declared resource ID with --input or --input-file."
+            )
         return None
     if getattr(args, "selector", None):
         raise ExplicitSiteConflict("An explicit Site cannot be combined with -l/--selector.")
@@ -523,7 +548,10 @@ def _explicit_site(args: argparse.Namespace, manifest_path: Path) -> Site | None
             "This manifest has no typed input contract. Use --site-file with "
             "a complete Site, or configure Sites in your project."
         )
-    return contract.resolve(values_file=input_file, inline=inline)
+    site, _ = _resolve_typed_site(
+        contract, args, manifest_path=manifest_path, orchestrator=orchestrator,
+    )
+    return site
 
 
 def _announce_explicit_site(args: argparse.Namespace, site: Site) -> None:
@@ -565,6 +593,55 @@ def _require_operator_file_path(path: Path, args: argparse.Namespace) -> None:
         raise GuidedInputError("Do not write operator files into a verified workspace package.")
 
 
+def _resolve_typed_site(
+    contract: InputContract,
+    args: argparse.Namespace,
+    *,
+    manifest_path: Path,
+    orchestrator: Orchestrator,
+) -> tuple[Site, dict[str, Any] | None]:
+    bound = contract.bind(values_file=args.input_file, inline=args.input_values)
+    if not bound.resources:
+        if getattr(args, "read_resources", False):
+            raise ResourceReadError("nothing-to-read", "No active resource ID input was supplied.")
+        return contract.build_site(bound), None
+    if not getattr(args, "read_resources", False):
+        if getattr(args, "command", None) == "validate":
+            raise ResourceReadError(
+                "read-required",
+                "Validation does not read Azure resources. Use "
+                "`siteops plan MANIFEST --describe --read-resources` "
+                "with the same answers.",
+            )
+        raise ResourceReadError(
+            "read-required", "Resource ID inputs need --read-resources before planning."
+        )
+    orchestrator.load_manifest(manifest_path)
+    try:
+        reader = new_arm_reader()
+    except ArmResourceError as error:
+        raise ResourceReadError(
+            "provider-unavailable", f"The selected resource reader is unavailable ({error.code})."
+        ) from None
+    observations = {}
+    for index, resource in enumerate(bound.resources, start=1):
+        name = resource.field.name
+        print(
+            f"Reading declared resource {_content_text(name)} "
+            f"{index}/{len(bound.resources)} using {_content_text(reader.identity.name)}.",
+            file=sys.stderr,
+        )
+        try:
+            observations[name] = reader.read(resource.ref, facts=resource.required_facts)
+        except ArmResourceError as error:
+            raise ResourceReadError(error.code.lower().replace("_", "-"), f"Input '{name}' read failed.") from None
+    site = contract.build_site(bound, observations)
+    return site, {
+        "provider": {"name": reader.identity.name, "version": reader.identity.version},
+        "resourceCount": len(observations),
+    }
+
+
 def cmd_inputs(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
     """Inspect an authored input contract or emit a completed ordinary Site."""
     manifest_path = _command_manifest(args)
@@ -580,17 +657,25 @@ def cmd_inputs(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
                 "This manifest has no typed input contract. Use a complete "
                 "Site file or inspect the manifest's authored guidance."
             )
-        if args.example and (args.save_site or args.input_file or args.input_values):
-            raise GuidedInputError("--example cannot be combined with answers or --save-site.")
+        if args.example and (
+            args.save_site or args.input_file or args.input_values or args.read_resources
+        ):
+            raise GuidedInputError(
+                "--example cannot be combined with answers, --save-site or --read-resources."
+            )
         if args.example:
             _require_operator_file_path(args.example, args)
         resolved_site: Site | None = None
-        if args.input_file or args.input_values or args.save_site:
+        resource_summary: dict[str, Any] | None = None
+        if args.input_file or args.input_values or args.save_site or args.read_resources:
             if args.input_file is not None:
                 _require_operator_file_path(args.input_file, args)
-            resolved_site = contract.resolve(
-                values_file=args.input_file,
-                inline=args.input_values,
+            if args.read_resources and not (args.input_file or args.input_values):
+                raise ResourceReadError(
+                    "nothing-to-read", "Supply a declared resource ID before requesting a read."
+                )
+            resolved_site, resource_summary = _resolve_typed_site(
+                contract, args, manifest_path=manifest_path, orchestrator=orchestrator,
             )
             errors = orchestrator.validate(
                 manifest_path,
@@ -605,6 +690,8 @@ def cmd_inputs(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
                 "status": "ready",
                 "site": None if is_redaction_enabled() else _site_document(resolved_site),
             }
+            if resource_summary is not None:
+                description["resolution"]["resourceReads"] = resource_summary
             if args.output == "plain" and not is_redaction_enabled():
                 document = yaml.safe_dump(
                     description["resolution"]["site"],
@@ -648,11 +735,46 @@ def cmd_inputs(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
             else:
                 print(f"Inputs for {manifest_name}:")
                 for field in description["inputs"]:
+                    status = field["status"]
+                    if field.get("derivableFrom"):
+                        status += " or derived from " + ", ".join(field["derivableFrom"])
                     print(
                         f"  {_content_text(field['name'])} "
-                        f"({_content_text(field['type'])}, {_content_text(field['status'])})"
+                        f"({_content_text(field['type'])}, {_content_text(status)})"
                         f": {_content_text(field['description'])}"
                     )
+                    if "when" in field:
+                        condition = field["when"]
+                        print(
+                            "    Active when "
+                            + _content_text(condition["input"])
+                            + "="
+                            + _content_text(json.dumps(condition["equals"]))
+                        )
+                    if "resource" in field:
+                        print(
+                            "    ARM type: "
+                            + _content_text(field["resource"]["type"])
+                            + ". Read only with --read-resources."
+                        )
+                        if field.get("derive"):
+                            print(
+                                "    Derives: "
+                                + _content_text(", ".join(field["derive"].values()))
+                            )
+                        for requirement in field.get("requires", []):
+                            condition = requirement.get("when")
+                            condition_text = (
+                                f" when {condition['input']}="
+                                f"{json.dumps(condition['equals'])}"
+                                if condition is not None else ""
+                            )
+                            print(
+                                "    Prerequisite"
+                                + _content_text(condition_text)
+                                + ": "
+                                + _content_text(requirement["description"])
+                            )
                     if "default" in field:
                         value = field["default"]
                         shown = json.dumps(value) if isinstance(value, bool) else str(value)
@@ -685,7 +807,7 @@ def cmd_plan(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
         else PlanIntent.EXECUTABLE
     )
     try:
-        explicit_site = _explicit_site(args, manifest_path)
+        explicit_site = _explicit_site(args, manifest_path, orchestrator)
     except (OSError, ValueError, yaml.YAMLError) as error:
         result = _explicit_site_failure(args, error, intent=intent)
         _write_plan_result(result, json_output=json_output, projection=projection)
@@ -809,7 +931,7 @@ def cmd_deploy(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
         return 1
 
     try:
-        explicit_site = _explicit_site(args, manifest_path)
+        explicit_site = _explicit_site(args, manifest_path, orchestrator)
     except (OSError, ValueError, yaml.YAMLError) as error:
         if json_output:
             failed = _explicit_site_failure(args, error, intent=PlanIntent.EXECUTABLE)
@@ -935,7 +1057,7 @@ def cmd_validate(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
         return 1
     try:
         manifest = orchestrator.load_manifest(manifest_path)
-        explicit_site = _explicit_site(args, manifest_path)
+        explicit_site = _explicit_site(args, manifest_path, orchestrator)
     except (ValueError, OSError, yaml.YAMLError) as error:
         _write_plain_validation_errors([_guided_error_detail(error)])
         return 1
@@ -1744,6 +1866,11 @@ Examples:
             "--offline", action="store_true",
             help="Use the pinned package and proof already in cache, without source requests",
         )
+    for command in (p_plan, p_deploy):
+        command.add_argument(
+            "--read-resources", action="store_true",
+            help="Read only supplied, declared ARM resource IDs with the selected Azure provider before preparing the Site",
+        )
 
     p_inputs = subparsers.add_parser(
         "inputs",
@@ -1774,6 +1901,10 @@ Examples:
     p_inputs.add_argument(
         "--save-site", type=Path, metavar="FILE",
         help="Write a validated Site to a new file after resolving complete typed answers",
+    )
+    p_inputs.add_argument(
+        "--read-resources", action="store_true",
+        help="Read only supplied, declared ARM resource IDs with the selected Azure provider before previewing the Site",
     )
     p_inputs.add_argument(
         "--offline", action="store_true",

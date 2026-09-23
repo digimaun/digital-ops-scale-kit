@@ -102,6 +102,11 @@ properties:
 
 A site is reachable by its filename basename, its relative path under the trusted directory, or its internal `name:` field. The three forms are symmetric. By convention `name:` matches the basename, but it can differ when a friendlier identifier is needed. See [targeting.md](targeting.md) for the full identity model and the workspace invariants the orchestrator enforces at load time.
 
+Saving with `siteops inputs ... --save-site` into the selected `sites/`
+inventory checks Site identities before writing. A later plan loads that
+inventory again so concurrent or subsequent configuration changes are
+still checked.
+
 **Subscription-level site** (for shared resources):
 
 ```yaml

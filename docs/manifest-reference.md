@@ -96,8 +96,9 @@ Each ordinary `inputs` row declares one semantic name, a `string` or
 `boolean` type, description, and a destination under `name`,
 `subscription`, `resourceGroup`, `location`, `labels`, `parameters`, or
 `properties`.
-An input without a default is required. Defaults, then answer files, then
-inline answers contribute values. A conditional row may use
+An input without a default is required unless `required: false` is
+declared. Defaults, then answer files, then inline answers contribute
+values. A conditional row may use
 `when: {input: featureEnabled, equals: true}` to require it only when a
 previously declared unconditional controller has that value. Contracts
 declaring `sensitive: true` are rejected in this initial route until protected
@@ -126,6 +127,13 @@ inputs:
     name: clusterName
 ```
 
+When an optional resource ID derives required fields, `inputs --example`
+includes `cluster: null` alongside required fields left null. Leave the
+resource null for manual answers, or fill its ID and use
+`--read-resources` to derive the matching target facts. A null optional
+ID does not trigger an Azure read. The example remains incomplete until
+the operator supplies every requirement through one route.
+
 An operator provides `cluster` through the same `--input NAME=VALUE`
 or answer file used for strings, and explicitly adds `--read-resources`
 to `inputs`, `plan` or `deploy`. If the role is omitted, ordinary manual
@@ -144,7 +152,7 @@ cluster role can declare `requires` facts
 boolean input. An active prerequisite must be verified by an explicit
 read or input resolution fails before deployment. Neither fact proves
 readiness or secret materialization. The selected workspace declares
-resource types and allowed mappings; Site Ops selects the read provider
+resource types and allowed mappings. Site Ops selects the read provider
 and the operator's configured Azure identity. A later SDK reader can
 use the same contract and pinned ARM API version.
 

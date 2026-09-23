@@ -36,6 +36,12 @@ siteops deploy manifests/aio-install/manifest.yaml                    # all env=
 siteops deploy manifests/aio-install/manifest.yaml -l name=munich-dev # only munich-dev
 ```
 
+The default `environment=dev` selects every matching Site, including one
+that already runs AIO. To install on a separate new cohort, review a plan
+with explicit `-l name=...` values and use the same selector for deploy.
+Reapplying `aio-install` to an existing AIO Site can overwrite settings
+managed there.
+
 ## Selector grammar
 
 A selector is one or more `key=value` pairs joined by commas. Pairs AND-combine across distinct keys.

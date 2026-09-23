@@ -103,6 +103,16 @@ def test_project_source_renewal_and_saved_site_guide_are_executable():
     assert "separate fleet deployment" in normalized and "already runs AIO" in normalized
 
 
+def test_reference_distinguishes_required_inputs_from_resource_derivation():
+    reference = (GUIDE.parent / "manifest-reference.md").read_text(encoding="utf-8")
+    targeting = (GUIDE.parent / "targeting.md").read_text(encoding="utf-8")
+    configuration = (GUIDE.parent / "site-configuration.md").read_text(encoding="utf-8")
+    assert "unless `required: false`" in reference
+    assert "`cluster: null`" in reference
+    assert "already runs AIO" in targeting
+    assert "checks Site identities before writing" in configuration
+
+
 @pytest.mark.parametrize("download_succeeds", [False, True])
 def test_root_quickstart_waits_for_full_https_download_before_execution(tmp_path, download_succeeds):
     readme = (GUIDE.parent.parent / "README.md").read_text(encoding="utf-8")

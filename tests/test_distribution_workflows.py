@@ -437,9 +437,65 @@ def test_qualification_verifies_before_it_extracts():
     assert names.index("Install the external qualification tooling") < names.index(
         "Install Site Ops from the verified lock"
     )
+    for name in ("Install with the signed Bash bootstrap", "Install with the signed PowerShell bootstrap"):
+        assert names.index("Install the external qualification tooling") < names.index(name)
+        assert names.index(name) < names.index("Install Site Ops from the verified lock")
     assert names.index("Install Site Ops from the verified lock") < names.index(
         "Install Site Ops from the standalone wheel"
     )
+
+
+def test_qualification_runs_both_signed_scripts_with_private_preseeded_assets():
+    qualify = REUSABLE["jobs"]["qualify"]
+    for name, platform, argument in (
+        ("Install with the signed Bash bootstrap", "ubuntu-24.04", "--yes"),
+        ("Install with the signed PowerShell bootstrap", "windows-2025", "-Yes"),
+    ):
+        step = _step(qualify, name)
+        assert step["if"] == f"matrix.os == '{platform}'"
+        if platform == "windows-2025":
+            assert step["shell"] == "powershell"
+        script = step["run"]
+        if platform == "ubuntu-24.04":
+            assert '"$download/$BOOTSTRAP_SH"' in script
+            assert '"$download/${ARCHIVE_NAME}${ATTESTATION_SUFFIX}"' in script
+        else:
+            assert "$env:BOOTSTRAP_PS1" in script
+            assert "$env:ARCHIVE_NAME + $env:ATTESTATION_SUFFIX" in script
+        assert argument in script
+        assert "install-downloads" in script and "Rechecking the retained release" in script
+        assert "SOURCE_SHA" in script and "SOURCE_REF" in script
+        assert "GH_CONFIG_DIR" in script and "PIPX_HOME" in script
+        assert "siteops" in script and "PACKAGE_VERSION" in script
+        assert "GH_TOKEN" in script and "GITHUB_TOKEN" in script
+        assert "az login" not in script and "--with-azure-cli" not in script
+    bash_step = _script(qualify, "Install with the signed Bash bootstrap")
+    assert 'bash "$download/$BOOTSTRAP_SH"' in bash_step
+    windows_step = _script(qualify, "Install with the signed PowerShell bootstrap")
+    assert "powershell.exe -NoProfile -ExecutionPolicy Bypass -File" in windows_step
+
+
+def test_bootstrap_qualification_shells_parse():
+    bash_step = _script(REUSABLE["jobs"]["qualify"], "Install with the signed Bash bootstrap")
+    parsed = subprocess.run(
+        [str(_required_bash()), "-n"], input=bash_step, text=True, capture_output=True, timeout=20,
+    )
+    assert parsed.returncode == 0, parsed.stderr
+    if sys.platform == "win32":
+        windows_step = _script(
+            REUSABLE["jobs"]["qualify"], "Install with the signed PowerShell bootstrap",
+        )
+        parsed = subprocess.run(
+            [
+                "powershell.exe", "-NoProfile", "-Command",
+                "$tokens=$null;$errors=$null;"
+                "[System.Management.Automation.Language.Parser]::ParseInput("
+                "[Console]::In.ReadToEnd(),[ref]$tokens,[ref]$errors)|Out-Null;"
+                "if($errors.Count){$errors|ForEach-Object{Write-Error $_};exit 1}",
+            ],
+            input=windows_step, text=True, capture_output=True, timeout=20,
+        )
+        assert parsed.returncode == 0, parsed.stderr
 
 
 def test_qualification_policy_pins_the_caller_source_and_local_signer():
@@ -636,6 +692,8 @@ def test_distribution_summary_uses_only_fixed_outputs_and_job_conclusions():
     assert "stdout" not in script
     assert "stderr" not in script
     assert REUSABLE["env"]["SITEOPS_REDACT_OUTPUT"] == "1"
+    assert "Both attested assets" not in script
+    assert "siteops-bootstrap.sh" in script and "siteops-bootstrap.ps1" in script
 
 
 def test_package_downloads_use_the_configured_feed_without_a_public_fallback():
@@ -831,6 +889,8 @@ def test_distribution_summary_reports_the_complete_success_matrix(tmp_path):
     summary = summary_path.read_text(encoding="utf-8")
     assert summary.count("## Site Ops installer check") == 1
     assert "Version: <code>1.0.0b1+build.42.2.gcccccccccccc</code>" in summary
+    assert "four attested assets" in summary
+    assert "siteops-bootstrap.sh" in summary and "siteops-bootstrap.ps1" in summary
     assert (
         "[Download the attested installation assets]"
         "(https://github.com/example/publisher/actions/runs/42/artifacts/987)"
@@ -1753,6 +1813,11 @@ def test_every_run_block_matches_its_declared_shell(tmp_path):
     for label, shell, script in blocks:
         if shell == "python":
             compile(script, label, "exec")
+            continue
+        if shell == "powershell":
+            assert label == (
+                "_siteops-distribution.yaml:qualify:Install with the signed PowerShell bootstrap"
+            )
             continue
         assert shell == "bash", f"Add syntax coverage for {label}: {shell}"
         path = tmp_path / "block.sh"

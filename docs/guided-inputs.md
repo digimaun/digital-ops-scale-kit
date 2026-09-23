@@ -148,24 +148,31 @@ Site must be complete and cannot inherit from packaged example Sites.
 Configured Sites can continue to use the existing inheritance and overlay
 rules.
 
-For another distinct cluster, reuse the same answer file and override its
-Site name and cluster ID. Keep the four target fields derived from `cluster`
-as `null` so the next authorized read supplies the new cluster's facts:
+For a separate fleet deployment after plant-one already runs AIO, reuse
+its answer file only to prepare new Sites. Override the Site name and
+cluster ID for each new target. Explicitly set `enableSecretSync=false`
+on each new Site, even if the original answer file enabled it for
+plant-one. Keep the four target fields derived from `cluster` as `null`
+so each authorized read supplies the new cluster's facts:
 
 ```text
-siteops --approved-source official --project ./factory inputs aio-install --input-file ./aio-inputs.yaml --input siteName=plant-two --input cluster="<second-Arc-cluster-ID>" --read-resources --save-site ./factory/sites/plant-two.yaml
-siteops --approved-source official --project ./factory plan aio-install -l name=plant-one,name=plant-two
+siteops --approved-source official --project ./factory inputs aio-install --input-file ./aio-inputs.yaml --input siteName=plant-two --input cluster="<second-Arc-cluster-ID>" --input enableSecretSync=false --read-resources --save-site ./factory/sites/plant-two.yaml
+siteops --approved-source official --project ./factory inputs aio-install --input-file ./aio-inputs.yaml --input siteName=plant-three --input cluster="<third-Arc-cluster-ID>" --input enableSecretSync=false --read-resources --save-site ./factory/sites/plant-three.yaml
+siteops --approved-source official --project ./factory plan aio-install -l name=plant-two,name=plant-three
 ```
 
-The two-name selector bounds this plan to the saved Sites. Review the target
-count and names before using that selector with `deploy`. For an initial
-installation on several clusters, select only new targets if plant-one
-already runs AIO. Reapplying `aio-install` can overwrite settings managed
-by the operator on that first cluster. Use a label such
-as `environment=dev` only after confirming that it selects precisely the
-intended cohort. `parallel` limits concurrent work, not the number of Sites
-selected. Saved Sites do not repeat guided OIDC and workload identity checks
-when Secret Sync is enabled.
+The two-name selector bounds this plan to new Sites and excludes
+plant-one. Review the target count and names before using the same
+selector with `deploy`. Reapplying `aio-install` to a cluster that already
+runs AIO can overwrite settings managed by the operator. To target three
+or four new clusters instead, save more Sites with the same explicit
+Secret Sync override and include only their names. The manifest permits
+three concurrent Sites by default. For four concurrent Sites, pass
+`--parallel 4` to both plan and deploy. Use a label such as
+`environment=dev` only after confirming that it selects precisely the
+new cohort and excludes plant-one. `parallel` limits concurrent work,
+not the number of Sites selected. Saved Sites do not repeat guided
+OIDC and workload identity checks when Secret Sync is enabled.
 
 An explicit Site replaces the manifest's default selector or `sites:` list.
 Combining `--site-file`, `--input-file`, or `--input` with `-l` fails rather than

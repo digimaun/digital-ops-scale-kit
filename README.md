@@ -119,16 +119,20 @@ explains manual answers without an Azure read, Secret Sync prerequisites and
 the same invocation with enablement selected. Planning does not submit
 deployments. Deployment success does not establish AIO workload health.
 
-**Scale out on the same model.** Save a resolved ordinary Site, add other
-configured project Sites and labels, then review a fleet selection with the
-same `aio-install` manifest:
+**Scale out on the same model.** Save the first Site for repeat use, then
+configure a separate set of new clusters as project Sites. Review only
+those new targets with the same `aio-install` manifest:
 
 ```text
-siteops --approved-source official --project factory plan aio-install -l environment=prod
+siteops --approved-source official --project factory plan aio-install -l name=plant-two,name=plant-three
 ```
 
-Deploy that selection only after reviewing its targets. Local workspaces
-and non-AIO content also use the generic Site Ops planner and executor.
+Deploy that selection only after reviewing its targets. Reapplying
+`aio-install` to the first cluster can overwrite settings there. If its
+answer file enabled Secret Sync, override `enableSecretSync=false` when
+saving each new fleet Site. A label selector is convenient once it matches
+only the intended cohort. Local workspaces and non-AIO content also use
+the generic Site Ops planner and executor.
 See [project Sites](docs/projects.md),
 [fleet targeting](docs/targeting.md) and the
 [local checkout guide](docs/getting-started.md) for experienced workflows.

@@ -579,7 +579,7 @@ def test_saved_site_is_normal_config_and_not_overwritten(
     assert "exists" in capsys.readouterr().err.lower()
 
 
-def test_resource_answers_save_three_project_sites_for_bounded_aio_plan(tmp_path, capsys):
+def test_guided_secret_sync_does_not_carry_into_fresh_fleet_sites(tmp_path, capsys):
     workspace = Path(__file__).resolve().parents[1] / "workspaces" / "iot-operations"
     project = tmp_path / "factory"
     (project / "sites").mkdir(parents=True)
@@ -589,27 +589,34 @@ def test_resource_answers_save_three_project_sites_for_bounded_aio_plan(tmp_path
         "values": {
             "siteName": "plant-one", "subscription": None, "resourceGroup": None,
             "location": None, "clusterName": None, "environment": "dev", "country": "US",
-            "cluster": _CLUSTER_ID,
+            "cluster": _CLUSTER_ID, "enableSecretSync": True,
         },
     }), encoding="utf-8")
     second_id = _CLUSTER_ID.replace("rg-first", "rg-second").replace("arc-first", "arc-second")
     third_id = _CLUSTER_ID.replace("rg-first", "rg-third").replace("arc-first", "arc-third")
+    fourth_id = _CLUSTER_ID.replace("rg-first", "rg-fourth").replace("arc-first", "arc-fourth")
     calls = []
+    sync_facts = frozenset({
+        "connectedClusters.workloadIdentityEnabled",
+        "connectedClusters.oidcIssuerAvailable",
+    })
 
     class Reader:
         identity = SimpleNamespace(name="azure-cli", version=None)
 
         def read(self, ref, *, facts=frozenset()):
             calls.append((ref.resource_id, facts))
-            assert ref.resource_id in {_CLUSTER_ID, second_id, third_id}
+            assert ref.resource_id in {_CLUSTER_ID, second_id, third_id, fourth_id}
             return ArmResourceObservation(
                 ref.resource_id, "Microsoft.Kubernetes/connectedClusters",
-                "eastus", ref.resource_id.rsplit("/", 1)[-1], {},
+                "eastus", ref.resource_id.rsplit("/", 1)[-1],
+                {key: True for key in facts},
             )
 
     with patch("siteops.cli.new_arm_reader", return_value=Reader()):
         for name, resource in (
             ("plant-one", _CLUSTER_ID), ("plant-two", second_id), ("plant-three", third_id),
+            ("plant-four", fourth_id),
         ):
             command = [
                 "--project", str(project), "-w", str(workspace),
@@ -617,30 +624,36 @@ def test_resource_answers_save_three_project_sites_for_bounded_aio_plan(tmp_path
                 "--read-resources", "--save-site", str(project / "sites" / f"{name}.yaml"),
             ]
             if name != "plant-one":
-                command.extend(["--input", f"siteName={name}", "--input", f"cluster={resource}"])
+                command.extend([
+                    "--input", f"siteName={name}", "--input", f"cluster={resource}",
+                    "--input", "enableSecretSync=false",
+                ])
             assert _invoke(command) == 0
             capsys.readouterr()
 
     assert calls == [
-        (_CLUSTER_ID, frozenset()), (second_id, frozenset()), (third_id, frozenset()),
+        (_CLUSTER_ID, sync_facts), (second_id, frozenset()), (third_id, frozenset()),
+        (fourth_id, frozenset()),
     ]
     for name, cluster in (
         ("plant-one", "arc-first"), ("plant-two", "arc-second"), ("plant-three", "arc-third"),
+        ("plant-four", "arc-fourth"),
     ):
         site = Site.from_file(project / "sites" / f"{name}.yaml")
         assert site.name == name
         assert site.labels["environment"] == "dev"
         assert site.parameters["clusterName"] == cluster
+        assert site.properties["deployOptions"]["enableSecretSync"] is (name == "plant-one")
 
     assert _invoke([
         "--project", str(project), "-w", str(workspace),
-        "plan", "aio-install", "-l", "name=plant-one,name=plant-two,name=plant-three",
+        "plan", "aio-install", "-l", "name=plant-two,name=plant-three,name=plant-four",
         "--describe", "--output", "json",
     ]) == 0
     document = json.loads(capsys.readouterr().out)
     plan = document["plan"]
     assert {target["name"] for target in plan["targets"]} == {
-        "plant-one", "plant-two", "plant-three",
+        "plant-two", "plant-three", "plant-four",
     }
     assert document["summary"]["targetCount"] == 3
     assert plan["parallel"]["maxSites"] == 3

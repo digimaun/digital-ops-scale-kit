@@ -67,7 +67,11 @@ if ($WithAzureCli) {
     } else { Stage 'Add: Azure CLI through WinGet or a managed channel.' }
 }
 if ($EnrollSource) {
-    Stage "Source $EnrollSource will approve $Repository with a time-limited policy after installation."
+    if ($env:SITEOPS_REDACT_OUTPUT -eq '1') {
+        Stage 'An explicitly selected source will be enrolled after installation.'
+    } else {
+        Stage "Source $EnrollSource will approve $Repository with a time-limited policy after installation."
+    }
 }
 if ($DryRun) {
     Stage 'Preview only. No tools or content were downloaded.'
@@ -430,6 +434,7 @@ try {
         (& $siteops --version) -cne "siteops $version") {
         Fail 'The exposed siteops command does not match the selected build.'
     }
+    Stage "Command directory: $binDir. Add it to your current PATH or open a new shell."
     if ($EnrollSource) {
         $lines = [Collections.Generic.List[string]]::new()
         $bytes = 0
@@ -493,7 +498,11 @@ try {
         }
     }
     if ($EnrollSource) {
-        Stage "Installed siteops $version with approved source $EnrollSource. Authenticate to Azure separately."
+        if ($env:SITEOPS_REDACT_OUTPUT -eq '1') {
+            Stage "Installed siteops $version with an approved source. Authenticate to Azure separately."
+        } else {
+            Stage "Installed siteops $version with approved source $EnrollSource. Authenticate to Azure separately."
+        }
     } else {
         Stage "Installed siteops $version. Authenticate to Azure and approve a workspace source separately."
     }

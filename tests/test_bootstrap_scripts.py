@@ -22,10 +22,44 @@ SOURCE_SHA = "c" * 40
 def test_private_pipx_venvs_are_created_at_their_retained_paths():
     bash = (SCRIPTS / "siteops-bootstrap.sh").read_text(encoding="utf-8")
     powershell = (SCRIPTS / "siteops-bootstrap.ps1").read_text(encoding="utf-8")
-    assert 'python3 -m venv "$tools/pipx"' in bash
+    assert '"${venv_tool[@]}" "$tools/pipx"' in bash
     assert "$tools/pipx-stage" not in bash
     assert "& $python -m venv $installed" in powershell
     assert "Move-Item -LiteralPath $staged" not in powershell
+
+
+def test_managed_azure_linux_uses_existing_os_tools_without_sudo():
+    bash = (SCRIPTS / "siteops-bootstrap.sh").read_text(encoding="utf-8")
+    assert "azurelinux:3.0" in bash
+    assert 'if [[ "$platform" == azurelinux ]]; then' in bash
+    assert "Managed Azure Linux" in bash
+    assert "python3 -m virtualenv" in bash
+    assert '"${venv_tool[@]}" "$staging/backend-tools"' in bash
+
+
+def test_pipx_managed_directories_are_isolated_before_package_operations():
+    bash = (SCRIPTS / "siteops-bootstrap.sh").read_text(encoding="utf-8")
+    assert 'PIPX_HOME="$data/pipx"' in bash
+    assert 'PIPX_BIN_DIR="$data/bin"' in bash
+    assert 'PIPX_SHARED_LIBS="$data/pipx/shared"' in bash
+    assert 'PIPX_MAN_DIR="$data/man"' in bash
+    assert 'PIPX_COMPLETION_DIR="$data/completions"' in bash
+    assert bash.index('export PIPX_HOME PIPX_BIN_DIR PIPX_SHARED_LIBS PIPX_MAN_DIR') < bash.index(
+        '"$pipx_bin" list --output json',
+    )
+
+
+def test_bootstrap_requires_configured_secure_index_before_python_download():
+    bash = (SCRIPTS / "siteops-bootstrap.sh").read_text(encoding="utf-8")
+    assert 'pip_configuration="$("$venv_check/check/bin/python" -m pip config list 2>/dev/null)"' in bash
+    assert "parsed.scheme != \"https\"" in bash
+    assert bash.index("  require_approved_python_index\n") < bash.index(
+        '"$tools/pipx/bin/python" -m pip install',
+    )
+    assert bash.rindex("  require_approved_python_index\n") < bash.index(
+        '"$staging/backend-tools/bin/python" -m pip download',
+    )
+    assert '> "$staging/pip-download.log" 2>&1' in bash
 
 
 def test_existing_siteops_build_is_rejected_before_any_shared_backend_change():
@@ -139,9 +173,10 @@ def test_bash_is_portable_lf_and_parses():
 def test_retained_bundle_accepts_matching_files_but_rejects_tampering(tmp_path):
     script = (SCRIPTS / "siteops-bootstrap.sh").read_text(encoding="utf-8")
     found = re.search(
-        r'python3 - "\$bundle" <<\'PY\' \|\|\n'
+        r'if ! python3 - "\$bundle" <<\'PY\'\n'
+        r"(.*?)\nPY\n  then\n"
         r'    fail "The retained bundle contents differ from the authenticated archive\."\n'
-        r"(.*?)\nPY", script, flags=re.DOTALL,
+        r"  fi", script, flags=re.DOTALL,
     )
     assert found, "The retained bundle verifier is missing."
     bundle = tmp_path / "bundle"
@@ -187,6 +222,28 @@ def test_both_scripts_keep_the_azure_and_source_boundaries_explicit():
         assert script.index("attestation verify") < script.index("--lock")
 
 
+def test_bootstrap_preview_keeps_source_names_private_in_redacted_output():
+    for path in (SCRIPTS / "siteops-bootstrap.sh", SCRIPTS / "siteops-bootstrap.ps1"):
+        script = path.read_text(encoding="utf-8")
+        assert "SITEOPS_REDACT_OUTPUT" in script
+        assert "An explicitly selected source will be enrolled after installation." in script
+        assert "with an approved source. Authenticate to Azure separately." in script
+    if sys.platform != "win32":
+        return
+    script = SCRIPTS / "siteops-bootstrap.ps1"
+    result = subprocess.run(
+        [
+            "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
+            "-Release", "siteops/v1.0.0b1", "-SourceCommit", SOURCE_SHA,
+            "-EnrollSource", "private-name", "-DryRun",
+        ],
+        env={**os.environ, "SITEOPS_REDACT_OUTPUT": "1"},
+        capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "private-name" not in result.stdout + result.stderr
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="Ubuntu preview runs on the Linux runner.")
 def test_bash_preview_and_unattended_refusal_do_not_acquire_tools(tmp_path):
     os_release = Path("/etc/os-release").read_text(encoding="utf-8")
@@ -209,7 +266,8 @@ def test_bash_preview_and_unattended_refusal_do_not_acquire_tools(tmp_path):
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="The Ubuntu runner exercises the script journey.")
-def test_ubuntu_bootstrap_recovers_and_requires_explicit_replacement(tmp_path):
+@pytest.mark.parametrize("venv_without_pip", [False, True])
+def test_ubuntu_bootstrap_recovers_and_requires_explicit_replacement(tmp_path, venv_without_pip):
     os_release = Path("/etc/os-release").read_text(encoding="utf-8")
     if "ID=ubuntu" not in os_release or 'VERSION_ID="24.04"' not in os_release:
         pytest.skip("Requires Ubuntu 24.04.")
@@ -221,6 +279,53 @@ def test_ubuntu_bootstrap_recovers_and_requires_explicit_replacement(tmp_path):
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "HOME": str(tmp_path), "TMPDIR": str(tmp_path),
             "PYTHONDONTWRITEBYTECODE": "1", "LC_ALL": "C",
+            "TEST_NO_PIP_IN_VENV": "1" if venv_without_pip else "0",
+        }, capture_output=True, text=True, timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "no network" in result.stdout
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="The Ubuntu runner exercises the script journey.")
+def test_ubuntu_bootstrap_keeps_a_compatible_pipx_backend(tmp_path):
+    os_release = Path("/etc/os-release").read_text(encoding="utf-8")
+    if "ID=ubuntu" not in os_release or 'VERSION_ID="24.04"' not in os_release:
+        pytest.skip("Requires Ubuntu 24.04.")
+    harness = ROOT / "tests" / "fixtures" / "bootstrap-harness.sh"
+    script = SCRIPTS / "siteops-bootstrap.sh"
+    result = subprocess.run(
+        [str(required_bash()), bash_path(harness), bash_path(script)],
+        cwd=tmp_path, env={
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(tmp_path), "TMPDIR": str(tmp_path),
+            "PYTHONDONTWRITEBYTECODE": "1", "LC_ALL": "C",
+            "TEST_HARNESS_SHARED_OK": "1",
+        }, capture_output=True, text=True, timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "backend was preserved" in result.stdout
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="The Ubuntu runner exercises managed-host flow.")
+@pytest.mark.parametrize(("existing_pipx", "venv_without_pip"), [(False, False), (True, True)])
+def test_managed_azure_linux_bootstrap_isolates_pipx_and_uses_virtualenv(
+    tmp_path, existing_pipx, venv_without_pip,
+):
+    source = (SCRIPTS / "siteops-bootstrap.sh").read_text(encoding="utf-8")
+    assert source.count(". /etc/os-release\n") == 1
+    fixture = ROOT / "tests" / "fixtures" / "bootstrap-azurelinux3-os-release"
+    bootstrap = tmp_path / "bootstrap.sh"
+    bootstrap.write_text(source.replace(". /etc/os-release\n", f'. "{fixture}"\n'), encoding="utf-8")
+    harness = ROOT / "tests" / "fixtures" / "bootstrap-harness.sh"
+    result = subprocess.run(
+        [str(required_bash()), bash_path(harness), bash_path(bootstrap)],
+        cwd=tmp_path, env={
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(tmp_path), "TMPDIR": str(tmp_path),
+            "PYTHONDONTWRITEBYTECODE": "1", "LC_ALL": "C",
+            "TEST_HARNESS_MANAGED": "1",
+            "TEST_HARNESS_NO_PIPX": "0" if existing_pipx else "1",
+            "TEST_NO_PIP_IN_VENV": "1" if venv_without_pip else "0",
         }, capture_output=True, text=True, timeout=180,
     )
     assert result.returncode == 0, result.stdout + result.stderr

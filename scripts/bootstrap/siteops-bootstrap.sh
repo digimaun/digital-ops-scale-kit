@@ -52,30 +52,46 @@ done
 [[ "$caller" == release.yaml || "$caller" == ci.yaml ]] || fail "Select a supported calling workflow."
 [[ -z "$enroll_name" || "$enroll_name" =~ ^[a-z][a-z0-9-]{0,39}$ ]] ||
   fail "Choose a lowercase approved source name."
-[[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] || fail "Use Ubuntu 24.04 on x86_64."
+[[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] || fail "Use Linux on x86_64."
 . /etc/os-release
-[[ "${ID:-}" == ubuntu && "${VERSION_ID:-}" == 24.04 ]] || fail "This bootstrap supports Ubuntu 24.04."
+case "${ID:-}:${VERSION_ID:-}" in
+  ubuntu:24.04) platform=ubuntu ;;
+  azurelinux:3.0) platform=azurelinux ;;
+  *) fail "This bootstrap supports Ubuntu 24.04 and managed Azure Linux 3." ;;
+esac
 
 data="${XDG_DATA_HOME:-$HOME/.local/share}/siteops"
 [[ "$data" == /* && "$data" != /siteops ]] || fail "Select an absolute private data location."
 stage "Release: $release ($commit) from $repository."
-stage "Tool changes use approved apt channels and your configured Python package feed."
-stage "GitHub CLI, Python with venv, pipx 1.17.2, and its shared pip 26.2.1 are needed."
-stage "The pipx backend is shared with other pipx applications. This script does not sign in or deploy."
+if [[ "$platform" == azurelinux ]]; then
+  stage "Managed Azure Linux uses existing OS tools without sudo or package manager changes."
+else
+  stage "Tool changes use approved apt channels and your configured Python package feed."
+fi
+stage "GitHub CLI, Python with a pip-equipped venv or virtualenv, pipx 1.17.2, and pip 26.2.1 are needed."
+stage "Changes to a pipx shared backend affect its selected home. Managed pipx homes are isolated."
+stage "This script does not sign in or deploy."
+stage "Python downloads, when needed, require a configured approved HTTPS package index."
 stage "pipx may add its application directory to your user PATH."
 if command -v curl >/dev/null; then
   stage "Keep: installed HTTPS downloader."
+elif [[ "$platform" == azurelinux ]]; then
+  stage "Required: HTTPS downloader supplied by the managed environment."
 else
   stage "Add: curl and certificate authorities from Ubuntu."
 fi
 if command -v python3 >/dev/null &&
     python3 -c 'import sys; raise SystemExit(not ((3, 10) <= sys.version_info[:2] <= (3, 14) and sys.maxsize > 2**32))' 2>/dev/null; then
-  stage "Keep: supported 64-bit Python. Check venv support before installation."
+  stage "Keep: supported 64-bit Python. Check pip-equipped venv support before installation."
+elif [[ "$platform" == azurelinux ]]; then
+  stage "Required: supported 64-bit Python supplied by the managed environment."
 else
   stage "Add: supported 64-bit Python and venv from Ubuntu."
 fi
 if command -v gh >/dev/null; then
   stage "Check: installed GitHub CLI version before changing tools."
+elif [[ "$platform" == azurelinux ]]; then
+  stage "Required: GitHub CLI 2.95 or newer supplied by the managed environment."
 else
   stage "Add: GitHub CLI from its signed Ubuntu package channel."
 fi
@@ -90,12 +106,18 @@ fi
 if $with_azure_cli; then
   if command -v az >/dev/null; then
     stage "Keep: available Azure CLI."
+  elif [[ "$platform" == azurelinux ]]; then
+    stage "Required: Azure CLI supplied by the managed environment."
   else
     stage "Add: Azure CLI from the Microsoft Ubuntu package channel."
   fi
 fi
 if [[ -n "$enroll_name" ]]; then
-  stage "Source $enroll_name will approve $repository with a time-limited policy after installation."
+  if [[ "${SITEOPS_REDACT_OUTPUT:-0}" == 1 ]]; then
+    stage "An explicitly selected source will be enrolled after installation."
+  else
+    stage "Source $enroll_name will approve $repository with a time-limited policy after installation."
+  fi
 fi
 if $dry_run; then
   stage "Preview only. No tools or content were downloaded."
@@ -112,6 +134,8 @@ if [[ -n "$enroll_name" ]] && ! $approve; then
 fi
 
 require_sudo() {
+  [[ "$platform" == ubuntu ]] ||
+    fail "Managed Azure Linux requires compatible OS tools. Use a provisioned session with curl, Python, GitHub CLI, and Azure CLI when selected."
   command -v sudo >/dev/null || fail "An approved administrator is needed to install missing OS tools."
   sudo -n true 2>/dev/null || {
     [[ -t 0 ]] || fail "Missing OS tools require administrator authorization."
@@ -133,14 +157,63 @@ python3 -c 'import sys; raise SystemExit(not ((3, 10) <= sys.version_info[:2] <=
   fail "The available Python must be a supported 64-bit interpreter."
 venv_check="$(mktemp -d)"
 trap 'rm -rf -- "$venv_check"' EXIT
-if ! python3 -m venv "$venv_check/check" >/dev/null 2>&1; then
-  require_sudo
-  sudo apt-get update -qq
-  sudo apt-get install -y python3-venv
-  python3 -m venv "$venv_check/check" || fail "Python venv is unavailable."
+venv_tool=(python3 -m venv)
+if ! "${venv_tool[@]}" "$venv_check/check" >/dev/null 2>&1 ||
+   ! "$venv_check/check/bin/python" -m pip --version >/dev/null 2>&1; then
+  rm -rf -- "$venv_check/check"
+  if python3 -m virtualenv --no-periodic-update "$venv_check/check" >/dev/null 2>&1 &&
+     "$venv_check/check/bin/python" -m pip --version >/dev/null 2>&1; then
+    venv_tool=(python3 -m virtualenv --no-periodic-update)
+  else
+    rm -rf -- "$venv_check/check"
+    [[ "$platform" == ubuntu ]] ||
+      fail "Managed Azure Linux needs a pip-equipped venv or an installed Python virtualenv."
+    require_sudo
+    sudo apt-get update -qq
+    sudo apt-get install -y python3-venv
+    "${venv_tool[@]}" "$venv_check/check" ||
+      fail "Python venv is unavailable."
+  fi
+  "$venv_check/check/bin/python" -m pip --version >/dev/null 2>&1 ||
+    fail "The Python environment must include pip."
 fi
+pip_configuration="$("$venv_check/check/bin/python" -m pip config list 2>/dev/null)" ||
+  pip_configuration=""
 rm -rf -- "$venv_check"
 trap - EXIT
+
+require_approved_python_index() {
+  printf '%s\n' "$pip_configuration" | python3 -c '
+import ast
+import sys
+from urllib.parse import urlsplit
+
+settings = {}
+for line in sys.stdin:
+    key, separator, raw = line.partition("=")
+    if not separator:
+        continue
+    try:
+        value = ast.literal_eval(raw.strip())
+    except (SyntaxError, ValueError):
+        raise SystemExit(1)
+    if not isinstance(value, str):
+        raise SystemExit(1)
+    settings[key.strip()] = value
+if any(value for key, value in settings.items()
+       if key.endswith((".extra-index-url", ".find-links", ".trusted-host"))):
+    raise SystemExit(1)
+index = next((settings[key] for key in
+              (":env:.index-url", "install.index-url", "global.index-url")
+              if settings.get(key)), "")
+try:
+    parsed = urlsplit(index)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise SystemExit(1)
+except ValueError:
+    raise SystemExit(1)
+' || fail "Configure one approved HTTPS Python index in pip settings or PIP_INDEX_URL, without extra indexes, find-links, or trusted hosts."
+}
 
 gh_ready=false
 if command -v gh >/dev/null; then
@@ -225,12 +298,49 @@ if [[ -z "$pipx_bin" || "$("$pipx_bin" --version 2>/dev/null)" != 1.17.2 ]]; the
        -f "$tools/pipx/pyvenv.cfg" && -x "$tools/pipx/bin/python" ]] ||
       fail "Existing Site Ops pipx tooling differs. Inspect it before repair."
   else
-    python3 -m venv "$tools/pipx" || fail "The user pipx environment could not be created."
+    "${venv_tool[@]}" "$tools/pipx" || fail "The user pipx environment could not be created."
   fi
-  "$tools/pipx/bin/python" -m pip install --only-binary=:all: --no-cache-dir 'pipx==1.17.2'
+  require_approved_python_index
+  pip_install_log="$(mktemp)"
+  trap 'rm -f -- "$pip_install_log"' EXIT
+  "$tools/pipx/bin/python" -m pip install --only-binary=:all: --no-cache-dir 'pipx==1.17.2' \
+    > "$pip_install_log" 2>&1 ||
+    fail "pipx could not be installed from the configured Python index."
+  rm -f -- "$pip_install_log"
+  trap - EXIT
   pipx_bin="$tools/pipx/bin/pipx"
 fi
 [[ "$("$pipx_bin" --version)" == 1.17.2 ]] || fail "pipx 1.17.2 is required."
+
+allowed_home="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve())' "$HOME")"
+allowed_data="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve())' "$data")"
+isolate_pipx=false
+for setting in PIPX_HOME PIPX_BIN_DIR PIPX_SHARED_LIBS; do
+  location="$("$pipx_bin" environment --value "$setting")" ||
+    fail "The pipx installation locations could not be inspected."
+  [[ "$location" == /* ]] || fail "The pipx installation locations must be absolute."
+  resolved="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve())' "$location")" ||
+    fail "The pipx installation locations could not be resolved."
+  case "$resolved" in
+    "$allowed_home"|"$allowed_home"/*|"$allowed_data"|"$allowed_data"/*) ;;
+    *) isolate_pipx=true ;;
+  esac
+done
+if $isolate_pipx; then
+  mkdir -p "$data/pipx" "$data/bin" "$data/man" "$data/completions" ||
+    fail "Private pipx storage could not be created."
+  private_dir "$data/pipx"
+  private_dir "$data/bin"
+  private_dir "$data/man"
+  private_dir "$data/completions"
+  PIPX_HOME="$data/pipx"
+  PIPX_BIN_DIR="$data/bin"
+  PIPX_SHARED_LIBS="$data/pipx/shared"
+  PIPX_MAN_DIR="$data/man"
+  PIPX_COMPLETION_DIR="$data/completions"
+  export PIPX_HOME PIPX_BIN_DIR PIPX_SHARED_LIBS PIPX_MAN_DIR PIPX_COMPLETION_DIR
+  stage "Using private Site Ops pipx storage instead of the managed pipx home."
+fi
 
 staging="$(mktemp -d)"
 trap 'rm -rf -- "$staging"' EXIT
@@ -298,8 +408,7 @@ if [[ -e "$bundle" ]]; then
   private_dir "$bundle"
   [[ -f "$bundle/bundle.json" && -f "$bundle/pylock.toml" ]] ||
     fail "The retained bundle is incomplete. Inspect it before repair."
-  python3 - "$archive" "$bundle/bundle.json" <<'PY' ||
-    fail "The retained bundle manifest differs from the authenticated archive."
+  if ! python3 - "$archive" "$bundle/bundle.json" <<'PY'
 import sys
 import zipfile
 
@@ -316,8 +425,10 @@ with open(sys.argv[2], "rb") as stream:
 if expected != actual:
     raise SystemExit(1)
 PY
-  python3 - "$bundle" <<'PY' ||
-    fail "The retained bundle contents differ from the authenticated archive."
+  then
+    fail "The retained bundle manifest differs from the authenticated archive."
+  fi
+  if ! python3 - "$bundle" <<'PY'
 import hashlib
 import json
 import pathlib
@@ -365,6 +476,9 @@ for path in root.rglob("*"):
 if actual != expected:
     raise SystemExit(1)
 PY
+  then
+    fail "The retained bundle contents differ from the authenticated archive."
+  fi
   if [[ "$recorded" == "$bundle/pylock.toml" ]] && ! $replace; then
     backend_version="$("$pipx_bin" runpip siteops --version)" ||
       fail "The installed pipx backend could not be inspected."
@@ -390,19 +504,29 @@ print(document["package"]["version"])
 [[ "$version" =~ ^[A-Za-z0-9][A-Za-z0-9.!+_-]{0,127}$ ]] ||
   fail "The verified bundle has an unsupported version."
 if ! $repeat; then
-wheelhouse="$(mktemp -d)"
-trap 'rm -rf -- "$staging" "$wheelhouse"' EXIT
-python3 -m venv "$staging/backend-tools" || fail "Python venv is unavailable."
-"$staging/backend-tools/bin/python" -m pip download 'pip==26.2.1' \
-  --no-deps --only-binary=:all: --dest "$wheelhouse"
-pip_wheels=("$wheelhouse"/pip-26.2.1-*.whl)
-[[ ${#pip_wheels[@]} -eq 1 && -f "${pip_wheels[0]}" ]] || fail "The approved backend wheel is unavailable."
-printf '%s  %s\n' '71138adf1f4ca900cdb7d289c21b7494329f2332b6d85f0e1c42108c0384ed3e' "${pip_wheels[0]}" |
-  sha256sum --check --status || fail "The selected backend wheel differs from its reviewed hash."
-wheelhouse_uri="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).as_uri())' "$wheelhouse")"
+shared_home="$("$pipx_bin" environment --value PIPX_SHARED_LIBS)" ||
+  fail "The pipx shared backend location could not be inspected."
+if [[ -x "$shared_home/bin/python" &&
+      "$("$shared_home/bin/python" -m pip --version 2>/dev/null)" == "pip 26.2.1 "* ]]; then
+  stage "Keeping the compatible pipx shared backend."
+else
+  wheelhouse="$(mktemp -d)"
+  trap 'rm -rf -- "$staging" "$wheelhouse"' EXIT
+  "${venv_tool[@]}" "$staging/backend-tools" || fail "Python venv is unavailable."
+  require_approved_python_index
+  "$staging/backend-tools/bin/python" -m pip download 'pip==26.2.1' \
+    --no-deps --only-binary=:all: --dest "$wheelhouse" > "$staging/pip-download.log" 2>&1 ||
+    fail "The shared backend could not be downloaded from the configured Python index."
+  pip_wheels=("$wheelhouse"/pip-26.2.1-*.whl)
+  [[ ${#pip_wheels[@]} -eq 1 && -f "${pip_wheels[0]}" ]] || fail "The approved backend wheel is unavailable."
+  printf '%s  %s\n' '71138adf1f4ca900cdb7d289c21b7494329f2332b6d85f0e1c42108c0384ed3e' "${pip_wheels[0]}" |
+    sha256sum --check --status || fail "The selected backend wheel differs from its reviewed hash."
+  wheelhouse_uri="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).as_uri())' "$wheelhouse")"
+  export PIPX_DEFAULT_PYTHON="$(python3 -c 'import sys; print(sys.executable)')"
+  "$pipx_bin" upgrade-shared --pip-args "--no-index --only-binary=:all: --no-cache-dir --force-reinstall --find-links=$wheelhouse_uri" ||
+    fail "The pipx shared backend could not be provisioned."
+fi
 export PIPX_DEFAULT_PYTHON="$(python3 -c 'import sys; print(sys.executable)')"
-"$pipx_bin" upgrade-shared --pip-args "--no-index --only-binary=:all: --no-cache-dir --force-reinstall --find-links=$wheelhouse_uri" ||
-  fail "The pipx shared backend could not be provisioned."
 force_args=()
 if $replace && [[ -n "$recorded" ]]; then force_args=(--force); fi
 "$pipx_bin" install siteops --lock "$bundle/pylock.toml" \
@@ -424,6 +548,7 @@ bin_dir="$("$pipx_bin" environment --value PIPX_BIN_DIR)" ||
 export PATH="$bin_dir:$PATH"
 [[ "$(command -v siteops)" == "$bin_dir/siteops" && "$(siteops --version)" == "siteops $version" ]] ||
   fail "The exposed siteops command does not match the selected build."
+stage "Command directory: $bin_dir. Add it to your current PATH or open a new shell."
 if [[ -n "$enroll_name" ]]; then
   trusted_root="$staging/trusted-root.jsonl"
   timeout --kill-after=5 120 gh attestation trusted-root | head -c 2097153 > "$trusted_root" ||
@@ -468,12 +593,16 @@ if [[ "$assets" == "$staging" ]]; then
   for asset in siteops-install.zip siteops-install.zip.attestation.jsonl; do
     cp -- "$staging/$asset" "$cache/$asset" ||
       fail "Authenticated release bytes could not be retained after installation."
-    cmp -s "$staging/$asset" "$cache/$asset" ||
+    [[ "$(sha256sum "$staging/$asset" | cut -d ' ' -f 1)" == "$(sha256sum "$cache/$asset" | cut -d ' ' -f 1)" ]] ||
       fail "The retained release bytes differ from the authenticated download."
   done
 fi
 if [[ -n "$enroll_name" ]]; then
-  stage "Installed siteops $version with approved source $enroll_name. Authenticate to Azure separately."
+  if [[ "${SITEOPS_REDACT_OUTPUT:-0}" == 1 ]]; then
+    stage "Installed siteops $version with an approved source. Authenticate to Azure separately."
+  else
+    stage "Installed siteops $version with approved source $enroll_name. Authenticate to Azure separately."
+  fi
 else
   stage "Installed siteops $version. Authenticate to Azure and approve a workspace source separately."
 fi

@@ -454,6 +454,7 @@ jobs:
         env:
           RELEASE: ${{ needs.prep.outputs.published-release }}
           SOURCE_SHA: ${{ needs.prep.outputs.published-source-sha }}
+          PUBLISHED_JOURNEY: ${{ needs.prep.outputs.published-journey }}
         run: |
           set -euo pipefail
           umask 077
@@ -464,9 +465,23 @@ jobs:
           unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
           export SITEOPS_CACHE_DIR="$cache"
           export GH_CONFIG_DIR="$gh_config"
+          trust_args=(--trust-policy "$SITEOPS_E2E_POLICY" --trusted-root "$SITEOPS_E2E_TRUSTED_ROOT")
+          if [[ "$PUBLISHED_JOURNEY" == "guided" ]]; then
+            export XDG_CONFIG_HOME="$RUNNER_TEMP/published-source-config"
+            echo "XDG_CONFIG_HOME=$XDG_CONFIG_HOME" >> "$GITHUB_ENV"
+            if ! SITEOPS_REDACT_OUTPUT=0 siteops \
+              --trust-policy "$SITEOPS_E2E_POLICY" \
+              --trusted-root "$SITEOPS_E2E_TRUSTED_ROOT" \
+              source enroll guided --source "github:$GITHUB_REPOSITORY" \
+              > "$RUNNER_TEMP/published-source-enroll.log" \
+              2> "$RUNNER_TEMP/published-source-enroll.err"; then
+              echo "::error::The approved published source could not be enrolled."
+              exit 1
+            fi
+            trust_args=(--approved-source guided)
+          fi
           if ! SITEOPS_REDACT_OUTPUT=0 siteops \
-            --trust-policy "$SITEOPS_E2E_POLICY" \
-            --trusted-root "$SITEOPS_E2E_TRUSTED_ROOT" \
+            "${trust_args[@]}" \
             project pin "$project" \
             --source "github:$GITHUB_REPOSITORY" \
             --release "$RELEASE" \
@@ -772,8 +787,7 @@ jobs:
           PY
           if ! siteops \
             --project "$SITEOPS_E2E_PROJECT" \
-            --trust-policy "$SITEOPS_E2E_POLICY" \
-            --trusted-root "$SITEOPS_E2E_TRUSTED_ROOT" \
+            --approved-source guided \
             inputs aio-install --offline --example "$RUNNER_TEMP/published-example.yaml" \
             --output json > "$RUNNER_TEMP/published-inspection.json" \
             2> "$RUNNER_TEMP/published-inspection.err"; then
@@ -782,8 +796,7 @@ jobs:
           fi
           if siteops \
             --project "$SITEOPS_E2E_PROJECT" \
-            --trust-policy "$SITEOPS_E2E_POLICY" \
-            --trusted-root "$SITEOPS_E2E_TRUSTED_ROOT" \
+            --approved-source guided \
             plan aio-install --offline --input-file "$RUNNER_TEMP/published-answers.json" \
             --output json > "$RUNNER_TEMP/published-no-read.json" \
             2> "$RUNNER_TEMP/published-no-read.err"; then
@@ -827,8 +840,7 @@ jobs:
               > "$RUNNER_TEMP/published-before-negative.json"
             if siteops \
               --project "$SITEOPS_E2E_PROJECT" \
-              --trust-policy "$SITEOPS_E2E_POLICY" \
-              --trusted-root "$SITEOPS_E2E_TRUSTED_ROOT" \
+              --approved-source guided \
               deploy aio-install --offline \
               --input-file "$RUNNER_TEMP/published-unready-answers.json" \
               --read-resources --output json \
@@ -856,8 +868,7 @@ jobs:
           fi
           if ! SITEOPS_REDACT_OUTPUT=0 siteops \
             --project "$SITEOPS_E2E_PROJECT" \
-            --trust-policy "$SITEOPS_E2E_POLICY" \
-            --trusted-root "$SITEOPS_E2E_TRUSTED_ROOT" \
+            --approved-source guided \
             plan aio-install --offline \
             --input-file "$RUNNER_TEMP/published-answers.json" \
             --read-resources --output json --projection local-private \
@@ -1039,13 +1050,14 @@ jobs:
           mkdir "$run_root"
           cd "$run_root"
           target_args=(-l "name=$SITE_NAME")
+          trust_args=(--trust-policy "$SITEOPS_E2E_POLICY" --trusted-root "$SITEOPS_E2E_TRUSTED_ROOT")
           if [[ "$PUBLISHED_JOURNEY" == "guided" ]]; then
             target_args=(--input-file "$RUNNER_TEMP/published-answers.json" --read-resources)
+            trust_args=(--approved-source guided)
           fi
           if ! siteops \
             --project "$SITEOPS_E2E_PROJECT" \
-            --trust-policy "$SITEOPS_E2E_POLICY" \
-            --trusted-root "$SITEOPS_E2E_TRUSTED_ROOT" \
+            "${trust_args[@]}" \
             deploy aio-install \
             --offline \
             "${target_args[@]}" \

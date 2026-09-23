@@ -36,6 +36,83 @@ def _block(section: str, language: str) -> str:
     return re.search(rf"```{language}\n(.*?)\n```", section, re.DOTALL).group(1)
 
 
+@pytest.mark.parametrize("heading", [
+    "### Bootstrap from HTTPS", "### Verify the bootstrap script",
+])
+def test_bootstrap_bash_examples_parse_without_executing_external_tools(tmp_path, heading):
+    section = _section(heading)
+    body = _block(section, "bash")
+    script = tmp_path / "example.sh"
+    script.write_text(body, encoding="utf-8", newline="\n")
+    bash = shutil.which("bash")
+    if sys.platform == "win32":
+        from tests.shell_helpers import required_bash
+
+        bash = str(required_bash())
+    result = subprocess.run(
+        [bash, "-n", bash_path(script)], capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--source-commit" in body and "--release" in body
+    assert "--tlsv1.2" in body
+
+
+@pytest.mark.parametrize("heading", [
+    "### Bootstrap from HTTPS", "### Verify the bootstrap script",
+])
+def test_bootstrap_windows_examples_parse(tmp_path, heading):
+    powershell = shutil.which("pwsh") or shutil.which("powershell")
+    if powershell is None:
+        pytest.skip("PowerShell is unavailable.")
+    body = _block(_section(heading), "powershell")
+    example = tmp_path / "example.ps1"
+    example.write_text(body, encoding="utf-8")
+    parser = (
+        "$tokens=$null;$errors=$null;"
+        "[System.Management.Automation.Language.Parser]::ParseFile($env:TEST_SCRIPT,"
+        "[ref]$tokens,[ref]$errors)|Out-Null;"
+        "if($errors.Count){$errors|ForEach-Object{Write-Error $_};exit 1}"
+    )
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-Command", parser],
+        capture_output=True, text=True, timeout=20,
+        env={**os.environ, "TEST_SCRIPT": str(example)},
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--tlsv1.2" in body
+
+
+@pytest.mark.parametrize("verified", [False, True])
+def test_verified_bootstrap_guide_runs_script_only_after_matching_proof(tmp_path, verified):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    write_executable(bin_dir / "curl", """#!/usr/bin/env bash
+while (($#)); do
+  if [[ "$1" == "--output" ]]; then output="$2"; shift 2; else shift; fi
+done
+printf 'echo SCRIPT_RAN\\n' > "$output"
+""")
+    write_executable(bin_dir / "gh", """#!/usr/bin/env bash
+[[ "$1 $2" == "attestation verify" ]] || exit 99
+printf '%s\\n' "$@" > "$TEST_GH_ARGUMENTS"
+printf '%s\\n' "$TEST_VERIFIED"
+""")
+    log = tmp_path / "gh-arguments.txt"
+    result = run_script(
+        _block(_section("### Verify the bootstrap script"), "bash"),
+        tmp_path, {
+            "TEST_GH_ARGUMENTS": bash_path(log),
+            "TEST_VERIFIED": "true" if verified else "false",
+        },
+    )
+    assert (result.returncode == 0) is verified
+    assert ("SCRIPT_RAN" in result.stdout) is verified
+    assert "--cert-identity" in log.read_text(encoding="utf-8")
+    assert "--source-digest" in log.read_text(encoding="utf-8")
+    assert "--signer-digest" in log.read_text(encoding="utf-8")
+    assert "--bundle" in log.read_text(encoding="utf-8")
+
+
 def test_online_transition_selects_a_release_wheel_instead_of_an_index_package():
     section = _section("## Select another build, repair, or remove")
     manifest = tomllib.loads(_block(section, "toml"))
@@ -50,6 +127,46 @@ def test_online_transition_selects_a_release_wheel_instead_of_an_index_package()
     assert "lock" not in manifest["tool"]["pipx"]["tools"]["siteops"]
     assert "PIP_ONLY_BINARY=:all:" in section
     assert "PIPX_FETCH_PYTHON=never" in section
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="PowerShell 5.1 is available on Windows.")
+@pytest.mark.parametrize("verified", [False, True])
+def test_verified_bootstrap_windows_requires_the_certificate_before_execution(tmp_path, verified):
+    section = _section("### Verify the bootstrap script")
+    body = _block(section, "powershell").replace(
+        "<approved-release-tag>", "siteops/v1.0.0b1",
+    ).replace("<full-source-commit>", "c" * 40)
+    observation = verified_observation(
+        "Azure/digital-ops-scale-kit", "c" * 40, "refs/heads/main",
+        ".github/workflows/_siteops-distribution.yaml", ".github/workflows/release.yaml",
+    )
+    if not verified:
+        observation["verificationResult"]["signature"]["certificate"]["runnerEnvironment"] = "PRIVATE_WRONG"
+    evidence = tmp_path / "observation.json"
+    evidence.write_text(json.dumps([observation]), encoding="utf-8")
+    script = tmp_path / "verified-example.ps1"
+    script.write_text(
+        """function icacls { $global:LASTEXITCODE = 0 }
+function curl.exe {
+    $target = $args[[array]::IndexOf($args, '--output') + 1]
+    Set-Content -LiteralPath $target -Value 'test bytes'
+    $global:LASTEXITCODE = 0
+}
+function gh.exe {
+    Get-Content -LiteralPath $env:TEST_EVIDENCE -Raw
+    $global:LASTEXITCODE = 0
+}
+function powershell.exe { 'SCRIPT_RAN'; $global:LASTEXITCODE = 0 }
+""" + body, encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+        env={**os.environ, "TEMP": str(tmp_path), "TEST_EVIDENCE": str(evidence)},
+        cwd=tmp_path, capture_output=True, text=True, timeout=30,
+    )
+    assert (result.returncode == 0) is verified, result.stdout + result.stderr
+    assert ("SCRIPT_RAN" in result.stdout) is verified
+    assert "PRIVATE_WRONG" not in result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("shell", ["powershell", "bash"])

@@ -12,8 +12,11 @@ Each asset has its own detached proof, `<asset>.attestation.jsonl`, and the
 publishing pipeline signs and cross-checks both. As an operator you use one
 asset: install the wheel directly, or download the archive with its proof and
 install from the authenticated bundle. Both paths install with stock
-[pipx](https://pipx.pypa.io/). Site Ops ships no installer program, no bootstrap
-script, and no private package store.
+[pipx](https://pipx.pypa.io/). Releases that publish
+`siteops-bootstrap.sh` and `siteops-bootstrap.ps1` also provide a detached
+proof for each script. Both script entry routes run the same platform script
+and install from the authenticated archive. Site Ops has no private package
+store.
 
 A Site Ops release installs the engine only. Workspace content has its own
 source and version. Acquire a compatible workspace from an approved content
@@ -24,6 +27,206 @@ A release without these assets uses the
 [linked Site Ops release](releasing.md#release-content-against-an-existing-engine)
 or the [contributor source installation](../CONTRIBUTING.md#development-setup)
 path.
+
+## Choose an installation route
+
+The bootstrap scripts support Ubuntu 24.04 x64 and Windows x64. Select an
+exact approved release tag and its full source commit. The public release
+notes identify both. Do not use a floating branch or `latest` as installation
+authority. Both scripts disclose required tool changes and ask for consent.
+Use `--yes` on Ubuntu or `-Yes` on Windows only for an explicitly approved
+unattended installation. Azure login and deployment are separate.
+
+| Route | First script trust | Requirements |
+|---|---|---|
+| [HTTPS bootstrap](#bootstrap-from-https) | Official HTTPS delivery. The script has not been independently authenticated before it starts. | Supported shell and HTTPS downloader. Missing tools may require an approved package channel and administrator consent. |
+| [Verify the bootstrap script](#verify-the-bootstrap-script) | Detached proof, exact publisher, source commit, signing workflow, caller and runner checked before execution. | GitHub CLI 2.95 or newer in version 2 from an approved channel. No GitHub login. |
+| [Release wheel](#install-the-release-wheel) or [manual verified bundle](#install-the-verified-bundle) | Separate native installation paths with different provenance and dependency guarantees. | Provision the tools in [Before you start](#before-you-start). |
+
+The HTTPS path is suitable when your policy accepts the official release
+endpoint as authority for the initial script. Later verification of the
+archive does not retroactively authenticate that script. For publisher
+provenance before any installer code runs, select the verified path. A
+checksum obtained alongside a script from the same location does not add
+independent publisher authentication. The script's approved source setup
+is always opt-in.
+
+### Bootstrap from HTTPS
+
+Replace the tag and commit with the pair in your approved release record.
+The following downloads the complete script to a new private location
+before execution. The release must contain the script asset.
+
+Ubuntu 24.04:
+
+```bash
+tag="<approved-release-tag>"; sha="<full-source-commit>"
+download="$(mktemp -d)"; chmod 700 "$download"
+script="$download/siteops-bootstrap.sh"
+url="https://github.com/Azure/digital-ops-scale-kit/releases/download/${tag//\//%2F}/siteops-bootstrap.sh"
+curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+  --tlsv1.2 --max-redirs 3 --max-time 120 --output "$script" "$url" &&
+  bash "$script" --release "$tag" --source-commit "$sha" \
+    --with-azure-cli --enroll-source official
+```
+
+If Ubuntu has `wget` but not `curl`, use
+`wget --https-only --max-redirect=3 --timeout=120 -O "$script" "$url"`
+in place of the `curl` download above, then run the same `bash` command
+only when the download succeeds. The script will disclose any required
+tool changes, including obtaining `curl` from the approved Ubuntu channel.
+
+Windows PowerShell:
+
+```powershell
+$tag = "<approved-release-tag>"; $sha = "<full-source-commit>"
+$download = Join-Path $env:TEMP ("siteops-bootstrap-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $download | Out-Null
+$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+icacls $download /inheritance:r /grant:r "*${sid}:(OI)(CI)F" | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "The download directory could not be protected." }
+$script = Join-Path $download "siteops-bootstrap.ps1"
+$url = "https://github.com/Azure/digital-ops-scale-kit/releases/download/$([uri]::EscapeDataString($tag))/siteops-bootstrap.ps1"
+& curl.exe --fail --silent --show-error --location --proto '=https' --proto-redir '=https' `
+  --tlsv1.2 --max-redirs 3 --max-time 120 --output $script $url
+if ($LASTEXITCODE -ne 0) { throw "The bootstrap script could not be downloaded." }
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script `
+  -Release $tag -SourceCommit $sha -WithAzureCli -EnrollSource official
+```
+
+The PowerShell execution policy setting is scoped to this process. An
+organization policy may still prohibit unsigned scripts. Use your approved
+managed installation path in that case. Keep the downloaded file to inspect
+it, or remove only the private directory you created when finished. The
+scripts do not run `gh auth login` or `az login`. They download public assets
+anonymously, verify the engine archive and offer source enrollment only
+because the command above selects `official`.
+
+Repeating the same selected installation checks the retained bundle before
+skipping pipx changes. The script retains the authenticated ZIP and proof
+in private user storage for that exact release selection. It rechecks
+their proof on repeat without downloading the same assets again. This
+uses additional disk space beside the extracted bundle. A different
+build or an explicit repair requires
+`--replace` on Ubuntu or `-Replace` on Windows. This opts into pipx
+`--force`, which can override a pipx pin. Review the selected version,
+source commit and existing installation before using it. An interrupted
+extraction or changed retained bundle fails for inspection rather than
+overwriting the existing directory. The bootstrap does not claim a
+transactional rollback.
+
+### Verify the bootstrap script
+
+Install GitHub CLI 2.95 or newer in version 2 through an approved channel
+before this route. Ubuntu 24.04's distribution package is older than the
+qualified verifier. Download the versioned script and its proof without
+executing either one. Neither public asset requires GitHub authentication.
+The verification below uses your approved source commit, not an identity
+read from the script or proof.
+
+Ubuntu 24.04:
+
+```bash
+tag="<approved-release-tag>"; sha="<full-source-commit>"
+download="$(mktemp -d)"; chmod 700 "$download"
+script="$download/siteops-bootstrap.sh"
+url="https://github.com/Azure/digital-ops-scale-kit/releases/download/${tag//\//%2F}/"
+curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+  --tlsv1.2 --max-redirs 3 --max-time 120 --output "$script" "${url}siteops-bootstrap.sh" &&
+  curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+    --tlsv1.2 --max-redirs 3 --max-time 120 --output "$script.attestation.jsonl" \
+    "${url}siteops-bootstrap.sh.attestation.jsonl" || exit 1
+repository="Azure/digital-ops-scale-kit"
+source_ref="refs/heads/main"
+signer="https://github.com/$repository/.github/workflows/_siteops-distribution.yaml@$source_ref"
+builder="https://github.com/$repository/.github/workflows/release.yaml@$source_ref"
+query="length > 0 and all(.[]; .verificationResult.mediaType == \"application/vnd.dev.sigstore.verificationresult+json;version=0.1\" and (.verificationResult.signature.certificate | .buildConfigURI == \"$builder\" and .buildConfigDigest == \"$sha\" and .runnerEnvironment == \"self-hosted\"))"
+verified="$(gh attestation verify "$script" --bundle "$script.attestation.jsonl" \
+  --repo "$repository" --cert-identity "$signer" --source-ref "$source_ref" \
+  --source-digest "$sha" --signer-digest "$sha" \
+  --cert-oidc-issuer https://token.actions.githubusercontent.com \
+  --predicate-type https://slsa.dev/provenance/v1 --hostname github.com \
+  --digest-alg sha256 --format json --jq "$query")"
+[[ "$verified" == true ]] || { echo "Script verification failed." >&2; exit 1; }
+bash "$script" --release "$tag" --source-commit "$sha" \
+  --with-azure-cli --enroll-source official
+```
+
+Windows PowerShell:
+
+```powershell
+$tag = "<approved-release-tag>"; $sha = "<full-source-commit>"
+$download = Join-Path $env:TEMP ("siteops-bootstrap-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $download | Out-Null
+$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+icacls $download /inheritance:r /grant:r "*${sid}:(OI)(CI)F" | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "The download directory could not be protected." }
+$script = Join-Path $download "siteops-bootstrap.ps1"
+$url = "https://github.com/Azure/digital-ops-scale-kit/releases/download/$([uri]::EscapeDataString($tag))/"
+foreach ($name in @("siteops-bootstrap.ps1", "siteops-bootstrap.ps1.attestation.jsonl")) {
+  & curl.exe --fail --silent --show-error --location --proto '=https' --proto-redir '=https' `
+    --tlsv1.2 --max-redirs 3 --max-time 120 --output (Join-Path $download $name) ($url + $name)
+  if ($LASTEXITCODE -ne 0) { throw "A bootstrap asset could not be downloaded." }
+}
+$repository = "Azure/digital-ops-scale-kit"; $sourceRef = "refs/heads/main"
+$signer = "https://github.com/$repository/.github/workflows/_siteops-distribution.yaml@$sourceRef"
+$builder = "https://github.com/$repository/.github/workflows/release.yaml@$sourceRef"
+$lines = [Collections.Generic.List[string]]::new(); $bytes = 0
+$preference = $ErrorActionPreference
+try {
+  $ErrorActionPreference = "Continue"
+  & gh.exe attestation verify $script --bundle "$script.attestation.jsonl" `
+    --repo $repository --cert-identity $signer --source-ref $sourceRef `
+    --source-digest $sha --signer-digest $sha `
+    --cert-oidc-issuer https://token.actions.githubusercontent.com `
+    --predicate-type https://slsa.dev/provenance/v1 --hostname github.com `
+    --digest-alg sha256 --format json 2>$null | ForEach-Object {
+      $bytes += [Text.Encoding]::UTF8.GetByteCount($_) + 1
+      if ($bytes -gt 8388608) { throw "Verification evidence is too large." }
+      $lines.Add($_)
+    }
+  $status = $LASTEXITCODE
+} finally { $ErrorActionPreference = $preference }
+if ($status -ne 0 -or $lines.Count -eq 0) { throw "Script verification failed." }
+$observations = @((($lines -join "`n") | ConvertFrom-Json))
+if ($observations.Count -lt 1 -or $observations.Count -gt 128) {
+  throw "Script verification returned an unsupported result count."
+}
+$expected = @{
+  subjectAlternativeName = $signer
+  issuer = "https://token.actions.githubusercontent.com"
+  sourceRepositoryURI = "https://github.com/$repository"
+  sourceRepositoryDigest = $sha
+  sourceRepositoryRef = $sourceRef
+  buildSignerDigest = $sha
+  buildConfigURI = $builder
+  buildConfigDigest = $sha
+  runnerEnvironment = "self-hosted"
+}
+foreach ($item in $observations) {
+  $verified = $item.verificationResult
+  $certificate = $verified.signature.certificate
+  if ($verified -isnot [pscustomobject] -or $certificate -isnot [pscustomobject] -or
+      $verified.mediaType -isnot [string] -or
+      $verified.mediaType -cne "application/vnd.dev.sigstore.verificationresult+json;version=0.1") {
+    throw "Unsupported verified script observation."
+  }
+  foreach ($key in $expected.Keys) {
+    $value = $certificate.PSObject.Properties[$key].Value
+    if ($value -isnot [string] -or $value -cne $expected[$key]) {
+      throw "The verified script certificate differs from the selected release."
+    }
+  }
+}
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script `
+  -Release $tag -SourceCommit $sha -WithAzureCli -EnrollSource official
+```
+
+Do not change these publisher, workflow or runner values to accommodate a
+failed check. The release ZIP has its own detached proof and is verified
+again by the authenticated script. Use the manual path below when a
+managed environment cannot run this bootstrap. Preinstalled tools that
+already meet the supported versions are retained.
 
 ## Before you start
 
@@ -45,8 +248,9 @@ official instructions:
 [pipx](https://pipx.pypa.io/stable/installation/), and
 [GitHub CLI](https://cli.github.com/).
 They are maintained separately from Site Ops, and some Linux distributions
-package Python's `venv` support separately. Prepare them first: the Site Ops
-installation commands below add no tooling of their own.
+package Python's `venv` support separately. Prepare them first for the native
+installation commands below. The bootstrap scripts inspect and propose tool
+changes instead.
 Use a maintained patch release of your selected Python minor version. The
 installed wheels also enforce their own Python-version requirements.
 

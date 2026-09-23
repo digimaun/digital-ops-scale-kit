@@ -11,6 +11,10 @@ First [install a compatible Site Ops build](install-siteops.md) and
 provisioned verification policy and trusted root. The package must include
 `aio-install` and its input contract. A local checkout selected with `-w`
 also works for authoring, without the pin or package trust options.
+If you explicitly enrolled an [approved source](projects.md#use-an-approved-source),
+use `--approved-source NAME` in place of the two trust file options on
+`project pin`, `inputs`, `plan` and `deploy`. The project pin cannot
+authorize its own source policy.
 
 ## Inspect and fill the inputs
 

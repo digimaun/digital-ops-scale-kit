@@ -163,6 +163,7 @@ def _context_options(args: argparse.Namespace) -> dict[str, Any]:
         "command": args.command,
         "policy": getattr(args, "trust_policy", None),
         "trusted_root": getattr(args, "trusted_root", None),
+        "approved_source": getattr(args, "approved_source", None),
         "offline": getattr(args, "offline", False),
         "discover": _auto_discover_workspace,
     }
@@ -178,20 +179,29 @@ def cmd_project(args: argparse.Namespace) -> int:
         if args.project is not None or args.workspace is not None:
             raise ProjectError("Project commands take their target directory as a positional argument.")
         if args.project_command == "show":
-            if args.trust_policy is not None or args.trusted_root is not None:
+            if args.trust_policy is not None or args.trusted_root is not None or args.approved_source is not None:
                 raise ProjectError("Project show reads a selection without applying trust options.")
             root = project_root(args.directory)
             pin = read_pin(root).pin
         else:
             from siteops.github_source import GitHubClient, GitHubReference
             from siteops.github_workspace_acquisition import GitHubWorkspaceAcquirer
+            from siteops.source_profiles import read_source
             from siteops.workspace_cache import WorkspaceCache, default_cache_root
 
-            cache_root = default_cache_root()
-            policy, trusted_root = require_trust_inputs(cache_root, args.trust_policy, args.trusted_root)
-            reference = GitHubReference.parse(args.source, ref=args.release)
+            profile = read_source(args.approved_source) if args.approved_source is not None else None
+            selected_source = args.source if args.source is not None else profile.reference if profile else None
+            if selected_source is None:
+                raise ProjectError("Project pin requires --source or --approved-source.")
+            reference = GitHubReference.parse(selected_source, ref=args.release)
             if reference.ref is None:
                 raise ProjectError("Project pin requires an explicit published release with --release.")
+            cache_root = default_cache_root()
+            policy, trusted_root = require_trust_inputs(
+                cache_root, args.trust_policy, args.trusted_root,
+                approved_source=args.approved_source,
+                source_reference=f"github:{reference.owner}/{reference.repository}",
+            )
             require_separate_cache(Path(args.directory).absolute(), cache_root)
             root = project_root(args.directory, create=True)
             require_separate_cache(root, cache_root)
@@ -222,6 +232,58 @@ def cmd_project(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_source(args: argparse.Namespace) -> int:
+    """Manage consumer-approved source trust independently of projects."""
+    from siteops.github_attestation import load_github_policy
+    from siteops.source_profiles import enroll_source, list_sources, read_source, remove_source
+
+    if is_redaction_enabled():
+        print("Source approval details are private. Use an authorized private destination.", file=sys.stderr)
+        return 1
+    try:
+        if args.project is not None or args.workspace is not None or args.approved_source is not None:
+            raise ProjectError("Source enrollment is user configuration, not a project or workspace selection.")
+        if args.source_command == "enroll":
+            if args.trust_policy is None or args.trusted_root is None:
+                raise ProjectError("Source enrollment requires --trust-policy and --trusted-root.")
+            from siteops.workspace_cache import default_cache_root
+
+            policy_file, root_file = require_trust_inputs(
+                default_cache_root(), args.trust_policy, args.trusted_root,
+            )
+            result = enroll_source(args.name, args.source, policy_file, root_file)
+            print(f"Approved source {_content_text(result.name)}: {_content_text(result.reference)}.")
+            return 0
+        if args.trust_policy is not None or args.trusted_root is not None:
+            raise ProjectError("Trust file options apply to source enroll, not inspection or removal.")
+        if args.source_command == "list":
+            for name in list_sources():
+                print(_content_text(name))
+        elif args.source_command == "show":
+            result = read_source(args.name, require_valid=False)
+            policy = load_github_policy(result.policy)
+            print(f"Approved source: {_content_text(result.name)}.")
+            print(f"Publisher: {_content_text(result.reference)}.")
+            print(f"Policy SHA-256: {result.policy_sha256}.")
+            print(f"Trusted root SHA-256: {result.root_sha256}.")
+            print(f"Signing workflow: {_content_text(policy.signer_workflow)} @ "
+                  f"{_content_text(policy.source_ref)}.")
+            print(f"Builder: {_content_text(policy.builder_workflow)}. "
+                  f"Runner: {policy.runner_environment}.")
+            print(f"Valid until: {policy.valid_until.isoformat()}.")
+            print("Package use checks current policy validity and artifact provenance.")
+        else:
+            remove_source(args.name)
+            print(f"Removed approved source {_content_text(args.name)}.")
+        return 0
+    except (ArtifactError, BrowseError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+    except OSError:
+        print("Error: The approved source files could not be accessed.", file=sys.stderr)
+        return 1
+
+
 def cmd_cache(args: argparse.Namespace) -> int:
     """Inspect private cached storage or remove one explicitly selected entry."""
     from siteops.cache_management import CacheManagement
@@ -234,6 +296,7 @@ def cmd_cache(args: argparse.Namespace) -> int:
         if any((
             args.project is not None, args.workspace is not None,
             args.trust_policy is not None, args.trusted_root is not None,
+            getattr(args, "approved_source", None) is not None,
             args.extra_sites_dirs,
         )):
             raise ProjectError("Cache commands use SITEOPS_CACHE_DIR or the platform default, not project or trust options.")
@@ -284,7 +347,8 @@ def cmd_browse(args: argparse.Namespace) -> int:
     try:
         validate_browse_options(args.name, args.search, tuple(args.tag), args.category, args.limit)
         if args.source:
-            if args.project is not None or args.trust_policy is not None or args.trusted_root is not None:
+            if (args.project is not None or args.trust_policy is not None
+                    or args.trusted_root is not None or args.approved_source is not None):
                 raise ProjectError("Choose metadata --source browsing or project content, not both.")
             from siteops.github_catalog import inspect_github
 
@@ -340,7 +404,8 @@ def cmd_index(args: argparse.Namespace) -> int:
     try:
         if not args.public:
             raise BrowseError("index.approval", "Use --public to approve the authored publication.")
-        if args.project is not None or args.trust_policy is not None or args.trusted_root is not None:
+        if (args.project is not None or args.trust_policy is not None
+                or args.trusted_root is not None or args.approved_source is not None):
             raise BrowseError("index.project", "Index generation uses local workspace input, not project or trust options.")
         if args.workspace is None and pin_exists(Path.cwd()):
             raise BrowseError("index.project", "Select a local workspace with -w before generating an index from a project.")
@@ -1591,6 +1656,10 @@ Examples:
         "--trusted-root", type=Path, metavar="FILE",
         help="Independent local trusted root snapshot, required to create or use a workspace pin",
     )
+    parser.add_argument(
+        "--approved-source", metavar="NAME",
+        help="Explicitly selected consumer source enrollment for a project pin or packaged command",
+    )
 
     parser.add_argument(
         "-v",
@@ -1631,19 +1700,29 @@ Examples:
         if name == "pin":
             description = (
                 "Acquire and verify an explicit workspace release, then atomically create or "
-                "replace DIRECTORY/siteops.pin without changing Sites. Supply the independent "
-                "global --trust-policy FILE and --trusted-root FILE options before 'project pin'."
+                "replace DIRECTORY/siteops.pin without changing Sites. Supply global "
+                "--approved-source NAME, or independent global --trust-policy FILE and "
+                "--trusted-root FILE options before 'project pin'."
             )
         command = project_commands.add_parser(name, help=help_text, description=description)
         command.add_argument("directory", nargs="?", type=Path, default=Path("."),
                              metavar="DIRECTORY", help="Operator project directory (default: current directory)")
         command.add_argument("--output", choices=("plain", "json"), default="plain")
         if name == "pin":
-            command.add_argument("--source", required=True,
+            command.add_argument("--source",
                                  help="Workspace release source: github:OWNER/REPO")
             command.add_argument("--release", metavar="RELEASE", help="Explicit published release tag")
             command.add_argument("--release-workspace", metavar="PATH",
                                  help="Workspace path listed in the release descriptor, required when several are listed")
+
+    p_source = subparsers.add_parser("source", help="Inspect, enroll or remove consumer-approved sources")
+    source_commands = p_source.add_subparsers(dest="source_command", required=True)
+    for name in ("enroll", "show", "list", "remove"):
+        command = source_commands.add_parser(name)
+        if name != "list":
+            command.add_argument("name", metavar="NAME")
+        if name == "enroll":
+            command.add_argument("--source", required=True, help="Approved repository: github:OWNER/REPO")
 
     p_browse = subparsers.add_parser(
         "browse",
@@ -1975,6 +2054,8 @@ Examples:
         sys.exit(cmd_index(args))
     if args.command == "project":
         sys.exit(cmd_project(args))
+    if args.command == "source":
+        sys.exit(cmd_source(args))
     if args.command == "cache":
         sys.exit(cmd_cache(args))
 

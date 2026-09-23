@@ -310,6 +310,14 @@ def test_published_workspace_uses_project_pin_and_separate_sites():
         assert value in step
     assert 'mkdir "$project" "$cache"' not in step
 
+    assert 'if [[ "$PUBLISHED_JOURNEY" == "guided" ]]' in step
+    assert 'export XDG_CONFIG_HOME="$RUNNER_TEMP/published-source-config"' in step
+    assert '"XDG_CONFIG_HOME=$XDG_CONFIG_HOME" >> "$GITHUB_ENV"' in step
+    assert 'source enroll guided --source "github:$GITHUB_REPOSITORY"' in step
+    assert 'trust_args=(--approved-source guided)' in step
+    assert 'trust_args=(--trust-policy "$SITEOPS_E2E_POLICY"' in step
+    assert '"${trust_args[@]}"' in step
+
     plan_step = workflow[
         workflow.index("- name: Render and plan the published-package operator Site"):
         workflow.index("- name: Preflight Arc cluster name is unused")
@@ -336,8 +344,7 @@ def test_guided_published_plan_waits_for_arc_and_keeps_private_data_local():
         "umask 077",
         "published-answers.json",
         "--project \"$SITEOPS_E2E_PROJECT\"",
-        "--trust-policy \"$SITEOPS_E2E_POLICY\"",
-        "--trusted-root \"$SITEOPS_E2E_TRUSTED_ROOT\"",
+        "--approved-source guided",
         "--read-resources",
         "--offline",
         "SITEOPS_REDACT_OUTPUT=0",
@@ -356,6 +363,7 @@ def test_guided_published_deploy_uses_answers_and_read_gate():
     assert '--input-file "$RUNNER_TEMP/published-answers.json"' in step
     assert "--read-resources" in step
     assert 'name=$SITE_NAME' in step
+    assert 'trust_args=(--approved-source guided)' in step
 
 
 def test_published_deploy_uses_only_the_pin_offline():

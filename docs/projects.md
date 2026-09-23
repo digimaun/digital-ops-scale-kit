@@ -94,6 +94,37 @@ siteops --project ./factory --trust-policy policy.json --trusted-root trusted-ro
 The workspace pin identifies the whole workspace. Each command still selects
 its manifest by the existing exact name/path rules.
 
+## Use an approved source
+
+An operator can explicitly enroll a named public release source in private
+user configuration. It records independently supplied policy and trusted
+root bytes outside the project and content cache:
+
+```text
+siteops --trust-policy policy.json --trusted-root trusted-root.json source enroll official --source github:Azure/digital-ops-scale-kit
+siteops source show official
+siteops --approved-source official project pin ./factory --release <approved-release>
+siteops --approved-source official --project ./factory plan aio-install --input-file ./aio-inputs.yaml
+siteops source remove official
+```
+
+The [bootstrap scripts](install-siteops.md#choose-an-installation-route) can
+offer that enrollment when the operator explicitly chooses
+`--enroll-source official` or `-EnrollSource official`. This does not
+sign in to GitHub or Azure. Use `siteops source list` to inspect the names.
+The approved source selects the repository and its verification files only
+when `--approved-source NAME` is passed. It does not change a project's pin
+or select a deployment target. An explicit `--source` on `project pin` must
+match the approved source. Mixing an approved source with explicit trust
+files is rejected instead of silently overriding either.
+
+Source records are private user configuration. Package use still checks
+current policy validity, trusted-root identity, source selection, package
+provenance and byte integrity. Expired enrollment can be inspected and
+removed. To change approved trust, remove the old name deliberately and
+enroll the reviewed replacement. Keep the explicit policy and root route
+above for environments that manage those files separately.
+
 If a release contains several workspaces, add
 `--release-workspace <path-from-the-release>` to `project pin`.
 The command requires an explicit published release and uses anonymous source

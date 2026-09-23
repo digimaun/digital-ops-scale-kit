@@ -48,6 +48,17 @@ from environment-specific configuration.
 
 ## Quick start
 
+Choose how to install an identified Site Ops release:
+
+| Route | Initial trust | Start here |
+|---|---|---|
+| HTTPS bootstrap for evaluation | Trust the official HTTPS endpoint for the script. The script verifies the engine ZIP before installation. | [Install from HTTPS](docs/install-siteops.md#bootstrap-from-https) |
+| Verify the script first | Check its detached proof against the approved publisher and source commit before executing it. Requires GitHub CLI, but no GitHub login. | [Verify before running](docs/install-siteops.md#verify-the-bootstrap-script) |
+| Native tools and managed environments | Select the direct pipx wheel or manually authenticated bundle according to your feed and provenance policy. | [Installation alternatives](docs/install-siteops.md#install-the-release-wheel) |
+
+Bootstrap assets are available only on releases that publish them. Installing
+does not sign in to Azure or approve deployment content automatically.
+
 **[Start with AIO on one Site](docs/guided-inputs.md).**
 
 With an approved workspace package, inspect required inputs, supply one

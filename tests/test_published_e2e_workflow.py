@@ -4,6 +4,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -54,6 +55,7 @@ def _parse_inputs(**changes: str) -> subprocess.CompletedProcess[str]:
         "INPUT_TESTS": "",
         "INPUT_PUBLISHED_RELEASE": "",
         "INPUT_PUBLISHED_SOURCE_SHA": "",
+        "INPUT_PUBLISHED_JOURNEY": "configured",
         "INPUT_SKIP_TEARDOWN": "false",
         "INPUT_KEEP_ALIVE": "0",
         "RUN_ID": "42",
@@ -73,12 +75,42 @@ def _embedded_python(run: str) -> list[str]:
     return re.findall(r"<<'PY'\n(.*?)\n\s*PY(?:\n|$)", run, re.S)
 
 
+@pytest.mark.parametrize(("step", "minimum_python"), [
+    ("Prepare guided AIO answers and plan", 5),
+    ("Deploy AIO through the published engine and package", 1),
+    ("Observe bounded AIO readiness", 3),
+])
+def test_guided_workflow_shell_and_embedded_python_parse_without_execution(
+    step, minimum_python,
+):
+    if os.name == "nt":
+        bash = Path(os.environ.get("ProgramFiles", "")) / "Git" / "bin" / "bash.exe"
+        if not bash.is_file():
+            pytest.skip("Git Bash is needed for Windows shell syntax checks.")
+    else:
+        resolved = shutil.which("bash")
+        if resolved is None:
+            pytest.skip("Bash is needed for shell syntax checks.")
+        bash = Path(resolved)
+    run = _step_run(step)
+    checked = subprocess.run(
+        [str(bash), "-n"],
+        input=run, capture_output=True, text=True, timeout=15, check=False,
+    )
+    assert checked.returncode == 0, checked.stderr
+    blocks = _embedded_python(run)
+    assert len(blocks) >= minimum_python
+    for number, block in enumerate(blocks, start=1):
+        compile(block, f"{step} embedded Python {number}", "exec")
+
+
 def test_published_mode_is_explicit_and_bounded():
     workflow = _workflow()
 
     for value in (
         "published-release:",
         "published-source-sha:",
+        "published-journey:",
         "published-release and published-source-sha must be supplied together.",
         "Published E2E requires exactly one aio-releases entry.",
         "Published E2E requires an existing resource group",
@@ -106,6 +138,41 @@ def test_published_input_contract_accepts_only_the_bounded_shape():
     assert "max_parallel=1" in result.stdout
     assert "persistent=true" in result.stdout
     assert "rg_in=paymauntarget3" in result.stdout
+
+
+def test_published_guided_journey_accepts_bounded_enabled_and_disabled_modes():
+    result = _parse_inputs(
+        INPUT_SECRET_SYNC_MODES="disabled,enabled",
+        INPUT_TESTS="aio-install",
+        INPUT_PUBLISHED_RELEASE="v0.0.4.dev20260919",
+        INPUT_PUBLISHED_SOURCE_SHA="a" * 40,
+        INPUT_PUBLISHED_JOURNEY="guided",
+        INPUT_RG="paymauntarget3",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "published_journey=guided" in result.stdout
+    assert 'secret_sync_modes=["disabled", "enabled"]' in result.stdout
+    assert "max_parallel=1" in result.stdout
+
+
+def test_guided_published_journey_is_not_inferred_from_source_checkout():
+    result = _parse_inputs(INPUT_PUBLISHED_JOURNEY="guided")
+    assert result.returncode != 0
+    assert "published-journey requires published-release" in result.stderr
+
+
+def test_guided_published_journey_pins_qualified_aio_version():
+    result = _parse_inputs(
+        INPUT_RELEASES="2607",
+        INPUT_SECRET_SYNC_MODES="enabled",
+        INPUT_TESTS="aio-install",
+        INPUT_PUBLISHED_RELEASE="v0.0.4.dev20260919",
+        INPUT_PUBLISHED_SOURCE_SHA="a" * 40,
+        INPUT_PUBLISHED_JOURNEY="guided",
+        INPUT_RG="paymauntarget3",
+    )
+    assert result.returncode != 0
+    assert "Published guided E2E currently requires aio-releases=2608" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -258,6 +325,39 @@ def test_published_workspace_uses_project_pin_and_separate_sites():
         assert value in plan_step
 
 
+def test_guided_published_plan_waits_for_arc_and_keeps_private_data_local():
+    workflow = _workflow()
+    connected = workflow.index("uses: ./.github/actions/connect-arc")
+    guided = workflow.index("- name: Prepare guided AIO answers and plan")
+    deployed = workflow.index("- name: Deploy AIO through the published engine and package")
+    assert connected < guided < deployed
+    step = _step_run("Prepare guided AIO answers and plan")
+    for value in (
+        "umask 077",
+        "published-answers.json",
+        "--project \"$SITEOPS_E2E_PROJECT\"",
+        "--trust-policy \"$SITEOPS_E2E_POLICY\"",
+        "--trusted-root \"$SITEOPS_E2E_TRUSTED_ROOT\"",
+        "--read-resources",
+        "--offline",
+        "SITEOPS_REDACT_OUTPUT=0",
+        "expected_steps",
+        "read-required",
+        "requirement-unmet",
+    ):
+        assert value in step
+    assert "cat \"$RUNNER_TEMP/" not in step
+    assert " -w workspaces/" not in step
+
+
+def test_guided_published_deploy_uses_answers_and_read_gate():
+    step = _step_run("Deploy AIO through the published engine and package")
+    assert 'PUBLISHED_JOURNEY' in step
+    assert '--input-file "$RUNNER_TEMP/published-answers.json"' in step
+    assert "--read-resources" in step
+    assert 'name=$SITE_NAME' in step
+
+
 def test_published_deploy_uses_only_the_pin_offline():
     workflow = _workflow()
 
@@ -391,3 +491,174 @@ def test_published_readiness_is_bounded_and_existing_teardown_is_retained():
         "operator-owned",
     ):
         assert value in workflow
+
+
+def test_guided_enabled_readiness_requires_live_secret_sync_resources():
+    step = _step_run("Observe bounded AIO readiness")
+    for value in (
+        "E2E_JOURNEY",
+        "E2E_ENABLE_SECRET_SYNC",
+        "microsoft.secretsynccontroller/azurekeyvaultsecretproviderclasses",
+        "microsoft.managedidentity/userassignedidentities",
+        "microsoft.keyvault/vaults",
+        "az identity federated-credential list",
+        "--api-version 2026-07-01",
+        "defaultSecretProviderClassRef",
+        "secretSyncEnabled",
+    ):
+        assert value in step
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_guided_readiness_receipt_asserts_enabled_state_without_private_ids(
+    tmp_path, enabled,
+):
+    script = _embedded_python(_step_run("Observe bounded AIO readiness"))[-1]
+    site = "private-site-name"
+    spc_id = "/subscriptions/private/spc/private-name"
+    resources = [
+        {"type": "Microsoft.IoTOperations/instances", "name": "private-instance",
+         "id": "/subscriptions/private/instance/private-name", "tags": {"site": site}},
+        {"type": "Microsoft.DeviceRegistry/schemaRegistries"},
+        {"type": "Microsoft.DeviceRegistry/namespaces"},
+    ]
+    if enabled:
+        resources.extend([
+            {"type": "Microsoft.SecretSyncController/azureKeyVaultSecretProviderClasses",
+             "id": spc_id, "tags": {"site": site}},
+            {"type": "Microsoft.ManagedIdentity/userAssignedIdentities", "tags": {"site": site}},
+            {"type": "Microsoft.KeyVault/vaults", "tags": {"site": site}},
+        ])
+        (tmp_path / "published-federated.json").write_text(
+            json.dumps([{"name": "private-credential"}]), encoding="utf-8",
+        )
+        (tmp_path / "published-aio-instance.json").write_text(
+            json.dumps({"properties": {
+                "defaultSecretProviderClassRef": {"resourceId": spc_id},
+            }}),
+            encoding="utf-8",
+        )
+    pods = {"items": [{
+        "status": {"phase": "Running", "conditions": [
+            {"type": "Ready", "status": "True"},
+        ]},
+    }]}
+    instances = {"items": [{}]}
+    for filename, document in (
+        ("resources.json", resources),
+        ("pods.json", pods),
+        ("instances.json", instances),
+    ):
+        (tmp_path / filename).write_text(json.dumps(document), encoding="utf-8")
+    output = tmp_path / "readiness.json"
+    environment = {
+        "RUNNER_TEMP": str(tmp_path), "E2E_SITE_NAME": site,
+        "E2E_JOURNEY": "guided",
+        "E2E_ENABLE_SECRET_SYNC": "true" if enabled else "false",
+    }
+    if os.name == "nt":
+        environment["SystemRoot"] = os.environ["SystemRoot"]
+    result = subprocess.run(
+        [
+            sys.executable, "-c", script,
+            str(tmp_path / "resources.json"),
+            str(tmp_path / "pods.json"),
+            str(tmp_path / "instances.json"),
+            str(output),
+        ],
+        env=environment, capture_output=True, text=True, timeout=15, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads(output.read_text(encoding="utf-8"))
+    assert receipt["secretSyncEnabled"] is enabled
+    assert spc_id not in json.dumps(receipt)
+    assert site not in json.dumps(receipt)
+    if enabled:
+        assert receipt["spcBoundToInstance"] is True
+        assert receipt["federatedCredentials"] == 1
+    else:
+        assert "federatedCredentials" not in receipt
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_guided_answers_use_a_private_file_with_no_implicit_site(tmp_path, enabled):
+    block = _embedded_python(_step_run("Prepare guided AIO answers and plan"))[0]
+    environment = {
+        "RUNNER_TEMP": str(tmp_path),
+        "E2E_SITE_NAME": "example-one",
+        "E2E_SUBSCRIPTION": "00000000-0000-0000-0000-000000000001",
+        "E2E_RESOURCE_GROUP": "rg-example",
+        "E2E_CLUSTER_NAME": "arc-example",
+        "E2E_AIO_RELEASE": "2608",
+        "E2E_ENABLE_SECRET_SYNC": "true" if enabled else "false",
+    }
+    if os.name == "nt":
+        environment["SystemRoot"] = os.environ["SystemRoot"]
+    invoked = subprocess.run(
+        [sys.executable, "-c", block],
+        env=environment, capture_output=True, text=True, timeout=15, check=False,
+    )
+    assert invoked.returncode == 0, invoked.stderr
+    assert not invoked.stdout
+    values = json.loads(
+        (tmp_path / "published-answers.json").read_text(encoding="utf-8")
+    )["values"]
+    assert values["siteName"] == "example-one"
+    assert values["cluster"].endswith("/connectedClusters/arc-example")
+    assert values["enableSecretSync"] is enabled
+    assert values["brokerMemoryProfile"] == "Low"
+    assert all(values[key] is None for key in (
+        "subscription", "resourceGroup", "location", "clusterName",
+    ))
+    if os.name == "posix":
+        assert (tmp_path / "published-answers.json").stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_guided_private_plan_assertion_requires_expected_operations(
+    tmp_path, enabled,
+):
+    block = _embedded_python(_step_run("Prepare guided AIO answers and plan"))[-1]
+    expected_steps = {
+        "global-edge-site": "skip", "edge-site": "skip",
+        "schema-registry": "execute", "adr-ns": "execute",
+        "aio-enablement": "execute", "aio-instance": "execute",
+        "schema-registry-role": "execute",
+        "resolve-aio": "execute" if enabled else "skip",
+        "secretsync": "execute" if enabled else "skip",
+    }
+    plan = {
+        "status": "planned", "executable": True,
+        "engine": {"version": "test-build"},
+        "plan": {
+            "manifest": {"targetSelection": "explicit-site"},
+            "submission": {"mode": "arm-json", "compilationBinding": "package-artifact"},
+            "targets": [{"operations": [
+                {"identity": {"step": name}, "disposition": disposition}
+                for name, disposition in expected_steps.items()
+            ]}],
+        },
+    }
+    path = tmp_path / "published-guided-plan.json"
+    path.write_text(json.dumps(plan), encoding="utf-8")
+    environment = {
+        "RUNNER_TEMP": str(tmp_path), "SITEOPS_E2E_ENGINE_VERSION": "test-build",
+        "E2E_ENABLE_SECRET_SYNC": "true" if enabled else "false",
+    }
+    if os.name == "nt":
+        environment["SystemRoot"] = os.environ["SystemRoot"]
+    selected = subprocess.run(
+        [sys.executable, "-c", block],
+        env=environment, capture_output=True, text=True, timeout=15, check=False,
+    )
+    assert selected.returncode == 0, selected.stderr
+    plan["plan"]["targets"][0]["operations"][-1]["disposition"] = (
+        "skip" if enabled else "execute"
+    )
+    path.write_text(json.dumps(plan), encoding="utf-8")
+    rejected = subprocess.run(
+        [sys.executable, "-c", block],
+        env=environment, capture_output=True, text=True, timeout=15, check=False,
+    )
+    assert rejected.returncode != 0
+    assert "unexpected operations" in rejected.stderr

@@ -75,6 +75,11 @@ on:
         description: "Full main-branch commit expected for published-release. Required with published-release."
         type: string
         default: ""
+      published-journey:
+        description: "Published package scenario: configured Site control or guided single Site. Guided supports Secret Sync enabled and disabled."
+        type: choice
+        options: [configured, guided]
+        default: configured
 
 permissions:
   id-token: write
@@ -105,6 +110,7 @@ jobs:
       published-mode: ${{ steps.v.outputs.published_mode }}
       published-release: ${{ steps.v.outputs.published_release }}
       published-source-sha: ${{ steps.v.outputs.published_source_sha }}
+      published-journey: ${{ steps.v.outputs.published_journey }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -130,6 +136,7 @@ jobs:
           INPUT_TESTS: "${{ inputs.tests }}"
           INPUT_PUBLISHED_RELEASE: "${{ inputs.published-release }}"
           INPUT_PUBLISHED_SOURCE_SHA: "${{ inputs.published-source-sha }}"
+          INPUT_PUBLISHED_JOURNEY: "${{ inputs.published-journey }}"
           INPUT_SKIP_TEARDOWN: "${{ inputs.skip-teardown }}"
           INPUT_KEEP_ALIVE: "${{ inputs.keep-cluster-alive-minutes }}"
           RUN_ID: "${{ github.run_id }}"
@@ -162,6 +169,15 @@ jobs:
           )
           published_source_sha = os.environ["INPUT_PUBLISHED_SOURCE_SHA"].strip()
           published_mode = bool(published_release)
+          published_journey = output_token(
+              os.environ["INPUT_PUBLISHED_JOURNEY"].strip(),
+              "published-journey",
+              maximum=16,
+          )
+          if published_journey not in {"configured", "guided"}:
+              sys.exit("published-journey must be configured or guided.")
+          if not published_mode and published_journey != "configured":
+              sys.exit("published-journey requires published-release.")
           if bool(published_source_sha) != published_mode:
               sys.exit(
                   "published-release and published-source-sha must be supplied together."
@@ -310,12 +326,14 @@ jobs:
           if published_mode:
               if len(rs) != 1:
                   sys.exit("Published E2E requires exactly one aio-releases entry.")
+              if published_journey == "guided" and rs != ["2608"]:
+                  sys.exit("Published guided E2E currently requires aio-releases=2608.")
               if not persistent or cl_in:
                   sys.exit(
                       "Published E2E requires an existing resource group and an "
                       "auto-generated cluster name."
                   )
-              if secret_sync_modes != ["disabled"]:
+              if published_journey == "configured" and secret_sync_modes != ["disabled"]:
                   sys.exit("Published E2E requires secret-sync-modes=disabled.")
               if ordered != ["aio-install"]:
                   sys.exit("Published E2E requires tests=aio-install.")
@@ -329,6 +347,7 @@ jobs:
           print(f"upgrade_to={upgrade_to}")
           print(f"persistent={'true' if persistent else 'false'}")
           print(f"published_mode={'true' if published_mode else 'false'}")
+          print(f"published_journey={published_journey}")
           print(f"published_release={published_release}")
           print(f"published_source_sha={published_source_sha}")
           # Emit trimmed operator inputs so downstream steps use the exact
@@ -375,6 +394,7 @@ jobs:
         secret-sync-mode: ${{ fromJSON(needs.prep.outputs.secret-sync-modes) }}
     env:
       PERSISTENT_RG: ${{ needs.prep.outputs.persistent }}
+      PUBLISHED_JOURNEY: ${{ needs.prep.outputs.published-journey }}
       DEBUG_USER_OID: ${{ secrets.DEBUG_USER_OID }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -608,7 +628,7 @@ jobs:
           echo "location=$LOC" >> "$GITHUB_OUTPUT"
 
       - name: Render and plan the published-package operator Site
-        if: needs.prep.outputs.published-mode == 'true'
+        if: needs.prep.outputs.published-mode == 'true' && needs.prep.outputs.published-journey == 'configured'
         shell: bash
         env:
           E2E_SITE_NAME: ${{ steps.names.outputs.site_name }}
@@ -617,7 +637,7 @@ jobs:
           E2E_LOCATION: ${{ steps.loc.outputs.location }}
           E2E_CLUSTER_NAME: ${{ steps.names.outputs.cluster }}
           E2E_AIO_RELEASE: ${{ matrix.aio-release }}
-          E2E_ENABLE_SECRET_SYNC: "false"
+          E2E_ENABLE_SECRET_SYNC: ${{ matrix.secret-sync-mode == 'enabled' && 'true' || 'false' }}
         run: |
           set -euo pipefail
           mkdir "$SITEOPS_E2E_PROJECT/sites"
@@ -699,6 +719,189 @@ jobs:
           # Secret Sync requires OIDC issuer and workload identity, so one
           # matrix axis intentionally controls all three settings.
           enable-workload-identity: ${{ matrix.secret-sync-mode == 'enabled' && 'true' || 'false' }}
+
+      - name: Prepare guided AIO answers and plan
+        if: needs.prep.outputs.published-mode == 'true' && needs.prep.outputs.published-journey == 'guided'
+        shell: bash
+        env:
+          E2E_SITE_NAME: ${{ steps.names.outputs.site_name }}
+          E2E_SUBSCRIPTION: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          E2E_RESOURCE_GROUP: ${{ steps.names.outputs.rg }}
+          E2E_CLUSTER_NAME: ${{ steps.names.outputs.cluster }}
+          E2E_AIO_RELEASE: ${{ matrix.aio-release }}
+          E2E_ENABLE_SECRET_SYNC: ${{ matrix.secret-sync-mode == 'enabled' && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          umask 077
+          if [[ -e "$SITEOPS_E2E_PROJECT/sites" ]]; then
+            echo "::error::Guided package use must not require configured Sites."
+            exit 1
+          fi
+          cluster_id="/subscriptions/$E2E_SUBSCRIPTION/resourceGroups/$E2E_RESOURCE_GROUP/providers/Microsoft.Kubernetes/connectedClusters/$E2E_CLUSTER_NAME"
+          for value in "$E2E_SUBSCRIPTION" "$E2E_RESOURCE_GROUP" "$E2E_CLUSTER_NAME" "$cluster_id"; do
+            echo "::add-mask::$value"
+          done
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          answer_file = Path(os.environ["RUNNER_TEMP"]) / "published-answers.json"
+          values = {
+              "siteName": os.environ["E2E_SITE_NAME"],
+              "subscription": None, "resourceGroup": None, "location": None,
+              "clusterName": None,
+              "environment": "e2e", "country": "US",
+              "aioRelease": os.environ["E2E_AIO_RELEASE"],
+              "enableSecretSync": os.environ["E2E_ENABLE_SECRET_SYNC"] == "true",
+              "brokerMemoryProfile": "Low",
+              "cluster": (
+                  "/subscriptions/" + os.environ["E2E_SUBSCRIPTION"] +
+                  "/resourceGroups/" + os.environ["E2E_RESOURCE_GROUP"] +
+                  "/providers/Microsoft.Kubernetes/connectedClusters/" +
+                  os.environ["E2E_CLUSTER_NAME"]
+              ),
+          }
+          document = {
+              "apiVersion": "siteops.inputs/v1", "kind": "SiteInputValues",
+              "values": values,
+          }
+          fd = os.open(answer_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+          with os.fdopen(fd, "w", encoding="utf-8") as stream:
+              json.dump(document, stream, sort_keys=True)
+          PY
+          if ! siteops \
+            --project "$SITEOPS_E2E_PROJECT" \
+            --trust-policy "$SITEOPS_E2E_POLICY" \
+            --trusted-root "$SITEOPS_E2E_TRUSTED_ROOT" \
+            inputs aio-install --offline --example "$RUNNER_TEMP/published-example.yaml" \
+            --output json > "$RUNNER_TEMP/published-inspection.json" \
+            2> "$RUNNER_TEMP/published-inspection.err"; then
+            echo "::error::Guided input inspection failed."
+            exit 1
+          fi
+          if siteops \
+            --project "$SITEOPS_E2E_PROJECT" \
+            --trust-policy "$SITEOPS_E2E_POLICY" \
+            --trusted-root "$SITEOPS_E2E_TRUSTED_ROOT" \
+            plan aio-install --offline --input-file "$RUNNER_TEMP/published-answers.json" \
+            --output json > "$RUNNER_TEMP/published-no-read.json" \
+            2> "$RUNNER_TEMP/published-no-read.err"; then
+            echo "::error::A resource ID was accepted without --read-resources."
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"])
+          inspection = json.loads((root / "published-inspection.json").read_text(encoding="utf-8"))
+          example = (root / "published-example.yaml").read_text(encoding="utf-8")
+          rejected = json.loads((root / "published-no-read.json").read_text(encoding="utf-8"))
+          fields = {row["name"]: row for row in inspection["inputs"]}
+          if (
+              inspection.get("kind") != "SiteInputContract"
+              or fields.get("cluster", {}).get("type") != "azureResourceId"
+              or fields.get("location", {}).get("derivableFrom") != ["cluster"]
+              or "siteName: null" not in example
+              or rejected.get("status") != "invalid"
+              or rejected.get("diagnostics", [{}])[0].get("code") != "inputs.resource.read-required"
+          ):
+              raise SystemExit("Guided input inspection or no-read admission failed.")
+          PY
+          if [[ "$E2E_ENABLE_SECRET_SYNC" == "false" ]]; then
+            python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"])
+          document = json.loads((root / "published-answers.json").read_text(encoding="utf-8"))
+          document["values"]["enableSecretSync"] = True
+          destination = root / "published-unready-answers.json"
+          fd = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+          with os.fdopen(fd, "w", encoding="utf-8") as stream:
+              json.dump(document, stream, sort_keys=True)
+          PY
+            az deployment group list -g "$E2E_RESOURCE_GROUP" --query '[].name' -o json \
+              > "$RUNNER_TEMP/published-before-negative.json"
+            if siteops \
+              --project "$SITEOPS_E2E_PROJECT" \
+              --trust-policy "$SITEOPS_E2E_POLICY" \
+              --trusted-root "$SITEOPS_E2E_TRUSTED_ROOT" \
+              deploy aio-install --offline \
+              --input-file "$RUNNER_TEMP/published-unready-answers.json" \
+              --read-resources --output json \
+              > "$RUNNER_TEMP/published-unready-run.json" \
+              2> "$RUNNER_TEMP/published-unready-run.err"; then
+              echo "::error::Guided Secret Sync ran without the cluster prerequisites."
+              exit 1
+            fi
+            az deployment group list -g "$E2E_RESOURCE_GROUP" --query '[].name' -o json \
+              > "$RUNNER_TEMP/published-after-negative.json"
+            python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"])
+          failed = json.loads((root / "published-unready-run.json").read_text(encoding="utf-8"))
+          before = json.loads((root / "published-before-negative.json").read_text(encoding="utf-8"))
+          after = json.loads((root / "published-after-negative.json").read_text(encoding="utf-8"))
+          if (
+              failed.get("diagnostics", [{}])[0].get("code") != "inputs.resource.requirement-unmet"
+              or sorted(before) != sorted(after)
+          ):
+              raise SystemExit("Guided Secret Sync prerequisite failure changed Azure deployments.")
+          PY
+          fi
+          if ! SITEOPS_REDACT_OUTPUT=0 siteops \
+            --project "$SITEOPS_E2E_PROJECT" \
+            --trust-policy "$SITEOPS_E2E_POLICY" \
+            --trusted-root "$SITEOPS_E2E_TRUSTED_ROOT" \
+            plan aio-install --offline \
+            --input-file "$RUNNER_TEMP/published-answers.json" \
+            --read-resources --output json --projection local-private \
+            > "$RUNNER_TEMP/published-guided-plan.json" \
+            2> "$RUNNER_TEMP/published-guided-plan.err"; then
+            echo "::error::The installed engine could not prepare guided AIO."
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          raw = json.loads(
+              (Path(os.environ["RUNNER_TEMP"]) / "published-guided-plan.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+          enabled = os.environ["E2E_ENABLE_SECRET_SYNC"] == "true"
+          plan = raw.get("plan") or {}
+          targets = plan.get("targets", [])
+          expected_steps = {
+              "global-edge-site": "skip", "edge-site": "skip",
+              "schema-registry": "execute", "adr-ns": "execute",
+              "aio-enablement": "execute", "aio-instance": "execute",
+              "schema-registry-role": "execute",
+              "resolve-aio": "execute" if enabled else "skip",
+              "secretsync": "execute" if enabled else "skip",
+          }
+          actual = (
+              {item["identity"]["step"]: item["disposition"]
+               for item in targets[0]["operations"]}
+              if len(targets) == 1 else {}
+          )
+          if (
+              raw.get("status") != "planned"
+              or raw.get("executable") is not True
+              or raw.get("engine", {}).get("version") != os.environ["SITEOPS_E2E_ENGINE_VERSION"]
+              or plan.get("manifest", {}).get("targetSelection") != "explicit-site"
+              or plan.get("submission", {}).get("mode") != "arm-json"
+              or plan.get("submission", {}).get("compilationBinding") != "package-artifact"
+              or actual != expected_steps
+          ):
+              raise SystemExit("Guided installed AIO plan has unexpected operations.")
+          PY
 
       - name: Check for kubectl manifest steps
         id: rbac-check
@@ -829,28 +1032,34 @@ jobs:
           RELEASE: ${{ needs.prep.outputs.published-release }}
           SOURCE_SHA: ${{ needs.prep.outputs.published-source-sha }}
           SITE_NAME: ${{ steps.names.outputs.site_name }}
+          E2E_JOURNEY: ${{ needs.prep.outputs.published-journey }}
         run: |
           set -euo pipefail
           run_root="$RUNNER_TEMP/published-run"
           mkdir "$run_root"
           cd "$run_root"
+          target_args=(-l "name=$SITE_NAME")
+          if [[ "$PUBLISHED_JOURNEY" == "guided" ]]; then
+            target_args=(--input-file "$RUNNER_TEMP/published-answers.json" --read-resources)
+          fi
           if ! siteops \
             --project "$SITEOPS_E2E_PROJECT" \
             --trust-policy "$SITEOPS_E2E_POLICY" \
             --trusted-root "$SITEOPS_E2E_TRUSTED_ROOT" \
             deploy aio-install \
             --offline \
-            -l "name=$SITE_NAME" \
+            "${target_args[@]}" \
             --output json \
-            > "$RUNNER_TEMP/published-deploy-output.txt"; then
+            > "$RUNNER_TEMP/published-deploy-output.txt" \
+            2> "$RUNNER_TEMP/published-deploy-output.err"; then
             echo "::error::The published Site Ops deployment failed."
-            cat "$RUNNER_TEMP/published-deploy-output.txt"
             exit 1
           fi
           python - "$RUNNER_TEMP/published-deploy-output.txt" \
             "$RUNNER_TEMP/published-deployment.json" \
             "$RELEASE" "$SOURCE_SHA" "$SITEOPS_E2E_ENGINE_VERSION" <<'PY'
           import json
+          import os
           import sys
           from pathlib import Path
 
@@ -878,6 +1087,12 @@ jobs:
               or operations["total"] < 1
               or type(operation_counts.get("succeeded")) is not int
               or operation_counts["succeeded"] < 1
+              or (
+                  os.environ.get("E2E_JOURNEY") == "guided"
+                  and result.get("assessments") != {
+                      "readiness": "not-assessed", "functionality": "not-assessed"
+                  }
+              )
           ):
               raise SystemExit("The published deployment result is incomplete.")
           receipt = {
@@ -902,6 +1117,9 @@ jobs:
         shell: bash
         env:
           RG: ${{ steps.names.outputs.rg }}
+          E2E_SITE_NAME: ${{ steps.names.outputs.site_name }}
+          E2E_JOURNEY: ${{ needs.prep.outputs.published-journey }}
+          E2E_ENABLE_SECRET_SYNC: ${{ matrix.secret-sync-mode == 'enabled' && 'true' || 'false' }}
         run: |
           set -euo pipefail
           az resource list --resource-group "$RG" --output json \
@@ -948,12 +1166,53 @@ jobs:
             echo "::error::AIO instance projection and operator readiness did not converge within five minutes."
             exit 1
           fi
+          if [[ "$E2E_JOURNEY" == "guided" && "$E2E_ENABLE_SECRET_SYNC" == "true" ]]; then
+            mapfile -t secret_resources < <(python3 - "$RUNNER_TEMP/published-resources.json" <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+          resources = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          owned = [
+              item for item in resources if isinstance(item, dict)
+              and isinstance(item.get("tags"), dict)
+              and item["tags"].get("site") == os.environ["E2E_SITE_NAME"]
+          ]
+          for resource_type in (
+              "microsoft.managedidentity/userassignedidentities",
+              "microsoft.iotoperations/instances",
+          ):
+              matching = [
+                  item for item in owned
+                  if item.get("type", "").lower() == resource_type
+              ]
+              if len(matching) != 1:
+                  raise SystemExit("Guided Secret Sync resource selection is incomplete.")
+              print(matching[0]["name"] if resource_type.startswith("microsoft.managedidentity")
+                    else matching[0]["id"])
+          PY
+            )
+            if [[ "${#secret_resources[@]}" -ne 2 ]]; then
+              echo "::error::Guided Secret Sync resources could not be selected."
+              exit 1
+            fi
+            az identity federated-credential list -g "$RG" \
+              --identity-name "${secret_resources[0]}" --only-show-errors -o json \
+              > "$RUNNER_TEMP/published-federated.json" \
+              2> "$RUNNER_TEMP/published-federated.err"
+            az resource show --ids "${secret_resources[1]}" \
+              --api-version 2026-07-01 \
+              --only-show-errors -o json \
+              > "$RUNNER_TEMP/published-aio-instance.json" \
+              2> "$RUNNER_TEMP/published-aio-instance.err"
+          fi
           python - \
             "$RUNNER_TEMP/published-resources.json" \
             "$RUNNER_TEMP/published-pods.json" \
             "$RUNNER_TEMP/published-instances.json" \
             "$RUNNER_TEMP/published-readiness.json" <<'PY'
           import json
+          import os
           import sys
           from pathlib import Path
 
@@ -1002,6 +1261,56 @@ jobs:
               "readyOperatorPods": ready_pod_count,
               "instanceCustomResources": custom_resource_count,
           }
+          if os.environ["E2E_JOURNEY"] == "guided":
+              owned = [
+                  item for item in resources if isinstance(item, dict)
+                  and isinstance(item.get("tags"), dict)
+                  and item["tags"].get("site") == os.environ["E2E_SITE_NAME"]
+              ]
+              owned_types = [item.get("type", "").lower() for item in owned]
+              spcs = [
+                  item for item in owned
+                  if item.get("type", "").lower()
+                  == "microsoft.secretsynccontroller/azurekeyvaultsecretproviderclasses"
+              ]
+              identities = owned_types.count("microsoft.managedidentity/userassignedidentities")
+              vaults = owned_types.count("microsoft.keyvault/vaults")
+              enabled = os.environ["E2E_ENABLE_SECRET_SYNC"] == "true"
+              if enabled:
+                  root = Path(os.environ["RUNNER_TEMP"])
+                  federated = json.loads(
+                      (root / "published-federated.json").read_text(encoding="utf-8")
+                  )
+                  instance = json.loads(
+                      (root / "published-aio-instance.json").read_text(encoding="utf-8")
+                  )
+                  reference = (
+                      instance.get("properties", {})
+                      .get("defaultSecretProviderClassRef", {})
+                      .get("resourceId")
+                  )
+                  bound = (
+                      len(spcs) == 1
+                      and isinstance(reference, str)
+                      and reference.casefold() == spcs[0].get("id", "").casefold()
+                  )
+                  if (
+                      identities != 1 or vaults != 1 or not bound
+                      or not isinstance(federated, list) or not federated
+                  ):
+                      raise SystemExit("Guided Secret Sync infrastructure observations failed.")
+                  receipt.update({
+                      "secretSyncEnabled": True,
+                      "secretProviderClasses": len(spcs),
+                      "managedIdentities": identities,
+                      "keyVaults": vaults,
+                      "federatedCredentials": len(federated),
+                      "spcBoundToInstance": bound,
+                  })
+              else:
+                  if spcs or identities or vaults:
+                      raise SystemExit("Guided disabled path created Secret Sync resources.")
+                  receipt["secretSyncEnabled"] = False
           Path(sys.argv[4]).write_text(
               json.dumps(receipt, indent=2, sort_keys=True) + "\n",
               encoding="utf-8",
@@ -1017,7 +1326,7 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always() && needs.prep.outputs.published-mode == 'true'
         with:
-          name: published-e2e-${{ matrix.aio-release }}
+          name: published-e2e-${{ matrix.aio-release }}-${{ matrix.secret-sync-mode }}-${{ needs.prep.outputs.published-journey }}
           path: |
             ${{ runner.temp }}/published-deployment.json
             ${{ runner.temp }}/published-readiness.json

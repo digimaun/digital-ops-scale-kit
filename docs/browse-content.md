@@ -27,6 +27,18 @@ For a published remote catalog, use `browse --source`. See
 reads and source-index publication. Remote preview does not acquire
 deployable workspace content.
 
+After pinning a verified workspace in an operator project, omit `-w` and
+browse the acquired package with the same approved source:
+
+```bash
+siteops --approved-source official --project ./factory browse aio-install
+siteops --approved-source official --project ./factory inputs aio-install
+```
+
+This reads the selected package rather than the checkout or the remote
+descriptive index. See [operator projects](projects.md) for the pin and
+approval steps.
+
 ## Find the right choice
 
 The default inventory lists declared standalone entries and visibly

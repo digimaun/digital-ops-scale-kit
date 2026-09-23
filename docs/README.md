@@ -22,9 +22,13 @@ separate planning, deployment, and health verification.
 | Inspect storage or remove a cached entry safely | [Cache maintenance](cache.md) |
 | Diagnose a failed command or provider operation | [Troubleshooting](troubleshooting.md) |
 
-Installing the CLI does not acquire a workspace. The included IoT Operations
-workspace is currently obtained from this repository. Review both the CLI
-release and the content checkout before deploying.
+Installing the CLI does not acquire a workspace. For local use, select the
+included IoT Operations workspace from a checkout. When a compatible
+approved release publishes a complete package, pin it in an operator
+project without cloning. Review the selected CLI and content source
+before deploying. The bootstrap scripts and typed AIO package are not yet
+published in official releases. Use the local checkout route until
+compatible assets are available.
 
 When an approved source publishes a complete workspace package and detached
 proof, an [operator project](projects.md) can acquire and use that release.

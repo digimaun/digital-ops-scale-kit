@@ -1,7 +1,7 @@
 # Install Site Ops from a release
 
-Install an identified Site Ops build without cloning this repository. A release
-publishes two assets that carry the same application bytes:
+Install an identified Site Ops build without cloning this repository. The
+native installation assets carry the same application bytes:
 
 | Asset | Contents | Use it for |
 |---|---|---|
@@ -30,12 +30,16 @@ path.
 
 ## Choose an installation route
 
-The bootstrap scripts support Ubuntu 24.04 x64 and Windows x64. Select an
+The bootstrap scripts support Ubuntu 24.04 x64, managed Azure Linux 3 x64,
+and Windows x64. Select an
 exact approved release tag and its full source commit. The public release
 notes identify both. Do not use a floating branch or `latest` as installation
 authority. Both scripts disclose required tool changes and ask for consent.
 Use `--yes` on Ubuntu or `-Yes` on Windows only for an explicitly approved
-unattended installation. Azure login and deployment are separate.
+unattended installation. The bootstrap scripts and guided AIO workspace
+have not yet been published in official releases. Check each selected
+release's asset inventory before using these commands. Azure login and
+deployment are separate.
 
 | Route | First script trust | Requirements |
 |---|---|---|
@@ -57,17 +61,20 @@ Replace the tag and commit with the pair in your approved release record.
 The following downloads the complete script to a new private location
 before execution. The release must contain the script asset.
 
-Ubuntu 24.04:
+Ubuntu 24.04 or managed Azure Linux 3:
 
 ```bash
-tag="<approved-release-tag>"; sha="<full-source-commit>"
-download="$(mktemp -d)"; chmod 700 "$download"
-script="$download/siteops-bootstrap.sh"
-url="https://github.com/Azure/digital-ops-scale-kit/releases/download/${tag//\//%2F}/siteops-bootstrap.sh"
-curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-  --tlsv1.2 --max-redirs 3 --max-time 120 --output "$script" "$url" &&
-  bash "$script" --release "$tag" --source-commit "$sha" \
-    --with-azure-cli --enroll-source official
+(
+  set -euo pipefail
+  tag="<approved-release-tag>"; sha="<full-source-commit>"
+  download="$(mktemp -d)"; chmod 700 "$download"
+  script="$download/siteops-bootstrap.sh"
+  url="https://github.com/Azure/digital-ops-scale-kit/releases/download/${tag//\//%2F}/siteops-bootstrap.sh"
+  curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+    --tlsv1.2 --max-redirs 3 --max-time 120 --output "$script" "$url" &&
+    bash "$script" --release "$tag" --source-commit "$sha" \
+      --with-azure-cli --enroll-source official
+)
 ```
 
 If Ubuntu has `wget` but not `curl`, use
@@ -79,19 +86,22 @@ tool changes, including obtaining `curl` from the approved Ubuntu channel.
 Windows PowerShell:
 
 ```powershell
-$tag = "<approved-release-tag>"; $sha = "<full-source-commit>"
-$download = Join-Path $env:TEMP ("siteops-bootstrap-" + [guid]::NewGuid())
-New-Item -ItemType Directory -Path $download | Out-Null
-$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-icacls $download /inheritance:r /grant:r "*${sid}:(OI)(CI)F" | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "The download directory could not be protected." }
-$script = Join-Path $download "siteops-bootstrap.ps1"
-$url = "https://github.com/Azure/digital-ops-scale-kit/releases/download/$([uri]::EscapeDataString($tag))/siteops-bootstrap.ps1"
-& curl.exe --fail --silent --show-error --location --proto '=https' --proto-redir '=https' `
-  --tlsv1.2 --max-redirs 3 --max-time 120 --output $script $url
-if ($LASTEXITCODE -ne 0) { throw "The bootstrap script could not be downloaded." }
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script `
-  -Release $tag -SourceCommit $sha -WithAzureCli -EnrollSource official
+& {
+  $ErrorActionPreference = "Stop"
+  $tag = "<approved-release-tag>"; $sha = "<full-source-commit>"
+  $download = Join-Path $env:TEMP ("siteops-bootstrap-" + [guid]::NewGuid())
+  New-Item -ItemType Directory -Path $download | Out-Null
+  $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  icacls $download /inheritance:r /grant:r "*${sid}:(OI)(CI)F" | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "The download directory could not be protected." }
+  $script = Join-Path $download "siteops-bootstrap.ps1"
+  $url = "https://github.com/Azure/digital-ops-scale-kit/releases/download/$([uri]::EscapeDataString($tag))/siteops-bootstrap.ps1"
+  & curl.exe --fail --silent --show-error --location --proto '=https' --proto-redir '=https' `
+    --tlsv1.2 --max-redirs 3 --max-time 120 --output $script $url
+  if ($LASTEXITCODE -ne 0) { throw "The bootstrap script could not be downloaded." }
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script `
+    -Release $tag -SourceCommit $sha -WithAzureCli -EnrollSource official
+}
 ```
 
 The PowerShell execution policy setting is scoped to this process. An
@@ -124,37 +134,42 @@ executing either one. Neither public asset requires GitHub authentication.
 The verification below uses your approved source commit, not an identity
 read from the script or proof.
 
-Ubuntu 24.04:
+Ubuntu 24.04 or managed Azure Linux 3:
 
 ```bash
-tag="<approved-release-tag>"; sha="<full-source-commit>"
-download="$(mktemp -d)"; chmod 700 "$download"
-script="$download/siteops-bootstrap.sh"
-url="https://github.com/Azure/digital-ops-scale-kit/releases/download/${tag//\//%2F}/"
-curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-  --tlsv1.2 --max-redirs 3 --max-time 120 --output "$script" "${url}siteops-bootstrap.sh" &&
+(
+  set -euo pipefail
+  tag="<approved-release-tag>"; sha="<full-source-commit>"
+  download="$(mktemp -d)"; chmod 700 "$download"
+  script="$download/siteops-bootstrap.sh"
+  url="https://github.com/Azure/digital-ops-scale-kit/releases/download/${tag//\//%2F}/"
+  curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+    --tlsv1.2 --max-redirs 3 --max-time 120 --output "$script" "${url}siteops-bootstrap.sh"
   curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
     --tlsv1.2 --max-redirs 3 --max-time 120 --output "$script.attestation.jsonl" \
-    "${url}siteops-bootstrap.sh.attestation.jsonl" || exit 1
-repository="Azure/digital-ops-scale-kit"
-source_ref="refs/heads/main"
-signer="https://github.com/$repository/.github/workflows/_siteops-distribution.yaml@$source_ref"
-builder="https://github.com/$repository/.github/workflows/release.yaml@$source_ref"
-query="length > 0 and all(.[]; .verificationResult.mediaType == \"application/vnd.dev.sigstore.verificationresult+json;version=0.1\" and (.verificationResult.signature.certificate | .buildConfigURI == \"$builder\" and .buildConfigDigest == \"$sha\" and .runnerEnvironment == \"self-hosted\"))"
-verified="$(gh attestation verify "$script" --bundle "$script.attestation.jsonl" \
-  --repo "$repository" --cert-identity "$signer" --source-ref "$source_ref" \
-  --source-digest "$sha" --signer-digest "$sha" \
-  --cert-oidc-issuer https://token.actions.githubusercontent.com \
-  --predicate-type https://slsa.dev/provenance/v1 --hostname github.com \
-  --digest-alg sha256 --format json --jq "$query")"
-[[ "$verified" == true ]] || { echo "Script verification failed." >&2; exit 1; }
-bash "$script" --release "$tag" --source-commit "$sha" \
-  --with-azure-cli --enroll-source official
+    "${url}siteops-bootstrap.sh.attestation.jsonl"
+  repository="Azure/digital-ops-scale-kit"
+  source_ref="refs/heads/main"
+  signer="https://github.com/$repository/.github/workflows/_siteops-distribution.yaml@$source_ref"
+  builder="https://github.com/$repository/.github/workflows/release.yaml@$source_ref"
+  query="length > 0 and all(.[]; .verificationResult.mediaType == \"application/vnd.dev.sigstore.verificationresult+json;version=0.1\" and (.verificationResult.signature.certificate | .buildConfigURI == \"$builder\" and .buildConfigDigest == \"$sha\" and .runnerEnvironment == \"self-hosted\"))"
+  verified="$(gh attestation verify "$script" --bundle "$script.attestation.jsonl" \
+    --repo "$repository" --cert-identity "$signer" --source-ref "$source_ref" \
+    --source-digest "$sha" --signer-digest "$sha" \
+    --cert-oidc-issuer https://token.actions.githubusercontent.com \
+    --predicate-type https://slsa.dev/provenance/v1 --hostname github.com \
+    --digest-alg sha256 --format json --jq "$query")"
+  [[ "$verified" == true ]] || { echo "Script verification failed." >&2; exit 1; }
+  bash "$script" --release "$tag" --source-commit "$sha" \
+    --with-azure-cli --enroll-source official
+)
 ```
 
 Windows PowerShell:
 
 ```powershell
+& {
+  $ErrorActionPreference = "Stop"
 $tag = "<approved-release-tag>"; $sha = "<full-source-commit>"
 $download = Join-Path $env:TEMP ("siteops-bootstrap-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $download | Out-Null
@@ -220,6 +235,7 @@ foreach ($item in $observations) {
 }
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script `
   -Release $tag -SourceCommit $sha -WithAzureCli -EnrollSource official
+}
 ```
 
 Do not change these publisher, workflow or runner values to accommodate a
@@ -227,6 +243,52 @@ failed check. The release ZIP has its own detached proof and is verified
 again by the authenticated script. Use the manual path below when a
 managed environment cannot run this bootstrap. Preinstalled tools that
 already meet the supported versions are retained.
+
+### Azure Cloud Shell and Codespaces
+
+Azure Cloud Shell runs managed Azure Linux 3 without `sudo`. Its supported
+quick route uses existing `curl`, Python, GitHub CLI and Azure CLI. When
+pipx is absent, the script installs it in private user storage. It tries
+a real pip-equipped `venv` first, then the installed `virtualenv` module
+when needed. The installer makes no OS package changes in this mode and
+fails with a remedy if a required tool is missing.
+
+Configure an approved HTTPS Python index in pip settings or `PIP_INDEX_URL`
+before any required pipx or shared backend download. The script checks this
+configuration without printing the index URL or credentials and rejects
+extra indexes, find-links and trusted hosts. It does not silently select
+the public default index. Keep package configuration and diagnostic output
+private. Check whether your Cloud Shell storage persists `$HOME`. An idle
+or interrupted session may end a long deployment. Confirm the current Azure
+identity and subscription privately before resource reads or deployment.
+
+The `Azure-Samples/explore-iot-operations` Codespace may use Ubuntu 24.04,
+but its base image can change. Check `/etc/os-release` and tool versions in
+the actual session. If its `venv` cannot seed pip, an installed `virtualenv`
+module is tried before any Ubuntu package change. When pipx uses an
+image-managed home, command directory,
+or shared backend outside your home, the Bash bootstrap isolates Site Ops
+under private user data rather than altering the image's pipx installation.
+Sign in to Azure explicitly when needed. Its local k3d cluster is not an
+Arc-connected target until you connect it separately with authorization.
+For both hosted journeys, installing the CLI is only the first step: obtain
+an approved workspace and review a plan before deploying to an existing
+Arc-connected cluster.
+
+The script verifies `siteops` inside its child shell and prints its
+`Command directory:` on success. If `siteops` is not on the parent shell's
+current PATH, open a new shell or add the printed directory for this session:
+
+```bash
+export PATH="<printed command directory>:$PATH"
+```
+
+```powershell
+$env:PATH = "<printed command directory>;" + $env:PATH
+```
+
+The printed directory can differ from pipx's default when a managed pipx
+home was isolated. Do not assume a fixed `$HOME/.local/bin` location.
 
 ## Before you start
 
@@ -236,9 +298,9 @@ keep downloaded files in a private directory.
 | Prerequisite | Requirement | Needed for |
 |---|---|---|
 | Platform | Windows x64, or Linux x64 using glibc 2.17 or newer | Both paths |
-| Python | Standard 64-bit CPython 3.10 through 3.14, with working `venv` support | Both paths |
+| Python | Standard 64-bit CPython 3.10 through 3.14 with a pip-equipped `venv`, or installed `virtualenv` on managed Azure Linux | Both paths |
 | pipx | Version 1.17.2, available as `pipx` | Both paths |
-| Package feed | An approved index that serves the runtime dependencies as wheels | Release wheel path |
+| Package feed | An approved index that serves required wheels. The bootstrap also needs it when provisioning pipx or its shared backend. | Release wheel and bootstrap tool downloads |
 | pipx backend pip | Version 26.2.1 | Verified bundle path |
 | GitHub CLI | Version 2.95.0 or newer in the 2.x release line | Downloading and verifying assets |
 

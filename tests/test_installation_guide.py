@@ -26,6 +26,106 @@ except ModuleNotFoundError:
 GUIDE = Path(__file__).resolve().parent.parent / "docs" / "install-siteops.md"
 
 
+def test_root_quickstart_connects_install_to_aio_without_hiding_fleet_use():
+    readme = (GUIDE.parent.parent / "README.md").read_text(encoding="utf-8")
+    journey = readme.split("## Quick start\n", 1)[1].split("\n## Browse deployment choices", 1)[0]
+    for phrase in (
+        "docs/install-siteops.md#bootstrap-from-https",
+        "docs/install-siteops.md#verify-the-bootstrap-script",
+        "siteops --approved-source official project pin",
+        "inputs aio-install --example",
+        "plan aio-install",
+        "deploy aio-install",
+        "--read-resources",
+        "docs/targeting.md",
+        "docs/getting-started.md",
+    ):
+        assert phrase in journey
+    assert journey.index("project pin") < journey.index("inputs aio-install --example")
+    assert journey.index("inputs aio-install --example") < journey.index("plan aio-install")
+    assert journey.index("plan aio-install") < journey.index("deploy aio-install")
+    assert journey.index("deploy aio-install") < journey.index("plan aio-install -l environment=prod")
+    assert "generated example does not include this" in " ".join(journey.split())
+    for verb in ("plan", "deploy"):
+        command = next(
+            line for line in journey.splitlines() if f" {verb} aio-install " in line
+        )
+        assert "--approved-source official" in command
+        assert "--input-file aio-inputs.yaml" in command
+        assert "--read-resources" in command
+    assert "&&\n    bash \"$script\"" in journey
+
+
+def test_quickstart_distinguishes_unpublished_bootstrap_and_checkout_browsing():
+    readme = (GUIDE.parent.parent / "README.md").read_text(encoding="utf-8")
+    assert "not yet published" in readme
+    assert "siteops --approved-source official --project factory browse aio-install" in readme
+    assert "require a local checkout" in readme
+    assert "az login" in readme
+
+
+def test_hosted_bootstrap_guidance_matches_managed_host_behavior():
+    guide = GUIDE.read_text(encoding="utf-8")
+    bash = (GUIDE.parent.parent / "scripts/bootstrap/siteops-bootstrap.sh").read_text(
+        encoding="utf-8",
+    )
+    powershell = (GUIDE.parent.parent / "scripts/bootstrap/siteops-bootstrap.ps1").read_text(
+        encoding="utf-8",
+    )
+    for phrase in (
+        "Azure Cloud Shell", "Azure Linux 3", "without `sudo`", "virtualenv",
+        "approved HTTPS Python index", "Codespace", "k3d", "Arc-connected",
+    ):
+        assert phrase in guide
+    for script in (bash, powershell):
+        assert "Command directory:" in script
+    assert "export PATH=" in guide and "$env:PATH" in guide
+
+
+def test_project_source_renewal_and_saved_site_guide_are_executable():
+    projects = (GUIDE.parent / "projects.md").read_text(encoding="utf-8")
+    guided = (GUIDE.parent / "guided-inputs.md").read_text(encoding="utf-8")
+    assert "siteops source enroll --help" in projects
+    assert "siteops source remove official" in projects
+    assert "siteops source show official" in projects
+    assert "30 days" in projects and "renewed-policy.json" in projects
+    assert "mkdir -p ./factory/sites" in guided
+    assert "--input-file ./aio-inputs.yaml --read-resources --save-site" in guided
+    assert "-l name=plant-one,name=plant-two" in guided
+    normalized = " ".join(guided.split())
+    assert "initial installation" in normalized and "already runs AIO" in normalized
+
+
+@pytest.mark.parametrize("download_succeeds", [False, True])
+def test_root_quickstart_waits_for_full_https_download_before_execution(tmp_path, download_succeeds):
+    readme = (GUIDE.parent.parent / "README.md").read_text(encoding="utf-8")
+    journey = readme.split("## Quick start\n", 1)[1].split("\n## Browse deployment choices", 1)[0]
+    block = re.search(r"```bash\n(.*?)\n```", journey, re.DOTALL).group(1)
+    block = block.replace("<approved-Site-Ops-release>", "siteops/v1.0.0b1").replace(
+        "<full-source-commit>", "c" * 40,
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    write_executable(bin_dir / "curl", """#!/usr/bin/env bash
+[[ "$*" == *"--proto =https"* && "$*" == *"--tlsv1.2"* ]] || exit 99
+[[ "$*" == *"releases/download/siteops%2Fv1.0.0b1/siteops-bootstrap.sh"* ]] || exit 99
+while (($#)); do
+  if [[ "$1" == "--output" ]]; then target="$2"; shift 2; else shift; fi
+done
+[[ "$TEST_DOWNLOAD_SUCCEEDS" == 1 ]] || exit 7
+printf 'printf SCRIPT_RAN\\\\n\\n' > "$target"
+""")
+    result = run_script(
+        block, tmp_path, {
+            "TMPDIR": bash_path(tmp_path),
+            "TEST_DOWNLOAD_SUCCEEDS": "1" if download_succeeds else "0",
+        },
+    )
+    assert (result.returncode == 0) is download_succeeds, result.stdout + result.stderr
+    assert ("SCRIPT_RAN" in result.stdout) is download_succeeds
+    assert not list(tmp_path.glob("tmp.*"))
+
+
 def _section(heading: str) -> str:
     text = GUIDE.read_text(encoding="utf-8")
     section = text.split(heading + "\n", 1)[1]
@@ -34,6 +134,23 @@ def _section(heading: str) -> str:
 
 def _block(section: str, language: str) -> str:
     return re.search(rf"```{language}\n(.*?)\n```", section, re.DOTALL).group(1)
+
+
+@pytest.mark.parametrize("heading", [
+    "### Bootstrap from HTTPS", "### Verify the bootstrap script",
+])
+def test_pasted_bootstrap_blocks_stop_before_execution_after_a_failure(heading):
+    section = _section(heading)
+    windows = _block(section, "powershell")
+    assert windows.lstrip().startswith('& {\n')
+    assert '$ErrorActionPreference = "Stop"' in windows
+    assert windows.index('$ErrorActionPreference = "Stop"') < windows.index('curl.exe')
+    assert windows.rstrip().endswith('}')
+    bash = _block(section, "bash")
+    assert bash.lstrip().startswith('(\n')
+    assert 'set -euo pipefail' in bash
+    assert bash.index('set -euo pipefail') < bash.index('curl ')
+    assert bash.rstrip().endswith(')')
 
 
 @pytest.mark.parametrize("heading", [

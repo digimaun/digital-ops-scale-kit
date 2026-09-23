@@ -7,22 +7,26 @@ Sites and fleet selectors.
 
 This guide uses `aio-install` in an approved, verified workspace package.
 First [install a compatible Site Ops build](install-siteops.md) and
-[pin that workspace](projects.md#run-project-pin) using an independently
-provisioned verification policy and trusted root. The package must include
-`aio-install` and its input contract. A local checkout selected with `-w`
-also works for authoring, without the pin or package trust options.
-If you explicitly enrolled an [approved source](projects.md#use-an-approved-source),
-use `--approved-source NAME` in place of the two trust file options on
-`project pin`, `inputs`, `plan` and `deploy`. The project pin cannot
-authorize its own source policy.
+[pin that workspace](projects.md#run-project-pin). The package must
+include `aio-install` and its input contract. The examples below use
+`--approved-source official`, explicitly selecting the source enrolled
+by the [bootstrap](install-siteops.md#choose-an-installation-route).
+If you manage independent policy and trusted root files yourself,
+use both `--trust-policy policy.json` and
+`--trusted-root trusted-root.json` instead, and supply `--source`
+when pinning. Never combine those options with an approved source.
+The project pin cannot authorize its own source policy. A local
+checkout selected with `-w` also works for authoring without a pin
+or package trust options.
 
 ## Inspect and fill the inputs
 
-Replace the paths and release in the [project pin example](projects.md#run-project-pin)
-with your approved source and policy. The following commands use that project:
+Pin the approved content release for your project as described in
+[operator projects](projects.md#use-an-approved-source). The following
+commands use that project and enrollment:
 
 ```text
-siteops --project ./factory --trust-policy policy.json --trusted-root trusted-root.json inputs aio-install --example ./aio-inputs.yaml
+siteops --approved-source official --project ./factory inputs aio-install --example ./aio-inputs.yaml
 ```
 
 This one command lists the required and defaulted inputs and writes the
@@ -56,8 +60,8 @@ identity can deploy. Do not use a plan as evidence of cluster readiness.
 Review the plan and target before deploying:
 
 ```text
-siteops --project ./factory --trust-policy policy.json --trusted-root trusted-root.json plan aio-install --input-file ./aio-inputs.yaml
-siteops --project ./factory --trust-policy policy.json --trusted-root trusted-root.json deploy aio-install --input-file ./aio-inputs.yaml
+siteops --approved-source official --project ./factory plan aio-install --input-file ./aio-inputs.yaml
+siteops --approved-source official --project ./factory deploy aio-install --input-file ./aio-inputs.yaml
 ```
 
 The ordinary plan performs local preflight and does not read Azure
@@ -85,8 +89,8 @@ keeps `subscription`, `resourceGroup`, `location` and `clusterName` as
 read with `--read-resources` on both `plan` and `deploy`:
 
 ```text
-siteops --project ./factory --trust-policy policy.json --trusted-root trusted-root.json plan aio-install --input-file ./aio-inputs.yaml --read-resources
-siteops --project ./factory --trust-policy policy.json --trusted-root trusted-root.json deploy aio-install --input-file ./aio-inputs.yaml --read-resources
+siteops --approved-source official --project ./factory plan aio-install --input-file ./aio-inputs.yaml --read-resources
+siteops --approved-source official --project ./factory deploy aio-install --input-file ./aio-inputs.yaml --read-resources
 ```
 
 For this route, also fill `siteName`, `environment` and `country`.
@@ -122,14 +126,17 @@ inputs. Duplicate and unknown answer names fail.
 ## Keep a Site for later
 
 To retain the resolved configuration, create the project's `sites` directory
-and run `inputs` with a completed answer file:
+and run `inputs` with a completed answer file. When that file contains an Arc
+cluster ID, authorize its resource read while saving:
 
 ```text
-siteops --project ./factory --trust-policy policy.json --trusted-root trusted-root.json inputs aio-install --input-file ./aio-inputs.yaml --save-site ./factory/sites/plant-one.yaml
-siteops --project ./factory --trust-policy policy.json --trusted-root trusted-root.json plan aio-install -l name=plant-one
+mkdir -p ./factory/sites
+siteops --approved-source official --project ./factory inputs aio-install --input-file ./aio-inputs.yaml --read-resources --save-site ./factory/sites/plant-one.yaml
+siteops --approved-source official --project ./factory plan aio-install -l name=plant-one
 ```
 
-The saved document is an ordinary Site. Site Ops does not overwrite an
+The answer file in this example must resolve `siteName: plant-one` and
+its first cluster. The saved document is an ordinary Site. Site Ops does not overwrite an
 existing file. An inline target remains in memory unless you explicitly
 choose `--save-site`.
 Saving a Site built from resource observations does not store the
@@ -140,6 +147,25 @@ To reuse a complete standalone Site without saving it into a project, pass
 Site must be complete and cannot inherit from packaged example Sites.
 Configured Sites can continue to use the existing inheritance and overlay
 rules.
+
+For another distinct cluster, reuse the same answer file and override its
+Site name and cluster ID. Keep the four target fields derived from `cluster`
+as `null` so the next authorized read supplies the new cluster's facts:
+
+```text
+siteops --approved-source official --project ./factory inputs aio-install --input-file ./aio-inputs.yaml --input siteName=plant-two --input cluster="<second-Arc-cluster-ID>" --read-resources --save-site ./factory/sites/plant-two.yaml
+siteops --approved-source official --project ./factory plan aio-install -l name=plant-one,name=plant-two
+```
+
+The two-name selector bounds this plan to the saved Sites. Review the target
+count and names before using that selector with `deploy`. For an initial
+installation on several clusters, select only new targets if plant-one
+already runs AIO. Reapplying `aio-install` can overwrite settings managed
+by the operator on that first cluster. Use a label such
+as `environment=dev` only after confirming that it selects precisely the
+intended cohort. `parallel` limits concurrent work, not the number of Sites
+selected. Saved Sites do not repeat guided OIDC and workload identity checks
+when Secret Sync is enabled.
 
 An explicit Site replaces the manifest's default selector or `sites:` list.
 Combining `--site-file`, `--input-file`, or `--input` with `-l` fails rather than

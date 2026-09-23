@@ -97,10 +97,10 @@ resource group must already exist, and deployment can incur charges.
 
 Then select the approved workspace release, inspect its typed input
 contract, and prepare one target. Fill `siteName`, `environment`, `country`
-in the generated file, then add `cluster` with the full Arc cluster
-resource ID under `values:`. The generated example does not include this
-optional key. The four manual target fields can stay `null` because the
-explicit resource read derives them. Review the Site and selected
+in the generated file, then replace `cluster: null` with the full Arc
+cluster resource ID. The generated example includes `cluster: null` as
+the optional resource route. The four manual target fields can stay
+`null` because the explicit resource read derives them. Review the Site and selected
 operations in the plan before deploying:
 
 ```text
@@ -129,8 +129,10 @@ siteops --approved-source official --project factory plan aio-install -l name=pl
 
 Deploy that selection only after reviewing its targets. Reapplying
 `aio-install` to the first cluster can overwrite settings there. If its
-answer file enabled Secret Sync, override `enableSecretSync=false` when
-saving each new fleet Site. A label selector is convenient once it matches
+answer file enabled Secret Sync, use a separate
+[fleet answer file](docs/guided-inputs.md#keep-a-site-for-later)
+with `enableSecretSync: false` and no conditional vault input for the
+new Sites. A label selector is convenient once it matches
 only the intended cohort. Local workspaces and non-AIO content also use
 the generic Site Ops planner and executor.
 See [project Sites](docs/projects.md),

@@ -29,12 +29,10 @@ commands use that project and enrollment:
 siteops --approved-source official --project ./factory inputs aio-install --example ./aio-inputs.yaml
 ```
 
-This one command lists the required and defaulted inputs and writes the
-example. Omit `--example` to inspect without writing anything. The
-generated answer file has null values for the required answers. It
-cannot be used to plan or deploy until you supply every required value in
-the file or override it with `--input`. For an existing Arc-connected
-Kubernetes cluster, fill these fields with your own target information:
+This one command lists required, derivable, defaulted and conditional inputs
+and writes an incomplete example. Omit `--example` to inspect without
+writing anything. The example includes a null optional `cluster` ID so
+you can choose the resource route without adding a new YAML key:
 
 ```yaml
 apiVersion: siteops.inputs/v1
@@ -47,10 +45,16 @@ values:
   clusterName: null    # Use the existing Arc cluster name.
   environment: null    # Choose the environment label, such as dev or prod.
   country: null        # Choose the country label for resource tags.
+  cluster: null        # Or supply the full existing Arc cluster resource ID.
 ```
 
-Replace each null with a string value, or supply the same named answer with
-`--input`, before deploying. The default AIO path selects release 2608,
+For the manual route, fill the seven required fields and leave `cluster`
+as `null`. For the resource route, fill `siteName`, `environment`, `country`
+and `cluster`. Leave `subscription`, `resourceGroup`, `location` and
+`clusterName` as `null` so an authorized read derives them.
+You can supply the same named answer with `--input`.
+Neither route is deployable until its required answers are complete.
+The default AIO path selects release 2608,
 enables cert-manager, and leaves Secret Sync disabled.
 Your existing cluster, resource group, appropriate Azure permissions, and
 Azure CLI are prerequisites. Input resolution checks types and the Site
@@ -82,11 +86,10 @@ publishing Site values.
 
 ## Use an existing resource ID
 
-Alternatively, give the typed `cluster` input the full ARM ID of your
-existing Arc-connected Kubernetes cluster. The generated answer file
-keeps `subscription`, `resourceGroup`, `location` and `clusterName` as
-`null`. Add `cluster` with your actual ID, then explicitly allow the
-read with `--read-resources` on both `plan` and `deploy`:
+Give `cluster` the full ARM ID of your existing Arc-connected Kubernetes
+cluster in the generated answer file. Keep the four derived fields `null`.
+Explicitly allow the read with `--read-resources` on both `plan` and
+`deploy`:
 
 ```text
 siteops --approved-source official --project ./factory plan aio-install --input-file ./aio-inputs.yaml --read-resources
@@ -118,7 +121,9 @@ cluster readiness, federation success or secret materialization.
 
 For a short non-secret command, supply the same named answers with repeated
 `--input NAME=VALUE` options on `plan` or `deploy`. Inline answers override
-the input file. Strings and strict `true` or `false` booleans are parsed
+the input file. `--input-file` selects exactly one answer file. Repeating
+that option is an error, not a way to select several Sites. Strings and
+strict `true` or `false` booleans are parsed
 according to the selected contract. Do not put secrets in process arguments
 or shell history. The initial typed route rejects contracts with protected
 inputs. Duplicate and unknown answer names fail.
@@ -136,8 +141,10 @@ siteops --approved-source official --project ./factory plan aio-install -l name=
 ```
 
 The answer file in this example must resolve `siteName: plant-one` and
-its first cluster. The saved document is an ordinary Site. Site Ops does not overwrite an
-existing file. An inline target remains in memory unless you explicitly
+its first cluster. The saved document is an ordinary Site. Site Ops does
+not overwrite an existing file. When saving into the selected project
+Site inventory, it checks the new name and path against configured Sites
+before writing. An inline target remains in memory unless you explicitly
 choose `--save-site`.
 Saving a Site built from resource observations does not store the
 observations or re-check their prerequisites on later `--site-file` use.
@@ -148,16 +155,29 @@ Site must be complete and cannot inherit from packaged example Sites.
 Configured Sites can continue to use the existing inheritance and overlay
 rules.
 
-For a separate fleet deployment after plant-one already runs AIO, reuse
-its answer file only to prepare new Sites. Override the Site name and
-cluster ID for each new target. Explicitly set `enableSecretSync=false`
-on each new Site, even if the original answer file enabled it for
-plant-one. Keep the four target fields derived from `cluster` as `null`
+For a separate fleet deployment after plant-one already runs AIO, create
+a distinct `fleet-inputs.yaml` answer file. Keep the common answers
+there and supply each new Site name and cluster ID inline:
+
+```yaml
+apiVersion: siteops.inputs/v1
+kind: SiteInputValues
+values:
+  environment: dev
+  country: US
+  enableSecretSync: false
+```
+
+The original file may have `enableSecretSync: true` and an
+`existingVault`. Copying it and overriding only `enableSecretSync=false`
+is invalid because `existingVault` is then inactive. The separate
+file contains no first-cluster identity or conditional vault input.
+The four required target fields derived from `cluster` are omitted,
 so each authorized read supplies the new cluster's facts:
 
 ```text
-siteops --approved-source official --project ./factory inputs aio-install --input-file ./aio-inputs.yaml --input siteName=plant-two --input cluster="<second-Arc-cluster-ID>" --input enableSecretSync=false --read-resources --save-site ./factory/sites/plant-two.yaml
-siteops --approved-source official --project ./factory inputs aio-install --input-file ./aio-inputs.yaml --input siteName=plant-three --input cluster="<third-Arc-cluster-ID>" --input enableSecretSync=false --read-resources --save-site ./factory/sites/plant-three.yaml
+siteops --approved-source official --project ./factory inputs aio-install --input-file ./fleet-inputs.yaml --input siteName=plant-two --input cluster="<second-Arc-cluster-ID>" --read-resources --save-site ./factory/sites/plant-two.yaml
+siteops --approved-source official --project ./factory inputs aio-install --input-file ./fleet-inputs.yaml --input siteName=plant-three --input cluster="<third-Arc-cluster-ID>" --read-resources --save-site ./factory/sites/plant-three.yaml
 siteops --approved-source official --project ./factory plan aio-install -l name=plant-two,name=plant-three
 ```
 
@@ -165,8 +185,8 @@ The two-name selector bounds this plan to new Sites and excludes
 plant-one. Review the target count and names before using the same
 selector with `deploy`. Reapplying `aio-install` to a cluster that already
 runs AIO can overwrite settings managed by the operator. To target three
-or four new clusters instead, save more Sites with the same explicit
-Secret Sync override and include only their names. The manifest permits
+or four new clusters instead, save more Sites from the fleet file
+and include only their names. The manifest permits
 three concurrent Sites by default. For four concurrent Sites, pass
 `--parallel 4` to both plan and deploy. Use a label such as
 `environment=dev` only after confirming that it selects precisely the

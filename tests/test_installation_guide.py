@@ -47,7 +47,7 @@ def test_root_quickstart_connects_install_to_aio_without_hiding_fleet_use():
     assert journey.index("deploy aio-install") < journey.index(
         "plan aio-install -l name=plant-two,name=plant-three"
     )
-    assert "generated example does not include this" in " ".join(journey.split())
+    assert "generated example includes `cluster: null`" in " ".join(journey.split())
     for verb in ("plan", "deploy"):
         command = next(
             line for line in journey.splitlines() if f" {verb} aio-install " in line
@@ -93,8 +93,11 @@ def test_project_source_renewal_and_saved_site_guide_are_executable():
     assert "30 days" in projects and "renewed-policy.json" in projects
     assert "mkdir -p ./factory/sites" in guided
     assert "--input-file ./aio-inputs.yaml --read-resources --save-site" in guided
+    assert "cluster: null" in guided
     assert "-l name=plant-two,name=plant-three" in guided
-    assert guided.count("--input enableSecretSync=false") >= 2
+    assert guided.count("--input-file ./fleet-inputs.yaml") >= 2
+    assert "existingVault" in guided
+    assert "enableSecretSync: false" in guided
     assert "name=plant-one,name=plant-two" not in guided
     normalized = " ".join(guided.split())
     assert "separate fleet deployment" in normalized and "already runs AIO" in normalized

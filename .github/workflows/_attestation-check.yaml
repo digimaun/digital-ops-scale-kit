@@ -1,0 +1,260 @@
+name: _Attestation Check
+
+on:
+  workflow_call:
+    inputs:
+      expected-source-sha:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  admit:
+    name: Admit
+    uses: ./.github/workflows/_release-runner.yaml
+    with:
+      expected-source-sha: ${{ inputs.expected-source-sha }}
+      mode: attestation
+    permissions:
+      contents: read
+
+  attest:
+    name: Sign diagnostic
+    needs: admit
+    runs-on: ${{ fromJSON(needs.admit.outputs.labels) }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Create the fixed non-release subject
+        shell: python
+        env:
+          RUNNER_CLASS: ${{ runner.environment }}
+        run: |
+          import os
+          import sys
+          from pathlib import Path
+
+          if sys.platform != "linux" or os.environ["RUNNER_CLASS"] != "self-hosted":
+              raise SystemExit("::error::The diagnostic requires the configured Linux 1ES runner.")
+          directory = Path(os.environ["RUNNER_TEMP"]) / "attestation-check"
+          directory.mkdir(mode=0o700)
+          with (directory / "runner-check.txt").open("xb") as output:
+              output.write(b"Site Ops 1ES attestation diagnostic. Not a release.\n")
+
+      - name: Attest the diagnostic subject
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/attestation-check/runner-check.txt
+          show-summary: false
+
+      - name: Retain the detached diagnostic proof
+        shell: python
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          import os
+          from pathlib import Path
+
+          directory = Path(os.environ["RUNNER_TEMP"]) / "attestation-check"
+          subject = directory / "runner-check.txt"
+          bundle = Path(os.environ["BUNDLE_PATH"])
+          for path in (subject, bundle):
+              if path.is_symlink() or not path.is_file() or not 0 < path.stat().st_size <= 2 * 1024 * 1024:
+                  raise SystemExit("::error::The diagnostic evidence is not a bounded regular file.")
+          if subject.read_bytes() != b"Site Ops 1ES attestation diagnostic. Not a release.\n":
+              raise SystemExit("::error::The diagnostic subject changed.")
+          with bundle.open("rb") as source:
+              proof = source.read(2 * 1024 * 1024 + 1)
+          if not proof or len(proof) > 2 * 1024 * 1024:
+              raise SystemExit("::error::The diagnostic proof exceeds its supported size.")
+          with (directory / "runner-check.txt.attestation.jsonl").open("xb") as output:
+              output.write(proof)
+
+      - name: Upload the non-release evidence
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: runner-attestation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/attestation-check
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 7
+
+  verify:
+    name: Inspect verified claims
+    needs: attest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Download the exact diagnostic evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.attest.outputs.artifact-id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/attestation-check
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Verify the diagnostic signature and exact source
+        id: verify
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_CONFIG_DIR: ${{ runner.temp }}/attestation-check-gh
+          SIGNER_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/_attestation-check.yaml@${{ github.ref }}
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$GH_CONFIG_DIR"
+          subject="$RUNNER_TEMP/attestation-check/runner-check.txt"
+          proof="$subject.attestation.jsonl"
+          python3 -c '
+          import os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"]) / "attestation-check"
+          expected = {"runner-check.txt", "runner-check.txt.attestation.jsonl"}
+          if {entry.name for entry in root.iterdir()} != expected:
+              raise SystemExit("::error::The diagnostic evidence has an unexpected inventory.")
+          for name in expected:
+              path = root / name
+              if path.is_symlink() or not path.is_file() or not 0 < path.stat().st_size <= 2 * 1024 * 1024:
+                  raise SystemExit("::error::The diagnostic evidence is not a bounded regular file.")
+          if (root / "runner-check.txt").read_bytes() != b"Site Ops 1ES attestation diagnostic. Not a release.\n":
+              raise SystemExit("::error::The diagnostic subject changed.")
+          '
+          # Bound both output files while the verifier runs.
+          if ! (ulimit -c 0 && ulimit -f 8192 && timeout 120 gh attestation verify "$subject" --bundle "$proof" \
+            --repo "$GITHUB_REPOSITORY" --cert-identity "$SIGNER_IDENTITY" \
+            --signer-digest "$SOURCE_SHA" --source-digest "$SOURCE_SHA" --source-ref "$SOURCE_REF" \
+            --cert-oidc-issuer https://token.actions.githubusercontent.com \
+            --predicate-type https://slsa.dev/provenance/v1 --digest-alg sha256 --hostname github.com --format json) \
+            > "$RUNNER_TEMP/attestation-check-verification.json" \
+            2> "$RUNNER_TEMP/attestation-check-verification.err"; then
+            echo "::error::Diagnostic signature verification failed. Release verification policy is unchanged."
+            exit 1
+          fi
+          if [[ ! -s "$RUNNER_TEMP/attestation-check-verification.json" ]] || \
+            (( $(wc -c < "$RUNNER_TEMP/attestation-check-verification.json") > 8388608 )); then
+            echo "::error::The verified diagnostic result exceeds its supported size."
+            exit 1
+          fi
+
+      - name: Compare the verified certificate claims
+        shell: python
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_REF: ${{ github.ref }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+        run: |
+          import hashlib
+          import json
+          import os
+          import re
+          from datetime import datetime, timedelta, timezone
+          from pathlib import Path
+
+          def unique(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError("Duplicate verification field.")
+                  result[key] = value
+              return result
+
+          def reject(message):
+              raise SystemExit("::error::" + message)
+
+          def constant(value):
+              raise ValueError("Unsupported JSON constant.")
+
+          def valid_timestamp(item):
+              if not isinstance(item, dict) or item.get("type") not in {"Tlog", "TimestampAuthority"}:
+                  return False
+              text = item.get("timestamp")
+              if not isinstance(text, str) or not re.fullmatch(
+                  r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z", text
+              ):
+                  return False
+              try:
+                  timestamp = datetime.fromisoformat(text[:-1] + "+00:00")
+              except ValueError:
+                  return False
+              return timestamp <= datetime.now(timezone.utc) + timedelta(minutes=5)
+
+          path = Path(os.environ["RUNNER_TEMP"]) / "attestation-check-verification.json"
+          with path.open("rb") as source:
+              raw = source.read(8388609)
+          if len(raw) > 8388608:
+              reject("The verified diagnostic result exceeds its supported size.")
+          try:
+              results = json.loads(raw, object_pairs_hook=unique, parse_constant=constant)
+          except (ValueError, RecursionError):
+              reject("The verified diagnostic result is not supported JSON.")
+          if not isinstance(results, list) or not 1 <= len(results) <= 128:
+              reject("The verifier returned no bounded evidence set.")
+          repository = "https://github.com/" + os.environ["SOURCE_REPOSITORY"]
+          sha, ref = os.environ["SOURCE_SHA"], os.environ["SOURCE_REF"]
+          expected = {
+              "subjectAlternativeName": repository + "/.github/workflows/_attestation-check.yaml@" + ref,
+              "issuer": "https://token.actions.githubusercontent.com",
+              "sourceRepositoryURI": repository, "sourceRepositoryDigest": sha,
+              "sourceRepositoryRef": ref, "buildSignerDigest": sha,
+              "runnerEnvironment": "self-hosted",
+              "buildConfigURI": repository + "/.github/workflows/ci.yaml@" + ref,
+              "buildConfigDigest": sha,
+          }
+          digest = hashlib.sha256(b"Site Ops 1ES attestation diagnostic. Not a release.\n").hexdigest()
+          for result in results:
+              try:
+                  verified = result["verificationResult"]
+                  certificate = verified["signature"]["certificate"]
+                  statement = verified["statement"]
+                  subjects = statement["subject"]
+                  timestamps = verified["verifiedTimestamps"]
+                  matches = (
+                      verified["mediaType"] == "application/vnd.dev.sigstore.verificationresult+json;version=0.1"
+                      and statement["_type"] == "https://in-toto.io/Statement/v1"
+                      and statement["predicateType"] == "https://slsa.dev/provenance/v1"
+                      and isinstance(subjects, list) and len(subjects) == 1
+                      and subjects[0]["digest"]["sha256"] == digest
+                      and all(certificate.get(key) == value for key, value in expected.items())
+                      and isinstance(timestamps, list) and 1 <= len(timestamps) <= 32
+                      and all(valid_timestamp(item) for item in timestamps)
+                  )
+              except (KeyError, TypeError, AttributeError):
+                  reject("The verified diagnostic evidence has an unsupported shape.")
+              if not matches:
+                  reject("The verified certificate differs from the expected diagnostic identity.")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as output:
+              output.write(
+                  "## Non-release attestation\n\n"
+                  "The signature and exact fork source, reusable signer, caller workflow and self-hosted runner class matched.\n\n"
+                  "Source: `" + sha + "`\n\n"
+                  "This evidence does not identify a particular pool, establish Trusted Launch or authorize a release. "
+                  "Production verification and the release gate remain unchanged.\n"
+              )
+
+      - name: Retain cryptographically verified observations
+        if: ${{ always() && steps.verify.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: runner-attestation-verification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/attestation-check-verification.json
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 7

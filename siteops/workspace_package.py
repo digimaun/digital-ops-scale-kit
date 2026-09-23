@@ -26,9 +26,6 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
 
-from packaging.specifiers import InvalidSpecifier, SpecifierSet
-from packaging.version import InvalidVersion, Version
-
 from siteops import __version__
 from siteops.artifacts import (
     ArtifactError,
@@ -55,6 +52,7 @@ from siteops.compilation import (
     validate_arm_template,
 )
 from siteops.manifest_selection import is_explicit_manifest_path, select_manifest_path
+from siteops.workspace_compatibility import require_engine_version, validate_engine_range
 
 PACKAGE_NAME = "siteops-package.json"
 PACKAGE_API = "siteops/v1alpha1"
@@ -107,21 +105,6 @@ def _digest(value: Any) -> str:
 
 def _strict_json(raw: bytes, *, label: str) -> Any:
     return load_artifact_json(raw, limit=MAX_FILE_BYTES, label=label)
-
-
-def _engine_range(value: Any) -> str:
-    text = _text(value)
-    try:
-        specifiers = SpecifierSet(text)
-    except InvalidSpecifier:
-        raise ArtifactError("The Site Ops compatibility range is invalid.") from None
-    operators = {item.operator for item in specifiers}
-    if "===" in operators or not (
-        operators & {"==", "~="}
-        or (operators & {">", ">="} and operators & {"<", "<="})
-    ):
-        raise ArtifactError("The Site Ops compatibility range must have lower and upper bounds.")
-    return text
 
 
 def json_bytes(document: dict[str, Any]) -> bytes:
@@ -595,7 +578,7 @@ class WorkspacePackage:
             )
         return cls(
             _text(kit["id"], maximum=128), _text(kit["version"], maximum=128),
-            _text(source["revision"]), workspace_root, _engine_range(compatibility["siteops"]),
+            _text(source["revision"]), workspace_root, validate_engine_range(compatibility["siteops"]),
             tuple(sorted(required_features)), ordered, expected_tree, templates,
         )
 
@@ -961,14 +944,7 @@ def check_compatibility(
     engine_version: str = __version__,
     features: frozenset[str] = SUPPORTED_FEATURES,
 ) -> None:
-    try:
-        compatible = SpecifierSet(metadata.siteops_range).contains(
-            Version(engine_version), prereleases=True,
-        )
-    except (InvalidVersion, InvalidSpecifier):
-        raise ArtifactError("The Site Ops compatibility declaration is invalid.") from None
-    if not compatible:
-        raise ArtifactError("This package requires a different Site Ops version.")
+    require_engine_version(metadata.siteops_range, engine_version)
     if set(metadata.required_features) - features:
         raise ArtifactError("This package requires unsupported Site Ops features.")
 
@@ -1121,7 +1097,9 @@ def _validate_template_artifacts(
 
 
 @contextmanager
-def _open_package(path: Path, expected_sha256: str) -> Iterator[
+def _open_package(
+    path: Path, expected_sha256: str, *, engine_version: str = __version__,
+) -> Iterator[
     tuple[zipfile.ZipFile, PackageInspection, bytes]
 ]:
     expected_sha256 = _digest(expected_sha256)
@@ -1140,7 +1118,7 @@ def _open_package(path: Path, expected_sha256: str) -> Iterator[
                 for entry in metadata.files:
                     if entries[entry.path].file_size != entry.size:
                         raise ArtifactError("A package ZIP file size differs from its declared size.")
-                check_compatibility(metadata)
+                check_compatibility(metadata, engine_version=engine_version)
                 _validate_template_artifacts(archive, metadata)
                 yield archive, PackageInspection(
                     metadata=metadata,
@@ -1170,8 +1148,23 @@ def _copy_member(archive: zipfile.ZipFile, entry: PayloadFile, destination: Bina
 
 def inspect_package(path: Path, expected_sha256: str) -> PackageInspection:
     """Check exact archive bytes, every payload file and current-engine compatibility."""
+    return _inspect_for_engine(path, expected_sha256, __version__)
+
+
+def inspect_produced_package(
+    path: Path, expected_sha256: str, *, engine_version: str,
+) -> PackageInspection:
+    """Inspect producer output against a target engine version without authorizing use.
+
+    Consumers still inspect and extract with the installed engine version. This
+    producer check does not establish support by an independently released engine.
+    """
+    return _inspect_for_engine(path, expected_sha256, engine_version)
+
+
+def _inspect_for_engine(path: Path, expected_sha256: str, engine_version: str) -> PackageInspection:
     try:
-        with _open_package(path, expected_sha256) as (archive, inspection, _):
+        with _open_package(path, expected_sha256, engine_version=engine_version) as (archive, inspection, _):
             for entry in inspection.metadata.files:
                 _copy_member(archive, entry, None)
     except OSError:

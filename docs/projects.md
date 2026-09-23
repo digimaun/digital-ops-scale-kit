@@ -65,10 +65,11 @@ Prepare these inputs:
 - A local consumer policy and independently provisioned trusted root.
 - Your configured Sites in the project directory.
 
-The current repository release workflow publishes engine assets only. It does
-not generate or publish the workspace asset set. Use a source that implements
-the workspace release contract and review its deployment qualification
-evidence for your targets.
+The [content release workflow](releasing.md) can publish the workspace asset
+set from reviewed declarations after qualification and approval. Choose a
+published source that implements the workspace release contract and review
+its deployment qualification evidence for your targets. Package compatibility
+and catalog loading do not establish workload health.
 
 Replace the source and release placeholders below with an approved release.
 The examples assume `policy.json` and `trusted-root.json` are your independently

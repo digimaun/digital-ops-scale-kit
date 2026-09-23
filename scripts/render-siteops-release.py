@@ -1,12 +1,13 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Render installation notes and an approval preview from a verified candidate."""
+"""Render installation notes and a release candidate summary."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import os
 import re
@@ -16,6 +17,12 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from siteops_release_assets import (
+    FrozenReleaseAssets,
+    native_engine_wheel,
+    publication_assets,
+)
+
 
 class RenderingError(ValueError):
     """Candidate presentation metadata is incomplete or invalid."""
@@ -24,29 +31,57 @@ class RenderingError(ValueError):
 def render_notes(
     plan: dict[str, Any],
     authored: str,
-    assets: dict[str, Any],
+    assets: FrozenReleaseAssets,
     *,
     engine_version: str,
     archive_name: str,
     attestation_suffix: str,
+    runner_environment: str,
 ) -> str:
-    """Append release-specific installation guidance to the authored notes."""
+    """Append installation guidance for this release to the authored notes."""
+    if runner_environment not in ("github-hosted", "self-hosted"):
+        raise RenderingError("The expected provenance runner class is unsupported.")
     source, engine = plan["source"], plan["siteops"]
+    native, workspace = publication_assets(plan, assets)
+    if assets.source != source:
+        raise RenderingError("The release asset inventory describes a different source.")
     repository = source["repository"]
     home = "https://github.com/" + repository
     notes = authored.rstrip() + "\n\n## Install Site Ops\n\n"
+    workspace_notes = ""
+    if workspace:
+        downloads = home + "/releases/download/" + urllib.parse.quote(plan["release"]["tag"], safe="") + "/"
+        project_guide = (
+            home + "/blob/" + source["commit"] + "/docs/projects.md#run-project-pin"
+        )
+        workspace_notes = (
+            "\n\n## Workspace content\n\n"
+            "This release contains complete workspace packages. Each package has a detached "
+            "attestation proof containing signed provenance evidence. "
+            f"Follow the [workspace pin guidance]({project_guide}) to run "
+            "`siteops project pin` with `--release` for this release. Supply the trust "
+            "policy and trusted roots independently. The routing descriptor cannot select "
+            "them.\n\n"
+            + "\n".join(f"- [{asset.name}]({downloads}{asset.name})" for asset in workspace)
+            + "\n\nWorkspace qualification used the selected installed engine to check package "
+            "compatibility, protected cache use, and guarded catalog loading. It did not compare "
+            "executable deployment plans, authorize targets, deploy resources, or evaluate "
+            "workload health.\n"
+        )
     if not engine["bundle"]:
         tag = engine["releaseTag"]
+        if assets.engine is None or assets.engine.tag != tag or native:
+            raise RenderingError("The release asset inventory does not match the engine selection.")
         url = home + "/releases/tag/" + urllib.parse.quote(tag, safe="")
         return (
             notes + f"Use [{tag}]({url}) and its installation instructions. "
             "The referenced engine release has its own source commit and native installation assets.\n"
+            + workspace_notes
         )
 
-    wheels = [item["name"] for item in assets["assets"] if item["name"].endswith(".whl")]
-    if assets.get("mode") != "publish" or len(wheels) != 1:
+    if assets.engine is not None:
         raise RenderingError("The release asset list cannot render installation guidance.")
-    wheel = wheels[0]
+    wheel = native_engine_wheel(native).name
     downloads = home + "/releases/download/" + urllib.parse.quote(plan["release"]["tag"], safe="") + "/"
     guide = home + "/blob/" + source["commit"] + "/docs/install-siteops.md#install-the-verified-bundle"
     command = (
@@ -63,14 +98,19 @@ def render_notes(
         f"```console\n{command}\n```",
         "To replace an existing online installation, review any pipx pin and rerun the command with `--force`. "
         "Confirm the result with `siteops --version` and `siteops --help`.",
-        "pipx does not automatically verify GitHub attestations for the online command. "
-        "For external verification before extraction and a hash-locked native install from stable private storage, "
+        "The installation ZIP and standalone wheel each have a detached attestation proof "
+        "containing signed provenance evidence. pipx does not automatically verify GitHub "
+        "attestations for the online command. "
+        "For external verification before extraction and a native installation locked to hashes "
+        "from stable private storage, "
         f"follow the [verified installation guide]({guide}). "
         "That path downloads only the ZIP and its detached proof, authenticates the ZIP before extraction, "
         "then installs from the authenticated `pylock.toml` with stock pipx.",
         f"Expected publisher: `{repository}`. Source commit: `{source['commit']}`. "
         f"Source ref: `{source['ref']}`. Use these values with the guide verification policy. "
         "The guide also describes switching between online and locked installations.",
+        f"Expected provenance runner class: `{runner_environment}`. "
+        "The runner class does not identify a particular pool.",
         "The locked path is qualified with pipx 1.17.2 and its shared pip 26.2.1. "
         "pip support for `pylock.toml` remains experimental.",
         f"Release assets: [{wheel}]({downloads}{wheel}), "
@@ -80,7 +120,7 @@ def render_notes(
         "Use these assets instead of the generated source archives.",
         "Installing the CLI does not authenticate to Azure or deploy resources.",
     ]
-    return notes + "\n\n".join(paragraphs) + "\n"
+    return notes + "\n\n".join(paragraphs) + "\n" + workspace_notes
 
 
 def embedded_notes(text: str) -> str:
@@ -122,9 +162,16 @@ def embedded_notes(text: str) -> str:
 
 
 def render_summary(plan: dict[str, Any], notes: str, values: Mapping[str, str]) -> str:
-    """Render the complete approval preview before publishing any summary text."""
+    """Render the complete candidate summary before publishing any summary text."""
     release, engine = plan["release"], plan["siteops"]
     dry_run = values.get("DRY_RUN") == "true"
+    components = {"siteops": "Site Ops only", "content": "Content only", "both": "Both"}
+    mode = release["components"]
+    expected_mode = "siteops" if release["stream"] == "siteops" else (
+        "both" if engine["bundle"] else "content"
+    )
+    if type(mode) is not str or mode not in components or mode != expected_mode:
+        raise RenderingError("The release components disagree with the engine selection.")
     action = "Reuse the matching tag" if values["TAG_EXISTS"] == "true" else "Create the missing tag"
     lines = ["# Release preview (no publication)\n" if dry_run else "# Ready for release approval\n"]
     if dry_run:
@@ -132,11 +179,42 @@ def render_summary(plan: dict[str, Any], notes: str, values: Mapping[str, str]) 
     for label, value in (
         ("Release", release["tag"]), ("Title", release["title"]),
         ("Source commit", plan["source"]["commit"]), ("Release file", plan["intent"]["path"]),
-        ("Stream", release["stream"]), ("Prerelease", release["prerelease"]),
+        ("Components", components[mode]), ("Stream", release["stream"]),
+        ("Content version", release["version"] if mode != "siteops" else "Not included"),
+        ("Engine selection", "Build from this commit" if engine["bundle"] else "Use an existing release"),
+        ("Prerelease", release["prerelease"]),
         ("Latest", release["latest"]), ("Proposed tag action" if dry_run else "Tag action", action),
         ("Site Ops", engine["releaseTag"] or values["ENGINE_VERSION"]),
     ):
         lines.append(f"- {label}: `{value}`")
+    if plan.get("workspaces"):
+        lines.extend([
+            "\n## Workspace builds\n",
+            "| Workspace | Kit ID | Package | Required Site Ops |",
+            "|---|---|---|---|",
+        ])
+        for request in plan["workspaces"]:
+            cells = [
+                html.escape(value, quote=False).translate(str.maketrans({
+                    character: f"&#{ord(character)};" for character in "\\`*_[]()|~"
+                }))
+                for value in (
+                    request["workspace"], request["id"], request["package"],
+                    request["compatibility"]["siteops"],
+                )
+            ]
+            lines.append("| " + " | ".join(cells) + " |")
+        lines.extend([
+            "\nEach workspace package has a proof containing signed provenance evidence. "
+            "The public routing descriptor routes packages and proofs. "
+            "It does not select trust policy or trusted roots.\n",
+            "The selected installed engine consumed the frozen workspace packages on every "
+            "declared target. Qualification checked package compatibility, protected cache use, "
+            "and guarded catalog loading. It did not compare executable deployment plans, "
+            "authorize targets, deploy resources, or evaluate workload health.\n",
+            f"[Download the complete release payload]({values['ARTIFACT_URL']})\n",
+            f"Frozen publication inventory SHA-256: `{values['ASSET_LIST_SHA']}`",
+        ])
     if engine["bundle"]:
         matrix = json.loads(values["MATRIX"])
         expected = ["3.10", "3.11", "3.12", "3.13", "3.14"]
@@ -154,7 +232,10 @@ def render_summary(plan: dict[str, Any], notes: str, values: Mapping[str, str]) 
             lines.append(f"| {row['python']} | {row['linux']} | {row['windows']} |")
         lines.extend([
             f"\n[Download the attested release assets]({values['ARTIFACT_URL']})\n",
-            "The Actions download contains the installation ZIP, standalone wheel, and a detached proof for each. "
+            "The Actions download contains the installation ZIP and standalone wheel. Each has "
+            "a detached attestation proof containing signed provenance evidence."
+            + (" It also contains the declared workspace assets. " if plan.get("workspaces") else " ")
+            +
             "For a verified installation, use the ZIP and its proof.\n",
             "<details><summary>Artifact identity</summary>\n",
             f"- `{values['ARCHIVE_NAME']}` SHA-256: `{values['BUNDLE_SHA']}`",
@@ -186,16 +267,23 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("notes", "summary"))
     parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument(
+        "--inventory",
+        type=Path,
+        metavar="FILE",
+        help="Final frozen publication inventory. Defaults to release-assets/release-assets.json under --root.",
+    )
     args = parser.parse_args(argv)
     root = args.root
     try:
         plan = json.loads((root / "release-plan" / "plan.json").read_text(encoding="utf-8"))
         if args.mode == "notes":
             authored = (root / "release-plan" / "release-notes.md").read_text(encoding="utf-8")
-            assets = json.loads((root / "release-assets" / "release-assets.json").read_text(encoding="utf-8"))
+            assets = FrozenReleaseAssets.read(args.inventory or root / "release-assets" / "release-assets.json")
             raw = render_notes(
                 plan, authored, assets, engine_version=os.environ.get("ENGINE_VERSION", ""),
                 archive_name=os.environ["ARCHIVE_NAME"], attestation_suffix=os.environ["ATTESTATION_SUFFIX"],
+                runner_environment=os.environ["EXPECTED_RUNNER_ENVIRONMENT"],
             ).encode("utf-8")
             (root / "publish-notes.md").write_bytes(raw)
             print("sha256=" + hashlib.sha256(raw).hexdigest())

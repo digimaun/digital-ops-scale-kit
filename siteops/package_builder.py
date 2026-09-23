@@ -45,6 +45,7 @@ from siteops.compilation import (
 )
 from siteops.models import DeploymentStep, Manifest, _parse_manifest_spec
 from siteops.runtime import RuntimePaths
+from siteops.workspace_compatibility import require_engine_version
 
 logger = logging.getLogger(__name__)
 CompilationSessionFactory = Callable[[], TemplateCompilationSession]
@@ -470,6 +471,7 @@ def build_package(
     companions: tuple[str, ...] = (),
     required_features: tuple[str, ...] = ("manifest/v1",),
     compilation_session_factory: CompilationSessionFactory | None = None,
+    engine_version: str = package.__version__,
 ) -> package.PackageInspection:
     """Build a complete workspace package from a prepared source snapshot.
 
@@ -477,6 +479,7 @@ def build_package(
     establishes it separately. This function creates no provenance assertion
     and never overwrites an existing output.
     """
+    require_engine_version(siteops_range, engine_version)
     require_node(snapshot, directory=True)
     snapshot = snapshot.resolve()
     output = Path(os.path.abspath(output))
@@ -567,7 +570,7 @@ def build_package(
         files, package.workspace_tree_digest(files, workspace), tuple(mappings),
     )
     metadata = package.WorkspacePackage.from_document(metadata.document())
-    package.check_compatibility(metadata)
+    package.check_compatibility(metadata, engine_version=engine_version)
     raw = package.json_bytes(metadata.document())
     if len(raw) > package.MAX_METADATA_BYTES:
         raise ArtifactError("Workspace package metadata exceeds its byte limit.")
@@ -598,7 +601,7 @@ def build_package(
                     if size != entry.size or digest.hexdigest() != entry.sha256:
                         raise ArtifactError("A package source changed during production.")
         _, digest = hash_file(staged, limit=package.MAX_ARCHIVE_BYTES)
-        inspection = package.inspect_package(staged, digest)
+        inspection = package.inspect_produced_package(staged, digest, engine_version=engine_version)
         _publish(staged, output, digest)
         return inspection
     except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile, zlib.error):

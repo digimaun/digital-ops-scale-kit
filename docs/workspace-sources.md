@@ -1,13 +1,20 @@
 # Workspace release sources
 
-`siteops-workspaces.json` lets `project pin` select one complete workspace
-package and detached proof from a content release. Selection does not require
-inspection of every ZIP or a descriptive index.
+Run `siteops project pin` with `--release` to select one complete workspace
+package from a content release. Supply a trust policy and trusted roots
+independently. The release descriptor cannot select them. See
+[workspace pins and configured Site execution](projects.md#run-project-pin)
+for the complete command.
 
-[`project pin`](projects.md) acquires this source and connects its verified
-workspace to ordinary planning and deployment. Current release automation
-publishes engine assets only. It does not generate or publish the workspace
-asset set.
+`siteops-workspaces.json` routes the selected package and its detached
+attestation proof. A proof is a separate file containing signed provenance
+evidence. Selection does not require inspection of every ZIP or a descriptive
+index.
+
+Release candidate preparation can build workspace packages, create their
+proofs, generate this descriptor, and qualify package consumption through the
+selected installed engine. Publication requires the complete qualified
+inventory, configured approval environment, and applicable release evidence.
 
 ## Descriptor
 
@@ -44,9 +51,9 @@ identities of the actual published files:
 }
 ```
 
-The revision is opaque in the common format. A GitHub adapter supplies the
-commit resolved from the selected release tag. Another provider supplies its
-own immutable revision identity.
+The revision is opaque in the common format. The current GitHub adapter supplies
+the commit resolved from the selected release tag. Other providers can supply
+their own immutable revision identity.
 
 Each workspace is `.` or a canonical relative path matching the package's
 workspace root. A release with one workspace can select it by default.
@@ -183,14 +190,27 @@ Those observations never authorize package execution.
 
 ## Publication integration
 
-The descriptor should be generated after the package and proof bytes exist,
-then frozen with their identities in the existing reviewed candidate inventory.
-The publisher must upload those exact bytes rather than regenerate them.
+Candidate preparation builds each workspace from the reviewed declaration
+through the existing package producer. A separate signing job creates one proof
+for the ZIP and another for its build record. The collector verifies the record
+before interpreting it and the ZIP before inspecting its metadata. Both proofs
+must satisfy the independently supplied repository, source, and workflow
+policy.
 
-Keep the existing internal `SiteOpsReleaseAssets` approval document separate
-from this public routing contract. Engine assets and workspace assets retain
-their independent version and compatibility rules. Extending publication
-must use the existing release pipeline rather than introduce another system.
+Only after every selected workspace passes collection does it generate the
+descriptor and freeze its bytes with the package and proof identities.
+Each workspace proof names one artifact, matching the current consumer
+contract. The descriptor contains no trust policy or trusted root selection.
+After approval, the publisher rechecks the exact package, proof, and descriptor
+bytes against the approved inventory and source contracts, then uploads those
+bytes.
+
+Keep the internal frozen `SiteOpsReleaseAssets` inventory separate from the
+public `WorkspaceReleaseAssets` routing descriptor. The inventory's publication
+list is also separate from the identity and assets of an existing engine
+release. Engine assets and workspace assets retain their independent version
+and compatibility rules. Workspace delivery uses the existing release
+pipeline.
 
 See [workspace packages](workspace-packages.md) for package contents and
 [artifact verification](artifact-verification.md) for consumer trust policy.

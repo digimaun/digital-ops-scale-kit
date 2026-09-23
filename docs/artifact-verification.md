@@ -15,10 +15,10 @@ use the receipt together with their own identity and access boundaries.
 
 ## GitHub policy
 
-The current adapter supports GitHub CLI 2.95 or newer in the 2.x release line,
-GitHub-hosted runners, and same-repository, same-commit reusable workflows.
+The current adapter supports GitHub CLI 2.95 or newer in the 2.x release line
+and reusable workflows in the same repository and commit.
 The policy identifies both the reusable signing workflow and its top-level
-build workflow. It does not accept a workflow-prefix match.
+build workflow, plus one exact signing runner class.
 
 An administrator supplies a policy with this shape, replacing the placeholders:
 
@@ -35,7 +35,8 @@ An administrator supplies a policy with this shape, replacing the placeholders:
     "repository": "example/content",
     "sourceRef": "refs/heads/main",
     "signerWorkflow": ".github/workflows/sign.yml",
-    "builderWorkflow": ".github/workflows/release.yml"
+    "builderWorkflow": ".github/workflows/release.yml",
+    "runnerEnvironment": "github-hosted"
   }
 }
 ```
@@ -45,10 +46,18 @@ artifact SHA-256 from an approved source resolver. Source resolution is not
 implemented by this verifier. A package, release-note body, or verifier policy
 echo cannot supply the consumer's publisher policy.
 
+`runnerEnvironment` is required. Choose `github-hosted` or `self-hosted`
+according to your independently approved publisher policy. There is no
+inference from the downloaded proof and no acceptance of both classes through
+one value. A `self-hosted` certificate does not identify a particular pool,
+image or isolation configuration. Approve those controls separately.
+
 The adapter checks the artifact hash before invoking GitHub CLI. It supplies
 the detached proof and custom trusted root, exact certificate identity,
 source and signer digests, source ref, GitHub OIDC issuer, SLSA predicate,
-hosted-runner requirement and SHA-256 algorithm explicitly.
+and SHA-256 algorithm explicitly. A `github-hosted` policy also passes
+`--deny-self-hosted-runners`. Both policies require every verified certificate
+to match the selected runner class exactly.
 On Windows, it requires the native `gh.exe` executable rather than a batch
 wrapper.
 

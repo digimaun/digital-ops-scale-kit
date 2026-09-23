@@ -14,6 +14,9 @@ import time
 from pathlib import Path
 
 import pytest
+import yaml
+
+from siteops.orchestrator import Orchestrator
 
 SCRIPT_PATH = Path(__file__).parent.parent / "scripts" / "render-e2e-site.py"
 
@@ -209,8 +212,6 @@ class TestRealTemplate:
     """Render the real e2e-test.yaml.tmpl and confirm it produces valid YAML."""
 
     def test_real_template_renders(self):
-        import yaml
-
         template = Path(__file__).parent.parent / "tests" / "e2e" / "sites" / "e2e-test.yaml.tmpl"
         out = render_e2e_site.render(template, FULL_ENV)
         doc = yaml.safe_load(out)
@@ -221,13 +222,48 @@ class TestRealTemplate:
         assert doc["properties"]["deployOptions"]["enableSecretSync"] is True
 
     def test_secret_sync_disabled_renders_boolean_false(self):
-        import yaml
-
         template = Path(__file__).parent.parent / "tests" / "e2e" / "sites" / "e2e-test.yaml.tmpl"
         values = {**FULL_ENV, "E2E_ENABLE_SECRET_SYNC": "false"}
         out = render_e2e_site.render(template, values)
         doc = yaml.safe_load(out)
         assert doc["properties"]["deployOptions"]["enableSecretSync"] is False
+
+    def test_published_template_is_a_self_contained_operator_site(self, tmp_path):
+        template = (
+            Path(__file__).parent.parent
+            / "tests"
+            / "e2e"
+            / "sites"
+            / "e2e-published.yaml.tmpl"
+        )
+        values = {**FULL_ENV, "E2E_ENABLE_SECRET_SYNC": "false"}
+        rendered = render_e2e_site.render(template, values)
+        document = yaml.safe_load(rendered)
+
+        assert "inherits" not in document
+        assert document["properties"]["deployOptions"] == {
+            "enableGlobalSite": False,
+            "enableEdgeSite": False,
+            "enableSecretSync": False,
+            "enableWorkloadIdentity": False,
+            "enableCertManager": True,
+            "allowKubernetesMinorUpgrade": False,
+        }
+        assert document["parameters"]["aksee"] == {
+            "aksEdgeMsiUrl": "https://aka.ms/aks-edge/k3s-msi",
+            "targetKubernetesVersion": "",
+        }
+
+        project = tmp_path / "project"
+        sites = project / "sites"
+        sites.mkdir(parents=True)
+        (sites / "published.yaml").write_text(rendered, encoding="utf-8")
+        workspace = Path(__file__).parent.parent / "workspaces" / "iot-operations"
+        site = Orchestrator(workspace, site_config_root=project).load_site(
+            FULL_ENV["E2E_SITE_NAME"]
+        )
+        assert site.name == FULL_ENV["E2E_SITE_NAME"]
+        assert site.parameters["clusterName"] == FULL_ENV["E2E_CLUSTER_NAME"]
 
 
 class TestWorkflowSecretSyncModes:
@@ -251,7 +287,7 @@ class TestWorkflowSecretSyncModes:
         assert "multiple AIO releases or Secret Sync modes" in workflow
         assert "Secret Sync requires OIDC issuer and workload identity" in workflow
         assert "matrix axis intentionally controls all three settings" in workflow
-        assert "max_parallel={1 if persistent else 20}" in workflow
+        assert "max_parallel={1 if persistent or published_mode else 20}" in workflow
         assert "max-parallel: ${{ fromJSON(needs.prep.outputs.max-parallel) }}" in workflow
         assert 'enabled) SYNC_SUFFIX="sync-on"' in workflow
         assert 'disabled) SYNC_SUFFIX="sync-off"' in workflow

@@ -126,6 +126,7 @@ class GitHubArtifactPolicy:
     source_ref: str
     signer_workflow: str
     builder_workflow: str
+    runner_environment: str
     sha256: str
 
     @property
@@ -155,10 +156,13 @@ def load_github_policy(path: Path) -> GitHubArtifactPolicy:
     if type(version) is not int or not 1 <= version <= 2**31 - 1:
         raise VerificationError("The verification policy version must be a positive integer.")
     provider = _record(document["provider"], {
-        "kind", "repository", "sourceRef", "signerWorkflow", "builderWorkflow",
+        "kind", "repository", "sourceRef", "signerWorkflow", "builderWorkflow", "runnerEnvironment",
     })
     if provider["kind"] != "github-attestation/v1":
         raise VerificationError("The verification policy provider is unsupported.")
+    runner_environment = provider["runnerEnvironment"]
+    if runner_environment not in ("github-hosted", "self-hosted"):
+        raise VerificationError("The verification policy runnerEnvironment must be github-hosted or self-hosted.")
     repository = _text(provider["repository"], maximum=256)
     if not _REPOSITORY.fullmatch(repository) or any(part in {".", ".."} for part in repository.split("/")):
         raise VerificationError("The verification policy repository is invalid.")
@@ -174,7 +178,7 @@ def load_github_policy(path: Path) -> GitHubArtifactPolicy:
     return GitHubArtifactPolicy(
         _text(document["id"], maximum=128), version, _timestamp(document["validUntil"]),
         _digest(document["trustedRootSha256"]), repository, reference,
-        workflows[0], workflows[1], hashlib.sha256(raw).hexdigest(),
+        workflows[0], workflows[1], runner_environment, hashlib.sha256(raw).hexdigest(),
     )
 
 
@@ -212,7 +216,7 @@ def _observations(
         "sourceRepositoryDigest": source_commit,
         "sourceRepositoryRef": policy.source_ref,
         "buildSignerDigest": source_commit,
-        "runnerEnvironment": "github-hosted",
+        "runnerEnvironment": policy.runner_environment,
         "buildConfigURI": policy.workflow_identity(policy.builder_workflow),
         "buildConfigDigest": source_commit,
     }
@@ -326,7 +330,8 @@ def verify_github_artifact(
             "--signer-digest", source_commit, "--source-digest", source_commit,
             "--source-ref", policy.source_ref,
             "--cert-oidc-issuer", _ISSUER, "--predicate-type", _PREDICATE,
-            "--deny-self-hosted-runners", "--digest-alg", "sha256", "--format", "json",
+            *(["--deny-self-hosted-runners"] if policy.runner_environment == "github-hosted" else []),
+            "--digest-alg", "sha256", "--format", "json",
         ])
         if code != 0:
             raise VerificationError("The detached artifact proof did not pass verification.")

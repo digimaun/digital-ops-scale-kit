@@ -9,6 +9,7 @@ fakes, so a change that widens the boundary fails here.
 `on` parses as the boolean True, since YAML 1.1 treats it as a keyword.
 """
 
+import copy
 import hashlib
 import json
 import os
@@ -47,6 +48,7 @@ from tests.shell_helpers import (
 from tests.shell_helpers import (
     write_executable as _write_executable,
 )
+from tests.verification_helpers import verified_observation
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
@@ -83,7 +85,7 @@ VERIFY_FLAGS = (
     "--source-ref",
     "--cert-oidc-issuer",
     "--predicate-type",
-    "--deny-self-hosted-runners",
+    "--format",
 )
 
 
@@ -118,7 +120,7 @@ def _all_steps(document: dict):
 def test_ci_rehearsal_requires_an_explicit_manual_request_and_source_commit():
     inputs = CI[ON]["workflow_dispatch"]["inputs"]
     assert inputs["run-mode"]["type"] == "choice"
-    assert inputs["run-mode"]["options"] == ["ci-only", "installer-check", "release-preview"]
+    assert inputs["run-mode"]["options"] == ["ci-only", "runner-check", "attestation-check", "installer-check", "release-preview"]
     assert inputs["run-mode"]["default"] == "ci-only"
     assert inputs["expected-source-sha"]["type"] == "string"
     assert inputs["expected-source-sha"]["required"] is False
@@ -126,7 +128,7 @@ def test_ci_rehearsal_requires_an_explicit_manual_request_and_source_commit():
     assert inputs["release-file"]["type"] == "string"
     assert inputs["release-file"]["required"] is False
     assert inputs["release-file"]["default"] == (
-        ".github/release-examples/combined-preview/release.json"
+        ".github/release-examples/workspace-preview/release.json"
     )
     job = CI["jobs"]["installer-check"]
     assert job["if"] == (
@@ -134,7 +136,10 @@ def test_ci_rehearsal_requires_an_explicit_manual_request_and_source_commit():
         "inputs.run-mode == 'installer-check' }}"
     )
     assert job["uses"] == "./.github/workflows/_siteops-distribution.yaml"
-    assert job["with"] == {"expected-source-sha": "${{ inputs.expected-source-sha }}"}
+    assert job["with"] == {
+        "expected-source-sha": "${{ inputs.expected-source-sha }}",
+        "release-pool": "${{ needs.release-runner.outputs.pool }}",
+    }
     assert "steps" not in job
     assert "secrets" not in job
     assert job["permissions"] == {
@@ -152,7 +157,7 @@ def test_ci_rehearsal_preserves_normal_ci_permissions_and_cannot_promote():
     assert all(job.get("permissions", {}).get("contents") != "write" for job in CI["jobs"].values())
     assert "release.yaml" not in yaml.safe_dump(CI["jobs"]["installer-check"])
     release = CI["jobs"]["release-preview"]
-    assert release["needs"] == ["lint", "test", "validate"]
+    assert release["needs"] == ["lint", "test", "validate", "release-runner"]
     assert release["if"] == (
         "${{ github.event_name == 'workflow_dispatch' && inputs.run-mode == 'release-preview' }}"
     )
@@ -161,6 +166,7 @@ def test_ci_rehearsal_preserves_normal_ci_permissions_and_cannot_promote():
         "expected-source-sha": "${{ inputs.expected-source-sha }}",
         "intent": "${{ inputs.release-file }}",
         "dry-run": True,
+        "release-pool": "${{ needs.release-runner.outputs.pool }}",
     }
     assert release["permissions"] == {
         "contents": "read",
@@ -183,7 +189,8 @@ def _fake_tools(tmp_path: Path) -> tuple[Path, Path]:
   for argument in "$@"; do printf '%s\\n' "$argument"; done
 } >> "$FAKE_GH_LOG"
 
-if [[ "$1" == "attestation" ]]; then
+if [[ "$1 $2" == "attestation verify" ]]; then
+  if [[ -n "${FAKE_GH_VERIFICATION:-}" ]]; then cat "$FAKE_GH_VERIFICATION"; fi
   if [[ "$3" == *.whl ]]; then
     exit "${FAKE_GH_WHEEL_EXIT:-${FAKE_GH_ATTESTATION_EXIT:-0}}"
   fi
@@ -198,12 +205,13 @@ fi
 exit 1
 """,
     )
-    _write_executable(
-        bin_dir / "python3",
-        """#!/usr/bin/env bash
+    for name in ("python", "python3"):
+        _write_executable(
+            bin_dir / name,
+            """#!/usr/bin/env bash
 exec "$FAKE_PYTHON" "$@"
 """,
-    )
+        )
     return bin_dir, log
 
 
@@ -225,7 +233,7 @@ def _invocations(log: Path) -> list[list[str]]:
 def test_build_job_executes_source_without_signing_capability():
     build = REUSABLE["jobs"]["build"]
     assert build["permissions"] == {"contents": "read"}
-    assert build["runs-on"] == "ubuntu-24.04"
+    assert build["runs-on"] == ["${{ inputs.release-pool }}"]
     assert "environment" not in build
     assert all(step.get("uses", "").split("@")[0] != "actions/attest" for step in build["steps"])
 
@@ -264,7 +272,7 @@ def test_build_checks_out_the_asserted_event_commit_without_credentials():
 
 def test_expected_source_sha_is_only_an_assertion():
     inputs = REUSABLE[ON]["workflow_call"]["inputs"]
-    assert set(inputs) == {"expected-source-sha", "version-mode", "report-summary"}
+    assert set(inputs) == {"expected-source-sha", "version-mode", "report-summary", "release-pool"}
     assert REUSABLE[ON]["workflow_call"]["inputs"]["version-mode"]["default"] == "build"
     assert inputs["report-summary"] == {
         "description": "Write the aggregate distribution report to the workflow summary.",
@@ -428,6 +436,7 @@ def test_qualification_policy_pins_the_caller_source_and_local_signer():
     # A local reusable reference binds to the caller's own event commit, so the
     # signer digest is that commit and the identity carries the caller ref.
     assert environment["SIGNER_DIGEST"] == "${{ github.sha }}"
+    assert environment["BUILDER_IDENTITY"] == "https://github.com/${{ github.workflow_ref }}"
     assert environment["SIGNER_IDENTITY"] == (
         f"https://github.com/${{{{ github.repository }}}}/{SIGNER_WORKFLOW}@${{{{ github.ref }}}}"
     )
@@ -970,8 +979,15 @@ def test_source_assertion_accepts_only_the_matching_event_commit(tmp_path, expec
 
 
 def _qualification_exports(tmp_path: Path, log: Path) -> dict[str, str]:
+    evidence = tmp_path / "verified-observations.json"
+    evidence.write_text(json.dumps([verified_observation(
+        "example/publisher", "c" * 40, "refs/heads/main",
+        SIGNER_WORKFLOW, ".github/workflows/ci.yaml",
+    )]), encoding="utf-8")
     return {
         "FAKE_GH_LOG": _bash_path(log),
+        "FAKE_GH_VERIFICATION": _bash_path(evidence),
+        "FAKE_PYTHON": Path(sys.executable).as_posix(),
         "RUNNER_TEMP": _bash_path(tmp_path / "temp"),
         "ARCHIVE_NAME": ARCHIVE_NAME,
         "ATTESTATION_SUFFIX": ATTESTATION_SUFFIX,
@@ -980,6 +996,7 @@ def _qualification_exports(tmp_path: Path, log: Path) -> dict[str, str]:
         "SOURCE_SHA": "c" * 40,
         "SOURCE_REF": "refs/heads/main",
         "SIGNER_DIGEST": "c" * 40,
+        "BUILDER_IDENTITY": "https://github.com/example/publisher/.github/workflows/ci.yaml@refs/heads/main",
         "SIGNER_IDENTITY": (
             f"https://github.com/example/publisher/{SIGNER_WORKFLOW}@refs/heads/main"
         ),
@@ -1025,7 +1042,7 @@ def _expected_verification(asset: str) -> list[str]:
         OIDC_ISSUER,
         "--predicate-type",
         PREDICATE_TYPE,
-        "--deny-self-hosted-runners",
+        "--hostname", "github.com", "--digest-alg", "sha256", "--format", "json",
     ]
 
 
@@ -1054,6 +1071,29 @@ def test_qualification_stops_when_verification_fails(tmp_path, failing, attempte
     result = _run_script(script, tmp_path, exports)
     assert result.returncode != 0
     assert len(_invocations(log)) == attempted
+
+
+@pytest.mark.parametrize("field", [
+    "subjectAlternativeName", "issuer", "sourceRepositoryURI", "sourceRepositoryDigest",
+    "sourceRepositoryRef", "buildSignerDigest", "buildConfigURI", "buildConfigDigest", "runnerEnvironment",
+])
+def test_native_qualification_checks_each_observed_claim(tmp_path, field):
+    _, log = _fake_tools(tmp_path)
+    _staged_download(tmp_path)
+    exports = _qualification_exports(tmp_path, log)
+    path = tmp_path / "verified-observations.json"
+    observations = json.loads(path.read_bytes())
+    changed = copy.deepcopy(observations[0])
+    changed["verificationResult"]["signature"]["certificate"][field] = "PRIVATE_WRONG"
+    observations.append(changed)
+    path.write_text(json.dumps(observations))
+    result = _run_script(
+        _script(REUSABLE["jobs"]["qualify"], "Verify both assets before use"), tmp_path, exports,
+    )
+    assert result.returncode != 0
+    assert "certificate does not match" in result.stdout + result.stderr
+    assert "PRIVATE_WRONG" not in result.stdout + result.stderr
+    assert len(_invocations(log)) == 1
 
 
 @pytest.mark.parametrize(
@@ -1620,7 +1660,7 @@ def test_signing_refuses_an_empty_detached_proof(tmp_path, empty):
     assert result.returncode != 0
     assert "attestation bundle is empty" in result.stdout + result.stderr
 
-def test_every_run_block_parses_as_bash(tmp_path):
+def test_every_run_block_matches_its_declared_shell(tmp_path):
     blocks = []
     for name, document in (
         (REUSABLE_PATH.name, REUSABLE),
@@ -1630,10 +1670,20 @@ def test_every_run_block_parses_as_bash(tmp_path):
         for job_id, job in document["jobs"].items():
             for step in job.get("steps", []):
                 if "run" in step:
-                    blocks.append((f"{name}:{job_id}:{step['name']}", step["run"]))
+                    shell = (
+                        step.get("shell")
+                        or job.get("defaults", {}).get("run", {}).get("shell")
+                        or document.get("defaults", {}).get("run", {}).get("shell")
+                        or "bash"
+                    )
+                    blocks.append((f"{name}:{job_id}:{step['name']}", shell, step["run"]))
     assert blocks
 
-    for label, script in blocks:
+    for label, shell, script in blocks:
+        if shell == "python":
+            compile(script, label, "exec")
+            continue
+        assert shell == "bash", f"Add syntax coverage for {label}: {shell}"
         path = tmp_path / "block.sh"
         path.write_text(script, encoding="utf-8", newline="\n")
         result = subprocess.run(

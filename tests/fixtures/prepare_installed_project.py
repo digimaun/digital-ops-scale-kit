@@ -53,6 +53,7 @@ policy.write_text(json.dumps({
         "kind": "github-attestation/v1", "repository": "example/content",
         "sourceRef": "refs/heads/main", "signerWorkflow": ".github/workflows/sign.yml",
         "builderWorkflow": ".github/workflows/release.yml",
+        "runnerEnvironment": "github-hosted",
     },
 }), encoding="utf-8")
 (root / "tool-context.json").write_text(json.dumps({

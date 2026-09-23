@@ -1,5 +1,6 @@
 """Exercise the native installation guide's command and path contracts."""
 
+import copy
 import hashlib
 import json
 import os
@@ -13,7 +14,8 @@ from pathlib import Path
 import pytest
 from packaging.requirements import Requirement
 
-from tests.shell_helpers import bash_path, run_script
+from tests.shell_helpers import bash_path, run_script, write_executable
+from tests.verification_helpers import verified_observation
 
 try:
     import tomllib
@@ -51,7 +53,12 @@ def test_online_transition_selects_a_release_wheel_instead_of_an_index_package()
 
 
 @pytest.mark.parametrize("shell", ["powershell", "bash"])
-@pytest.mark.parametrize("state", ["verified", "rejected", "existing"])
+@pytest.mark.parametrize("state", [
+    "verified", "rejected", "existing", "subjectAlternativeName", "issuer",
+    "sourceRepositoryURI", "sourceRepositoryDigest", "sourceRepositoryRef",
+    "buildSignerDigest", "buildConfigURI", "buildConfigDigest", "runnerEnvironment",
+    "runner-case", "runner-type", "media-type",
+])
 def test_guide_authenticates_before_creating_retained_files(tmp_path, shell, state):
     if shell == "powershell" and (sys.platform != "win32" or not shutil.which("pwsh")):
         pytest.skip("The PowerShell retention example uses Windows identity and ACL tools.")
@@ -60,6 +67,7 @@ def test_guide_authenticates_before_creating_retained_files(tmp_path, shell, sta
     archive = download / "siteops-install.zip"
     with zipfile.ZipFile(archive, "w") as stream:
         stream.writestr("payload.txt", "authenticated test payload")
+    (download / "siteops-install.zip.attestation.jsonl").write_bytes(b"opaque fixture proof")
     identity = hashlib.sha256(archive.read_bytes()).hexdigest()
     destination = tmp_path / "data" / "siteops" / "bundles" / identity
     if state == "existing":
@@ -70,34 +78,90 @@ def test_guide_authenticates_before_creating_retained_files(tmp_path, shell, sta
         "<download directory>", str(download) if shell == "powershell" else bash_path(download),
     ).replace("<full source commit from the selected official release>", "a" * 40)
     code = 9 if state == "rejected" else 0
+    observation = verified_observation(
+        "Azure/digital-ops-scale-kit", "a" * 40, "refs/heads/main",
+        ".github/workflows/_siteops-distribution.yaml", ".github/workflows/release.yaml",
+    )
+    observations = [observation]
+    if state not in {"verified", "rejected", "existing"}:
+        changed = copy.deepcopy(observation)
+        certificate = changed["verificationResult"]["signature"]["certificate"]
+        if state == "runner-case":
+            certificate["runnerEnvironment"] = "SELF-HOSTED"
+        elif state == "runner-type":
+            certificate["runnerEnvironment"] = ["self-hosted"]
+        elif state == "media-type":
+            changed["verificationResult"]["mediaType"] = [changed["verificationResult"]["mediaType"]]
+        else:
+            certificate[state] = "PRIVATE_WRONG"
+        observations.append(changed)
+    evidence = tmp_path / "observations.json"
+    evidence.write_text(json.dumps(observations), encoding="utf-8")
+    arguments = tmp_path / "arguments.json"
     if shell == "powershell":
         script = tmp_path / "retain.ps1"
         script.write_text(
-            f"function gh {{ $global:LASTEXITCODE = {code} }}\n" + body, encoding="utf-8",
+            f"""function gh {{
+    ConvertTo-Json -InputObject @($args) -Compress | Set-Content -LiteralPath $env:TEST_ARGUMENTS
+    Get-Content -LiteralPath $env:TEST_EVIDENCE -Raw
+    $global:LASTEXITCODE = {code}
+}}
+""" + body, encoding="utf-8",
         )
         result = subprocess.run(
             [shutil.which("pwsh"), "-NoProfile", "-File", str(script)], cwd=tmp_path,
-            env={**os.environ, "LOCALAPPDATA": str(tmp_path / "data")},
+            env={
+                **os.environ, "LOCALAPPDATA": str(tmp_path / "data"),
+                "TEST_ARGUMENTS": str(arguments), "TEST_EVIDENCE": str(evidence),
+            },
             capture_output=True, text=True, timeout=30,
         )
     else:
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        write_executable(bin_dir / "gh", f"""#!/usr/bin/env bash
+[[ "$1 $2" == "attestation verify" ]] || exit 99
+printf '%s\\n' "$@" > "$TEST_ARGUMENTS"
+cat "$TEST_EVIDENCE"
+exit {code}
+""")
         result = run_script(
-            f'gh() {{ return {code}; }}\npython3() {{ "$TEST_PYTHON" "$@"; }}\n' + body,
+            'python3() { "$TEST_PYTHON" "$@"; }\n' + body,
             tmp_path, {
                 "TEST_PYTHON": Path(sys.executable).as_posix(),
+                "TEST_ARGUMENTS": bash_path(arguments), "TEST_EVIDENCE": bash_path(evidence),
                 "XDG_DATA_HOME": bash_path(tmp_path / "data"),
             },
         )
+    argv = (
+        json.loads(arguments.read_text(encoding="utf-8-sig"))
+        if shell == "powershell" else arguments.read_text().splitlines()
+    )
+    expected = {
+        "--repo": "Azure/digital-ops-scale-kit",
+        "--cert-identity": "https://github.com/Azure/digital-ops-scale-kit/.github/workflows/_siteops-distribution.yaml@refs/heads/main",
+        "--source-ref": "refs/heads/main", "--source-digest": "a" * 40, "--signer-digest": "a" * 40,
+        "--cert-oidc-issuer": "https://token.actions.githubusercontent.com",
+        "--predicate-type": "https://slsa.dev/provenance/v1", "--hostname": "github.com",
+        "--digest-alg": "sha256", "--format": "json",
+    }
+    assert argv[:2] == ["attestation", "verify"]
+    assert argv[2] == (str(archive) if shell == "powershell" else bash_path(archive))
+    assert argv[argv.index("--bundle") + 1] == argv[2] + ".attestation.jsonl"
+    assert "--deny-self-hosted-runners" not in argv
+    for flag, value in expected.items():
+        assert argv.count(flag) == 1 and argv[argv.index(flag) + 1] == value
     if state == "verified":
         assert result.returncode == 0, result.stdout + result.stderr
         assert (destination / "payload.txt").read_text() == "authenticated test payload"
     else:
         assert result.returncode != 0
         assert not (destination / "payload.txt").exists()
-        if state == "rejected":
+        if state != "existing":
             assert not destination.exists()
         else:
             assert (destination / "operator.txt").read_text() == "preserve"
+    assert "PRIVATE_WRONG" not in result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("language", ["powershell", "bash"])

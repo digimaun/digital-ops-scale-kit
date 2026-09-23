@@ -6,16 +6,18 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 from pathlib import Path
 
-from siteops_release import (
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from siteops_release import (  # noqa: E402
     ReleaseIntentError,
     discover_release_intent,
     inactive_release_plan,
     load_release_intent,
+    serialize_release_plan,
 )
 
 _SUCCESS = "Prepared release candidate."
@@ -28,9 +30,9 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--source-sha", required=True)
     parser.add_argument("--source-ref", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--dry-run", action="store_true", help="Prepare a non-publishable rehearsal, allowing committed examples.")
+    parser.add_argument("--dry-run", action="store_true", help="Allow committed examples and produce a release plan that cannot be published.")
     selection = parser.add_mutually_exclusive_group(required=True)
-    selection.add_argument("--intent")
+    selection.add_argument("--intent", metavar="PATH", help="Path to the committed release.json, relative to the repository.")
     selection.add_argument("--before-sha")
     return parser.parse_args()
 
@@ -38,7 +40,7 @@ def _arguments() -> argparse.Namespace:
 def _write_plan(output_dir: Path, plan: dict, notes: str | None) -> None:
     try:
         output_dir.mkdir(mode=0o700)
-        plan_bytes = (json.dumps(plan, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+        plan_bytes = serialize_release_plan(plan)
         with (output_dir / "plan.json").open("xb") as output:
             output.write(plan_bytes)
         if notes is not None:

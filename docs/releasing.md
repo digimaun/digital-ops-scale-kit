@@ -8,21 +8,141 @@ Site Ops and Scale Kit have independent version streams in the same repository.
 A content release can reference an existing engine release without rebuilding
 it or changing its version.
 
+A detached attestation proof is a separate file containing signed provenance
+evidence for an artifact. Each signed artifact has its own proof.
+
 ## Choose the right workflow
 
-| Workflow | Use it for | Can it publish? |
+| Workflow | Use it for | Can it publish a release? |
 |---|---|---|
-| **CI** | Code checks, installer checks, or a release preview | No |
+| **CI** | Code and runner checks, attestation diagnostics, installer checks, or a release preview | No |
 | **Release (approval required)** | Preparing and publishing a reviewed release | Only after the configured reviewer approves |
 
 These entry points share candidate preparation. A CI preview is not a pending
 release and cannot be promoted. A real release prepares its own candidate from
 the reviewed files on `main`.
 
+CI run titles identify the selected mode and branch. The **Overview** summary
+shows ordinary checks and only the optional path selected for that run.
+The graph still contains the workflow's other branches because GitHub controls
+its layout. Detailed installation and release reports remain in their jobs.
+
 If **Release (approval required)** is not available in Actions, its workflow
 file must first exist on the repository's default branch. Use the already
 registered CI workflow to preview feature-branch changes. Changing the default
 branch or pushing the feature directly to `main` is not needed for a preview.
+
+## Configure release artifact runners
+
+In each publishing or rehearsal repository, set the Actions repository variable
+`SITEOPS_RELEASE_POOL` to its dedicated 1ES GitHub runner pool name. Register
+the pool for that exact repository. A fork has its own configuration and pool,
+separate from the upstream repository.
+
+Use `runner-check` to confirm the pool's baseline. A fork can also run the
+attestation diagnostic below. Review the repository registration, maintained
+image, isolation controls and verification policy, then
+set `SITEOPS_RELEASE_PROVENANCE_READY` to `true` to enable artifact execution
+in that repository. An absent or different value keeps admission closed
+before worker allocation. Configuring the fork does not enable the upstream
+repository. Run an approved release preview to qualify the actual artifact
+path before publication.
+
+Artifact execution requires `SITEOPS_RELEASE_RUNNER_MODE=scaleset` and an
+enrolled Scale Set pool. Each artifact job checks its Linux `self-hosted`
+runtime before source or artifact work. Verification separately requires
+that exact signing class and the selected repository, source and workflow
+identities. A pool label or runner class does not establish 1ES membership.
+
+| Work | Runner |
+|---|---|
+| Runner configuration admission | Public GitHub runner, without source checkout or write permissions |
+| Release preparation, engine and workspace builds, signing, descriptor and payload assembly, publication | Configured 1ES pool |
+| Lint, unit tests, template validation, installation and workspace qualification, result summaries | Public GitHub runners |
+
+The admission job requires the expected source commit and a supported entry
+point before allocating release workers. CI requests release workers only for
+explicit `installer-check` or `release-preview` dispatches. The Release workflow
+requires `main`. Pull request events cannot enter the reusable release producers.
+Missing or malformed pool configuration fails explicitly, with no fallback to
+public runners.
+
+The pool comes from repository configuration, not a release declaration or
+dispatch override. Artifact jobs request only the admitted pool name.
+Keep source builds separate from signing and publishing jobs. Their
+permissions and publication approval remain independent
+of runner placement.
+
+Use the maintained runner image for baseline tools. Existing workflow steps
+select Python, install locked packages through the configured feed and verify
+the Bicep compiler before use. A custom image bootstrap is not required.
+
+### Check the runner without producing artifacts
+
+Use **Actions > CI > Run workflow**, select a reviewed branch, choose
+`runner-check` for `run-mode`, and enter its full `expected-source-sha`.
+The configured pool runs two short jobs without repository checkout, signing
+permissions, artifact production or deployment. The first records baseline
+Python, Git, GitHub CLI and Azure CLI versions using temporary empty profiles.
+The second requires a different boot session. The summary contains tool
+versions and the comparison outcome, not machine identities or credentials.
+For legacy routing, set the repository Actions variable `SITEOPS_RELEASE_IMAGE`
+to the approved image name configured in that pool before using this mode. The diagnostic
+requests `self-hosted`, the configured pool label and an explicit
+`1ES.ImageOverride` label. Missing or malformed image configuration stops
+admission before allocation. The image choice is not a dispatch override.
+
+For a pool explicitly enrolled in the 1ES Scale Set API preview, set the
+repository variable `SITEOPS_RELEASE_RUNNER_MODE` to `scaleset`.
+An unset variable or `legacy` retains legacy routing for `runner-check`.
+Artifact execution requires `scaleset`. Other values stop admission rather
+than choosing a fallback.
+
+The Scale Set diagnostic requests only the admitted pool name. It uses the
+pool's configured image, rather than `SITEOPS_RELEASE_IMAGE`, and sends no
+`self-hosted`, `1ES.Pool`, `ImageOverride` or `JobId` demand labels.
+Configure a single image on that pool before using this preview.
+The variable must agree with the pool's integration mode. It does not
+reconfigure the pool. Other repositories retain their own routing settings.
+
+Scale Set routing supports the diagnostics and explicitly enabled artifact
+jobs. Preview support limitations apply.
+
+This mode does not change release admission. Different boot sessions
+do not establish complete machine isolation, Trusted Launch or provenance.
+Ordinary CI still runs on public runners, and `release-file` is ignored.
+
+### Inspect an attestation from the fork runner
+
+After `runner-check` succeeds on a fork's Scale Set pool, choose
+`attestation-check` for `run-mode` and enter the reviewed branch's full
+`expected-source-sha`. This mode requires a fork, a manual branch dispatch,
+and `SITEOPS_RELEASE_RUNNER_MODE=scaleset`. It waits for ordinary CI to pass.
+The `release-file` input is ignored.
+
+This is real signing. It creates a public attestation and permanent
+transparency record identifying the fork, workflow and commit, even if later
+verification fails. Deleting the run or its temporary artifacts does not remove
+that record. Approve those consequences before dispatching.
+
+The 1ES job creates only `runner-check.txt` with fixed diagnostic text and
+attests it without checking out repository source. A public runner downloads
+the exact evidence artifact, uses stock GitHub CLI verification, and compares
+the observed certificate with the expected repository, branch, source commit,
+reusable signer, caller workflow and `self-hosted` class. This diagnostic uses
+the CLI's online trust roots. Release consumers retain their separate policy
+and trusted root requirements.
+
+The subject and detached proof are retained as a workflow artifact for seven
+days. If signature verification succeeds, its bounded JSON result is also
+retained, including when the later certificate comparison fails. A failed
+comparison requires investigation rather than wider identity matching.
+
+This mode creates no tag or release and leaves the production verification
+policy and release gate unchanged. A `self-hosted` certificate does not identify
+a particular pool or establish Trusted Launch, complete worker isolation or
+release authority. The upstream pool and installed engine compatibility require
+their own qualification.
 
 ## Preview a release without publishing
 
@@ -39,28 +159,54 @@ commit identifier. This field confirms which commit will run. It does not
 select an older commit from the branch.
 
 The default example is
-`.github/release-examples/combined-preview/release.json`. It exercises the
-combined preview path using the selected source commit. Examples are accepted
-only for a dry run and never trigger publication when merged.
+`.github/release-examples/workspace-preview/release.json`. It builds one
+complete IoT Operations workspace and the selected engine from the chosen
+source commit. Choose
+`.github/release-examples/combined-preview/release.json` to preview engine
+artifacts under a content tag. Examples are accepted only for a dry run and
+never trigger publication when merged.
 
-The preview runs ordinary CI, then uses the real release-file preparation,
-wheel and bundle production, independent attestation, and installation
-qualification.
-The final summary shows one Python/platform matrix and a link to the attested
-release assets. Individual job logs remain available for diagnosis.
+For the default example, the CI preview performs real builds and signing, but
+it cannot publish and cannot be promoted into a release. Once the repository
+opts in to artifact execution as described above, it follows ordinary CI with
+these steps:
 
-This path needs no `siteops-release` environment. Its jobs have no repository
-content-write permission, request no publishing approval, and create no tag or
-GitHub Release. A generated dry-run plan cannot be used by the publisher.
+1. Prepares the exact release plan and requested engine assets.
+2. Builds each declared workspace with read permissions, using that release
+   plan and checking any committed indexes for freshness.
+3. Creates a proof for each workspace package and build record. A collector
+   with read permissions verifies those subjects before creating the public
+   workspace routing descriptor.
+4. Installs the selected engine from its authenticated lock and checks package
+   compatibility, protected cache use, and guarded catalog loading on every
+   declared Windows or Linux Python target.
+5. Requires all qualification results to identify the same engine, workspace
+   inventory, and release plan, then freezes the complete publication
+   inventory.
+
+Workspace qualification does not compare executable deployment plans,
+authorize targets, deploy resources, or evaluate workload health. Publication
+remains a separate approval step.
+
+The default preview's final summary shows one matrix of Python versions and
+platforms, plus a link to the attested release assets. Individual job logs
+remain available for diagnosis.
+
+This path needs no `siteops-release` environment. Its jobs have no permission
+to write repository contents, request no publishing approval, and
+create no tag or GitHub Release. A release plan from a preview cannot be used
+by the publisher.
 
 The other `run-mode` choices are `installer-check` for CI plus bundle and
 installation checks, and `ci-only` for ordinary CI. `ci-only` uses neither
 additional input. `installer-check` uses the SHA but ignores `release-file`.
 None of these modes publishes a release.
 
-Successful dry runs establish preparation and installation behavior. The
-approval UI and actual release upload still require a configured environment
-and an explicitly approved publication.
+A successful CI release preview exercises preparation and the builds, signing,
+and qualification required by its declaration. Script commands that accept
+`--dry-run` can instead perform unsigned local preparation. The flag alone
+does not imply signing. The approval UI and release upload still require a
+configured environment and explicit approval.
 
 ## Prepare the real release files
 
@@ -91,10 +237,10 @@ title.
 Write the changes and release-specific guidance in `notes.md`. The workflow
 adds **Install Site Ops** automatically. It includes the exact versioned wheel
 URL for the simple online pipx path, the configured package index policy, the
-four release asset links, and the source-pinned verified installation guide.
-A content-only release links to its independently published engine. There is no
-need to copy installation commands, source hashes, or download URLs into the
-authored notes.
+four release asset links, and the verified installation guide pinned to the
+source commit. A content release that references an existing engine links to
+that independently published release. There is no need to copy installation
+commands, source hashes, or download URLs into the authored notes.
 
 | Location | Purpose |
 |---|---|
@@ -107,8 +253,18 @@ CI validates changed release declarations on pull requests.
 Invalid fields, version choices, headlines, or record paths fail before the
 publication workflow needs to build installation assets.
 
-Choose the release-file shape that matches the release. These examples illustrate
-formats, not scheduled releases.
+Choose the components through the release tag and engine selection:
+
+| Components | Reviewed declaration |
+|---|---|
+| Site Ops only | A `siteops/v...` tag that matches the source engine version |
+| Content only | A `v...` tag and `siteops.release` naming an existing engine release |
+| Both | A prerelease `v...` tag and `siteops.build: true` |
+
+The generated release plan and approval summary show that resolved choice, the
+content version, and whether the engine is built or referenced. The workflow
+uses that reviewed choice directly. The examples below illustrate formats, not
+scheduled releases.
 
 ### Release Site Ops independently
 
@@ -149,12 +305,13 @@ the release evidence.
 The reference is an exact engine release, not a minimum-version range.
 Stable content requires a stable referenced engine release. Candidate
 preparation requires its complete native asset set: the ZIP, standalone wheel,
-and one detached proof for each. It freezes their GitHub digests and rejects an
-older ZIP-only release.
+and one proof for each. It freezes their GitHub digests and rejects an older
+release that contains only a ZIP.
 
-Scale Kit content currently comes from the tagged repository. This workflow
-does not produce a separately packaged workspace or claim that GitHub's
-generated source archives are verified workspace packages.
+Add reviewed `workspaces` records to publish complete workspace packages
+and their proofs with the content release. Their kit version comes
+from the content tag, while the referenced engine retains its own version
+and assets. See [workspace production](workspace-packages.md#build-workspaces-declared-by-a-release).
 
 ### Include an engine build in a content prerelease
 
@@ -173,10 +330,11 @@ while the source engine version follows its existing policy. The included
 engine receives a distinguishable build version such as
 `1.0.0b1+build.12345.1.gabcdef123456`.
 
-It creates one content release with the Site Ops ZIP and standalone wheel. Each
-subject has its own detached attestation. It does not create another Site Ops
-tag. This option requires a prerelease content version. Stable content
-references a separately released engine instead.
+It creates one content release with the Site Ops ZIP and standalone wheel,
+plus any declared workspace packages and their proofs. Each signed subject
+has its own proof. It does not create another Site Ops tag.
+This option requires a prerelease content version. Stable content references
+a separately released engine instead.
 
 ## Release fields and defaults
 
@@ -185,6 +343,7 @@ references a separately released engine instead.
 | `tag` | Required version identity. `v...` releases Scale Kit content, while `siteops/v...` releases the engine independently. |
 | `headline` | Required short description used with the tag to form the release title. |
 | `siteops` | Required for a content release. Choose `{"build": true}` or `{"release": "siteops/v<version>"}`. Omit it for an independent engine release. |
+| `workspaces` | Optional reviewed workspace build inputs for a content release. See [workspace production](workspace-packages.md#build-workspaces-declared-by-a-release). Publication requires every declared package, its proof, and the routing descriptor. |
 | `latest` | Optional, defaults to `false`. Set `true` only to designate a stable Scale Kit release as GitHub's Latest release. |
 
 `siteops.build` is a selection, not an on/off switch. `true` includes a fresh
@@ -222,7 +381,8 @@ Merge to main at commit A
           v
 Read release files from A
 Run CI for A
-Build, attest, and qualify the engine ZIP and standalone wheel when requested
+Build and attest the requested engine and workspace assets
+Qualify native installation and workspace consumption as applicable
           |
           v
 Review the candidate summary and applicable content evidence
@@ -252,25 +412,45 @@ Source and artifact identities remain fixed while approval is pending.
 An unrelated advance of `main` does not change the candidate. Changing its
 release file or notes requires a fresh candidate and approval.
 
-The approval summary shows the tag, source commit, version stream, engine
-selection, title, ZIP and wheel digests when applicable, tag action, and final
-release notes.
+The approval summary shows the components, tag, source commit, independent
+content and engine versions, engine selection, title, ZIP and wheel digests
+when applicable, tag action, and final release notes.
 The summary nests the note headings beneath **Release notes**. Published notes
 retain their authored Markdown heading levels. Installation commands are
 included in the final notes before approval and remain bound to that approval.
-You may download the attested release artifact for a hands-on trial. It contains
-exactly the ZIP, wheel, and one detached proof for each. The pipeline
-authenticates both subjects and confirms their application wheel bytes match.
+Download the complete candidate payload from the summary for a local trial.
+It includes the declared workspace assets and, when an engine is built, its
+installation ZIP, standalone wheel, and one proof for each. The pipeline
+authenticates both engine artifacts and confirms their application wheel bytes match.
 For a verified installation, consume only the ZIP and its proof by following
 [the installation guide](install-siteops.md).
 The generated online command is for the published release.
 For a candidate preview, use the Actions artifact above the notes and the
 installation guide's steps for manually downloaded files.
 
-CI and engine installation qualification are automated. For content releases,
-the reviewer must also confirm the applicable content/AIO evidence and any
-valid carry-forward from earlier qualification. The release workflow does not
-deploy Azure resources or infer workload health from installation success.
+The frozen asset inventory separates files to publish from assets that remain
+in an existing engine release. Every asset records its filename, byte size, and
+SHA-256 digest.
+Referenced engine assets retain their own release identity and tag target.
+They are not uploaded to the content release again. The publisher consumes
+the approved publication list and compares the uploaded identities with that
+list.
+
+When workspaces are declared, the final payload combines their qualified ZIPs,
+proofs and `siteops-workspaces.json` with any engine assets built for this
+release. The referenced engine's files remain in its own release. Candidate
+preparation compares its frozen engine selection with the current native
+inventory, preserving the exact engine that qualified the workspaces.
+
+This approval inventory is distinct from the public `siteops-workspaces.json`
+routing descriptor. Workspace package delivery is described in
+[workspace release sources](workspace-sources.md).
+
+The workflow runs CI and applicable engine and workspace qualification. For
+content releases, the reviewer must also confirm the applicable content/AIO
+evidence and any valid evidence carried forward from earlier qualification.
+The release workflow does not deploy Azure resources or infer workload health
+from installation success.
 
 ## Approve publication
 
@@ -304,8 +484,9 @@ After approval, the workflow:
 3. Creates a missing tag at the approved commit, or reuses a tag already
    pointing there. It never moves a conflicting tag.
 4. Reauthenticates the ZIP and standalone wheel, confirms their byte identity,
-   and creates the GitHub Release with the approved notes and four declared
-   assets.
+   and reauthenticates each declared workspace package. It compares workspace
+   routing, source, kit and compatibility metadata with the approved
+   declaration before creating the release with its unchanged payload.
 5. Confirms every uploaded asset digest and verifies GitHub's release
    attestation when immutable releases are enabled.
 

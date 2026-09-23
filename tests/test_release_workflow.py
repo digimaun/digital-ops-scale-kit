@@ -1,5 +1,6 @@
 """Exercise the declaration-driven publisher through its actual workflow steps."""
 
+import copy
 import hashlib
 import importlib.util
 import json
@@ -14,10 +15,11 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tests.release_helpers import CLI, _commit, _write_record, _write_source_version
+from tests.release_helpers import repository as repository
 from tests.shell_helpers import bash_path, write_executable
 from tests.shell_helpers import run_script as _run_script
-from tests.test_release_intent import CLI, _commit, _write_record, _write_source_version
-from tests.test_release_intent import repository as repository
+from tests.verification_helpers import verified_observation
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = yaml.safe_load((ROOT / ".github" / "workflows" / "release.yaml").read_text())
@@ -31,6 +33,8 @@ PROOF = ARCHIVE + ".attestation.jsonl"
 WHEEL = "siteops-1.0.0b1+build.42.1.gcccccccccccc-py3-none-any.whl"
 WHEEL_PROOF = WHEEL + ".attestation.jsonl"
 RENDERER = ROOT / "scripts" / "render-siteops-release.py"
+ASSET_MODEL = ROOT / "scripts" / "siteops_release_assets.py"
+PAYLOAD_TOOL = ROOT / "scripts" / "stage-release-payload.py"
 
 
 def step(job, name):
@@ -45,7 +49,9 @@ def digest(value):
 def renderer():
     spec = importlib.util.spec_from_file_location("siteops_release_renderer", RENDERER)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    with pytest.MonkeyPatch.context() as context:
+        context.syspath_prepend(str(RENDERER.parent))
+        spec.loader.exec_module(module)
     return module
 
 
@@ -82,7 +88,7 @@ def candidate(tmp_path):
             "notesPath": "releases/candidate/notes.md", "notesSha256": digest(notes),
         },
         "release": {
-            "stream": "scalekit", "tag": "v1.0.0b8", "version": "1.0.0b8",
+            "stream": "scalekit", "components": "both", "tag": "v1.0.0b8", "version": "1.0.0b8",
             "title": "v1.0.0b8: Release highlights", "prerelease": True, "latest": False,
         },
         "siteops": {
@@ -110,14 +116,15 @@ def candidate(tmp_path):
     (directory / "release-notes" / "publish-notes.md").write_bytes(notes)
     (directory / "release-assets").mkdir()
     assets = {
-        "apiVersion": "siteops.release.assets/v1",
+        "apiVersion": "siteops.release.assets/v2",
         "kind": "SiteOpsReleaseAssets",
-        "mode": "publish",
         "source": plan["source"],
         "assets": [
-            {"name": name, "sha256": digest((bundle_dir / name).read_bytes())}
+            {"name": name, "size": (bundle_dir / name).stat().st_size,
+             "sha256": digest((bundle_dir / name).read_bytes())}
             for name in (ARCHIVE, PROOF, WHEEL, WHEEL_PROOF)
         ],
+        "engine": None,
     }
     (directory / "release-assets" / "release-assets.json").write_text(
         json.dumps(assets, indent=2, sort_keys=True) + "\n",
@@ -132,11 +139,102 @@ def candidate(tmp_path):
     return {"root": directory, "plan": plan, "declaration": declaration, "responses": responses}
 
 
+def _reference_inventory(candidate):
+    path = candidate["root"] / "release-assets" / "release-assets.json"
+    inventory = json.loads(path.read_text(encoding="utf-8"))
+    inventory["engine"] = {
+        "releaseId": "71", "tag": "siteops/v1.0.0", "target": "d" * 40,
+        "assets": inventory["assets"],
+    }
+    inventory["assets"] = []
+    path.write_text(json.dumps(inventory), encoding="utf-8")
+
+
+def _workspace_publication(candidate, tmp_path, *, built=True):
+    from siteops.package_builder import build_package
+    from siteops.workspace_source import (
+        ArtifactIdentity,
+        WorkspaceReleaseAssets,
+        WorkspaceReleaseEntry,
+    )
+
+    root = candidate["root"]
+    if not built:
+        _reference_inventory(candidate)
+        candidate["plan"]["siteops"] = {
+            "bundle": False, "versionMode": None, "baseVersion": None, "releaseTag": "siteops/v1.0.0",
+        }
+        candidate["plan"]["release"]["components"] = "content"
+        candidate["declaration"]["siteops"] = {"release": "siteops/v1.0.0"}
+    directory = root / "release-workspaces"
+    directory.mkdir()
+    source = tmp_path / "workspace-source"
+    shutil.copytree(ROOT / "tests/fixtures/browse-workspace", source / "workspace")
+    inspection = build_package(
+        source, directory / "workspace.zip", workspace="workspace", kit_id="fixture.storage",
+        version=candidate["plan"]["release"]["version"], source_revision=SHA,
+        siteops_range=">=1.0.0b1,<2",
+    )
+    proof = b"opaque workspace proof"
+    (directory / "workspace.zip.attestation.jsonl").write_bytes(proof)
+    entry = WorkspaceReleaseEntry(
+        "workspace", "fixture.storage", candidate["plan"]["release"]["version"],
+        ArtifactIdentity("workspace.zip", inspection.size, inspection.sha256),
+        ArtifactIdentity("workspace.zip.attestation.jsonl", len(proof), digest(proof)),
+    )
+    descriptor = WorkspaceReleaseAssets(SHA, (entry,)).serialized()
+    (directory / "siteops-workspaces.json").write_bytes(descriptor)
+    native = json.loads((root / "release-assets/release-assets.json").read_bytes())
+    workspace = {
+        **native, "engine": None,
+        "assets": [entry.package.document(), entry.proof.document(), {
+            "name": "siteops-workspaces.json", "size": len(descriptor), "sha256": digest(descriptor),
+        }],
+    }
+    workspace_raw = json.dumps(workspace).encode()
+    (directory / "release-assets.json").write_bytes(workspace_raw)
+    request = {
+        "workspace": "workspace", "id": "fixture.storage", "package": "workspace.zip",
+        "compatibility": {"siteops": ">=1.0.0b1,<2"}, "licenses": ["LICENSE"],
+    }
+    candidate["plan"]["workspaces"] = candidate["declaration"]["workspaces"] = [request]
+    declaration = json.dumps(candidate["declaration"])
+    candidate["plan"]["intent"]["sha256"] = digest(declaration.encode())
+    for revision in (SHA, "refs/heads/main"):
+        candidate["responses"][f"repos/{REPO}/contents/releases/candidate/release.json?ref={revision}"]["raw"] = declaration
+    plan_sha = digest(json.dumps(candidate["plan"]).encode())
+    selected = {
+        "candidate": native["source"], "planSha256": plan_sha,
+        "native": {**native, "engine": None, "assets": native["assets"] if built else native["engine"]["assets"]},
+        "version": "1.0.0b1+build.42.1.gcccccccccccc" if built else "1.0.0",
+        "reference": native["engine"],
+    }
+    selected_root = root / "release-engine-selection"
+    selected_root.mkdir()
+    selected_raw = json.dumps(selected).encode()
+    (selected_root / "workspace-engine.json").write_bytes(selected_raw)
+    if not built:
+        tag = urllib.parse.quote(native["engine"]["tag"], safe="")
+        candidate["responses"][f"repos/{REPO}/releases/tags/{tag}"] = {
+            "status": 200, "body": {
+                "id": 71, "draft": False, "tag_name": native["engine"]["tag"],
+                "assets": [{**asset, "digest": "sha256:" + asset["sha256"], "state": "uploaded"} for asset in native["engine"]["assets"]],
+            },
+        }
+        candidate["responses"][f"repos/{REPO}/git/ref/tags/{tag}"] = {
+            "status": 200, "body": {"object": {"sha": "d" * 40}},
+        }
+    return {"WORKSPACE_SHA": digest(workspace_raw), "ENGINE_SELECTION_SHA": digest(selected_raw),
+            "APPROVED_ENGINE_ID": "71", "APPROVED_ENGINE_REF": "d" * 40}
+
+
 @pytest.fixture
 def runner(tmp_path, candidate):
     rendering_source = tmp_path / "release-tools" / "scripts"
     rendering_source.mkdir(parents=True)
     (rendering_source / RENDERER.name).write_bytes(RENDERER.read_bytes())
+    (rendering_source / ASSET_MODEL.name).write_bytes(ASSET_MODEL.read_bytes())
+    (rendering_source / PAYLOAD_TOOL.name).write_bytes(PAYLOAD_TOOL.read_bytes())
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     fake = tmp_path / "fake-gh.py"
@@ -148,11 +246,14 @@ with open(os.environ["FAKE_CALLS"], "a") as output:
     output.write(json.dumps(args) + "\\n")
 if args[:2] == ["attestation", "verify"]:
     expected = os.environ.get("EXPECTED_SIGNER_IDENTITY")
+    if Path(args[2]).name in json.loads(os.environ.get("WORKSPACE_SUBJECTS", "[]")):
+        expected = "https://github.com/" + os.environ["GITHUB_REPOSITORY"] + "/.github/workflows/_workspace-distribution.yaml@" + os.environ["SOURCE_REF"]
     if expected and args[args.index("--cert-identity") + 1] != expected:
         raise SystemExit(9)
     failed_subject = os.environ.get("FAIL_ATTESTATION_SUBJECT")
     if failed_subject and Path(args[2]).name == failed_subject:
         raise SystemExit(9)
+    print(json.dumps(json.loads(Path(os.environ["FAKE_VERIFICATIONS"]).read_text())[Path(args[2]).name]))
     raise SystemExit(int(os.environ.get("FAIL_ATTESTATION", "0")))
 if args[0] == "release":
     raise SystemExit(int(os.environ.get("FAIL_RELEASE", "0")))
@@ -178,6 +279,7 @@ raise SystemExit(0 if 200 <= status < 300 else 1)
     shim = tmp_path / "python-shim.py"
     shim.write_text(
         """import os, runpy, subprocess, sys, time
+from pathlib import Path
 native = subprocess.run
 def isolated_run(command, *args, **kwargs):
     if command[0] != "gh":
@@ -196,6 +298,7 @@ if sys.argv[1] == "-c":
     exec(compile(code, "<workflow>", "exec"), {"__name__": "__main__"})
 else:
     sys.argv = sys.argv[1:]
+    sys.path.insert(0, str(Path(sys.argv[0]).resolve().parent))
     runpy.run_path(sys.argv[0], run_name="__main__")
 """,
         encoding="utf-8",
@@ -220,17 +323,22 @@ else:
         )
         responses.write_text(json.dumps(candidate["responses"]), encoding="utf-8")
         output = tmp_path / f"output-{counter}.txt"
+        native_root = candidate["root"] / candidate.get("native_directory", "release-bundle")
         wheel_paths = [
-            path for path in (candidate["root"] / "release-bundle").iterdir()
+            path for path in native_root.iterdir()
             if path.name.endswith(".whl")
         ]
-        wheel_path = wheel_paths[0] if len(wheel_paths) == 1 else candidate["root"] / "release-bundle" / WHEEL
+        wheel_path = wheel_paths[0] if len(wheel_paths) == 1 else native_root / WHEEL
         asset_document = json.loads(
             (candidate["root"] / "release-assets" / "release-assets.json").read_text()
         )
-        approved_wheel = next(
-            item for item in asset_document["assets"] if item["name"].endswith(".whl")
-        )
+        if name == "Render the final release notes" and not (candidate["root"] / "final-release-assets").exists():
+            (candidate["root"] / "final-release-assets").mkdir()
+            (candidate["root"] / "final-release-assets" / "release-assets.json").write_text(
+                json.dumps(asset_document), encoding="utf-8",
+            )
+        engine_assets = asset_document["engine"]["assets"] if asset_document["engine"] else asset_document["assets"]
+        approved_wheel = next(item for item in engine_assets if item["name"].endswith(".whl"))
         environment = {
             "FAKE_PYTHON": Path(sys.executable).as_posix(),
             "FAKE_PROGRAM": fake.as_posix(), "FAKE_SHIM": shim.as_posix(),
@@ -240,16 +348,15 @@ else:
             "GITHUB_REPOSITORY": REPO, "SOURCE_SHA": candidate.get("source_sha", SHA),
             "SOURCE_REF": "refs/heads/main",
             "DRY_RUN": "false",
+            "EXPECTED_RUNNER_ENVIRONMENT": "self-hosted",
             "GITHUB_RUN_ID": "42", "GITHUB_RUN_ATTEMPT": "1",
             "PYTHONIOENCODING": WORKFLOW["env"]["PYTHONIOENCODING"],
             "RUNNER_TEMP": candidate["root"].as_posix(),
             "ARCHIVE_NAME": ARCHIVE, "ATTESTATION_SUFFIX": ".attestation.jsonl",
-            "SIGNER_IDENTITY": f"https://github.com/{REPO}/.github/workflows/_siteops-distribution.yaml@refs/heads/main",
-            "EXPECTED_SIGNER_IDENTITY": f"https://github.com/{REPO}/.github/workflows/_siteops-distribution.yaml@refs/heads/main",
             "BUILD_NUMBER": "42", "BUILD_ATTEMPT": "1",
             "OIDC_ISSUER": "https://token.actions.githubusercontent.com",
             "PREDICATE_TYPE": "https://slsa.dev/provenance/v1",
-            "BUILD_ARCHIVE_SHA": digest((candidate["root"] / "release-bundle" / ARCHIVE).read_bytes()),
+            "BUILD_ARCHIVE_SHA": digest((native_root / ARCHIVE).read_bytes()),
             "BUILD_WHEEL_NAME": wheel_path.name,
             "BUILD_WHEEL_SHA": digest(wheel_path.read_bytes()),
             "WHEEL_NAME": wheel_path.name,
@@ -258,8 +365,12 @@ else:
                 (candidate["root"] / "release-assets" / "release-assets.json").read_bytes()
             ),
             "APPROVED_PLAN_SHA": digest((candidate["root"] / "release-plan" / "plan.json").read_bytes()),
+            "EXPECTED_PLAN_SHA": digest((candidate["root"] / "release-plan" / "plan.json").read_bytes()),
+            "EXPECTED_NATIVE_SHA": digest((candidate["root"] / "release-assets/release-assets.json").read_bytes()),
+            "WORKSPACES": str(bool(candidate["plan"].get("workspaces"))).lower(),
+            "BUNDLE": str(candidate["plan"]["siteops"]["bundle"]).lower(),
             "APPROVED_NOTES_SHA": digest((candidate["root"] / "release-notes" / "publish-notes.md").read_bytes()),
-            "APPROVED_BUNDLE_SHA": digest((candidate["root"] / "release-bundle" / ARCHIVE).read_bytes()),
+            "APPROVED_BUNDLE_SHA": digest((native_root / ARCHIVE).read_bytes()),
             "APPROVED_WHEEL_NAME": approved_wheel["name"],
             "APPROVED_WHEEL_SHA": approved_wheel["sha256"],
             "APPROVED_ASSET_LIST_SHA": digest(
@@ -268,6 +379,28 @@ else:
             "TAG": candidate["plan"]["release"]["tag"],
         }
         environment.update(extra or {})
+        signer_identity = f"https://github.com/{REPO}/.github/workflows/_siteops-distribution.yaml@{environment['SOURCE_REF']}"
+        environment.setdefault("SIGNER_IDENTITY", signer_identity)
+        environment.setdefault("EXPECTED_SIGNER_IDENTITY", signer_identity)
+        builder = ".github/workflows/" + ("ci.yaml" if environment["DRY_RUN"] == "true" else "release.yaml")
+        environment.setdefault("BUILDER_IDENTITY", f"https://github.com/{REPO}/{builder}@{environment['SOURCE_REF']}")
+        packages = [request["package"] for request in candidate["plan"].get("workspaces", [])]
+        environment["WORKSPACE_SUBJECTS"] = json.dumps(packages)
+        observations = {}
+        for subject in (ARCHIVE, wheel_path.name, *packages):
+            signer = ".github/workflows/" + ("_workspace-distribution.yaml" if subject in packages else "_siteops-distribution.yaml")
+            observation = verified_observation(
+                REPO, environment["SOURCE_SHA"], environment["SOURCE_REF"], signer,
+                builder,
+            )
+            observations[subject] = [observation]
+            if environment.get("CERTIFICATE_FAULT"):
+                changed = copy.deepcopy(observation)
+                changed["verificationResult"]["signature"]["certificate"][environment["CERTIFICATE_FAULT"]] = "PRIVATE_WRONG"
+                observations[subject].append(changed)
+        evidence = tmp_path / "verifications.json"
+        evidence.write_text(json.dumps(observations), encoding="utf-8")
+        environment["FAKE_VERIFICATIONS"] = evidence.as_posix()
         result = _run_script(step(job, name)["run"], tmp_path, environment)
         values = dict(
             line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines()
@@ -282,6 +415,9 @@ else:
 
 def test_publication_uses_only_the_completed_candidate_and_required_approval():
     assert WORKFLOW["permissions"] == {"contents": "read"}
+    for document in (WORKFLOW, CANDIDATE_WORKFLOW):
+        assert document["env"]["BUILDER_IDENTITY"] == "https://github.com/${{ github.workflow_ref }}"
+    assert CANDIDATE_WORKFLOW["env"]["EXPECTED_RUNNER_ENVIRONMENT"] == "self-hosted"
     assert "head_sha=" in step("review", "Require successful CI for the candidate")["run"]
     assert JOBS["distribution"]["uses"] == "./.github/workflows/_siteops-distribution.yaml"
     assert JOBS["distribution"]["with"]["version-mode"] == "${{ needs.prepare.outputs.version-mode }}"
@@ -294,7 +430,7 @@ def test_publication_uses_only_the_completed_candidate_and_required_approval():
     condition = " ".join(JOBS["review"]["if"].split())
     assert "needs.distribution.result == 'success'" in condition
     assert "needs.distribution.result == 'skipped'" in condition
-    assert JOBS["publish"]["needs"] == "candidate"
+    assert JOBS["publish"]["needs"] == ["release-runner", "candidate"]
     assert JOBS["publish"]["if"] == "needs.candidate.result == 'success' && needs.candidate.outputs.active == 'true'"
     assert JOBS["candidate"]["uses"] == "./.github/workflows/_release-candidate.yaml"
     assert JOBS["candidate"]["with"]["dry-run"] is False
@@ -311,6 +447,7 @@ def test_shared_verification_runs_again_before_any_publication_write():
     names = [item["name"] for item in JOBS["publish"]["steps"]]
     assert names.index("Verify the approved candidate") < names.index("Create only the approved missing tag")
     assert names.index("Verify the approved release assets") < names.index("Create only the approved missing tag")
+    assert names.index("Verify the approved workspace subjects and descriptor") < names.index("Create only the approved missing tag")
     assert names.index("Check the publication target") < names.index("Create only the approved missing tag")
     assert step("prepare", "Check the publication target")["run"] == step("publish", "Check the publication target")["run"]
     assert JOBS["distribution"]["needs"] == "prepare"
@@ -318,10 +455,26 @@ def test_shared_verification_runs_again_before_any_publication_write():
     assert step("review", "Show the release approval preview")["env"]["TAG_EXISTS"] == "${{ needs.prepare.outputs.tag-exists }}"
     assert step("review", "Download the pinned declaration")["with"]["artifact-ids"] == "${{ needs.prepare.outputs.artifact-id }}"
     assert step("publish", "Download the qualified release assets")["with"]["artifact-ids"] == (
-        "${{ needs.candidate.outputs.bundle-artifact-id }}"
+        "${{ needs.candidate.outputs.payload-artifact-id }}"
     )
     assert step("publish", "Download the frozen asset list")["with"]["artifact-ids"] == "${{ needs.candidate.outputs.assets-artifact-id }}"
     assert not any("checkout@" in item.get("uses", "") for item in JOBS["publish"]["steps"])
+
+
+@pytest.mark.parametrize("job,name", [
+    ("review", "Verify the pinned candidate"), ("publish", "Verify the approved release assets"),
+])
+@pytest.mark.parametrize("field", [
+    "subjectAlternativeName", "issuer", "sourceRepositoryURI", "sourceRepositoryDigest",
+    "sourceRepositoryRef", "buildSignerDigest", "buildConfigURI", "buildConfigDigest", "runnerEnvironment",
+])
+def test_candidate_and_publisher_reject_each_mismatched_verified_claim(runner, job, name, field):
+    result, _, calls = runner(job, name, extra={"CERTIFICATE_FAULT": field})
+    assert result.returncode != 0
+    assert "certificate does not match release policy" in result.stdout + result.stderr
+    assert "PRIVATE_WRONG" not in result.stdout + result.stderr
+    assert len([call for call in calls if call[:2] == ["attestation", "verify"]]) == 1
+    assert not any("--method" in call or call[:2] == ["release", "create"] for call in calls)
 
 
 def test_rendering_source_is_pinned_and_only_executed_in_read_only_preparation():
@@ -329,7 +482,8 @@ def test_rendering_source_is_pinned_and_only_executed_in_read_only_preparation()
     checkout = step("review", "Checkout the exact rendering source")
     assert checkout["with"] == {
         "ref": "${{ github.sha }}", "path": "release-tools", "persist-credentials": False,
-        "sparse-checkout": "scripts/render-siteops-release.py", "sparse-checkout-cone-mode": False,
+        "sparse-checkout": "scripts/render-siteops-release.py\nscripts/siteops_release_assets.py\nscripts/stage-release-payload.py\n",
+        "sparse-checkout-cone-mode": False,
     }
     assert JOBS["review"]["permissions"] == {"contents": "read", "actions": "read"}
     names = [item["name"] for item in JOBS["review"]["steps"]]
@@ -371,9 +525,14 @@ def test_operator_guide_matches_the_visible_workflow_controls():
 def _source_check_fixture(repository, tmp_path):
     scripts = repository / "scripts"
     scripts.mkdir()
-    for name in ("prepare-siteops-release.py", "siteops_release.py"):
+    for name in (
+        "prepare-siteops-release.py", "siteops_release.py",
+        "siteops_release_assets.py", "workspace_release.py",
+    ):
         shutil.copyfile(ROOT / "scripts" / name, scripts / name)
     _write_source_version(repository, '__version__ = "1.0.0b1"\n')
+    for name in ("artifacts.py", "workspace_compatibility.py"):
+        shutil.copyfile(ROOT / "siteops" / name, repository / "siteops" / name)
     before = _commit(repository, "source before release")
     (repository / "bin").mkdir()
     write_executable(
@@ -478,6 +637,104 @@ def test_approval_preview_discloses_tag_authorization_notes_and_evidence(candida
     for value in (SHA, "Create the missing tag", "Reviewed release notes", "Content", "Approval authorizes"):
         assert value.lower() in summary.lower()
     assert "- Title: `v1.0.0b8: Release highlights`" in summary
+    assert "- Components: `Both`" in summary
+    assert "- Content version: `1.0.0b8`" in summary
+    assert "- Engine selection: `Build from this commit`" in summary
+
+
+@pytest.mark.parametrize(
+    "mode,label,version",
+    [("siteops", "Site Ops only", "Not included"), ("content", "Content only", "1.0.0b8"),
+     ("both", "Both", "1.0.0b8")],
+)
+def test_component_summary_distinguishes_versions_and_engine_source(
+    candidate, renderer, mode, label, version,
+):
+    plan = candidate["plan"]
+    plan["release"]["components"] = mode
+    plan["release"]["stream"] = "siteops" if mode == "siteops" else "scalekit"
+    if mode == "content":
+        plan["siteops"] = {"bundle": False, "releaseTag": "siteops/v1.2.3"}
+    summary = renderer.render_summary(plan, "## Changes\n", summary_values())
+    assert f"- Components: `{label}`" in summary
+    assert f"- Content version: `{version}`" in summary
+    if mode == "content":
+        assert "- Engine selection: `Use an existing release`" in summary
+        assert "- Site Ops: `siteops/v1.2.3`" in summary
+    else:
+        assert "- Engine selection: `Build from this commit`" in summary
+        assert "- Site Ops: `1.0.0b1+build.42`" in summary
+
+
+def test_workspace_summary_preserves_literal_reviewed_values(candidate, renderer):
+    request = {
+        "workspace": "workspaces/storage_demo",
+        "id": "[Label](https://example.invalid) | <b>bold</b> `code` \\ *text*",
+        "package": "storage_demo.zip",
+        "compatibility": {"siteops": ">=1.0.0b1,<2"},
+    }
+    candidate["plan"]["workspaces"] = [request]
+    summary = renderer.render_summary(candidate["plan"], "## Changes\n", summary_values())
+    rows = [
+        line for line in summary.split("\n## Workspace builds\n", 1)[1].split("\n## Installation checks", 1)[0].splitlines()
+        if line.startswith("|")
+    ]
+    assert len(rows) == 3
+    assert rows[2].count("|") == 5
+    assert "storage&#95;demo" in rows[2]
+    assert "&#91;Label&#93;&#40;https://example.invalid&#41;" in rows[2]
+    assert "&#124; &lt;b&gt;bold&lt;/b&gt; &#96;code&#96; &#92; &#42;text&#42;" in rows[2]
+    assert "&gt;=1.0.0b1,&lt;2" in rows[2]
+    assert candidate["plan"]["workspaces"] == [request]
+
+
+@pytest.mark.parametrize("mode", [None, {}, "unreviewed"])
+def test_invalid_component_summary_leaves_existing_output_unchanged(candidate, runner, mode):
+    _render_install_notes(candidate, runner)
+    candidate["plan"]["release"]["components"] = mode
+    summary = candidate["root"].parent / "summary.md"
+    summary.write_text("Earlier summary\n")
+    result, _, _ = runner("review", "Show the release approval preview", extra=summary_values())
+    assert result.returncode != 0
+    assert "components disagree" in result.stdout + result.stderr
+    assert summary.read_text() == "Earlier summary\n"
+
+
+@pytest.mark.parametrize("job,name", [
+    ("review", "Verify the pinned candidate"), ("publish", "Verify the approved candidate"),
+])
+@pytest.mark.parametrize("fault", ["omitted", "missing-assets"])
+def test_declared_workspaces_cannot_be_silently_omitted(candidate, runner, job, name, fault):
+    request = {
+        "workspace": "workspace", "id": "fixture.storage", "package": "workspace.zip",
+        "compatibility": {"siteops": ">=1.0.0b1,<2"}, "licenses": ["LICENSE"],
+    }
+    declaration = {**candidate["declaration"], "workspaces": [request]}
+    raw = json.dumps(declaration)
+    candidate["plan"]["intent"]["sha256"] = digest(raw.encode())
+    for revision in (SHA, "refs/heads/main"):
+        candidate["responses"][f"repos/{REPO}/contents/releases/candidate/release.json?ref={revision}"]["raw"] = raw
+    if fault == "missing-assets":
+        candidate["plan"]["workspaces"] = [request]
+    result, _, calls = runner(job, name)
+    if job == "review" and fault == "missing-assets":
+        assert result.returncode == 0, result.stdout + result.stderr
+        result, _, calls = runner("review", "Freeze the complete qualified publication payload")
+    assert result.returncode != 0
+    assert "workspace" in (result.stdout + result.stderr).lower()
+    assert not any("--method" in call or call[:2] == ["release", "create"] for call in calls)
+
+
+def test_note_renderer_rejects_unknown_inventory_fields_before_output(candidate, runner):
+    path = candidate["root"] / "release-assets" / "release-assets.json"
+    inventory = json.loads(path.read_text())
+    inventory["mode"] = "publish"
+    path.write_text(json.dumps(inventory))
+    result, _, _ = runner(
+        "review", "Render the final release notes", extra={"ENGINE_VERSION": "1.0.0b1+build.42"},
+    )
+    assert result.returncode != 0
+    assert not (candidate["root"] / "publish-notes.md").exists()
 
 
 def test_every_embedded_python_program_compiles_without_shell_indentation():
@@ -502,7 +759,8 @@ def test_valid_preview_bundle_keeps_its_exact_source_and_artifact(candidate, run
     for verify in verifies:
         assert verify[verify.index("--source-digest") + 1] == SHA
         assert verify[verify.index("--signer-digest") + 1] == SHA
-        assert "--deny-self-hosted-runners" in verify
+        assert "--deny-self-hosted-runners" not in verify
+        assert verify[verify.index("--format") + 1] == "json"
         assert "--signer-repo" not in verify
     assert not any("--method" in call for call in calls)
     asset_list = json.loads(
@@ -510,6 +768,7 @@ def test_valid_preview_bundle_keeps_its_exact_source_and_artifact(candidate, run
     )
     assert [item["name"] for item in asset_list["assets"]] == [ARCHIVE, PROOF, WHEEL, WHEEL_PROOF]
     for item in asset_list["assets"]:
+        assert item["size"] == (candidate["root"] / "release-bundle" / item["name"]).stat().st_size
         assert item["sha256"] == digest(
             (candidate["root"] / "release-bundle" / item["name"]).read_bytes()
         )
@@ -605,7 +864,7 @@ def test_real_git_declaration_and_cli_feed_the_candidate_controller(
         tag = "siteops/v1.0.0"
         encoded = urllib.parse.quote(tag, safe="")
         assets = [
-            {"name": name, "digest": "sha256:" + digest(name.encode()), "state": "uploaded"}
+            {"name": name, "size": len(name), "digest": "sha256:" + digest(name.encode()), "state": "uploaded"}
             for name in (ARCHIVE, PROOF, WHEEL, WHEEL_PROOF)
         ]
         candidate["responses"][f"repos/{REPO}/releases/tags/{encoded}"] = {
@@ -628,7 +887,7 @@ def test_real_git_declaration_and_cli_feed_the_candidate_controller(
     assert "\u03b1" in (candidate["root"] / "publish-notes.md").read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize("fault", ["source", "notes", "latest", "version", "mode", "title", "current-intent"])
+@pytest.mark.parametrize("fault", ["source", "notes", "latest", "version", "mode", "components", "title", "current-intent"])
 def test_invalid_or_superseded_candidate_cannot_reach_tag_creation(candidate, runner, fault):
     plan = candidate["plan"]
     if fault == "source":
@@ -641,6 +900,8 @@ def test_invalid_or_superseded_candidate_cannot_reach_tag_creation(candidate, ru
         plan["release"]["version"] = "1.0.0"
     elif fault == "mode":
         plan["siteops"]["versionMode"] = "source"
+    elif fault == "components":
+        plan["release"]["components"] = "content"
     elif fault == "title":
         plan["release"]["title"] = "v1.0.0b8: Unreviewed title"
     else:
@@ -738,6 +999,7 @@ def test_publisher_rejects_approved_wheel_that_differs_from_the_bundle(candidate
     next(item for item in asset_list["assets"] if item["name"] == WHEEL)["sha256"] = digest(
         wheel.read_bytes()
     )
+    next(item for item in asset_list["assets"] if item["name"] == WHEEL)["size"] = wheel.stat().st_size
     asset_path.write_text(
         json.dumps(asset_list, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -753,14 +1015,17 @@ def test_independent_content_uses_released_engine_without_bundle_verification(ca
     plan = candidate["plan"]
     tag = "siteops/v1.0.0"
     raw = json.dumps({"tag": "v2.0.0", "headline": "Content highlights", "siteops": {"release": tag}}).encode()
-    plan["release"].update(tag="v2.0.0", version="2.0.0", prerelease=False, title="v2.0.0: Content highlights")
+    plan["release"].update(
+        tag="v2.0.0", version="2.0.0", components="content",
+        prerelease=False, title="v2.0.0: Content highlights",
+    )
     plan["siteops"] = {"bundle": False, "versionMode": None, "baseVersion": None, "releaseTag": tag}
     plan["intent"]["sha256"] = digest(raw)
     for revision in (SHA, "refs/heads/main"):
         candidate["responses"][f"repos/{REPO}/contents/releases/candidate/release.json?ref={revision}"]["raw"] = raw.decode()
     encoded = urllib.parse.quote(tag, safe="")
     assets = [
-        {"name": name, "digest": "sha256:" + digest(name.encode()), "state": "uploaded"}
+        {"name": name, "size": len(name), "digest": "sha256:" + digest(name.encode()), "state": "uploaded"}
         for name in (ARCHIVE, PROOF, WHEEL, WHEEL_PROOF)
     ]
     candidate["responses"][f"repos/{REPO}/releases/tags/{encoded}"] = {
@@ -775,6 +1040,12 @@ def test_independent_content_uses_released_engine_without_bundle_verification(ca
     assert outputs["engine-id"] == "71"
     assert outputs["wheel-name"] == WHEEL
     assert not any(call[0] == "attestation" for call in calls)
+    inventory = json.loads(
+        (candidate["root"] / "release-assets" / "release-assets.json").read_text()
+    )
+    assert inventory["source"] == plan["source"]
+    assert inventory["assets"] == []
+    assert len(inventory["engine"]["assets"]) == 4
     candidate["responses"][f"repos/{REPO}/releases/tags/{encoded}"]["body"]["assets"] = [
         {"name": ARCHIVE, "digest": "sha256:" + digest(ARCHIVE.encode()), "state": "uploaded"},
         {"name": PROOF, "digest": "sha256:" + digest(PROOF.encode()), "state": "uploaded"},
@@ -798,6 +1069,73 @@ def test_independent_content_uses_released_engine_without_bundle_verification(ca
     assets[2]["digest"] = "sha256:" + digest(WHEEL.encode())
     result, _, _ = runner("publish", "Verify the approved candidate", extra={"APPROVED_ENGINE_ID": "71", "APPROVED_ENGINE_REF": "e" * 40})
     assert result.returncode != 0
+
+
+@pytest.mark.parametrize("components", ["siteops", "content", None])
+def test_publisher_rejects_inconsistent_components(candidate, runner, components):
+    candidate["plan"]["release"]["components"] = components
+    result, _, calls = runner("publish", "Verify the approved candidate")
+    assert result.returncode != 0
+    assert "components disagree" in result.stdout + result.stderr
+    assert not any("--method" in call for call in calls)
+
+
+@pytest.mark.parametrize("size", [None, True, 0, -1, 4294967297, "12"])
+def test_publisher_rejects_invalid_frozen_asset_size(candidate, runner, size):
+    path = candidate["root"] / "release-assets" / "release-assets.json"
+    inventory = json.loads(path.read_text())
+    inventory["assets"][0]["size"] = size
+    path.write_text(json.dumps(inventory))
+    result, _, calls = runner("publish", "Verify the approved candidate")
+    assert result.returncode != 0
+    assert "asset identity is invalid" in result.stdout + result.stderr
+    assert not any("--method" in call for call in calls)
+
+
+def test_publisher_detects_size_drift_before_authentication(candidate, runner):
+    path = candidate["root"] / "release-assets" / "release-assets.json"
+    inventory = json.loads(path.read_text())
+    inventory["assets"][0]["size"] += 1
+    path.write_text(json.dumps(inventory))
+    result, _, calls = runner("publish", "Verify the approved release assets")
+    assert result.returncode != 0
+    assert not calls
+
+
+@pytest.mark.parametrize("fault", ["digest", "size", "approved-list"])
+def test_publication_rechecks_frozen_bytes_before_upload(candidate, runner, fault):
+    extra = {"TITLE": "Example release", "PRERELEASE": "true", "LATEST": "false"}
+    wheel = candidate["root"] / "release-bundle" / WHEEL
+    if fault == "digest":
+        wheel.write_bytes(b"x" * wheel.stat().st_size)
+    elif fault == "size":
+        wheel.write_bytes(wheel.read_bytes() + b"x")
+    else:
+        extra["APPROVED_ASSET_LIST_SHA"] = "a" * 64
+    result, _, calls = runner("publish", "Publish the approved release", extra=extra)
+    assert result.returncode != 0
+    assert not any(call[:2] == ["release", "create"] for call in calls)
+
+
+def test_published_identity_comes_from_approval_not_changed_local_bytes(candidate, runner):
+    path = candidate["root"] / "release-bundle" / WHEEL
+    path.write_bytes(b"changed after upload")
+    asset_path = candidate["root"] / "release-assets" / "release-assets.json"
+    inventory = json.loads(asset_path.read_text())
+    candidate["responses"][f"repos/{REPO}/releases/tags/v1.0.0b8"] = {
+        "status": 200,
+        "body": {
+            "tag_name": "v1.0.0b8", "draft": False, "prerelease": True, "immutable": False,
+            "assets": [
+                {**asset, "digest": "sha256:" + asset["sha256"], "state": "uploaded"}
+                for asset in inventory["assets"]
+            ],
+        },
+    }
+    result, _, _ = runner(
+        "publish", "Confirm published assets and immutability", extra={"PRERELEASE": "true"},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("state", ["missing", "matching", "conflicting", "unavailable", "published"])
@@ -872,7 +1210,7 @@ def test_release_rehearsal_cannot_reach_publishing_permissions():
     assert "release create" not in text and "--method POST" not in text
     ci = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yaml").read_text())
     job = ci["jobs"]["release-preview"]
-    assert job["needs"] == ["lint", "test", "validate"]
+    assert job["needs"] == ["lint", "test", "validate", "release-runner"]
     assert job["with"]["dry-run"] is True
     assert job["permissions"]["contents"] == "read"
 
@@ -915,6 +1253,7 @@ def test_dry_run_uses_completed_ci_jobs_without_waiting_for_its_own_run(candidat
     required_names = [
         CI_WORKFLOW["jobs"][job]["name"]
         for job in CI_WORKFLOW["jobs"]["release-preview"]["needs"]
+        if job != "release-runner"
     ]
     candidate["responses"][f"repos/{REPO}/actions/runs/42/attempts/1/jobs?per_page=100"] = {
         "status": 200, "body": {"jobs": [
@@ -957,6 +1296,17 @@ def _render_install_notes(candidate, runner):
     return notes
 
 
+def test_install_notes_require_explicit_supported_runner_policy(candidate, runner):
+    result, _, _ = runner(
+        "review", "Render the final release notes",
+        extra={"ENGINE_VERSION": "1.0.0b1", "EXPECTED_RUNNER_ENVIRONMENT": "PRIVATE_UNKNOWN"},
+    )
+    assert result.returncode != 0
+    assert "expected provenance runner class is unsupported" in result.stdout + result.stderr
+    assert "PRIVATE_UNKNOWN" not in result.stdout + result.stderr
+    assert not (candidate["root"] / "publish-notes.md").exists()
+
+
 def _installation_block(notes):
     match = re.search(r"```console\n(.*?)\n```", notes, re.DOTALL)
     assert match is not None
@@ -995,6 +1345,8 @@ def test_install_notes_bind_downloads_and_commands_to_the_selected_release(candi
     assert f"Expected publisher: `{REPO}`" in notes
     assert f"Source commit: `{SHA}`" in notes
     assert f'Source ref: `{candidate["plan"]["source"]["ref"]}`' in notes
+    assert "Expected provenance runner class: `self-hosted`" in notes
+    assert "runner class does not identify a particular pool" in notes
     assert "switching between online and locked installations" in notes
     assert "authenticated `pylock.toml` with stock pipx" in notes
     assert "shared pip 26.2.1" in notes and "experimental" in notes
@@ -1019,6 +1371,7 @@ def test_content_only_install_notes_link_to_the_engine_release_without_wrong_sou
     candidate["plan"]["siteops"] = {
         "bundle": False, "versionMode": None, "baseVersion": None, "releaseTag": "siteops/v1.0.0",
     }
+    _reference_inventory(candidate)
     notes = _render_install_notes(candidate, runner)
     assert f"https://github.com/{REPO}/releases/tag/siteops%2Fv1.0.0" in notes
     assert "own source commit and native installation assets" in notes
@@ -1095,7 +1448,9 @@ def test_invalid_rendering_inputs_leave_existing_summary_unchanged(candidate, ru
 
 
 @pytest.mark.parametrize("bundle", [False, True])
-def test_publication_uploads_only_declared_assets(runner, bundle):
+def test_publication_uploads_only_declared_assets(candidate, runner, bundle):
+    if not bundle:
+        _reference_inventory(candidate)
     result, _, calls = runner(
         "publish", "Publish the approved release",
         extra={"TITLE": "Example release", "PRERELEASE": "true", "LATEST": "false", "BUNDLE": str(bundle).lower()},
@@ -1120,7 +1475,8 @@ def test_publication_uploads_only_declared_assets(runner, bundle):
 def test_published_asset_digests_and_immutable_release_are_checked(candidate, runner, immutable):
     tag = candidate["plan"]["release"]["tag"]
     assets = [
-        {"name": name, "digest": "sha256:" + digest((candidate["root"] / "release-bundle" / name).read_bytes()), "state": "uploaded"}
+        {"name": name, "size": (candidate["root"] / "release-bundle" / name).stat().st_size,
+         "digest": "sha256:" + digest((candidate["root"] / "release-bundle" / name).read_bytes()), "state": "uploaded"}
         for name in (ARCHIVE, PROOF, WHEEL, WHEEL_PROOF)
     ]
     endpoint = f"repos/{REPO}/releases/tags/{tag}"
@@ -1150,3 +1506,97 @@ def test_published_asset_digests_and_immutable_release_are_checked(candidate, ru
         extra={"PRERELEASE": "true", "BUNDLE": "true"},
     )
     assert result.returncode != 0
+
+
+@pytest.mark.parametrize("built", [False, True])
+def test_complete_workspace_candidate_reaches_only_the_approved_publication_set(candidate, runner, tmp_path, built):
+    extra = _workspace_publication(candidate, tmp_path, built=built)
+    result, outputs, _ = runner("review", "Freeze the complete qualified publication payload", extra=extra)
+    assert result.returncode == 0, result.stdout + result.stderr
+    root = candidate["root"]
+    inventory = json.loads((root / "final-release-assets/release-assets.json").read_bytes())
+    assert outputs["asset-list-sha"] == digest((root / "final-release-assets/release-assets.json").read_bytes())
+    assert len(inventory["assets"]) == (7 if built else 3)
+    result, _, _ = runner("review", "Render the final release notes", extra={"ENGINE_VERSION": "1.0.0b1+build.42"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    notes = (root / "publish-notes.md").read_text()
+    assert "## Workspace content" in notes and "siteops-workspaces.json" in notes
+    assert f"https://github.com/{REPO}/blob/{SHA}/docs/projects.md#run-project-pin" in notes
+    assert "`siteops project pin` with `--release`" in notes
+    (root / "release-bundle").rename(root / "review-native")
+    candidate["native_directory"] = "review-native"
+    shutil.copytree(root / "release-payload", root / "release-bundle")
+    (root / "release-assets/release-assets.json").write_bytes((root / "final-release-assets/release-assets.json").read_bytes())
+    for name in ("Verify the approved candidate", "Verify the approved release assets"):
+        result, _, _ = runner("publish", name, extra=extra)
+        assert result.returncode == 0, result.stdout + result.stderr
+    result, _, calls = runner("publish", "Verify the approved workspace subjects and descriptor", extra=extra)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert any(call[:2] == ["attestation", "verify"] and Path(call[2]).name == "workspace.zip" for call in calls)
+    result, _, calls = runner("publish", "Publish the approved release", extra={
+        "TITLE": candidate["plan"]["release"]["title"], "PRERELEASE": "true", "LATEST": "false",
+    })
+    assert result.returncode == 0, result.stdout + result.stderr
+    command = calls[-1]
+    assert {Path(value).name for value in command if value.startswith(str(root))} >= {
+        asset["name"] for asset in inventory["assets"]
+    }
+    tag = candidate["plan"]["release"]["tag"]
+    candidate["responses"][f"repos/{REPO}/releases/tags/{tag}"] = {
+        "status": 200, "body": {
+            "tag_name": tag, "draft": False, "prerelease": True, "immutable": True,
+            "assets": [{**asset, "digest": "sha256:" + asset["sha256"], "state": "uploaded"}
+                       for asset in inventory["assets"]],
+        },
+    }
+    result, _, calls = runner("publish", "Confirm published assets and immutability", extra={"PRERELEASE": "true"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len([call for call in calls if call[:2] == ["release", "verify-asset"]]) == len(inventory["assets"])
+
+
+@pytest.mark.parametrize("fault", ["descriptor", "descriptor-source", "source", "kit", "proof"])
+def test_workspace_publisher_rechecks_routing_and_verified_metadata(candidate, runner, tmp_path, fault):
+    _workspace_publication(candidate, tmp_path)
+    root = candidate["root"]
+    workspace = root / "release-workspaces"
+    inventory_path = root / "release-assets/release-assets.json"
+    native = json.loads(inventory_path.read_bytes())
+    assets = json.loads((workspace / "release-assets.json").read_bytes())["assets"]
+    for asset in assets:
+        shutil.copyfile(workspace / asset["name"], root / "release-bundle" / asset["name"])
+    native["assets"].extend(assets)
+    if fault in {"descriptor", "descriptor-source"}:
+        path = root / "release-bundle/siteops-workspaces.json"
+        data = json.loads(path.read_bytes())
+        if fault == "descriptor":
+            data["workspaces"][0]["kit"]["version"] = "wrong"
+        else:
+            data["source"]["revision"] = "d" * 40
+        path.write_text(json.dumps(data))
+    elif fault in {"source", "kit"}:
+        path = root / "release-bundle/workspace.zip"
+        with zipfile.ZipFile(path) as archive:
+            contents = [(entry, archive.read(entry)) for entry in archive.infolist()]
+        with zipfile.ZipFile(path, "w") as archive:
+            for entry, raw in contents:
+                if entry.filename == "siteops-package.json":
+                    metadata = json.loads(raw)
+                    if fault == "source":
+                        metadata["source"]["revision"] = "d" * 40
+                    else:
+                        metadata["kit"]["id"] = "other"
+                    raw = json.dumps(metadata).encode()
+                archive.writestr(entry, raw)
+    inventory_path.write_text(json.dumps(native))
+    extra = {}
+    if fault == "proof":
+        extra["FAIL_ATTESTATION_SUBJECT"] = "workspace.zip"
+        result, _, calls = runner("publish", "Verify the approved release assets", extra=extra)
+        assert result.returncode != 0
+        assert any(call[:2] == ["attestation", "verify"] and Path(call[2]).name == "workspace.zip" for call in calls)
+        return
+    result, _, calls = runner("publish", "Verify the approved workspace subjects and descriptor", extra=extra)
+    assert result.returncode != 0
+    if fault in {"source", "kit"}:
+        assert "verified workspace differs from the reviewed source contract" in result.stdout + result.stderr
+    assert not any("--method" in call or call[:2] == ["release", "create"] for call in calls)

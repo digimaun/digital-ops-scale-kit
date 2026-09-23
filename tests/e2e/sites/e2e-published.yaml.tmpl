@@ -1,0 +1,38 @@
+# Self-contained operator Site for published engine/workspace E2E.
+#
+# This file deliberately does not inherit package or checkout Site content.
+# The published workspace supplies deployment content, while this rendered
+# Site remains independent operator configuration.
+
+apiVersion: siteops/v1
+kind: Site
+name: ${E2E_SITE_NAME}
+
+subscription: "${E2E_SUBSCRIPTION}"
+resourceGroup: "${E2E_RESOURCE_GROUP}"
+location: "${E2E_LOCATION}"
+
+labels:
+  environment: e2e
+  managedBy: siteops-e2e
+  country: US
+  city: E2E
+
+properties:
+  aioRelease: "${E2E_AIO_RELEASE}"
+  deployOptions:
+    enableGlobalSite: false
+    enableEdgeSite: false
+    enableSecretSync: false
+    enableWorkloadIdentity: false
+    enableCertManager: true
+    allowKubernetesMinorUpgrade: false
+
+parameters:
+  clusterName: "${E2E_CLUSTER_NAME}"
+  brokerConfig:
+    memoryProfile: Low
+  defaultDataflowInstanceCount: 1
+  aksee:
+    aksEdgeMsiUrl: "https://aka.ms/aks-edge/k3s-msi"
+    targetKubernetesVersion: ""

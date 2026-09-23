@@ -2,9 +2,9 @@
 
 Content authors can build one `WorkspacePackage` ZIP containing a complete
 authored workspace, approved companion documentation and licensing files, and
-producer-compiled ARM JSON for executable Bicep roots. Authored files keep
-their source-relative paths. Generated templates use a separate
-producer-owned namespace.
+ARM JSON compiled by the producer for executable Bicep roots. Authored files
+keep their paths relative to the source. Generated templates use a separate
+namespace owned by the producer.
 
 This content artifact is separate from the Site Ops installation wheel or ZIP
 bundle. Building it performs no upload, signing, release operation or
@@ -98,8 +98,156 @@ filesystems.
 
 The output is a JSON summary with the ZIP's SHA-256, size, kit identity and
 workspace path, plus the number of mapped deployment templates. Keep those
-exact bytes for separate provenance signing and qualification. Reconstructing
-another ZIP is a different artifact.
+exact bytes for later signing and qualification. Signing creates a detached
+attestation proof, a separate file containing signed provenance evidence.
+Reconstructing another ZIP is a different artifact.
+
+## Build workspaces declared by a release
+
+A content release file can declare complete workspace builds alongside its
+engine choice. The content tag supplies the kit version. Each workspace names
+its own package, compatibility range and licensing files:
+
+```json
+{
+  "tag": "v1.0.0b8",
+  "headline": "Verified workspace content",
+  "siteops": {"build": true},
+  "workspaces": [
+    {
+      "workspace": "workspaces/iot-operations",
+      "id": "azure.iot-operations",
+      "package": "iot-operations.zip",
+      "compatibility": {
+        "siteops": ">=1.0.0b1,<2",
+        "requiredFeatures": ["manifest/v1", "composition/v1"]
+      },
+      "include": ["docs", "README.md"],
+      "licenses": ["LICENSE", "ThirdPartyNotices.txt"]
+    }
+  ]
+}
+```
+
+Commit this as `releases/workspace-candidate/release.json` with a sibling
+`notes.md`. Choose the tag and engine selection according to the
+[release policy](releasing.md). The example describes the format rather than
+a scheduled release.
+
+From a clean checkout, build the declared unsigned assets into a new directory.
+Supply the build number and attempt for the engine build that these workspaces
+will accompany:
+
+```powershell
+$commit = git rev-parse HEAD
+$sourceRef = git symbolic-ref --quiet HEAD
+if ($LASTEXITCODE -ne 0) { throw 'Use a named source branch for this example.' }
+python scripts\build-workspace-release.py `
+  --root . `
+  --repository '<owner/repository>' `
+  --expected-source-sha $commit `
+  --source-ref $sourceRef `
+  --release-file releases/workspace-candidate/release.json `
+  --build-number <build-number> `
+  --build-attempt <build-attempt> `
+  --output-dir '<new-absolute-output-directory>'
+```
+
+When `siteops.release` selects an existing engine, omit the build number and
+attempt. Its exact version is used instead of the development engine version
+in the checkout. The command always creates unsigned files. `--dry-run` also
+permits a committed file under `.github/release-examples/` and marks the
+unsigned build record as a preview. The flag does not sign the output.
+`--release-workspace <workspace>` selects one exact workspace from the
+declaration while retaining the identity of the complete prepared release
+plan.
+
+The directory receives each declared ZIP and `workspace-builds.json`, which
+records their exact sizes, hashes, source, content version and selected engine
+version. The record also binds the prepared release plan's SHA-256. Production
+uses the same complete workspace builder as the individual package command. A
+failure removes outputs created by that invocation, with an explicit warning
+if cleanup cannot complete.
+
+Automation can supply `--prepared-plan <file>` together with
+`--expected-plan-sha <sha256>`. The producer requires both the exact expected
+bytes and agreement with the release intent loaded from the selected commit.
+Omitting these options derives the release plan directly from that committed
+intent.
+
+Declarations allow up to 64 distinct workspace paths, within the release
+file's byte limit. Package names are unique portable ZIP filenames and reserve
+room for their proof names. Workspace and companion paths must exist
+in the selected commit. License paths must identify regular files. `include`
+is optional, and omitted `requiredFeatures` defaults to `manifest/v1`.
+The producer also records `compiled-templates/v1`.
+
+If a workspace contains either generated index file, both must be present and
+current for that exact source. Production preserves the existing generic or
+GitHub binding settings and records the public index's exact digest. It never
+rewrites a stale index. A workspace without generated indexes remains a valid
+package source.
+
+The producer checks declared compatibility against the selected engine
+version. This does not establish that the released engine supports the
+workspace. Consumer inspection and extraction still enforce the actual
+installed engine's version and supported features. For an individual package,
+`--target-engine-version` sets the compatibility target explicitly. It does
+not acquire an engine or authorize consumer use.
+
+The candidate workflow uses one reusable build and signing path per workspace,
+with bounded parallelism. Its build job has read permissions and consumes the
+release plan from the same run. It restores the committed Python locks through
+the configured feed, verifies the selected Bicep binary against the SHA-256
+pinned in workflow source before installing or using it, and builds the
+workspace with private configuration and temporary directories.
+
+A separate signing job downloads only that workspace's build artifact.
+It admits the exact package and build record before creating a proof for each.
+The signing job executes no repository scripts. A
+collector with read permissions verifies both proofs under independent workflow
+policy, checks the package against the reviewed declaration, and then creates
+`siteops-workspaces.json` and the frozen workspace asset inventory.
+
+The local build command produces unsigned files only. The candidate's
+workspace proofs and descriptor are retained as Actions artifacts. Workspace
+qualification against the selected installed engine and publication happen
+later.
+
+## Qualify against the selected engine
+
+Workspace qualification uses the actual selected engine installation. A
+combined release reuses the completed engine build. A content release
+acquires the exact referenced engine assets without rebuilding them from
+the current checkout. The ZIP and standalone wheel are verified before
+inspection, and their source, version and identical application wheel bytes
+are retained with the qualification inputs.
+
+The qualification transfer path is anonymous and bounded to 128 MiB per
+native engine asset and 2 MiB per proof. It uses the existing HTTPS transfer
+boundary, restricted to approved origins. This limit applies to workspace
+qualification, not to ordinary direct wheel installation.
+
+For each declared Windows or Linux target and Python version, a new application
+environment consumes the engine's authenticated `pylock.toml` through stock
+pip. The probe runs with isolated Python imports, confirms the exact installed
+version and module location, then checks package compatibility, protected
+cache publication and reuse, and guarded loading of catalog manifests. Source
+checkout imports cannot satisfy this gate.
+
+The result reports package and catalog counts separately. It loads no operator
+Site values. It does not authorize targets, compare executable deployment
+plans, deploy resources, or evaluate workload health. The final matrix gate
+requires every declared target's result to name the same frozen engine,
+workspace inventory, and release plan.
+
+Direct `pip install <wheel-url>` and `pipx install <wheel-url>` remain
+available through the [installation guide](install-siteops.md). The isolated
+qualification environment is release tooling, not another operator installer.
+The final candidate payload includes the qualified workspaces and any engine
+assets built for that release. After approval, the publisher rechecks those
+exact bytes, proofs, and source contracts. The configured approval environment
+and applicable content release evidence remain required.
 
 ## Package identities
 
@@ -280,7 +428,7 @@ The [source acquisition flow](workspace-sources.md) provides release resolution,
 downloads, retained proofs and verified cache use. [Operator projects](projects.md)
 connect packaged content and separate configured Sites to ordinary planning
 and deployment. Cache maintenance has its own commands. Workspace asset
-publication is not integrated into the release workflow.
+publication uses the content release workflow after qualification and approval.
 
 ## Internal workspace cache
 

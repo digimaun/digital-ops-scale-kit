@@ -16,10 +16,11 @@ import zipfile
 import zlib
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from siteops import package_builder
+from siteops import artifacts, package_builder
 from siteops import workspace_package as package
 from siteops.artifacts import (
     ArtifactError,
@@ -199,6 +200,18 @@ def test_complete_package_preserves_workspace_and_companion_paths(snapshot, tmp_
         if os.name != "nt":
             assert stat.S_IMODE(target.stat().st_mode) == 0o600
     assert (destination / package.PACKAGE_NAME).is_file()
+
+
+@pytest.mark.parametrize("engine_version", ["invalid", "99.0.0"])
+def test_producer_target_is_checked_before_template_discovery(snapshot, tmp_path, monkeypatch, engine_version):
+    def unexpected(*args):
+        pytest.fail("Invalid engine selection must fail before template discovery.")
+
+    monkeypatch.setattr(package_builder, "_discover_template_sources", unexpected)
+    output = tmp_path / "package.zip"
+    with pytest.raises(ArtifactError, match="compatibility declaration|different Site Ops version"):
+        _build(snapshot, output, engine_version=engine_version)
+    assert not output.exists()
 
 
 def test_materialized_binding_resolves_manifest_name_and_revalidates_inventory(
@@ -1223,6 +1236,24 @@ def test_file_context_preserves_errors_from_its_caller(tmp_path):
     assert raised.value is failure
 
 
+def test_windows_file_identity_uses_birth_time_while_posix_keeps_change_time(monkeypatch):
+    def identity(**changes):
+        values = {
+            "st_dev": 1, "st_ino": 2, "st_size": 7, "st_mtime_ns": 3,
+            "st_ctime_ns": 4, "st_birthtime_ns": 5, "st_nlink": 1,
+        }
+        values.update(changes)
+        return SimpleNamespace(**values)
+
+    monkeypatch.setattr(artifacts.os, "name", "nt")
+    before = artifacts._identity(identity())
+    assert artifacts._identity(identity(st_ctime_ns=99)) == before
+    for changed in (identity(st_birthtime_ns=99), identity(st_ino=99), identity(st_mtime_ns=99)):
+        assert artifacts._identity(changed) != before
+    monkeypatch.setattr(artifacts.os, "name", "posix")
+    assert artifacts._identity(identity(st_ctime_ns=99)) != artifacts._identity(identity())
+
+
 def test_encrypted_zip_flags_are_rejected_before_materialization(tmp_path):
     path = tmp_path / "package.zip"
     _archive(path)
@@ -1293,6 +1324,22 @@ def test_git_producer_uses_reviewed_source_not_ignored_files_or_cwd_tools(git_sn
     assert inspected.metadata.source_revision == sha
     assert "ignored-secret" not in {entry.path for entry in inspected.metadata.files}
     assert "PRIVATE_SENTINEL" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("target,compatible", [("1.2.3", True), ("2.0.0", False)])
+def test_git_producer_checks_the_explicit_target_engine_version(git_snapshot, tmp_path, target, compatible):
+    root, sha = git_snapshot
+    output = tmp_path / "package.zip"
+    result = _producer(root, sha, output, "--target-engine-version", target)
+    assert result.returncode == (0 if compatible else 1), result.stdout + result.stderr
+    assert output.exists() is compatible
+    if compatible:
+        receipt = json.loads(result.stdout)
+        assert receipt["provenance"] == "not-established"
+        inspected = package.inspect_package(output, receipt["sha256"])
+        assert inspected.metadata.siteops_range == ">=1.0.0b1,<2"
+    else:
+        assert "This package requires a different Site Ops version." in result.stderr
 
 
 @pytest.mark.parametrize("fault", ["dirty", "wrong-commit", "export-ignore"])

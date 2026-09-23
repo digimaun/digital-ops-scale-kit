@@ -16,11 +16,37 @@ ROOT = Path(__file__).resolve().parent.parent
 RUNTIME_WHEELHOUSE = "SITEOPS_TEST_RUNTIME_WHEELHOUSE"
 
 
+def build_engine_wheel(root: Path) -> Path:
+    """Build the actual engine with the declared local backend and no package-index access."""
+    source = root / "source"
+    source.mkdir()
+    for name in ("pyproject.toml", "README.md", "LICENSE", "ThirdPartyNotices.txt"):
+        shutil.copyfile(ROOT / name, source / name)
+    shutil.copytree(ROOT / "siteops", source / "siteops", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    environment = {
+        **isolated_environment(root / "build-state"),
+        "PIP_CONFIG_FILE": os.devnull, "PIP_NO_INDEX": "1",
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1", "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    result = subprocess.run(
+        [sys.executable, "-B", "-m", "pip", "wheel", "--no-index", "--no-deps", "--no-build-isolation",
+         str(source), "--wheel-dir", str(root / "wheels")],
+        cwd=root, env=environment, capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    wheels = list((root / "wheels").glob("*.whl"))
+    assert len(wheels) == 1
+    return wheels[0]
+
+
 def isolated_environment(root: Path) -> dict[str, str]:
     """Keep application state and tool lookup inside the test's owned directories."""
     environment = {
         key: value for key, value in os.environ.items()
-        if key.upper() in {"SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "PATHEXT"}
+        if key.upper() in {
+            "SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "PATHEXT",
+            "PROCESSOR_ARCHITECTURE", "PROCESSOR_ARCHITEW6432",
+        }
     }
     for name in ("home", "appdata", "localappdata", "temp", "tools", "azure", "github"):
         (root / name).mkdir(parents=True, exist_ok=True)
@@ -80,6 +106,7 @@ class InstalledEngine:
     python: Path
     command: Path
     environment: dict[str, str]
+    runtime_wheelhouse: Path
 
     def run(self, *arguments: str, expected: int = 0) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
@@ -133,4 +160,4 @@ def install_engine(root: Path, wheel: Path) -> InstalledEngine:
     identity = json.loads(imported.stdout)
     assert Path(identity["module"]).is_relative_to(application)
     assert str(ROOT) not in identity["path"]
-    return InstalledEngine(root, python, binary / f"siteops{suffix}", environment)
+    return InstalledEngine(root, python, binary / f"siteops{suffix}", environment, wheels)

@@ -1,6 +1,7 @@
 # Validates manifests and runs unit tests on push and pull requests
 
 name: CI
+run-name: "CI: ${{ github.event_name == 'workflow_dispatch' && inputs.run-mode || 'ci-only' }} (${{ github.ref_name }})"
 
 on:
   push:
@@ -32,13 +33,13 @@ on:
   workflow_dispatch:
     inputs:
       run-mode:
-        description: "CI always runs. Optional installer checks and release previews never publish."
+        description: "CI always runs. attestation-check creates a permanent public signing record. No mode publishes a release."
         type: choice
         required: false
-        options: [ci-only, installer-check, release-preview]
+        options: [ci-only, runner-check, attestation-check, installer-check, release-preview]
         default: ci-only
       expected-source-sha:
-        description: "For installer-check or release-preview: full commit SHA of the selected branch."
+        description: "Required for any mode except ci-only: full commit SHA of the selected branch."
         type: string
         required: false
         default: ""
@@ -46,18 +47,30 @@ on:
         description: "Release preview only. Keep the example or choose a committed releases/<name>/release.json."
         type: string
         required: false
-        default: .github/release-examples/combined-preview/release.json
+        default: .github/release-examples/workspace-preview/release.json
 
 permissions:
   contents: read
 
 jobs:
+  release-runner:
+    name: Runner
+    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.run-mode == 'runner-check' || inputs.run-mode == 'installer-check' || inputs.run-mode == 'release-preview') }}
+    uses: ./.github/workflows/_release-runner.yaml
+    with:
+      expected-source-sha: ${{ inputs.expected-source-sha }}
+      mode: ${{ inputs.run-mode == 'runner-check' && 'check' || 'preview' }}
+    permissions:
+      contents: read
+
   installer-check:
-    name: Check installer (no publication)
+    name: Installer
+    needs: release-runner
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run-mode == 'installer-check' }}
     uses: ./.github/workflows/_siteops-distribution.yaml
     with:
       expected-source-sha: ${{ inputs.expected-source-sha }}
+      release-pool: ${{ needs.release-runner.outputs.pool }}
     permissions:
       contents: read
       actions: read
@@ -65,14 +78,28 @@ jobs:
       attestations: write
 
   release-preview:
-    name: Preview release (no publication)
-    needs: [lint, test, validate]
+    name: Preview
+    needs: [lint, test, validate, release-runner]
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run-mode == 'release-preview' }}
     uses: ./.github/workflows/_release-candidate.yaml
     with:
       expected-source-sha: ${{ inputs.expected-source-sha }}
       intent: ${{ inputs.release-file }}
       dry-run: true
+      release-pool: ${{ needs.release-runner.outputs.pool }}
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+
+  attestation-check:
+    name: Attestation
+    needs: [lint, test, validate]
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run-mode == 'attestation-check' }}
+    uses: ./.github/workflows/_attestation-check.yaml
+    with:
+      expected-source-sha: ${{ inputs.expected-source-sha }}
     permissions:
       contents: read
       actions: read
@@ -288,3 +315,63 @@ jobs:
           done
 
           exit $EXIT_CODE
+
+  overview:
+    name: Overview
+    needs: [lint, test, validate, release-runner, installer-check, release-preview, attestation-check]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Summarize the selected CI mode
+        shell: python
+        env:
+          CI_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.run-mode || 'ci-only' }}
+          SOURCE_SHA: ${{ github.sha }}
+          LINT_RESULT: ${{ needs.lint.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          VALIDATE_RESULT: ${{ needs.validate.result }}
+          RUNNER_RESULT: ${{ needs.release-runner.result }}
+          INSTALLER_RESULT: ${{ needs.installer-check.result }}
+          PREVIEW_RESULT: ${{ needs.release-preview.result }}
+          ATTESTATION_RESULT: ${{ needs.attestation-check.result }}
+        run: |
+          import os
+          import re
+
+          modes = {
+              "ci-only": ("Checks", (), "No release artifact work was requested."),
+              "runner-check": (
+                  "Runner check", (("Runner admission and diagnostics", "RUNNER_RESULT"),),
+                  "This mode does not build, sign or publish release artifacts.",
+              ),
+              "attestation-check": (
+                  "Attestation check", (("Non-release attestation", "ATTESTATION_RESULT"),),
+                  "This mode signs public, non-release evidence and creates a permanent public signing record. It does not publish a release.",
+              ),
+              "installer-check": (
+                  "Installer check", (("Runner admission", "RUNNER_RESULT"), ("Installer", "INSTALLER_RESULT")),
+                  "This mode does not publish a release.",
+              ),
+              "release-preview": (
+                  "Release preview", (("Runner admission", "RUNNER_RESULT"), ("Preview", "PREVIEW_RESULT")),
+                  "This mode does not publish a release.",
+              ),
+          }
+          mode = modes.get(os.environ["CI_MODE"])
+          source = os.environ["SOURCE_SHA"]
+          if mode is None or not re.fullmatch("[0-9a-f]{40}", source):
+              raise SystemExit("::error::The CI summary requires a supported mode and source commit.")
+          title, extra, scope = mode
+          rows = (("Lint", "LINT_RESULT"), ("Unit tests", "TEST_RESULT"), ("Manifests", "VALIDATE_RESULT"), *extra)
+          results = {"success": "Passed", "failure": "Failed", "cancelled": "Cancelled", "skipped": "Skipped"}
+          lines = ["## CI: " + title, "", "Source: `" + source + "`", "", "| Check | Result |", "|---|---|"]
+          for label, key in rows:
+              value = os.environ[key]
+              if value not in results:
+                  raise SystemExit("::error::A CI job returned an unsupported completion result.")
+              lines.append("| " + label + " | " + results[value] + " |")
+          lines.extend(["", scope, "", "Open the relevant job for its detailed output.", ""])
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as output:
+              output.write("\n".join(lines))

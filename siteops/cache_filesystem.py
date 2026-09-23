@@ -24,6 +24,10 @@ class CacheError(ArtifactError):
         super().__init__(message, code=code)
 
 
+def _trusted_windows_ace(sid: str, trusted: set[str]) -> bool:
+    return sid in trusted or sid == "S-1-3-4"  # OWNER RIGHTS resolves to the validated owner.
+
+
 @lru_cache(maxsize=1)
 def _windows():
     """Load native declarations only on Windows."""
@@ -135,7 +139,7 @@ def _check_windows_access(path: Path, *, private: bool) -> None:
             sid = _sid_text(advapi, kernel, ctypes.c_void_p(address.value + 8))
             # Ancestors must prevent replacement or permission changes by other users.
             forbidden = 0xFFFFFFFF if private else 0x500D0140
-            if ace.mask & forbidden and sid not in trusted:
+            if ace.mask & forbidden and not _trusted_windows_ace(sid, trusted):
                 raise CacheError(
                     "Choose a private cache location whose access controls exclude other users.",
                     code="cache.permissions",

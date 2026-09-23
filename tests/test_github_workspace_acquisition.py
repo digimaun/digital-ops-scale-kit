@@ -68,6 +68,7 @@ def github(tmp_path, monkeypatch):
             "sourceRef": "refs/heads/main",
             "signerWorkflow": ".github/workflows/sign.yml",
             "builderWorkflow": ".github/workflows/release.yml",
+            "runnerEnvironment": "github-hosted",
         },
     }), encoding="utf-8")
     executable = tmp_path / "gh.exe"
@@ -240,6 +241,19 @@ def test_policy_updates_are_used_locally_without_source_refresh(github):
         assert content.verification.policy_sha256 == hashlib.sha256(github.policy.read_bytes()).hexdigest()
     assert len(github.downloads) == 3
     assert github.client.resolve_release.call_count == 1
+
+
+def test_runner_policy_change_revalidates_pinned_proof_without_downloading(github):
+    selected = github.flow.acquire(github.client)
+    document = json.loads(github.policy.read_bytes())
+    document["provider"]["runnerEnvironment"] = "self-hosted"
+    github.policy.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(attestation.VerificationError, match="certificate"):
+        with github.flow.lease(selected.resolved):
+            pytest.fail("A cached receipt bypassed the current runner policy.")
+    assert len(github.downloads) == 3
+    assert github.client.resolve_release.call_count == 1
+    assert "--deny-self-hosted-runners" not in github.calls[-1]
 
 
 def test_expired_policy_rejects_pinned_use_without_network(github):

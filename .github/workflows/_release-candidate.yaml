@@ -4,6 +4,10 @@ name: _Release Candidate
 on:
   workflow_call:
     inputs:
+      release-pool:
+        description: "Dedicated 1ES pool admitted by the caller's release runner configuration."
+        required: true
+        type: string
       expected-source-sha:
         required: true
         type: string
@@ -26,6 +30,8 @@ on:
         value: ${{ jobs.prepare.outputs.tag }}
       bundle:
         value: ${{ jobs.prepare.outputs.bundle }}
+      workspaces:
+        value: ${{ jobs.prepare.outputs.workspaces }}
       plan-artifact-id:
         value: ${{ jobs.prepare.outputs.artifact-id }}
       plan-sha:
@@ -40,8 +46,8 @@ on:
         value: ${{ jobs.review.outputs.wheel-sha }}
       asset-list-sha:
         value: ${{ jobs.review.outputs.asset-list-sha }}
-      bundle-artifact-id:
-        value: ${{ jobs.distribution.outputs.staging-artifact-id }}
+      payload-artifact-id:
+        value: ${{ jobs.review.outputs.payload-artifact-id }}
       assets-artifact-id:
         value: ${{ jobs.review.outputs.assets-artifact-id }}
       build-number:
@@ -54,6 +60,12 @@ on:
         value: ${{ jobs.review.outputs.engine-ref }}
       notes-artifact-id:
         value: ${{ jobs.review.outputs.notes-artifact-id }}
+      workspace-artifact-id:
+        value: ${{ jobs.workspace-assets.outputs.artifact-id }}
+      workspace-inventory-sha:
+        value: ${{ jobs.workspace-assets.outputs.inventory-sha }}
+      engine-selection-sha:
+        value: ${{ jobs.engine-input.outputs.selection-sha }}
 
 permissions:
   contents: read
@@ -66,14 +78,24 @@ env:
   OIDC_ISSUER: https://token.actions.githubusercontent.com
   PREDICATE_TYPE: https://slsa.dev/provenance/v1
   SIGNER_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/_siteops-distribution.yaml@${{ github.ref }}
+  BUILDER_IDENTITY: https://github.com/${{ github.workflow_ref }}
+  EXPECTED_RUNNER_ENVIRONMENT: self-hosted
   PYTHONDONTWRITEBYTECODE: "1"
   PYTHONIOENCODING: utf-8
   DRY_RUN: ${{ inputs.dry-run }}
 
 jobs:
   prepare:
-    name: Read the release file
-    runs-on: ubuntu-24.04
+    name: Prepare
+    if: >-
+      inputs.release-pool != '' && inputs.release-pool == vars.SITEOPS_RELEASE_POOL &&
+      inputs.expected-source-sha == github.sha &&
+      vars.SITEOPS_RELEASE_PROVENANCE_READY == 'true' && vars.SITEOPS_RELEASE_RUNNER_MODE == 'scaleset' &&
+      (github.workflow_ref == format('{0}/.github/workflows/ci.yaml@{1}', github.repository, github.ref) ||
+       github.workflow_ref == format('{0}/.github/workflows/release.yaml@{1}', github.repository, github.ref)) &&
+      (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    runs-on:
+      - ${{ inputs.release-pool }}
     permissions:
       contents: read
       actions: read
@@ -82,9 +104,24 @@ jobs:
       tag: ${{ steps.plan.outputs.tag }}
       bundle: ${{ steps.plan.outputs.bundle }}
       version-mode: ${{ steps.plan.outputs.version-mode }}
+      workspaces: ${{ steps.plan.outputs.workspaces }}
+      workspace-matrix: ${{ steps.plan.outputs.workspace-matrix }}
+      single-workspace-artifact: ${{ steps.plan.outputs.single-workspace-artifact }}
+      intent-path: ${{ steps.plan.outputs.intent-path }}
+      plan-sha: ${{ steps.plan.outputs.plan-sha }}
       tag-exists: ${{ steps.target.outputs.tag-exists }}
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
+      - name: Require the admitted runner class
+        shell: python
+        env:
+          RUNNER_CLASS: ${{ runner.environment }}
+        run: |
+          import os
+          import sys
+          if sys.platform != "linux" or os.environ["RUNNER_CLASS"] != "self-hosted":
+              raise SystemExit("::error::Release artifacts require the admitted Linux self-hosted runner.")
+
       - name: Confirm the source request
         shell: bash
         env:
@@ -154,11 +191,22 @@ jobs:
             --source-ref "$SOURCE_REF" --output-dir "$RUNNER_TEMP/release-plan" \
             "${arguments[@]}"
           python -c '
-          import json, os, sys
-          with open(sys.argv[1], encoding="utf-8") as stream:
-              plan = json.load(stream)
+          import hashlib, json, os, sys
+          raw = open(sys.argv[1], "rb").read()
+          plan = json.loads(raw)
           print("active=" + str(plan["active"]).lower())
+          print("workspaces=" + str(bool(plan.get("workspaces"))).lower())
+          print("workspace-matrix=" + json.dumps({"include": [
+              {"slot": slot, "workspace": request["workspace"]}
+              for slot, request in enumerate(plan.get("workspaces", []), 1)
+          ]}, separators=(",", ":")))
+          print("single-workspace-artifact=" + (
+              "workspace-attested-" + os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"] + "-1"
+              if len(plan.get("workspaces", [])) == 1 else ""
+          ))
+          print("plan-sha=" + hashlib.sha256(raw).hexdigest())
           if plan["active"]:
+              print("intent-path=" + plan["intent"]["path"])
               print("tag=" + plan["release"]["tag"])
               print("bundle=" + str(plan["siteops"]["bundle"]).lower())
               print("version-mode=" + (plan["siteops"]["versionMode"] or "build"))
@@ -248,7 +296,7 @@ jobs:
           retention-days: 30
 
   distribution:
-    name: Candidate installation
+    name: Engine
     needs: prepare
     if: needs.prepare.outputs.active == 'true' && needs.prepare.outputs.bundle == 'true'
     uses: ./.github/workflows/_siteops-distribution.yaml
@@ -256,21 +304,605 @@ jobs:
       expected-source-sha: ${{ github.sha }}
       version-mode: ${{ needs.prepare.outputs.version-mode }}
       report-summary: false
+      release-pool: ${{ inputs.release-pool }}
     permissions:
       contents: read
       actions: read
       id-token: write
       attestations: write
 
-  review:
-    name: Prepare release summary
+  workspace-build:
+    name: Workspace (${{ matrix.workspace }})
+    needs: prepare
+    if: needs.prepare.outputs.active == 'true' && needs.prepare.outputs.workspaces == 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.prepare.outputs.workspace-matrix) }}
+    uses: ./.github/workflows/_workspace-distribution.yaml
+    with:
+      expected-source-sha: ${{ github.sha }}
+      plan-artifact-id: ${{ needs.prepare.outputs.artifact-id }}
+      expected-plan-sha: ${{ needs.prepare.outputs.plan-sha }}
+      intent: ${{ needs.prepare.outputs.intent-path }}
+      workspace: ${{ matrix.workspace }}
+      slot: ${{ matrix.slot }}
+      dry-run: ${{ inputs.dry-run }}
+      release-pool: ${{ inputs.release-pool }}
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+
+  workspace-assets:
+    name: Collect workspaces
+    needs: [prepare, workspace-build]
+    if: >-
+      always() && needs.prepare.result == 'success' &&
+      needs.prepare.outputs.workspaces == 'true' && needs.workspace-build.result == 'success'
+    runs-on:
+      - ${{ inputs.release-pool }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      inventory-sha: ${{ steps.collect.outputs.inventory-sha }}
+    env:
+      INTENT_PATH: ${{ needs.prepare.outputs.intent-path }}
+      EXPECTED_PLAN_SHA: ${{ needs.prepare.outputs.plan-sha }}
+      BUILDER_REF: ${{ github.workflow_ref }}
+    steps:
+      - name: Require the admitted runner class
+        shell: python
+        env:
+          RUNNER_CLASS: ${{ runner.environment }}
+        run: |
+          import os
+          import sys
+          if sys.platform != "linux" or os.environ["RUNNER_CLASS"] != "self-hosted":
+              raise SystemExit("::error::Release artifacts require the admitted Linux self-hosted runner.")
+
+      - name: Initialize private collection home
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          home="$RUNNER_TEMP/workspace-verification-home"
+          mkdir -p "$home"
+          printf 'HOME=%s\n' "$home" >> "$GITHUB_ENV"
+
+      - name: Checkout the event commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Download the prepared release plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.artifact-id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/workspace-plan
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Download attested workspace subjects
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.prepare.outputs.single-workspace-artifact }}
+          pattern: workspace-attested-${{ github.run_id }}-${{ github.run_attempt }}-*
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/workspace-staging/${{ needs.prepare.outputs.single-workspace-artifact }}
+          merge-multiple: false
+          digest-mismatch: error
+
+      - name: Prepare independent verification inputs
+        shell: bash
+        env:
+          PIP_CONFIG_FILE: /dev/null
+          PIP_INDEX_URL: https://packagefeedproxy.microsoft.io/pypi/simple/
+          PIP_EXTRA_INDEX_URL: ""
+          PIP_NO_INPUT: "1"
+          PIP_KEYRING_PROVIDER: disabled
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$HOME" "$RUNNER_TEMP/workspace-trust"
+          python -m venv "$RUNNER_TEMP/workspace-verifier"
+          if ! "$RUNNER_TEMP/workspace-verifier/bin/python" -m pip install --require-hashes --only-binary=:all: --no-cache-dir \
+            -r scripts/siteops-build-requirements.txt -r scripts/siteops-runtime-requirements.txt \
+            > "$RUNNER_TEMP/workspace-verifier-tools.log" 2>&1; then
+            echo "::error::Workspace verification tooling could not be installed from the configured feed."
+            exit 1
+          fi
+          if ! gh attestation trusted-root > "$RUNNER_TEMP/workspace-trust/root.json" \
+            2> "$RUNNER_TEMP/workspace-trust.err"; then
+            echo "::error::Trusted attestation roots could not be obtained independently."
+            exit 1
+          fi
+          python3 -c '
+          import hashlib, json, os
+          from datetime import datetime, timedelta, timezone
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"]) / "workspace-trust"
+          repository, ref = os.environ["GITHUB_REPOSITORY"], os.environ["SOURCE_REF"]
+          builder = os.environ["BUILDER_REF"]
+          permitted = [repository + "/" + path + "@" + ref for path in (".github/workflows/ci.yaml", ".github/workflows/release.yaml")]
+          if builder not in permitted:
+              raise SystemExit("::error::The top-level workspace release workflow is unsupported.")
+          policy = {
+              "apiVersion": "siteops/v1alpha1", "kind": "ArtifactVerificationPolicy",
+              "id": "workspace-release", "version": 1,
+              "validUntil": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+              "trustedRootSha256": hashlib.sha256((root / "root.json").read_bytes()).hexdigest(),
+              "provider": {
+                  "kind": "github-attestation/v1", "repository": repository, "sourceRef": ref,
+                  "signerWorkflow": ".github/workflows/_workspace-distribution.yaml",
+                  "builderWorkflow": builder.removeprefix(repository + "/").removesuffix("@" + ref),
+                  "runnerEnvironment": "self-hosted",
+              },
+          }
+          (root / "policy.json").write_text(json.dumps(policy), encoding="utf-8")
+          '
+
+      - name: Collect verified workspace routing
+        id: collect
+        shell: bash
+        run: |
+          set -euo pipefail
+          arguments=()
+          if [[ "$DRY_RUN" == "true" ]]; then arguments+=(--dry-run); fi
+          if ! "$RUNNER_TEMP/workspace-verifier/bin/python" -B scripts/assemble-workspace-release.py \
+            --root "$GITHUB_WORKSPACE" --repository "$GITHUB_REPOSITORY" \
+            --source-sha "$SOURCE_SHA" --source-ref "$SOURCE_REF" --release-file "$INTENT_PATH" \
+            --prepared-plan "$RUNNER_TEMP/workspace-plan/plan.json" --expected-plan-sha "$EXPECTED_PLAN_SHA" \
+            --staging "$RUNNER_TEMP/workspace-staging" --output "$RUNNER_TEMP/workspace-release" \
+            --build-number "$GITHUB_RUN_ID" --build-attempt "$GITHUB_RUN_ATTEMPT" \
+            --trust-policy "$RUNNER_TEMP/workspace-trust/policy.json" --trusted-root "$RUNNER_TEMP/workspace-trust/root.json" \
+            "${arguments[@]}" > "$RUNNER_TEMP/workspace-collection.json" 2> "$RUNNER_TEMP/workspace-collection.err"; then
+            echo "::error::Workspace source, proof or package verification failed."
+            exit 1
+          fi
+          python3 -c '
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"])
+          summary = json.loads((root / "workspace-collection.json").read_bytes())
+          digest = hashlib.sha256((root / "workspace-release/release-assets.json").read_bytes()).hexdigest()
+          if digest != summary["inventorySha256"]:
+              raise SystemExit("::error::The workspace collection inventory changed.")
+          print("inventory-sha=" + digest)
+          ' >> "$GITHUB_OUTPUT"
+
+      - name: Retain verified workspace assets
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: workspace-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/workspace-release
+          if-no-files-found: error
+          overwrite: false
+          compression-level: 0
+          retention-days: 30
+
+  engine-input:
+    name: Select engine
     needs: [prepare, distribution]
+    if: >-
+      always() && needs.prepare.result == 'success' && needs.prepare.outputs.workspaces == 'true' &&
+      ((needs.prepare.outputs.bundle == 'true' && needs.distribution.result == 'success') ||
+       (needs.prepare.outputs.bundle == 'false' && needs.distribution.result == 'skipped'))
+    runs-on:
+      - ${{ inputs.release-pool }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      selection-sha: ${{ steps.select.outputs.selection-sha }}
+      matrix: ${{ steps.select.outputs.matrix }}
+      single-qualification-artifact: ${{ steps.select.outputs.single-qualification-artifact }}
+    env:
+      INTENT_PATH: ${{ needs.prepare.outputs.intent-path }}
+      EXPECTED_PLAN_SHA: ${{ needs.prepare.outputs.plan-sha }}
+      BUILT_ENGINE: ${{ needs.prepare.outputs.bundle }}
+      ARCHIVE_SHA: ${{ needs.distribution.outputs.archive-sha256 }}
+      WHEEL_SHA: ${{ needs.distribution.outputs.wheel-sha256 }}
+      BUILDER_REF: ${{ github.workflow_ref }}
+    steps:
+      - name: Require the admitted runner class
+        shell: python
+        env:
+          RUNNER_CLASS: ${{ runner.environment }}
+        run: |
+          import os
+          import sys
+          if sys.platform != "linux" or os.environ["RUNNER_CLASS"] != "self-hosted":
+              raise SystemExit("::error::Release artifacts require the admitted Linux self-hosted runner.")
+
+      - name: Initialize private engine selection home
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          home="$RUNNER_TEMP/engine-selection-home"
+          mkdir -p "$home"
+          printf 'HOME=%s\n' "$home" >> "$GITHUB_ENV"
+
+      - name: Checkout engine selection tools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Download the prepared release plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.artifact-id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/engine-plan
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Download the completed engine build
+        if: needs.prepare.outputs.bundle == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.distribution.outputs.staging-artifact-id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/built-engine
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Setup selection Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Prepare selection tooling and roots
+        shell: bash
+        env:
+          PIP_CONFIG_FILE: /dev/null
+          PIP_INDEX_URL: https://packagefeedproxy.microsoft.io/pypi/simple/
+          PIP_EXTRA_INDEX_URL: ""
+          PIP_NO_INPUT: "1"
+          PIP_KEYRING_PROVIDER: disabled
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$HOME"
+          python -m venv "$RUNNER_TEMP/engine-tools"
+          "$RUNNER_TEMP/engine-tools/bin/python" -m pip install --require-hashes --only-binary=:all: --no-cache-dir \
+            -r scripts/siteops-build-requirements.txt -r scripts/siteops-runtime-requirements.txt \
+            > "$RUNNER_TEMP/engine-tooling.log" 2>&1
+          gh attestation trusted-root > "$RUNNER_TEMP/engine-roots.json" 2> "$RUNNER_TEMP/engine-roots.err"
+
+      - name: Freeze the selected engine
+        id: select
+        shell: bash
+        run: |
+          set -euo pipefail
+          arguments=()
+          if [[ "$DRY_RUN" == "true" ]]; then arguments+=(--dry-run); fi
+          if [[ "$BUILT_ENGINE" == "true" ]]; then
+            arguments+=(--built-assets "$RUNNER_TEMP/built-engine" --archive-sha "$ARCHIVE_SHA" --wheel-sha "$WHEEL_SHA")
+          fi
+          builder="${BUILDER_REF#"$GITHUB_REPOSITORY/"}"
+          builder="${builder%"@$SOURCE_REF"}"
+          if ! "$RUNNER_TEMP/engine-tools/bin/python" -B scripts/prepare-workspace-engine.py \
+            --root "$GITHUB_WORKSPACE" --repository "$GITHUB_REPOSITORY" \
+            --source-sha "$SOURCE_SHA" --source-ref "$SOURCE_REF" --release-file "$INTENT_PATH" \
+            --prepared-plan "$RUNNER_TEMP/engine-plan/plan.json" --expected-plan-sha "$EXPECTED_PLAN_SHA" \
+            --trusted-root "$RUNNER_TEMP/engine-roots.json" --control "$RUNNER_TEMP/engine-control" \
+            --output "$RUNNER_TEMP/selected-engine" --builder-workflow "$builder" \
+            --expected-runner-environment "$EXPECTED_RUNNER_ENVIRONMENT" \
+            --build-number "$GITHUB_RUN_ID" --build-attempt "$GITHUB_RUN_ATTEMPT" \
+            "${arguments[@]}" > "$RUNNER_TEMP/engine-selection.json" 2> "$RUNNER_TEMP/engine-selection.err"; then
+            echo "::error::The exact selected engine could not be acquired and verified."
+            exit 1
+          fi
+          python3 -c '
+          import json, os
+          from pathlib import Path
+          result = json.loads((Path(os.environ["RUNNER_TEMP"]) / "engine-selection.json").read_bytes())
+          print("selection-sha=" + result["selectionSha256"])
+          print("matrix=" + json.dumps(result["matrix"], separators=(",", ":")))
+          targets = result["matrix"]["include"]
+          print("single-qualification-artifact=" + (
+              "workspace-qualification-" + os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+              + "-" + targets[0]["platform"] + "-" + targets[0]["python"]
+              if len(targets) == 1 else ""
+          ))
+          ' >> "$GITHUB_OUTPUT"
+
+      - name: Retain selected engine inputs
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: workspace-engine-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/selected-engine
+          overwrite: false
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  workspace-qualify:
+    name: Qualify workspace engine (${{ matrix.os }}, Python ${{ matrix.python }})
+    needs: [prepare, engine-input, workspace-assets]
+    if: >-
+      always() && needs.prepare.outputs.workspaces == 'true' &&
+      needs.engine-input.result == 'success' && needs.workspace-assets.result == 'success'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.engine-input.outputs.matrix) }}
+    env:
+      EXPECTED_ENGINE_SHA: ${{ needs.engine-input.outputs.selection-sha }}
+      EXPECTED_WORKSPACE_SHA: ${{ needs.workspace-assets.outputs.inventory-sha }}
+      EXPECTED_PLAN_SHA: ${{ needs.prepare.outputs.plan-sha }}
+      QUALIFICATION_PLATFORM: ${{ matrix.platform }}
+      QUALIFICATION_PYTHON: ${{ matrix.python }}
+      BUILDER_REF: ${{ github.workflow_ref }}
+    steps:
+      - name: Checkout qualification tools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Setup target Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Download selected engine inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.engine-input.outputs.artifact-id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/qualification-engine
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Download frozen workspace assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.workspace-assets.outputs.artifact-id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/qualification-workspaces
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Select private qualification state
+        shell: python
+        run: |
+          import os
+          import re
+          from pathlib import Path
+
+          runner = os.environ["RUNNER_OS"]
+          key = "LOCALAPPDATA" if runner == "Windows" else "RUNNER_TEMP"
+          values = (
+              os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_RUN_ATTEMPT"],
+              os.environ["QUALIFICATION_PLATFORM"], os.environ["QUALIFICATION_PYTHON"],
+          )
+          if (
+              runner not in {"Windows", "Linux"}
+              or not all(re.fullmatch(r"[A-Za-z0-9._-]+", value) for value in values)
+          ):
+              raise SystemExit("::error::The qualification state identity is unsupported.")
+          root = Path(os.environ.get(key, ""))
+          if not root.is_absolute():
+              raise SystemExit("::error::The qualification state root must be an absolute path.")
+          state = root / ("siteops-qualification-" + "-".join(values))
+          if os.path.lexists(state):
+              raise SystemExit("::error::Select a new private qualification state directory.")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+              output.write("QUALIFICATION_STATE=" + str(state) + "\n")
+
+      - name: Qualify through the installed engine
+        shell: bash
+        env:
+          PIP_INDEX_URL: https://packagefeedproxy.microsoft.io/pypi/simple/
+          PIP_EXTRA_INDEX_URL: ""
+          PIP_NO_INPUT: "1"
+          PIP_KEYRING_PROVIDER: disabled
+        run: |
+          set -euo pipefail
+          umask 077
+          unset PYTHONPATH PYTHONHOME
+          temp="${RUNNER_TEMP//\\//}"
+          export PIP_CONFIG_FILE="$(python -c 'import os; print(os.devnull)')"
+          export HOME="$temp/qualification-home"
+          export GH_CONFIG_DIR="$HOME/github"
+          mkdir -p "$HOME"
+          python -m venv "$temp/qualification-tools"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            python="$temp/qualification-tools/Scripts/python.exe"
+          else
+            python="$temp/qualification-tools/bin/python"
+          fi
+          "$python" -m pip install --require-hashes --only-binary=:all: --no-cache-dir \
+            -r scripts/siteops-build-requirements.txt -r scripts/siteops-runtime-requirements.txt \
+            > "$temp/qualification-tooling.log" 2>&1
+          gh attestation trusted-root > "$temp/qualification-roots.json" 2> "$temp/qualification-roots.err"
+          gh_path="$(command -v gh)"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then gh_path="$(cygpath -w "$gh_path")"; fi
+          builder="${BUILDER_REF#"$GITHUB_REPOSITORY/"}"
+          builder="${builder%"@$SOURCE_REF"}"
+          if ! "$python" -B scripts/qualify-workspace-engine.py \
+            --engine "$temp/qualification-engine" --expected-engine-selection-sha256 "$EXPECTED_ENGINE_SHA" \
+            --workspaces "$temp/qualification-workspaces" --expected-workspace-inventory-sha256 "$EXPECTED_WORKSPACE_SHA" \
+            --expected-plan-sha "$EXPECTED_PLAN_SHA" --trusted-root "$temp/qualification-roots.json" \
+            --state "$QUALIFICATION_STATE" --output "$temp/workspace-qualification.json" \
+            --gh "$gh_path" --builder-workflow "$builder" --platform "$QUALIFICATION_PLATFORM" \
+            --expected-runner-environment "$EXPECTED_RUNNER_ENVIRONMENT" \
+            > "$temp/workspace-qualification.out" 2> "$temp/workspace-qualification.err"; then
+            echo "::error::The selected installed engine did not qualify the frozen workspaces."
+            exit 1
+          fi
+
+      - name: Retain workspace qualification result
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: workspace-qualification-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.platform }}-${{ matrix.python }}
+          path: ${{ runner.temp }}/workspace-qualification.json
+          overwrite: false
+          if-no-files-found: error
+          retention-days: 30
+
+  workspace-qualified:
+    name: Workspace results
+    needs: [prepare, engine-input, workspace-assets, workspace-qualify]
+    if: >-
+      always() && needs.prepare.outputs.workspaces == 'true' &&
+      needs.engine-input.result == 'success' && needs.workspace-assets.result == 'success' &&
+      needs.workspace-qualify.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    env:
+      EXPECTED_ENGINE_SHA: ${{ needs.engine-input.outputs.selection-sha }}
+      EXPECTED_WORKSPACE_SHA: ${{ needs.workspace-assets.outputs.inventory-sha }}
+      EXPECTED_PLAN_SHA: ${{ needs.prepare.outputs.plan-sha }}
+    steps:
+      - name: Download engine qualification identity
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.engine-input.outputs.artifact-id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/qualification-identity
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Download the prepared release plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.artifact-id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/qualification-plan
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Download every qualification cell
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.engine-input.outputs.single-qualification-artifact }}
+          pattern: workspace-qualification-${{ github.run_id }}-${{ github.run_attempt }}-*
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/qualification-results/${{ needs.engine-input.outputs.single-qualification-artifact }}
+          merge-multiple: false
+          digest-mismatch: error
+
+      - name: Require the complete frozen qualification matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -c '
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"])
+          raw = (root / "qualification-identity/workspace-engine.json").read_bytes()
+          plan_raw = (root / "qualification-plan/plan.json").read_bytes()
+          if (
+              len(raw) > 2097152 or len(plan_raw) > 1048576
+              or hashlib.sha256(raw).hexdigest() != os.environ["EXPECTED_ENGINE_SHA"]
+              or hashlib.sha256(plan_raw).hexdigest() != os.environ["EXPECTED_PLAN_SHA"]
+          ):
+              raise SystemExit("::error::Qualification source identities changed.")
+          engine, plan = json.loads(raw), json.loads(plan_raw)
+          if engine["candidate"] != plan["source"] or engine["planSha256"] != os.environ["EXPECTED_PLAN_SHA"]:
+              raise SystemExit("::error::Qualification inputs describe another candidate.")
+          prefix = "workspace-qualification-" + os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"] + "-"
+          expected = {
+              prefix + target["platform"] + "-" + target["python"]: target
+              for target in engine["targets"]
+          }
+          directory = root / "qualification-results"
+          entries = list(directory.iterdir())
+          if (
+              not 1 <= len(expected) == len(engine["targets"]) <= 10
+              or len(entries) != len(expected) or {path.name for path in entries} != set(expected)
+              or any(path.is_symlink() or not path.is_dir() for path in entries)
+          ):
+              raise SystemExit("::error::The qualification matrix is missing or contains unexpected cells.")
+          counts = set()
+          for name, target in expected.items():
+              folder = directory / name
+              if {path.name for path in folder.iterdir()} != {"workspace-qualification.json"}:
+                  raise SystemExit("::error::A qualification cell has an unexpected inventory.")
+              path = folder / "workspace-qualification.json"
+              if path.is_symlink() or not path.is_file() or path.stat().st_size > 1048576:
+                  raise SystemExit("::error::A qualification cell is not a bounded regular result.")
+              result = json.loads(path.read_bytes())
+              if (
+                  result.get("apiVersion") != "siteops.release.qualification/v1"
+                  or result.get("kind") != "WorkspaceEngineQualification"
+                  or result.get("engineVersion") != engine["version"]
+                  or result.get("engineSelectionSha256") != os.environ["EXPECTED_ENGINE_SHA"]
+                  or result.get("workspaceInventorySha256") != os.environ["EXPECTED_WORKSPACE_SHA"]
+                  or result.get("planSha256") != os.environ["EXPECTED_PLAN_SHA"]
+                  or result.get("target") != target
+                  or type(result.get("packages")) is not int or result["packages"] != len(plan["workspaces"])
+                  or type(result.get("catalogManifests")) is not int or result["catalogManifests"] < 0
+                  or result.get("deployment") != "not-run" or result.get("workloadHealth") != "not-checked"
+              ):
+                  raise SystemExit("::error::A qualification result differs from the selected engine and workspaces.")
+              counts.add(result["catalogManifests"])
+          if len(counts) != 1:
+              raise SystemExit("::error::Qualification targets disagreed about the manifest catalog.")
+          print("Every declared engine target consumed the frozen workspace package set.")
+          '
+
+  review:
+    name: Assemble release
+    needs: [prepare, distribution, workspace-assets, engine-input, workspace-qualified]
     if: >-
       always() && needs.prepare.result == 'success' &&
       needs.prepare.outputs.active == 'true' &&
       ((needs.prepare.outputs.bundle == 'true' && needs.distribution.result == 'success') ||
-       (needs.prepare.outputs.bundle == 'false' && needs.distribution.result == 'skipped'))
-    runs-on: ubuntu-24.04
+       (needs.prepare.outputs.bundle == 'false' && needs.distribution.result == 'skipped')) &&
+      ((needs.prepare.outputs.workspaces == 'true' && needs.workspace-assets.result == 'success' && needs.workspace-qualified.result == 'success') ||
+       (needs.prepare.outputs.workspaces == 'false' && needs.workspace-assets.result == 'skipped'))
+    runs-on:
+      - ${{ inputs.release-pool }}
     timeout-minutes: 45
     permissions:
       contents: read
@@ -287,13 +919,24 @@ jobs:
       bundle-sha: ${{ steps.candidate.outputs.bundle-sha }}
       wheel-name: ${{ steps.candidate.outputs.wheel-name }}
       wheel-sha: ${{ steps.candidate.outputs.wheel-sha }}
-      asset-list-sha: ${{ steps.candidate.outputs.asset-list-sha }}
+      asset-list-sha: ${{ steps.payload.outputs.asset-list-sha }}
       engine-id: ${{ steps.candidate.outputs.engine-id }}
       engine-ref: ${{ steps.candidate.outputs.engine-ref }}
       notes-sha: ${{ steps.notes.outputs.sha256 }}
       notes-artifact-id: ${{ steps.notes-upload.outputs.artifact-id }}
       assets-artifact-id: ${{ steps.assets-upload.outputs.artifact-id }}
+      payload-artifact-id: ${{ steps.payload-upload.outputs.artifact-id }}
     steps:
+      - name: Require the admitted runner class
+        shell: python
+        env:
+          RUNNER_CLASS: ${{ runner.environment }}
+        run: |
+          import os
+          import sys
+          if sys.platform != "linux" or os.environ["RUNNER_CLASS"] != "self-hosted":
+              raise SystemExit("::error::Release artifacts require the admitted Linux self-hosted runner.")
+
       - name: Require successful CI for the candidate
         id: ci
         shell: bash
@@ -416,6 +1059,9 @@ jobs:
               raise SystemExit("::error::The candidate boolean fields are invalid.")
           if release["stream"] != ("siteops" if tag.startswith("siteops/") else "scalekit"):
               raise SystemExit("::error::The release stream and tag disagree.")
+          components = "siteops" if release["stream"] == "siteops" else ("both" if engine["bundle"] else "content")
+          if release.get("components") != components:
+              raise SystemExit("::error::The release components disagree with the engine selection.")
           if release["version"] != tag.removeprefix("siteops/").removeprefix("v"):
               raise SystemExit("::error::The release version and tag disagree.")
           if release["latest"] and (release["prerelease"] or release["stream"] != "scalekit"):
@@ -462,6 +1108,8 @@ jobs:
               if hashlib.sha256(Path(path).read_bytes()).hexdigest() != plan["intent"][field]:
                   raise SystemExit("::error::The release file or notes changed. Prepare and review a new candidate.")
           declaration = json.loads(Path(sys.argv[2]).read_text())
+          if plan.get("workspaces") != declaration.get("workspaces"):
+              raise SystemExit("::error::The workspace builds differ from the reviewed declaration.")
           release, engine = plan["release"], plan["siteops"]
           headline = declaration.get("headline")
           if (
@@ -501,23 +1149,54 @@ jobs:
           mkdir -p "$assets"
           if [[ "$bundle" == "true" ]]; then
             archive="$RUNNER_TEMP/release-bundle/$ARCHIVE_NAME"
-            archive_proof="${archive}${ATTESTATION_SUFFIX}"
             if [[ ! "$BUILD_WHEEL_NAME" =~ ^siteops-[0-9A-Za-z][0-9A-Za-z.!+_~-]*-py3-none-any\.whl$ || "$BUILD_WHEEL_NAME" == *".."* ]]; then
               echo "::error::The standalone wheel filename is invalid."
               exit 1
             fi
             wheel="$RUNNER_TEMP/release-bundle/$BUILD_WHEEL_NAME"
-            wheel_proof="${wheel}${ATTESTATION_SUFFIX}"
-            gh attestation verify "$archive" --bundle "$archive_proof" --repo "$GITHUB_REPOSITORY" \
-              --cert-identity "$SIGNER_IDENTITY" --signer-digest "$SOURCE_SHA" \
-              --source-digest "$SOURCE_SHA" --source-ref "$SOURCE_REF" \
-              --cert-oidc-issuer "$OIDC_ISSUER" \
-              --predicate-type "$PREDICATE_TYPE" --deny-self-hosted-runners
-            gh attestation verify "$wheel" --bundle "$wheel_proof" --repo "$GITHUB_REPOSITORY" \
-              --cert-identity "$SIGNER_IDENTITY" --signer-digest "$SOURCE_SHA" \
-              --source-digest "$SOURCE_SHA" --source-ref "$SOURCE_REF" \
-              --cert-oidc-issuer "$OIDC_ISSUER" \
-              --predicate-type "$PREDICATE_TYPE" --deny-self-hosted-runners
+            for asset in "$archive" "$wheel"; do
+              if ! timeout --kill-after=5 120 gh attestation verify "$asset" \
+                --bundle "${asset}${ATTESTATION_SUFFIX}" --repo "$GITHUB_REPOSITORY" \
+                --cert-identity "$SIGNER_IDENTITY" --signer-digest "$SOURCE_SHA" \
+                --source-digest "$SOURCE_SHA" --source-ref "$SOURCE_REF" \
+                --cert-oidc-issuer "$OIDC_ISSUER" --predicate-type "$PREDICATE_TYPE" \
+                --hostname github.com --digest-alg sha256 --format json 2>/dev/null \
+                | head -c 8388609 > "$RUNNER_TEMP/engine-verification.json"; then
+                echo "::error::A candidate asset did not pass signature verification."
+                exit 1
+              fi
+              python3 -c '
+          import json, os, sys
+          from pathlib import Path
+          raw = Path(sys.argv[1]).read_bytes()
+          if len(raw) > 8388608:
+              raise SystemExit("::error::Verification evidence exceeds its byte limit.")
+          expected = {
+              "subjectAlternativeName": os.environ["SIGNER_IDENTITY"],
+              "issuer": os.environ["OIDC_ISSUER"],
+              "sourceRepositoryURI": "https://github.com/" + os.environ["GITHUB_REPOSITORY"],
+              "sourceRepositoryDigest": os.environ["SOURCE_SHA"],
+              "sourceRepositoryRef": os.environ["SOURCE_REF"],
+              "buildSignerDigest": os.environ["SOURCE_SHA"],
+              "buildConfigURI": os.environ["BUILDER_IDENTITY"],
+              "buildConfigDigest": os.environ["SOURCE_SHA"], "runnerEnvironment": "self-hosted",
+          }
+          try:
+              results = json.loads(raw.decode("utf-8"))
+              if not isinstance(results, list) or not 1 <= len(results) <= 128:
+                  raise ValueError()
+              for result in results:
+                  verified = result["verificationResult"]
+                  certificate = verified["signature"]["certificate"]
+                  if (
+                      verified["mediaType"] != "application/vnd.dev.sigstore.verificationresult+json;version=0.1"
+                      or any(certificate.get(key) != value for key, value in expected.items())
+                  ):
+                      raise ValueError()
+          except (ValueError, KeyError, TypeError, AttributeError, RecursionError):
+              raise SystemExit("::error::The verified candidate certificate does not match release policy.") from None
+          ' "$RUNNER_TEMP/engine-verification.json"
+            done
             python3 -c '
           import hashlib, json, os, re, sys, zipfile
           from pathlib import Path
@@ -571,14 +1250,14 @@ jobs:
           ):
               raise SystemExit("::error::The bundle does not describe the selected candidate.")
           asset_list = {
-              "apiVersion": "siteops.release.assets/v1",
+              "apiVersion": "siteops.release.assets/v2",
               "kind": "SiteOpsReleaseAssets",
-              "mode": "publish",
               "source": plan["source"],
               "assets": [
-                  {"name": name, "sha256": digest(paths[name])}
+                  {"name": name, "size": paths[name].stat().st_size, "sha256": digest(paths[name])}
                   for name in expected_names
               ],
+              "engine": None,
           }
           output_path.write_text(
               json.dumps(asset_list, indent=2, sort_keys=True) + "\n",
@@ -623,26 +1302,32 @@ jobs:
           for name in names:
               asset = by_name[name]
               digest = asset.get("digest")
-              if asset.get("state") != "uploaded" or not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+              size = asset.get("size")
+              if (
+                  asset.get("state") != "uploaded"
+                  or not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+                  or type(size) is not int or not 0 < size <= 4294967296
+              ):
                   raise SystemExit("::error::The referenced Site Ops release asset identity is incomplete.")
-              assets.append({"name": name, "sha256": digest.removeprefix("sha256:")})
+              assets.append({"name": name, "size": size, "sha256": digest.removeprefix("sha256:")})
           identity_value = release.get("id")
           target = ref.get("object", {}).get("sha")
-          if not isinstance(identity_value, int) or identity_value <= 0:
+          if type(identity_value) is not int or identity_value <= 0:
               raise SystemExit("::error::The referenced Site Ops release identity is invalid.")
           identity = str(identity_value)
           if not isinstance(target, str) or not re.fullmatch(r"[0-9a-f]{40}", target):
               raise SystemExit("::error::The referenced Site Ops tag target is invalid.")
           asset_list = {
-              "apiVersion": "siteops.release.assets/v1",
+              "apiVersion": "siteops.release.assets/v2",
               "kind": "SiteOpsReleaseAssets",
-              "mode": "reference",
+              "source": plan["source"],
+              "assets": [],
               "engine": {
                   "releaseId": identity,
                   "tag": plan["siteops"]["releaseTag"],
                   "target": target,
+                  "assets": assets,
               },
-              "assets": assets,
           }
           Path(sys.argv[4]).write_text(
               json.dumps(asset_list, indent=2, sort_keys=True) + "\n",
@@ -657,7 +1342,8 @@ jobs:
           fi
           python3 -c '
           import hashlib, sys
-          print("asset-list-sha=" + hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())
+          raw = open(sys.argv[1], "rb").read()
+          print("asset-list-sha=" + hashlib.sha256(raw).hexdigest())
           ' "$assets/release-assets.json" >> "$GITHUB_OUTPUT"
 
       - name: Checkout the exact rendering source
@@ -666,8 +1352,74 @@ jobs:
           ref: ${{ github.sha }}
           path: release-tools
           persist-credentials: false
-          sparse-checkout: scripts/render-siteops-release.py
+          sparse-checkout: |
+            scripts/render-siteops-release.py
+            scripts/siteops_release_assets.py
+            scripts/stage-release-payload.py
           sparse-checkout-cone-mode: false
+
+      - name: Download the qualified workspace publication inputs
+        if: needs.prepare.outputs.workspaces == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.workspace-assets.outputs.artifact-id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/release-workspaces
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Download the qualified engine selection
+        if: needs.prepare.outputs.workspaces == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.engine-input.outputs.artifact-id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/release-engine-selection
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Freeze the complete qualified publication payload
+        id: payload
+        shell: bash
+        env:
+          WORKSPACES: ${{ needs.prepare.outputs.workspaces }}
+          EXPECTED_PLAN_SHA: ${{ steps.candidate.outputs.plan-sha }}
+          EXPECTED_NATIVE_SHA: ${{ steps.candidate.outputs.asset-list-sha }}
+          WORKSPACE_SHA: ${{ needs.workspace-assets.outputs.inventory-sha }}
+          ENGINE_SELECTION_SHA: ${{ needs.engine-input.outputs.selection-sha }}
+        run: |
+          set -euo pipefail
+          arguments=()
+          if [[ "$WORKSPACES" == "true" ]]; then
+            arguments+=(
+              --workspace-directory "$RUNNER_TEMP/release-workspaces" --expected-workspace-inventory-sha256 "$WORKSPACE_SHA"
+              --engine-selection "$RUNNER_TEMP/release-engine-selection/workspace-engine.json"
+              --expected-engine-selection-sha256 "$ENGINE_SELECTION_SHA"
+            )
+          fi
+          python3 -B release-tools/scripts/stage-release-payload.py \
+            --plan "$RUNNER_TEMP/release-plan/plan.json" --expected-plan-sha "$EXPECTED_PLAN_SHA" \
+            --engine-inventory "$RUNNER_TEMP/release-assets/release-assets.json" \
+            --expected-engine-inventory-sha256 "$EXPECTED_NATIVE_SHA" \
+            --engine-directory "$RUNNER_TEMP/release-bundle" --output "$RUNNER_TEMP/release-payload" \
+            --output-inventory "$RUNNER_TEMP/final-release-assets/release-assets.json" \
+            "${arguments[@]}" >> "$GITHUB_OUTPUT"
+
+      - name: Retain the complete publication payload
+        id: payload-upload
+        if: needs.prepare.outputs.bundle == 'true' || needs.prepare.outputs.workspaces == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-payload-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-payload
+          if-no-files-found: error
+          overwrite: false
+          compression-level: 0
+          retention-days: 30
 
       - name: Render the final release notes
         id: notes
@@ -677,7 +1429,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 -B release-tools/scripts/render-siteops-release.py notes \
-            --root "$RUNNER_TEMP" >> "$GITHUB_OUTPUT"
+            --root "$RUNNER_TEMP" --inventory "$RUNNER_TEMP/final-release-assets/release-assets.json" >> "$GITHUB_OUTPUT"
 
       - name: Retain the final release notes
         id: notes-upload
@@ -694,7 +1446,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-assets-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/release-assets/release-assets.json
+          path: ${{ runner.temp }}/final-release-assets/release-assets.json
           if-no-files-found: error
           overwrite: false
           retention-days: 30
@@ -705,12 +1457,12 @@ jobs:
           BUNDLE_SHA: ${{ steps.candidate.outputs.bundle-sha }}
           WHEEL_NAME: ${{ steps.candidate.outputs.wheel-name }}
           WHEEL_SHA: ${{ steps.candidate.outputs.wheel-sha }}
-          ASSET_LIST_SHA: ${{ steps.candidate.outputs.asset-list-sha }}
+          ASSET_LIST_SHA: ${{ steps.payload.outputs.asset-list-sha }}
           TAG_EXISTS: ${{ needs.prepare.outputs.tag-exists }}
           ENGINE_VERSION: ${{ steps.candidate.outputs.engine-version }}
           CI_URL: ${{ steps.ci.outputs.url }}
           MATRIX: ${{ needs.distribution.outputs.qualification-matrix }}
-          ARTIFACT_URL: ${{ needs.distribution.outputs.staging-artifact-url }}
+          ARTIFACT_URL: ${{ steps.payload-upload.outputs.artifact-url }}
         run: |
           set -euo pipefail
           python3 -B release-tools/scripts/render-siteops-release.py summary --root "$RUNNER_TEMP"

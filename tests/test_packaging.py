@@ -5,7 +5,6 @@ import email
 import os
 import shutil
 import subprocess
-import sys
 import zipfile
 from pathlib import Path
 
@@ -13,7 +12,7 @@ import pytest
 from packaging.requirements import Requirement
 
 from siteops import __version__
-from tests.installed_runtime import install_engine, isolated_environment
+from tests.installed_runtime import build_engine_wheel, install_engine, isolated_environment
 
 try:
     import tomllib
@@ -27,37 +26,7 @@ ROOT = Path(__file__).resolve().parent.parent
 @pytest.fixture(scope="module")
 def built_wheel(tmp_path_factory):
     root = tmp_path_factory.mktemp("package-build")
-    source = root / "source"
-    source.mkdir()
-    for name in ("pyproject.toml", "README.md", "LICENSE", "ThirdPartyNotices.txt"):
-        shutil.copyfile(ROOT / name, source / name)
-    shutil.copytree(
-        ROOT / "siteops", source / "siteops",
-        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
-    )
-    environment = {
-        **isolated_environment(root / "build-state"),
-        "PIP_CONFIG_FILE": os.devnull,
-        "PIP_NO_INDEX": "1",
-        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
-        "PYTHONDONTWRITEBYTECODE": "1",
-    }
-    result = subprocess.run(
-        [
-            sys.executable, "-B", "-m", "pip", "wheel", "--no-index",
-            "--no-deps", "--no-build-isolation", str(source),
-            "--wheel-dir", str(root / "wheels"),
-        ],
-        cwd=root,
-        env=environment,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    wheels = list((root / "wheels").glob("*.whl"))
-    assert len(wheels) == 1
-    return wheels[0]
+    return build_engine_wheel(root)
 
 
 def test_build_backend_requires_spdx_metadata_support():

@@ -1,0 +1,432 @@
+name: _Workspace Distribution
+
+on:
+  workflow_call:
+    inputs:
+      release-pool:
+        description: "Dedicated 1ES pool admitted by the caller's release runner configuration."
+        required: true
+        type: string
+      expected-source-sha:
+        required: true
+        type: string
+      plan-artifact-id:
+        required: true
+        type: string
+      expected-plan-sha:
+        required: true
+        type: string
+      intent:
+        required: true
+        type: string
+      workspace:
+        required: true
+        type: string
+      slot:
+        required: true
+        type: number
+      dry-run:
+        required: true
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_SHA: ${{ github.sha }}
+  SOURCE_REF: ${{ github.ref }}
+  EXPECTED_SOURCE_SHA: ${{ inputs.expected-source-sha }}
+  EXPECTED_PLAN_SHA: ${{ inputs.expected-plan-sha }}
+  INTENT_PATH: ${{ inputs.intent }}
+  WORKSPACE_SELECTION: ${{ inputs.workspace }}
+  WORKSPACE_SLOT: ${{ inputs.slot }}
+  DRY_RUN: ${{ inputs.dry-run }}
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONIOENCODING: utf-8
+
+jobs:
+  build:
+    name: Build workspace
+    if: >-
+      inputs.release-pool != '' && inputs.release-pool == vars.SITEOPS_RELEASE_POOL &&
+      inputs.expected-source-sha == github.sha &&
+      vars.SITEOPS_RELEASE_PROVENANCE_READY == 'true' && vars.SITEOPS_RELEASE_RUNNER_MODE == 'scaleset' &&
+      (github.workflow_ref == format('{0}/.github/workflows/ci.yaml@{1}', github.repository, github.ref) ||
+       github.workflow_ref == format('{0}/.github/workflows/release.yaml@{1}', github.repository, github.ref)) &&
+      (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    runs-on:
+      - ${{ inputs.release-pool }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      record-sha: ${{ steps.build.outputs.record-sha }}
+      package-name: ${{ steps.build.outputs.package-name }}
+      package-sha: ${{ steps.build.outputs.package-sha }}
+    env:
+      AZURE_CORE_OUTPUT: none
+      AZURE_CORE_COLLECT_TELEMETRY: "false"
+      BICEP_VERSION: v0.45.15
+      BICEP_SHA256: ff5b194b042c220df4a50d6768ed1d6c39a32894bfdc4ff83d62b115d966a7ce
+    steps:
+      - name: Require the admitted runner class
+        shell: python
+        env:
+          RUNNER_CLASS: ${{ runner.environment }}
+        run: |
+          import os
+          import sys
+          if sys.platform != "linux" or os.environ["RUNNER_CLASS"] != "self-hosted":
+              raise SystemExit("::error::Release artifacts require the admitted Linux self-hosted runner.")
+
+      - name: Initialize private workspace paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/workspace-home" "$RUNNER_TEMP/workspace-azure"
+          {
+            printf 'HOME=%s\n' "$RUNNER_TEMP/workspace-home"
+            printf 'AZURE_CONFIG_DIR=%s\n' "$RUNNER_TEMP/workspace-azure"
+            printf 'WORKSPACE_PYTHON=%s\n' "$RUNNER_TEMP/workspace-tools/bin/python"
+          } >> "$GITHUB_ENV"
+
+      - name: Checkout the event commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Download the prepared release plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ inputs.plan-artifact-id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/workspace-plan
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Install workspace production tools
+        shell: bash
+        env:
+          PIP_CONFIG_FILE: /dev/null
+          PIP_INDEX_URL: https://packagefeedproxy.microsoft.io/pypi/simple/
+          PIP_EXTRA_INDEX_URL: ""
+          PIP_NO_INPUT: "1"
+          PIP_KEYRING_PROVIDER: disabled
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$HOME" "$AZURE_CONFIG_DIR"
+          python -m venv "$RUNNER_TEMP/workspace-tools"
+          if ! "$WORKSPACE_PYTHON" -m pip install --require-hashes --only-binary=:all: --no-cache-dir \
+            -r scripts/siteops-build-requirements.txt -r scripts/siteops-runtime-requirements.txt \
+            > "$RUNNER_TEMP/workspace-tooling.log" 2>&1; then
+            echo "::error::Workspace production tooling could not be installed from the configured feed."
+            exit 1
+          fi
+          download="$RUNNER_TEMP/workspace-bicep.download"
+          if ! curl --disable --fail --silent --show-error --location \
+            --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --max-time 120 --max-redirs 3 --max-filesize 134217728 \
+            "https://github.com/Azure/bicep/releases/download/$BICEP_VERSION/bicep-linux-x64" \
+            --output "$download" \
+            > "$RUNNER_TEMP/workspace-bicep.log" 2>&1; then
+            echo "::error::The selected Bicep compiler could not be downloaded."
+            exit 1
+          fi
+          if ! printf '%s  %s\n' "$BICEP_SHA256" "$download" | sha256sum --check --status; then
+            echo "::error::The Bicep compiler differs from its approved SHA-256."
+            exit 1
+          fi
+          mkdir -p "$AZURE_CONFIG_DIR/bin"
+          if [[ -e "$AZURE_CONFIG_DIR/bin/bicep" || -L "$AZURE_CONFIG_DIR/bin/bicep" ]]; then
+            echo "::error::The compiler destination already exists."
+            exit 1
+          fi
+          install -m 700 "$download" "$AZURE_CONFIG_DIR/bin/bicep"
+          rm "$download"
+
+      - name: Produce the prepared workspaces
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          if [[ "$EXPECTED_SOURCE_SHA" != "$SOURCE_SHA" || ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::The workspace source must be the asserted event commit."
+            exit 1
+          fi
+          arguments=()
+          if [[ "$DRY_RUN" == "true" ]]; then
+            arguments+=(--dry-run)
+          fi
+          if ! "$WORKSPACE_PYTHON" -B scripts/build-workspace-release.py \
+            --root "$GITHUB_WORKSPACE" --repository "$GITHUB_REPOSITORY" \
+            --expected-source-sha "$SOURCE_SHA" --source-ref "$SOURCE_REF" \
+            --release-file "$INTENT_PATH" --release-workspace "$WORKSPACE_SELECTION" \
+            --prepared-plan "$RUNNER_TEMP/workspace-plan/plan.json" --expected-plan-sha "$EXPECTED_PLAN_SHA" \
+            --build-number "$GITHUB_RUN_ID" --build-attempt "$GITHUB_RUN_ATTEMPT" \
+            --bicep "$AZURE_CONFIG_DIR/bin/bicep" --output-dir "$RUNNER_TEMP/workspace-assets" \
+            "${arguments[@]}" > "$RUNNER_TEMP/workspace-build-summary.json" 2> "$RUNNER_TEMP/workspace-build.err"; then
+            echo "::error::Workspace production failed. Check the declared source, compatibility, indexes and compiler inputs."
+            exit 1
+          fi
+          "$WORKSPACE_PYTHON" -c '
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"])
+          summary = json.loads((root / "workspace-build-summary.json").read_bytes())
+          assets = root / "workspace-assets"
+          raw = (assets / "workspace-builds.json").read_bytes()
+          plan_raw = (root / "workspace-plan/plan.json").read_bytes()
+          if (
+              hashlib.sha256(raw).hexdigest() != summary["sha256"]
+              or hashlib.sha256(plan_raw).hexdigest() != os.environ["EXPECTED_PLAN_SHA"]
+          ):
+              raise SystemExit("::error::Workspace production did not retain the prepared identities.")
+          record = json.loads(raw)
+          plan = json.loads(plan_raw)
+          slot = int(os.environ["WORKSPACE_SLOT"])
+          if not 1 <= slot <= len(plan["workspaces"]) <= 64:
+              raise SystemExit("::error::The workspace slot is invalid.")
+          request = plan["workspaces"][slot - 1]
+          if (
+              record["planSha256"] != os.environ["EXPECTED_PLAN_SHA"]
+              or record["source"] != plan["source"]
+              or record["dryRun"] is not (os.environ["DRY_RUN"] == "true")
+              or record["provenance"] != "not-established"
+              or request["workspace"] != os.environ["WORKSPACE_SELECTION"]
+              or len(record["workspaces"]) != 1
+          ):
+              raise SystemExit("::error::Workspace production did not retain the prepared identities.")
+          produced = record["workspaces"][0]
+          package = produced["package"]
+          if (
+              produced["workspace"] != request["workspace"]
+              or produced["kit"] != {"id": request["id"], "version": plan["release"]["version"]}
+              or package["name"] != request["package"]
+          ):
+              raise SystemExit("::error::A workspace output differs from the prepared selection.")
+          path = assets / package["name"]
+          if (
+              path.is_symlink() or not path.is_file()
+              or path.stat().st_size != package["size"]
+              or type(package["size"]) is not int or not 0 < package["size"] <= 134217728
+          ):
+              raise SystemExit("::error::A workspace output has an invalid file identity.")
+          digest = hashlib.sha256()
+          with path.open("rb") as stream:
+              for chunk in iter(lambda: stream.read(1048576), b""):
+                  digest.update(chunk)
+          if digest.hexdigest() != package["sha256"]:
+              raise SystemExit("::error::A workspace output changed after production.")
+          if {path.name for path in assets.iterdir()} != {"workspace-builds.json", package["name"]}:
+              raise SystemExit("::error::Workspace output includes undeclared files.")
+          print("record-sha=" + summary["sha256"])
+          print("package-name=" + package["name"])
+          print("package-sha=" + package["sha256"])
+          ' >> "$GITHUB_OUTPUT"
+
+      - name: Retain the unsigned workspace assets
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: workspace-build-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.slot }}
+          path: ${{ runner.temp }}/workspace-assets
+          if-no-files-found: error
+          overwrite: false
+          compression-level: 0
+          retention-days: 30
+
+  attest:
+    name: Attest workspace
+    needs: build
+    runs-on:
+      - ${{ inputs.release-pool }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    env:
+      EXPECTED_RECORD_SHA: ${{ needs.build.outputs.record-sha }}
+      EXPECTED_PACKAGE_SHA: ${{ needs.build.outputs.package-sha }}
+      PACKAGE_NAME: ${{ needs.build.outputs.package-name }}
+    steps:
+      - name: Require the admitted runner class
+        shell: python
+        env:
+          RUNNER_CLASS: ${{ runner.environment }}
+        run: |
+          import os
+          import sys
+          if sys.platform != "linux" or os.environ["RUNNER_CLASS"] != "self-hosted":
+              raise SystemExit("::error::Release artifacts require the admitted Linux self-hosted runner.")
+
+      - name: Download the prepared release plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ inputs.plan-artifact-id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/workspace-plan
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Download this workspace build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/workspace-subject
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Admit the exact workspace subjects
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -c '
+          import hashlib, json, os, re, stat
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"])
+          subject = root / "workspace-subject"
+
+          def checked(path, maximum):
+              info = path.lstat()
+              if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not 0 < info.st_size <= maximum:
+                  raise SystemExit("::error::A signing input is not a bounded regular file.")
+              digest = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(1048576), b""):
+                      digest.update(chunk)
+              return info.st_size, digest.hexdigest()
+
+          plan_path = root / "workspace-plan/plan.json"
+          record_path = subject / "workspace-builds.json"
+          if (
+              checked(plan_path, 1048576)[1] != os.environ["EXPECTED_PLAN_SHA"]
+              or checked(record_path, 2097152)[1] != os.environ["EXPECTED_RECORD_SHA"]
+              or os.environ["SOURCE_SHA"] != os.environ["EXPECTED_SOURCE_SHA"]
+          ):
+              raise SystemExit("::error::Signing inputs differ from the prepared build.")
+          plan = json.loads(plan_path.read_bytes())
+          record = json.loads(record_path.read_bytes())
+          slot = int(os.environ["WORKSPACE_SLOT"])
+          if not 1 <= slot <= len(plan["workspaces"]) <= 64:
+              raise SystemExit("::error::The signing slot is invalid.")
+          request = plan["workspaces"][slot - 1]
+          name = request["package"]
+          if (
+              not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.!+_~-]*\.zip", name)
+              or ".." in name or len(name + ".attestation.jsonl") > 255 or name != os.environ["PACKAGE_NAME"]
+              or request["workspace"] != os.environ["WORKSPACE_SELECTION"]
+          ):
+              raise SystemExit("::error::The selected signing subject is invalid.")
+          source = {"repository": os.environ["GITHUB_REPOSITORY"], "commit": os.environ["SOURCE_SHA"], "ref": os.environ["SOURCE_REF"]}
+          if (
+              plan["source"] != source or record["source"] != source
+              or record["apiVersion"] != "siteops.release.workspaces/v1" or record["kind"] != "WorkspaceBuilds"
+              or record["planSha256"] != os.environ["EXPECTED_PLAN_SHA"]
+              or record["intent"] != {"path": plan["intent"]["path"], "sha256": plan["intent"]["sha256"]}
+              or record["dryRun"] is not (os.environ["DRY_RUN"] == "true")
+              or plan["dryRun"] is not record["dryRun"]
+              or record["provenance"] != "not-established" or len(record["workspaces"]) != 1
+          ):
+              raise SystemExit("::error::The signing record describes another candidate.")
+          engine = plan["siteops"]
+          version = (
+              engine["baseVersion"] + "+build." + os.environ["GITHUB_RUN_ID"] + "." +
+              os.environ["GITHUB_RUN_ATTEMPT"] + ".g" + os.environ["SOURCE_SHA"][:12]
+              if engine["bundle"] else engine["releaseTag"].removeprefix("siteops/v")
+          )
+          produced = record["workspaces"][0]
+          size, digest = checked(subject / name, 134217728)
+          if (
+              record["engineVersion"] != version or produced["workspace"] != request["workspace"]
+              or produced["kit"] != {"id": request["id"], "version": plan["release"]["version"]}
+              or produced["package"] != {"name": name, "size": size, "sha256": digest}
+              or digest != os.environ["EXPECTED_PACKAGE_SHA"]
+              or {path.name for path in subject.iterdir()} != {"workspace-builds.json", name}
+          ):
+              raise SystemExit("::error::The workspace subject differs from its build identity.")
+          '
+
+      - name: Attest workspace package
+        id: package
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/workspace-subject/${{ needs.build.outputs.package-name }}
+          show-summary: false
+
+      - name: Attest workspace build record
+        id: record
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/workspace-subject/workspace-builds.json
+          show-summary: false
+
+      - name: Retain the exact attested bytes
+        shell: bash
+        env:
+          PACKAGE_PROOF: ${{ steps.package.outputs.bundle-path }}
+          RECORD_PROOF: ${{ steps.record.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          python3 -c '
+          import hashlib, os, stat
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"])
+          output = root / "workspace-attested"
+          output.mkdir(mode=0o700)
+          suffix = ".attestation.jsonl"
+          inputs = (
+              (root / "workspace-subject" / os.environ["PACKAGE_NAME"], os.environ["PACKAGE_NAME"], 134217728, os.environ["EXPECTED_PACKAGE_SHA"]),
+              (root / "workspace-subject/workspace-builds.json", "workspace-builds.json", 2097152, os.environ["EXPECTED_RECORD_SHA"]),
+              (Path(os.environ["PACKAGE_PROOF"]), os.environ["PACKAGE_NAME"] + suffix, 2097152, None),
+              (Path(os.environ["RECORD_PROOF"]), "workspace-builds.json" + suffix, 2097152, None),
+          )
+          for path, name, maximum, expected in inputs:
+              info = path.lstat()
+              if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not 0 < info.st_size <= maximum:
+                  raise SystemExit("::error::An attested input is not a bounded regular file.")
+              digest = hashlib.sha256()
+              size = 0
+              descriptor = os.open(output / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+              with path.open("rb") as incoming, os.fdopen(descriptor, "wb") as target:
+                  while chunk := incoming.read(min(1048576, maximum - size + 1)):
+                      size += len(chunk)
+                      if size > maximum:
+                          raise SystemExit("::error::An attested input exceeds its byte limit.")
+                      target.write(chunk)
+                      digest.update(chunk)
+              if size != info.st_size or (expected is not None and digest.hexdigest() != expected):
+                  raise SystemExit("::error::Staging changed an attested subject.")
+          '
+
+      - name: Upload the attested workspace
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: workspace-attested-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.slot }}
+          path: ${{ runner.temp }}/workspace-attested
+          if-no-files-found: error
+          overwrite: false
+          compression-level: 0
+          retention-days: 30

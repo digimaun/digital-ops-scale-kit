@@ -1293,6 +1293,99 @@ class TestMainArgumentParsing:
         assert "validate" in captured.out
         assert "sites" in captured.out
 
+    def test_help_leads_with_operator_work_and_distinguishes_global_options(self, capsys):
+        with patch.object(sys, "argv", ["siteops", "--help"]):
+            with pytest.raises(SystemExit) as stopped:
+                main()
+        assert stopped.value.code == 0
+        help_text = capsys.readouterr().out
+        rows = help_text.split("positional arguments:", 1)[1].split("options:", 1)[0]
+        order = re.findall(
+            r"^    (browse|inputs|sites|validate|plan|deploy|project|source|index|cache)\s",
+            rows, flags=re.MULTILINE,
+        )
+        assert order == [
+            "browse", "inputs", "sites", "validate", "plan", "deploy",
+            "project", "source", "index", "cache",
+        ]
+        assert "Global options such as --project and --approved-source precede the command." in help_text
+        assert "siteops --approved-source NAME project pin ./factory --release RELEASE" in help_text
+
+    @pytest.mark.parametrize(("arguments", "expected"), [
+        (["source", "--help"], "Enroll a consumer-approved source"),
+        (["source", "enroll", "--help"], "--trust-policy FILE"),
+        (["source", "show", "--help"], "private"),
+        (["source", "list", "--help"], "private"),
+        (["source", "remove", "--help"], "workspace pin"),
+        (["project", "pin", "--help"], "@RELEASE"),
+    ])
+    def test_source_and_project_help_explain_requiredness_and_effects(
+        self, capsys, arguments, expected,
+    ):
+        with patch.object(sys, "argv", ["siteops", *arguments]):
+            with pytest.raises(SystemExit) as stopped:
+                main()
+        assert stopped.value.code == 0
+        assert expected in capsys.readouterr().out
+
+    @pytest.mark.parametrize(("option", "first", "second"), [
+        ("-w", "one", "two"),
+        ("--project", "one", "two"),
+        ("--trust-policy", "one.json", "two.json"),
+        ("--trusted-root", "one.jsonl", "two.jsonl"),
+        ("--approved-source", "one", "two"),
+    ])
+    def test_repeated_global_content_and_trust_selection_fails_before_use(
+        self, capsys, option, first, second,
+    ):
+        with (
+            patch.object(sys, "argv", ["siteops", option, first, option, second, "sites"]),
+            patch("siteops.cli.open_command_context", side_effect=AssertionError("No source read")),
+        ):
+            with pytest.raises(SystemExit) as stopped:
+                main()
+        assert stopped.value.code == 2
+        output = capsys.readouterr().err
+        assert option in output and "only once" in output
+        assert first not in output and second not in output
+
+    @pytest.mark.parametrize("arguments", [
+        ["browse", "--source", "github:example/one", "--source", "github:example/two"],
+        ["browse", "--ref", "first", "--ref", "second"],
+        ["browse", "--auth", "anonymous", "--auth", "cli"],
+        ["project", "pin", "--source", "github:example/one", "--source", "github:example/two"],
+        ["project", "pin", "--release", "v1", "--release", "v2"],
+        ["project", "pin", "--release-workspace", "one", "--release-workspace", "two"],
+    ])
+    def test_repeated_publisher_or_access_selection_fails_before_use(
+        self, capsys, arguments,
+    ):
+        with (
+            patch.object(sys, "argv", ["siteops", *arguments]),
+            patch("siteops.cli.cmd_browse", side_effect=AssertionError("No remote read")),
+            patch("siteops.cli.cmd_project", side_effect=AssertionError("No project write")),
+        ):
+            with pytest.raises(SystemExit) as stopped:
+                main()
+        assert stopped.value.code == 2
+        assert "only once" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("command", ["plan", "deploy"])
+    def test_repeated_parallel_cap_does_not_silently_change_fleet_concurrency(
+        self, capsys, command,
+    ):
+        with (
+            patch.object(
+                sys, "argv",
+                ["siteops", command, "aio-install", "--parallel", "3", "-p", "0"],
+            ),
+            patch("siteops.cli.open_command_context", side_effect=AssertionError("No Site read")),
+        ):
+            with pytest.raises(SystemExit) as stopped:
+                main()
+        assert stopped.value.code == 2
+        assert "--parallel" in capsys.readouterr().err
+
     def test_version_flag(self, capsys):
         """Test --version shows version."""
         from siteops import __version__

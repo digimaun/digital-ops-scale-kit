@@ -79,7 +79,7 @@ def _card(
     if entry.targeting_known and not entry.selector and not entry.sites:
         lines.append("  No targets declared. Supply an explicit selector when planning.")
     lines.append("  Targets have not been resolved. A CLI selector replaces manifest targeting.")
-    lines.extend(("", "Supported Site inputs"))
+    lines.extend(("", "Authored Site input guidance"))
     if guidance.inputs is None:
         lines.append("  Input guidance is not documented. This does not mean no inputs are required.")
     elif not guidance.inputs:
@@ -96,6 +96,25 @@ def _card(
                 lines.extend(_wrap(
                     "Default behavior: " + _text(item.default_behavior), indent="    "
                 ))
+    if guidance.role == "standalone":
+        if local or project is not None:
+            lines.extend((
+                "", "Input guidance above is descriptive, not the executable input contract.",
+            ))
+            lines.extend(_wrap(
+                "Use `siteops inputs NAME` with this selected workspace or project "
+                "for exact typed answers, if the entry declares a contract.",
+                indent="",
+            ))
+        else:
+            lines.extend((
+                "", "Remote metadata cannot validate typed inputs.",
+            ))
+            lines.extend(_wrap(
+                "Pin an approved workspace or choose reviewed local content before "
+                "using `siteops inputs`.",
+                indent="",
+            ))
     lines.extend(("", "Supplied during deployment"))
     if guidance.supplied is None:
         lines.append("  Step-supplied inputs are not documented.")

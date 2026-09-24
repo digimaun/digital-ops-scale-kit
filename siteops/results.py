@@ -207,6 +207,7 @@ class RunDiagnostic:
     summary: str
     private_detail: str | None = field(default=None, repr=False, compare=False)
     serialized_detail: str | None = None
+    public_summary: str | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.code, "Run diagnostic code")
@@ -218,6 +219,8 @@ class RunDiagnostic:
                 self.serialized_detail,
                 "Run diagnostic serialized detail",
             )
+        if self.public_summary is not None:
+            _require_text(self.public_summary, "Run diagnostic public summary")
 
 
 @dataclass(frozen=True)
@@ -522,6 +525,7 @@ def preparation_failure_result(result: PlanBuildResult) -> RunResult:
             summary=diagnostic.summary,
             private_detail=diagnostic.detail,
             serialized_detail=diagnostic.serialized_detail,
+            public_summary=diagnostic.public_summary,
         )
         for diagnostic in result.diagnostics
     )

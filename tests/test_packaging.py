@@ -44,6 +44,8 @@ def test_wheel_contains_the_engine_not_a_workspace(built_wheel):
     with zipfile.ZipFile(built_wheel) as wheel:
         names = wheel.namelist()
     assert "siteops/cli.py" in names
+    assert "siteops/arm_resources.py" in names
+    assert "siteops/arm_resources_azure_cli.py" in names
     assert "siteops/orchestrator.py" in names
     assert "siteops/results.py" in names
     assert all(
@@ -146,6 +148,38 @@ def test_installed_project_cache_and_offline_plan_surface(installed_engine):
     failed = app.run(*project_options, "plan", "storage", "--offline", expected=1)
     assert "selected proof is not cached" in failed.stderr
     assert (site.read_bytes(), (project / "siteops.pin").read_bytes()) == before
+
+
+def test_installed_engine_prepares_a_guided_aio_target(installed_engine):
+    import json
+
+    workspace = ROOT / "workspaces" / "iot-operations"
+    app = installed_engine
+    command = ("-w", str(workspace))
+    inspected = json.loads(app.run(*command, "inputs", "aio-install", "--output", "json").stdout)
+    assert next(field for field in inspected["inputs"] if field["name"] == "clusterName")[
+        "status"
+    ] == "required"
+
+    planned = json.loads(app.run(
+        *command, "plan", "aio-install", "--describe",
+        "--input", "siteName=plant-one",
+        "--input", "subscription=00000000-0000-0000-0000-000000000001",
+        "--input", "resourceGroup=rg-existing",
+        "--input", "location=eastus",
+        "--input", "clusterName=existing-arc",
+        "--input", "environment=dev",
+        "--input", "country=US",
+        "--output", "json",
+    ).stdout)
+    assert planned["status"] == "planned"
+    assert [target["name"] for target in planned["plan"]["targets"]] == ["plant-one"]
+    invalid = app.run(
+        *command, "plan", "aio-install", "--describe",
+        "--input", "cluster=not-an-arm-id", "--read-resources", "--output", "json",
+        expected=1,
+    )
+    assert json.loads(invalid.stdout)["diagnostics"][0]["code"] == "inputs.resource.invalid-id"
 
 
 def test_installed_worker_is_present_and_uses_its_fixed_protocol(installed_engine):

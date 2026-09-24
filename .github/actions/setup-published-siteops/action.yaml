@@ -1,0 +1,360 @@
+name: Setup published Site Ops
+description: Verify and install one published Site Ops bundle for package-backed E2E.
+
+inputs:
+  repository:
+    description: GitHub repository that owns the release.
+    required: true
+  release:
+    description: Exact published release tag.
+    required: true
+  source-sha:
+    description: Full expected main-branch source commit.
+    required: true
+  github-token:
+    description: Read-only GitHub token for release and attestation access.
+    required: true
+  state:
+    description: New private state directory beneath RUNNER_TEMP.
+    required: true
+
+outputs:
+  version:
+    description: Installed Site Ops package version.
+    value: ${{ steps.install.outputs.version }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: "3.11"
+
+    - name: Verify and install the published bundle
+      id: install
+      shell: bash
+      env:
+        EXPECTED_REPOSITORY: ${{ inputs.repository }}
+        EXPECTED_RELEASE: ${{ inputs.release }}
+        EXPECTED_SOURCE_SHA: ${{ inputs.source-sha }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        STATE: ${{ inputs.state }}
+        PACKAGE_INDEX_URL: https://packagefeedproxy.microsoft.io/pypi/simple/
+        PIPX_VERSION: 1.17.2
+        SHARED_PIP_SPEC: pip==26.2.1
+        SHARED_PIP_SHA256: 71138adf1f4ca900cdb7d289c21b7494329f2332b6d85f0e1c42108c0384ed3e
+        PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        PIP_NO_INPUT: "1"
+        PIP_KEYRING_PROVIDER: disabled
+        PIP_EXTRA_INDEX_URL: ""
+        PYTHONSAFEPATH: "1"
+      run: |
+        set -euo pipefail
+        umask 077
+        unset PYTHONPATH PYTHONHOME
+        export PIP_CONFIG_FILE=/dev/null
+
+        python - "$STATE" "$RUNNER_TEMP" "$EXPECTED_REPOSITORY" \
+          "$GITHUB_REPOSITORY" "$EXPECTED_RELEASE" "$EXPECTED_SOURCE_SHA" <<'PY'
+        import re
+        import sys
+        from pathlib import Path
+
+        state, temp = (Path(value).resolve() for value in sys.argv[1:3])
+        if not state.is_relative_to(temp) or state == temp or state.exists():
+            raise SystemExit("Published E2E state must be a new directory beneath RUNNER_TEMP.")
+        if sys.argv[3] != sys.argv[4]:
+            raise SystemExit("Published E2E can consume releases only from the current repository.")
+        if not sys.argv[5].strip() or len(sys.argv[5]) > 128 or any(
+            character.isspace() for character in sys.argv[5]
+        ):
+            raise SystemExit("The published release tag is invalid.")
+        if not re.fullmatch(r"[0-9a-f]{40}", sys.argv[6]):
+            raise SystemExit("The published release source SHA must be a full lowercase commit.")
+        state.mkdir(parents=True)
+        PY
+
+        mkdir "$STATE/gh" "$STATE/download" "$STATE/trust"
+        export GH_CONFIG_DIR="$STATE/gh"
+        encoded_tag="$(python -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$EXPECTED_RELEASE")"
+        gh api "repos/$EXPECTED_REPOSITORY/releases/tags/$encoded_tag" > "$STATE/release.json"
+        gh api "repos/$EXPECTED_REPOSITORY/git/ref/tags/$encoded_tag" > "$STATE/tag.json"
+        python - "$STATE/release.json" "$STATE/tag.json" \
+          "$EXPECTED_RELEASE" "$EXPECTED_SOURCE_SHA" <<'PY'
+        import json
+        import sys
+        from pathlib import Path
+
+        release = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+        reference = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+        if (
+            release.get("tag_name") != sys.argv[3]
+            or release.get("draft") is not False
+            or reference.get("object", {}).get("type") != "commit"
+            or reference.get("object", {}).get("sha") != sys.argv[4]
+        ):
+            raise SystemExit("The published release does not target the expected commit.")
+        assets = release.get("assets")
+        if not isinstance(assets, list):
+            raise SystemExit("The published release has no bounded asset inventory.")
+        selected = {
+            asset.get("name"): asset
+            for asset in assets
+            if isinstance(asset, dict)
+            and asset.get("name") in {
+                "siteops-install.zip",
+                "siteops-install.zip.attestation.jsonl",
+            }
+        }
+        if set(selected) != {
+            "siteops-install.zip",
+            "siteops-install.zip.attestation.jsonl",
+        }:
+            raise SystemExit("The published release lacks the verified installation pair.")
+        limits = {
+            "siteops-install.zip": 128 * 1024 * 1024,
+            "siteops-install.zip.attestation.jsonl": 2 * 1024 * 1024,
+        }
+        for name, asset in selected.items():
+            size = asset.get("size")
+            digest = asset.get("digest")
+            if (
+                type(size) is not int
+                or not 1 <= size <= limits[name]
+                or not isinstance(digest, str)
+                or not digest.startswith("sha256:")
+                or len(digest) != 71
+            ):
+                raise SystemExit("The published installation asset identity is invalid.")
+        Path(sys.argv[1]).with_name("selected-assets.json").write_text(
+            json.dumps(selected, sort_keys=True),
+            encoding="utf-8",
+        )
+        PY
+
+        gh release download "$EXPECTED_RELEASE" \
+          --repo "$EXPECTED_REPOSITORY" \
+          --pattern siteops-install.zip \
+          --pattern siteops-install.zip.attestation.jsonl \
+          --dir "$STATE/download"
+        python - "$STATE/selected-assets.json" "$STATE/download" <<'PY'
+        import hashlib
+        import json
+        import sys
+        from pathlib import Path
+
+        selected = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+        root = Path(sys.argv[2])
+        for name, identity in selected.items():
+            path = root / name
+            raw = path.read_bytes()
+            if (
+                len(raw) != identity.get("size")
+                or "sha256:" + hashlib.sha256(raw).hexdigest() != identity.get("digest")
+            ):
+                raise SystemExit(f"The downloaded published asset changed: {name}")
+        PY
+
+        source_ref=refs/heads/main
+        signer="https://github.com/$EXPECTED_REPOSITORY/.github/workflows/_siteops-distribution.yaml@$source_ref"
+        builder="https://github.com/$EXPECTED_REPOSITORY/.github/workflows/release.yaml@$source_ref"
+        gh attestation verify "$STATE/download/siteops-install.zip" \
+          --bundle "$STATE/download/siteops-install.zip.attestation.jsonl" \
+          --repo "$EXPECTED_REPOSITORY" \
+          --cert-identity "$signer" \
+          --source-ref "$source_ref" \
+          --source-digest "$EXPECTED_SOURCE_SHA" \
+          --signer-digest "$EXPECTED_SOURCE_SHA" \
+          --cert-oidc-issuer https://token.actions.githubusercontent.com \
+          --predicate-type https://slsa.dev/provenance/v1 \
+          --hostname github.com \
+          --digest-alg sha256 \
+          --format json > "$STATE/engine-verification.json"
+        python - "$STATE/engine-verification.json" "$EXPECTED_REPOSITORY" \
+          "$EXPECTED_SOURCE_SHA" "$source_ref" "$signer" "$builder" <<'PY'
+        import json
+        import sys
+        from pathlib import Path
+
+        results = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+        expected = {
+            "subjectAlternativeName": sys.argv[5],
+            "issuer": "https://token.actions.githubusercontent.com",
+            "sourceRepositoryURI": "https://github.com/" + sys.argv[2],
+            "sourceRepositoryDigest": sys.argv[3],
+            "sourceRepositoryRef": sys.argv[4],
+            "buildSignerDigest": sys.argv[3],
+            "buildConfigURI": sys.argv[6],
+            "buildConfigDigest": sys.argv[3],
+            "runnerEnvironment": "self-hosted",
+        }
+        if not isinstance(results, list) or not 1 <= len(results) <= 128:
+            raise SystemExit("The engine verifier returned no bounded evidence.")
+        for result in results:
+            try:
+                verified = result["verificationResult"]
+                certificate = verified["signature"]["certificate"]
+                valid = (
+                    verified["mediaType"]
+                    == "application/vnd.dev.sigstore.verificationresult+json;version=0.1"
+                    and all(certificate.get(key) == value for key, value in expected.items())
+                )
+            except (KeyError, TypeError):
+                valid = False
+            if not valid:
+                raise SystemExit("The engine certificate does not satisfy release policy.")
+        PY
+
+        gh attestation trusted-root > "$STATE/trust/trusted-root.json"
+        python - "$STATE/download/siteops-install.zip" "$STATE/bundle" <<'PY'
+        import stat
+        import sys
+        import zipfile
+        from pathlib import Path, PurePosixPath
+
+        archive, output = Path(sys.argv[1]), Path(sys.argv[2])
+        output.mkdir()
+        with zipfile.ZipFile(archive) as package:
+            members = package.infolist()
+            if not 1 <= len(members) <= 4096:
+                raise SystemExit("The installation archive inventory is invalid.")
+            seen = set()
+            total = 0
+            for member in members:
+                name = member.filename
+                path = PurePosixPath(name)
+                mode = member.external_attr >> 16
+                key = name.casefold()
+                total += member.file_size
+                if (
+                    not name
+                    or "\\" in name
+                    or path.is_absolute()
+                    or ".." in path.parts
+                    or stat.S_ISLNK(mode)
+                    or key in seen
+                    or total > 256 * 1024 * 1024
+                ):
+                    raise SystemExit("The installation archive contains an unsafe member.")
+                seen.add(key)
+            package.extractall(output)
+        PY
+
+        python -m venv "$STATE/tooling"
+        PIP_INDEX_URL="$PACKAGE_INDEX_URL" "$STATE/tooling/bin/python" -m pip install \
+          --no-cache-dir \
+          "pipx==$PIPX_VERSION"
+        mkdir "$STATE/tool-wheels"
+        printf '%s \\\n    --hash=sha256:%s\n' \
+          "$SHARED_PIP_SPEC" "$SHARED_PIP_SHA256" > "$STATE/pip-requirements.txt"
+        PIP_INDEX_URL="$PACKAGE_INDEX_URL" "$STATE/tooling/bin/python" -m pip download \
+          --no-cache-dir \
+          --require-hashes \
+          --only-binary=:all: \
+          --no-deps \
+          --dest "$STATE/tool-wheels" \
+          --requirement "$STATE/pip-requirements.txt"
+        export PIPX_HOME="$STATE/pipx"
+        export PIPX_BIN_DIR="$STATE/pipx-bin"
+        export PIPX_MAN_DIR="$STATE/pipx-man"
+        export PIPX_COMPLETION_DIR="$STATE/pipx-completions"
+        export PIPX_SHARED_LIBS="$STATE/pipx-shared"
+        export PIPX_DEFAULT_PYTHON="$(command -v python)"
+        export PIPX_USE_EMOJI=0
+        export PIP_CACHE_DIR="$STATE/pip-cache"
+        wheelhouse="$(python -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).as_uri())' "$STATE/tool-wheels")"
+        "$STATE/tooling/bin/pipx" upgrade-shared \
+          --pip-args "--no-index --only-binary=:all: --no-cache-dir --force-reinstall --find-links=$wheelhouse"
+        "$STATE/tooling/bin/pipx" install siteops \
+          --lock "$STATE/bundle/pylock.toml" \
+          --backend pip \
+          --fetch-python never \
+          --skip-maintenance \
+          --app siteops \
+          --pip-args "--isolated --require-hashes --no-index --only-binary=:all: --no-cache-dir"
+        export PATH="$PIPX_BIN_DIR:$PATH"
+        backend_version="$("$STATE/tooling/bin/pipx" runpip siteops --version)"
+        if [[ "${backend_version%% from *}" != "pip ${SHARED_PIP_SPEC#pip==}" ]]; then
+          echo "::error::The published E2E application uses an unexpected pip backend."
+          exit 1
+        fi
+
+        package_version="$(python - "$STATE/bundle/bundle.json" <<'PY'
+        import json
+        import sys
+        from pathlib import Path
+
+        document = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+        package = document.get("package")
+        version = package.get("version") if isinstance(package, dict) else None
+        if not isinstance(version, str) or not version:
+            raise SystemExit("The authenticated bundle has no package version.")
+        print(version)
+        PY
+        )"
+        observed="$(cd "$STATE" && siteops --version)"
+        if [[ "$observed" != "siteops $package_version" ]]; then
+          echo "::error::The installed command does not match the authenticated bundle."
+          exit 1
+        fi
+        "$PIPX_HOME/venvs/siteops/bin/python" -I - \
+          "$GITHUB_WORKSPACE" "$package_version" <<'PY'
+        import importlib.metadata
+        import sys
+        from pathlib import Path
+
+        source = Path(sys.argv[1]).resolve()
+        import siteops
+
+        module = Path(siteops.__file__).resolve()
+        if module.is_relative_to(source):
+            raise SystemExit("Published E2E imported Site Ops from checkout.")
+        if importlib.metadata.version("siteops") != sys.argv[2]:
+            raise SystemExit("The installed Site Ops package version changed.")
+        PY
+
+        root_digest="$(sha256sum "$STATE/trust/trusted-root.json" | cut -d ' ' -f 1)"
+        root_size="$(wc -c < "$STATE/trust/trusted-root.json")"
+        if (( root_size < 1 || root_size > 2097152 )); then
+          echo "::error::The independent trusted-root snapshot is invalid."
+          exit 1
+        fi
+        python - "$STATE/trust/policy.json" "$root_digest" \
+          "$EXPECTED_REPOSITORY" <<'PY'
+        import json
+        import sys
+        from datetime import datetime, timedelta, timezone
+        from pathlib import Path
+
+        document = {
+            "apiVersion": "siteops/v1alpha1",
+            "kind": "ArtifactVerificationPolicy",
+            "id": "published-e2e-workspace",
+            "version": 1,
+            "validUntil": (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat(),
+            "trustedRootSha256": sys.argv[2],
+            "provider": {
+                "kind": "github-attestation/v1",
+                "repository": sys.argv[3],
+                "sourceRef": "refs/heads/main",
+                "signerWorkflow": ".github/workflows/_workspace-distribution.yaml",
+                "builderWorkflow": ".github/workflows/release.yaml",
+                "runnerEnvironment": "self-hosted",
+            },
+        }
+        Path(sys.argv[1]).write_text(
+            json.dumps(document, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        PY
+
+        {
+          echo "SITEOPS_E2E_POLICY=$STATE/trust/policy.json"
+          echo "SITEOPS_E2E_TRUSTED_ROOT=$STATE/trust/trusted-root.json"
+          echo "SITEOPS_E2E_INSTALL_STATE=$STATE"
+          echo "SITEOPS_E2E_ENGINE_VERSION=$package_version"
+          echo "PYTHONSAFEPATH=1"
+        } >> "$GITHUB_ENV"
+        echo "$PIPX_BIN_DIR" >> "$GITHUB_PATH"
+        echo "version=$package_version" >> "$GITHUB_OUTPUT"

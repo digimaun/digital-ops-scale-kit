@@ -271,7 +271,16 @@ def conventional_candidate(path: PurePosixPath) -> bool:
         return False
     if any(part.startswith(".") or part.casefold() in _PROTECTED for part in path.parts):
         return False
-    if _is_guidance_file(path) or path.suffix.casefold() not in {".yaml", ".yml"}:
+    if (
+        _is_guidance_file(path)
+        or path.name.casefold().endswith(".inputs.yaml")
+        or (
+            path.name.casefold() == "inputs.yaml"
+            and path.parts[0] == "manifests"
+            and len(path.parts) > 2
+        )
+        or path.suffix.casefold() not in {".yaml", ".yml"}
+    ):
         return False
     return (
         path.parts[0] == "manifests"

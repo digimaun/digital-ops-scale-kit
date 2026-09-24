@@ -83,6 +83,16 @@ def render_notes(
         raise RenderingError("The release asset list cannot render installation guidance.")
     wheel = native_engine_wheel(native).name
     downloads = home + "/releases/download/" + urllib.parse.quote(plan["release"]["tag"], safe="") + "/"
+    native_names = {asset.name for asset in native}
+    scripts = ("siteops-bootstrap.ps1", "siteops-bootstrap.sh")
+    bootstrap_links = (
+        " Bootstrap scripts: " + ", ".join(
+            f"[{name}]({downloads}{name}) and "
+            f"[{name}{attestation_suffix}]({downloads}{name}{attestation_suffix})"
+            for name in scripts
+        ) + "."
+        if all(name in native_names for name in scripts) else ""
+    )
     guide = home + "/blob/" + source["commit"] + "/docs/install-siteops.md#install-the-verified-bundle"
     command = (
         f'pipx install "{downloads}{wheel}" --backend pip --fetch-python never '
@@ -116,8 +126,8 @@ def render_notes(
         f"Release assets: [{wheel}]({downloads}{wheel}), "
         f"[{wheel}{attestation_suffix}]({downloads}{wheel}{attestation_suffix}), "
         f"[{archive_name}]({downloads}{archive_name}), and "
-        f"[{archive_name}{attestation_suffix}]({downloads}{archive_name}{attestation_suffix}). "
-        "Use these assets instead of the generated source archives.",
+        f"[{archive_name}{attestation_suffix}]({downloads}{archive_name}{attestation_suffix})."
+        + bootstrap_links + " Use these assets instead of the generated source archives.",
         "Installing the CLI does not authenticate to Azure or deploy resources.",
     ]
     return notes + "\n\n".join(paragraphs) + "\n" + workspace_notes

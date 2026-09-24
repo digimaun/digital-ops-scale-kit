@@ -163,8 +163,11 @@ except ValueError:
     }
 }
 function Require-PrivateDataRoot([string]$Path) {
+    function Reject([string]$Code) {
+        Fail "Configure a private Site Ops data root. $Code Use trusted, non-symlinked directories."
+    }
     if ($Path -cnotmatch '^[A-Za-z]:\\' -or [IO.Path]::GetFullPath($Path) -cne $Path) {
-        Fail 'Configure a private Site Ops data root under trusted, non-symlinked directories.'
+        Reject 'ROOT_PATH'
     }
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     $trusted = @($sid, 'S-1-5-18', 'S-1-5-32-544', 'S-1-3-4')
@@ -183,12 +186,12 @@ function Require-PrivateDataRoot([string]$Path) {
         $node = Get-Item -LiteralPath $ancestor -Force -ErrorAction Stop
         if (-not $node.PSIsContainer -or
             ($node.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-            Fail 'Configure a private Site Ops data root under trusted, non-symlinked directories.'
+            Reject 'ROOT_ANCESTOR_TYPE'
         }
         $acl = [IO.Directory]::GetAccessControl($ancestor)
         $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
         if ($owner -notin $trustedOwners) {
-            Fail 'Configure a private Site Ops data root under trusted, non-symlinked directories.'
+            Reject 'ROOT_ANCESTOR_OWNER'
         }
         foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
             if ($rule.AccessControlType -ne 'Allow' -or $rule.IdentityReference.Value -in $trusted -or
@@ -197,7 +200,7 @@ function Require-PrivateDataRoot([string]$Path) {
             }
             # An ancestor must not let another user replace or relabel our private child.
             if ([int]$rule.FileSystemRights -band 0x500D0140) {
-                Fail 'Configure a private Site Ops data root under trusted, non-symlinked directories.'
+                Reject 'ROOT_ANCESTOR_ACL'
             }
         }
     }
@@ -210,15 +213,15 @@ function Require-PrivateDataRoot([string]$Path) {
     }
     $node = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     if (-not $node.PSIsContainer -or ($node.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-        Fail 'Configure a private Site Ops data root under trusted, non-symlinked directories.'
+        Reject 'ROOT_DATA_TYPE'
     }
     $acl = [IO.Directory]::GetAccessControl($Path)
     if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -cne $sid) {
-        Fail 'Configure a private Site Ops data root under trusted, non-symlinked directories.'
+        Reject 'ROOT_DATA_OWNER'
     }
     foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
         if ($rule.AccessControlType -eq 'Allow' -and $rule.IdentityReference.Value -notin $trusted) {
-            Fail 'Configure a private Site Ops data root under trusted, non-symlinked directories.'
+            Reject 'ROOT_DATA_ACL'
         }
     }
 }

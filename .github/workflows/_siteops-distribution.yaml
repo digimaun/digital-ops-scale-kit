@@ -852,7 +852,36 @@ jobs:
           $env:PIPX_DEFAULT_PYTHON = $env:PYTHON
           $env:PATH = (Split-Path -Parent $env:PYTHON) + ';' +
               (Join-Path $owned 'tooling\Scripts') + ';' + $env:PATH
-          foreach ($directory in @($env:LOCALAPPDATA, $env:TEMP, $env:GH_CONFIG_DIR)) {
+          if (Test-Path -LiteralPath $env:LOCALAPPDATA) {
+              throw 'The Windows qualification data root was not fresh.'
+          }
+          $bootstrapData = Join-Path $env:LOCALAPPDATA 'siteops'
+          $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          foreach ($directory in @($env:LOCALAPPDATA, $bootstrapData)) {
+              try {
+                  New-Item -ItemType Directory -Path $directory -ErrorAction Stop | Out-Null
+              } catch {
+                  throw 'The Windows qualification data root could not be created.'
+              }
+              $previousPreference = $ErrorActionPreference
+              try {
+                  $ErrorActionPreference = 'Continue'
+                  & icacls.exe $directory /setowner "*$sid" *> $null
+                  $ownedByUser = $LASTEXITCODE -eq 0
+                  if ($ownedByUser) {
+                      & icacls.exe $directory /inheritance:r /grant:r "*${sid}:(OI)(CI)F" *> $null
+                      $protected = $LASTEXITCODE -eq 0
+                  } else {
+                      $protected = $false
+                  }
+              } finally {
+                  $ErrorActionPreference = $previousPreference
+              }
+              if (-not $protected) {
+                  throw 'The Windows qualification data root could not be protected.'
+              }
+          }
+          foreach ($directory in @($env:TEMP, $env:GH_CONFIG_DIR)) {
               New-Item -ItemType Directory -Path $directory -Force | Out-Null
           }
           if ($env:BUILDER_IDENTITY -notmatch '/(ci|release)\.yaml@') {
@@ -888,6 +917,15 @@ jobs:
           if ($bootstrapStatus -ne 0) {
               if ((Get-Item -LiteralPath $log).Length -le 65536) {
                   $privateLog = Get-Content -LiteralPath $log -Raw
+                  foreach ($code in @('ROOT_PATH', 'ROOT_ANCESTOR_TYPE', 'ROOT_ANCESTOR_OWNER',
+                                      'ROOT_ANCESTOR_ACL', 'ROOT_DATA_TYPE', 'ROOT_DATA_OWNER',
+                                      'ROOT_DATA_ACL')) {
+                      if ($privateLog -and $privateLog.Contains(
+                          "Configure a private Site Ops data root. $code"
+                      )) {
+                          throw "The signed PowerShell bootstrap rejected the isolated data root ($code)."
+                      }
+                  }
                   if ($privateLog -and $privateLog.Contains('Configure a private Site Ops data root')) {
                       throw 'The signed PowerShell bootstrap rejected the isolated data root.'
                   }

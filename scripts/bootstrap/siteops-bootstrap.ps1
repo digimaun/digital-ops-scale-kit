@@ -192,6 +192,19 @@ if ($pipxVersion -cne '1.17.2') {
 }
 if ((& $pipx --version) -cne '1.17.2') { Fail 'pipx 1.17.2 is required.' }
 
+function InvokePipx([string[]]$Arguments, [string]$FailureMessage) {
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = & $pipx @Arguments 2>$null
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+    if ($exitCode -ne 0) { Fail $FailureMessage }
+    return $output
+}
+
 $download = Join-Path $env:TEMP ('siteops-download-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $download | Out-Null
 try {
@@ -300,8 +313,13 @@ try {
     }
     $bundleId = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
     $root = Join-Path $data 'bundles'
-    $installation = & $pipx list --output json | ConvertFrom-Json
-    if ($LASTEXITCODE -ne 0 -or $null -eq $installation.venvs) {
+    $listing = InvokePipx @('list', '--output', 'json') `
+        'The current pipx installation could not be inspected.'
+    if (-not $listing) {
+        Fail 'The current pipx installation could not be inspected.'
+    }
+    $installation = ($listing -join "`n") | ConvertFrom-Json
+    if ($null -eq $installation.venvs) {
         Fail 'The current pipx installation could not be inspected.'
     }
     $mainPackage = $installation.venvs.siteops.metadata.main_package
@@ -363,8 +381,9 @@ try {
             }
         }
         if ($recorded -ieq (Join-Path $bundle 'pylock.toml') -and -not $Replace) {
-            $backendVersion = & $pipx runpip siteops --version
-            if ($LASTEXITCODE -ne 0 -or $backendVersion -cnotmatch '^pip 26\.2\.1 ') {
+            $backendVersion = InvokePipx @('runpip', 'siteops', '--version') `
+                'The installed pipx backend could not be inspected.'
+            if ($backendVersion -cnotmatch '^pip 26\.2\.1 ') {
                 Fail 'The installed pipx backend differs from the verified lock reader.'
             }
             $repeat = $true
@@ -403,25 +422,26 @@ try {
         }
         $wheelUri = ([UriBuilder]::new('file', '', -1, $wheelhouse)).Uri.AbsoluteUri
         $env:PIPX_DEFAULT_PYTHON = $python
-        & $pipx upgrade-shared --pip-args "--no-index --only-binary=:all: --no-cache-dir --force-reinstall --find-links=$wheelUri"
-        if ($LASTEXITCODE -ne 0) { Fail 'The pipx shared backend could not be provisioned.' }
+        $null = InvokePipx @(
+            'upgrade-shared', '--pip-args',
+            "--no-index --only-binary=:all: --no-cache-dir --force-reinstall --find-links=$wheelUri"
+        ) 'The pipx shared backend could not be provisioned.'
         $install = @('install', 'siteops', '--lock', (Join-Path $bundle 'pylock.toml'),
                      '--backend', 'pip', '--fetch-python', 'never', '--skip-maintenance',
                      '--app', 'siteops', '--pip-args',
                      '--isolated --require-hashes --no-index --only-binary=:all: --no-cache-dir')
         if ($Replace -and $recorded) { $install += '--force' }
-        & $pipx @install
-        if ($LASTEXITCODE -ne 0) { Fail 'Site Ops could not be installed from the verified lock.' }
-        $backendVersion = & $pipx runpip siteops --version
-        if ($LASTEXITCODE -ne 0 -or $backendVersion -cnotmatch '^pip 26\.2\.1 ') {
+        $null = InvokePipx $install 'Site Ops could not be installed from the verified lock.'
+        $backendVersion = InvokePipx @('runpip', 'siteops', '--version') `
+            'The installed pipx backend could not be inspected.'
+        if ($backendVersion -cnotmatch '^pip 26\.2\.1 ') {
             Fail 'The installed pipx backend differs from the verified lock reader.'
         }
-        & $pipx ensurepath | Out-Null
-        if ($LASTEXITCODE -ne 0) { Fail 'pipx could not update the user command path.' }
+        $null = InvokePipx @('ensurepath') 'pipx could not update the user command path.'
     }
-    $binDir = & $pipx environment --value PIPX_BIN_DIR
-    if ($LASTEXITCODE -ne 0 -or $binDir -isnot [string] -or
-        -not [IO.Path]::IsPathRooted($binDir)) {
+    $binDir = InvokePipx @('environment', '--value', 'PIPX_BIN_DIR') `
+        'The pipx command directory could not be resolved.'
+    if ($binDir -isnot [string] -or -not [IO.Path]::IsPathRooted($binDir)) {
         Fail 'The pipx command directory could not be resolved.'
     }
     $expectedCommand = Join-Path $binDir 'siteops.exe'

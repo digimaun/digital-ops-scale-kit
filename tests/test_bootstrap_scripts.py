@@ -67,7 +67,7 @@ def test_existing_siteops_build_is_rejected_before_any_shared_backend_change():
     powershell = (SCRIPTS / "siteops-bootstrap.ps1").read_text(encoding="utf-8")
     assert bash.index('if [[ -n "$recorded"') < bash.index('"$pipx_bin" upgrade-shared')
     assert powershell.index('if ($recorded -and $recorded -ine') < powershell.index(
-        '& $pipx upgrade-shared',
+        "'upgrade-shared', '--pip-args'",
     )
     assert 'if $replace && [[ -n "$recorded" ]]' in bash
     assert 'if ($Replace -and $recorded) { $install += \'--force\' }' in powershell
@@ -156,6 +156,99 @@ def test_windows_retained_release_key_binds_exact_selection(tmp_path):
     )
     expected = hashlib.sha256(("\0".join(selected) + "\0").encode()).hexdigest()
     assert result.stdout.strip() == expected
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Native stderr handling needs PowerShell 5.1.")
+@pytest.mark.parametrize("list_exit", [0, 7])
+def test_windows_bootstrap_inspects_empty_pipx_without_ignoring_real_failure(
+    tmp_path, list_exit,
+):
+    source = (SCRIPTS / "siteops-bootstrap.ps1").read_text(encoding="utf-8")
+    block = source.split("    $root = Join-Path $data 'bundles'\n", 1)[1].split(
+        "    $mainPackage =", 1,
+    )[0]
+    helper = re.search(r"(?ms)^function InvokePipx\([^\n]*\) \{.*?^\}", source)
+    assert helper
+    fake = tmp_path / "pipx.cmd"
+    fake.write_text(
+        '@echo off\n'
+        'echo {"venvs":{}}\n'
+        'echo nothing has been installed with pipx 1>&2\n'
+        f'exit /b {list_exit}\n',
+        encoding="ascii",
+    )
+    wrapper = tmp_path / "inspect-pipx.ps1"
+    wrapper.write_text(
+        "function Fail([string]$message) { throw \"Site Ops installation: $message\" }\n"
+        + helper.group(0) + "\n"
+        "$ErrorActionPreference = 'Stop'\n"
+        "$pipx = $env:TEST_PIPX\n"
+        + block + "\n'EMPTY_HOME_ACCEPTED'\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(wrapper)],
+        cwd=tmp_path, env={**os.environ, "TEST_PIPX": str(fake)},
+        capture_output=True, text=True, timeout=20,
+    )
+    assert (result.returncode == 0) is (list_exit == 0), result.stdout + result.stderr
+    if list_exit:
+        assert "current pipx installation could not be inspected" in result.stderr
+    else:
+        assert "EMPTY_HOME_ACCEPTED" in result.stdout
+        assert "nothing has been installed" not in result.stdout + result.stderr
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Native pipx messages need PowerShell 5.1.")
+@pytest.mark.parametrize("failing", ["", "install"])
+def test_windows_pipx_operations_check_exit_without_emitting_native_warnings(
+    tmp_path, failing,
+):
+    source = (SCRIPTS / "siteops-bootstrap.ps1").read_text(encoding="utf-8")
+    helper = re.search(r"(?ms)^function InvokePipx\([^\n]*\) \{.*?^\}", source)
+    assert helper, "The pipx native exit and output gate is missing."
+    fake = tmp_path / "pipx.cmd"
+    fake.write_text(
+        "@echo off\n"
+        "if \"%1\"==\"--version\" echo 1.17.2\n"
+        "if \"%1\"==\"list\" echo {\"venvs\":{}}\n"
+        "if \"%1\"==\"runpip\" echo pip 26.2.1 from controlled fixture\n"
+        "if \"%1\"==\"environment\" echo C:\\private\\bin\n"
+        "echo controlled benign pipx warning 1>&2\n"
+        "if \"%TEST_FAIL_PIPX%\"==\"%1\" exit /b 7\n"
+        "exit /b 0\n",
+        encoding="ascii",
+    )
+    wrapper = tmp_path / "pipx-operations.ps1"
+    wrapper.write_text(
+        "function Fail([string]$message) { throw \"Site Ops installation: $message\" }\n"
+        + helper.group(0) + "\n"
+        "$ErrorActionPreference = 'Stop';$pipx = $env:TEST_PIPX\n"
+        "$version = InvokePipx @('--version') 'Version check failed.'\n"
+        "$listing = InvokePipx @('list', '--output', 'json') 'Inspection failed.'\n"
+        "$null = InvokePipx @('upgrade-shared') 'Backend failed.'\n"
+        "$null = InvokePipx @('install', 'siteops') 'Installation failed.'\n"
+        "$backend = InvokePipx @('runpip', 'siteops', '--version') 'Reader failed.'\n"
+        "$null = InvokePipx @('ensurepath') 'Path failed.'\n"
+        "$binDir = InvokePipx @('environment', '--value', 'PIPX_BIN_DIR') 'Location failed.'\n"
+        "if ($version -ne '1.17.2' -or $listing -notmatch 'venvs' -or "
+        "$backend -notmatch '^pip 26\\.2\\.1 ' -or $binDir -ne 'C:\\private\\bin') { throw 'Unexpected result' }\n"
+        "'PIPX_OPERATIONS_ACCEPTED'\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(wrapper)],
+        cwd=tmp_path,
+        env={**os.environ, "TEST_PIPX": str(fake), "TEST_FAIL_PIPX": failing},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert (result.returncode == 0) is (not failing), result.stdout + result.stderr
+    if failing:
+        assert "Installation failed." in result.stderr
+        assert "PIPX_OPERATIONS_ACCEPTED" not in result.stdout
+    else:
+        assert "PIPX_OPERATIONS_ACCEPTED" in result.stdout
+        assert "controlled benign pipx warning" not in result.stdout + result.stderr
 
 
 def test_bash_is_portable_lf_and_parses():

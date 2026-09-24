@@ -475,6 +475,89 @@ def test_qualification_runs_both_signed_scripts_with_private_preseeded_assets():
     assert "powershell.exe -NoProfile -ExecutionPolicy Bypass -File" in windows_step
 
 
+@pytest.mark.parametrize(("caller", "source_ref", "accepted"), [
+    ("ci.yaml", "refs/heads/feat/siteops-guided-inputs", True),
+    ("release.yaml", "refs/heads/main", True),
+    ("other.yaml", "refs/heads/feat/siteops-guided-inputs", False),
+])
+def test_signed_bash_qualification_resolves_caller_before_branch_path(
+    tmp_path, caller, source_ref, accepted,
+):
+    script = _script(REUSABLE["jobs"]["qualify"], "Install with the signed Bash bootstrap")
+    block = "caller=" + script.split("caller=", 1)[1].split("release=", 1)[0]
+    result = _run_script(
+        "set -euo pipefail\n" + block + "printf '%s\\n' \"$caller\"\n",
+        tmp_path,
+        {
+            "BUILDER_IDENTITY": (
+                f"https://github.com/example/publisher/.github/workflows/{caller}@{source_ref}"
+            ),
+        },
+    )
+    assert (result.returncode == 0) is accepted, result.stdout + result.stderr
+    if accepted:
+        assert result.stdout.strip() == caller
+
+
+def test_windows_bootstrap_qualification_captures_native_stderr_then_checks_exit():
+    script = _script(REUSABLE["jobs"]["qualify"], "Install with the signed PowerShell bootstrap")
+    invocation = script.index("& powershell.exe -NoProfile -ExecutionPolicy Bypass -File")
+    assert "$ErrorActionPreference = 'Continue'" in script[invocation - 170:invocation]
+    assert "$bootstrapStatus = $LASTEXITCODE" in script[invocation:invocation + 310]
+    assert "$ErrorActionPreference = $previousPreference" in script[invocation:invocation + 420]
+    assert "if ($bootstrapStatus -ne 0)" in script
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Native stderr needs Windows PowerShell 5.1.")
+@pytest.mark.parametrize("bootstrap_exit", [0, 7])
+def test_windows_qualification_preserves_child_exit_with_private_stderr(
+    tmp_path, bootstrap_exit,
+):
+    step = _script(REUSABLE["jobs"]["qualify"], "Install with the signed PowerShell bootstrap")
+    block = step.split("$log = Join-Path $owned 'logs\\bootstrap-ps1.log'\n", 1)[1].split(
+        "if ((Get-Content -LiteralPath $log -Raw) -notmatch", 1,
+    )[0]
+    (tmp_path / "logs").mkdir()
+    fake = tmp_path / "bootstrap.ps1"
+    fake.write_text(
+        "param([string]$Release,[string]$SourceCommit,[string]$Repository,"
+        "[string]$SourceRef,[string]$Caller,[switch]$Yes)\n"
+        "[Console]::Error.WriteLine('controlled benign diagnostic')\n"
+        "exit [int]$env:TEST_BOOTSTRAP_EXIT\n",
+        encoding="utf-8",
+    )
+    wrapper = tmp_path / "qualify.ps1"
+    wrapper.write_text(
+        "$ErrorActionPreference='Stop'\n"
+        "$owned=$env:TEST_ROOT;$download=$owned\n"
+        "$script=Join-Path $download $env:BOOTSTRAP_PS1\n"
+        "$log=Join-Path $owned 'logs\\bootstrap-ps1.log'\n"
+        "$release='siteops/v0.0.0-ci';$caller='ci.yaml'\n"
+        + block + "\n'CAPTURE_ACCEPTED'\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(wrapper)],
+        cwd=tmp_path, env={
+            **os.environ, "TEST_ROOT": str(tmp_path), "BOOTSTRAP_PS1": fake.name,
+            "TEST_BOOTSTRAP_EXIT": str(bootstrap_exit),
+            "SOURCE_SHA": "c" * 40, "SOURCE_REPOSITORY": "example/publisher",
+            "SOURCE_REF": "refs/heads/feat/siteops-guided-inputs",
+        },
+        capture_output=True, text=True, timeout=30,
+    )
+    assert (result.returncode == 0) is (bootstrap_exit == 0), result.stdout + result.stderr
+    if bootstrap_exit:
+        assert "did not install the verified build" in result.stderr
+        assert "CAPTURE_ACCEPTED" not in result.stdout
+    else:
+        assert "CAPTURE_ACCEPTED" in result.stdout
+        assert "controlled benign diagnostic" not in result.stdout + result.stderr
+    assert "controlled benign diagnostic" in (tmp_path / "logs" / "bootstrap-ps1.log").read_text(
+        encoding="utf-16",
+    )
+
+
 def test_bootstrap_qualification_shells_parse():
     bash_step = _script(REUSABLE["jobs"]["qualify"], "Install with the signed Bash bootstrap")
     parsed = subprocess.run(

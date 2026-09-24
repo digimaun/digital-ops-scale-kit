@@ -787,7 +787,7 @@ jobs:
           export PIPX_DEFAULT_PYTHON="$PYTHON"
           export PATH="$owned/tooling/bin:$PATH"
           mkdir -p "$HOME" "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" "$TMPDIR" "$GH_CONFIG_DIR"
-          caller="${BUILDER_IDENTITY##*/}"
+          caller="${BUILDER_IDENTITY#*/.github/workflows/}"
           caller="${caller%%@*}"
           [[ "$caller" == ci.yaml || "$caller" == release.yaml ]] ||
             { echo "::error::The attested caller is not supported by the bootstrap."; exit 1; }
@@ -870,10 +870,17 @@ jobs:
               -Destination $cache
           $script = Join-Path $download $env:BOOTSTRAP_PS1
           $log = Join-Path $owned 'logs\bootstrap-ps1.log'
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script `
-              -Release $release -SourceCommit $env:SOURCE_SHA -Repository $env:SOURCE_REPOSITORY `
-              -SourceRef $env:SOURCE_REF -Caller $caller -Yes *> $log
-          if ($LASTEXITCODE -ne 0) {
+          $previousPreference = $ErrorActionPreference
+          try {
+              $ErrorActionPreference = 'Continue'
+              & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script `
+                  -Release $release -SourceCommit $env:SOURCE_SHA -Repository $env:SOURCE_REPOSITORY `
+                  -SourceRef $env:SOURCE_REF -Caller $caller -Yes *> $log
+              $bootstrapStatus = $LASTEXITCODE
+          } finally {
+              $ErrorActionPreference = $previousPreference
+          }
+          if ($bootstrapStatus -ne 0) {
               throw 'The signed PowerShell bootstrap did not install the verified build.'
           }
           if ((Get-Content -LiteralPath $log -Raw) -notmatch

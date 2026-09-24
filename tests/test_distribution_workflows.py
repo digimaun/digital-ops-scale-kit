@@ -508,10 +508,75 @@ def test_windows_bootstrap_qualification_captures_native_stderr_then_checks_exit
     assert "if ($bootstrapStatus -ne 0)" in script
 
 
+def test_windows_bootstrap_qualification_selects_private_user_profile_before_cache():
+    script = _script(REUSABLE["jobs"]["qualify"], "Install with the signed PowerShell bootstrap")
+    profile = "$profileHome = [Environment]::GetFolderPath('UserProfile')"
+    selection = "$env:LOCALAPPDATA = Join-Path $profileHome 'siteops-qualification-bootstrap'"
+    assert profile in script and selection in script
+    assert script.index(selection) < script.index('$cache = Join-Path $env:LOCALAPPDATA')
+    assert "$env:LOCALAPPDATA = Join-Path $owned 'bootstrap-user'" not in script
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Native PowerShell 5.1 redirects the private child log.")
+@pytest.mark.parametrize(
+    ("private_message", "public_message"),
+    [
+        (
+            "Site Ops installation: Configure a private Site Ops data root. PRIVATE_PATH",
+            "The signed PowerShell bootstrap rejected the isolated data root.",
+        ),
+        (
+            "Site Ops installation: Configure one approved HTTPS Python index. PRIVATE_URL",
+            "The signed PowerShell bootstrap rejected the configured Python feed.",
+        ),
+    ],
+)
+def test_windows_bootstrap_qualification_reports_only_bounded_failure(
+    tmp_path, private_message, public_message,
+):
+    script = _script(REUSABLE["jobs"]["qualify"], "Install with the signed PowerShell bootstrap")
+    block = script.split("$log = Join-Path $owned 'logs\\bootstrap-ps1.log'\n", 1)[1].split(
+        "if ((Get-Content -LiteralPath $log -Raw) -notmatch", 1,
+    )[0]
+    (tmp_path / "logs").mkdir()
+    fake = tmp_path / "bootstrap.ps1"
+    fake.write_text(
+        "param([string]$Release,[string]$SourceCommit,[string]$Repository,"
+        "[string]$SourceRef,[string]$Caller,[switch]$Yes)\n"
+        "[Console]::Error.WriteLine($env:TEST_PRIVATE_MESSAGE)\n"
+        "exit 7\n",
+        encoding="utf-8",
+    )
+    wrapper = tmp_path / "qualify.ps1"
+    wrapper.write_text(
+        "$ErrorActionPreference='Stop'\n"
+        "$owned=$env:TEST_ROOT;$download=$owned\n"
+        "$script=Join-Path $download $env:BOOTSTRAP_PS1\n"
+        "$log=Join-Path $owned 'logs\\bootstrap-ps1.log'\n"
+        "$release='siteops/v0.0.0-ci';$caller='ci.yaml'\n"
+        + block + "\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(wrapper)],
+        cwd=tmp_path, env={
+            **os.environ, "TEST_ROOT": str(tmp_path), "BOOTSTRAP_PS1": fake.name,
+            "TEST_PRIVATE_MESSAGE": private_message,
+            "SOURCE_SHA": "c" * 40, "SOURCE_REPOSITORY": "example/publisher",
+            "SOURCE_REF": "refs/heads/feat/siteops-guided-inputs",
+        },
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode != 0
+    assert public_message in result.stderr
+    assert "PRIVATE_PATH" not in result.stdout + result.stderr
+    assert "PRIVATE_URL" not in result.stdout + result.stderr
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Native stderr needs Windows PowerShell 5.1.")
-@pytest.mark.parametrize("bootstrap_exit", [0, 7])
+@pytest.mark.parametrize(("bootstrap_exit", "emit_diagnostic"), [(0, True), (7, True), (7, False)])
 def test_windows_qualification_preserves_child_exit_with_private_stderr(
-    tmp_path, bootstrap_exit,
+    tmp_path, bootstrap_exit, emit_diagnostic,
 ):
     step = _script(REUSABLE["jobs"]["qualify"], "Install with the signed PowerShell bootstrap")
     block = step.split("$log = Join-Path $owned 'logs\\bootstrap-ps1.log'\n", 1)[1].split(
@@ -522,7 +587,8 @@ def test_windows_qualification_preserves_child_exit_with_private_stderr(
     fake.write_text(
         "param([string]$Release,[string]$SourceCommit,[string]$Repository,"
         "[string]$SourceRef,[string]$Caller,[switch]$Yes)\n"
-        "[Console]::Error.WriteLine('controlled benign diagnostic')\n"
+        "if ($env:TEST_EMIT_DIAGNOSTIC -eq '1') { "
+        "[Console]::Error.WriteLine('controlled benign diagnostic') }\n"
         "exit [int]$env:TEST_BOOTSTRAP_EXIT\n",
         encoding="utf-8",
     )
@@ -541,6 +607,7 @@ def test_windows_qualification_preserves_child_exit_with_private_stderr(
         cwd=tmp_path, env={
             **os.environ, "TEST_ROOT": str(tmp_path), "BOOTSTRAP_PS1": fake.name,
             "TEST_BOOTSTRAP_EXIT": str(bootstrap_exit),
+            "TEST_EMIT_DIAGNOSTIC": "1" if emit_diagnostic else "0",
             "SOURCE_SHA": "c" * 40, "SOURCE_REPOSITORY": "example/publisher",
             "SOURCE_REF": "refs/heads/feat/siteops-guided-inputs",
         },
@@ -553,9 +620,10 @@ def test_windows_qualification_preserves_child_exit_with_private_stderr(
     else:
         assert "CAPTURE_ACCEPTED" in result.stdout
         assert "controlled benign diagnostic" not in result.stdout + result.stderr
-    assert "controlled benign diagnostic" in (tmp_path / "logs" / "bootstrap-ps1.log").read_text(
-        encoding="utf-16",
-    )
+    if emit_diagnostic:
+        assert "controlled benign diagnostic" in (tmp_path / "logs" / "bootstrap-ps1.log").read_text(
+            encoding="utf-16",
+        )
 
 
 def test_bootstrap_qualification_shells_parse():

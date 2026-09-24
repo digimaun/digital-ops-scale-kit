@@ -834,8 +834,13 @@ jobs:
                               'PYTHONPATH', 'PYTHONHOME')) {
               [Environment]::SetEnvironmentVariable($name, $null, 'Process')
           }
+          $profileHome = [Environment]::GetFolderPath('UserProfile')
+          if (-not [IO.Path]::IsPathRooted($profileHome)) {
+              throw 'The Windows qualification runner has no private user profile.'
+          }
+          # Keep retained bootstrap executables under the user's private profile.
           $env:HOME = $owned
-          $env:LOCALAPPDATA = Join-Path $owned 'bootstrap-user'
+          $env:LOCALAPPDATA = Join-Path $profileHome 'siteops-qualification-bootstrap'
           $env:TEMP = Join-Path $owned 'bootstrap-temp'
           $env:GH_CONFIG_DIR = Join-Path $owned 'gh-config'
           $env:PIP_CONFIG_FILE = 'NUL'
@@ -881,6 +886,15 @@ jobs:
               $ErrorActionPreference = $previousPreference
           }
           if ($bootstrapStatus -ne 0) {
+              if ((Get-Item -LiteralPath $log).Length -le 65536) {
+                  $privateLog = Get-Content -LiteralPath $log -Raw
+                  if ($privateLog -and $privateLog.Contains('Configure a private Site Ops data root')) {
+                      throw 'The signed PowerShell bootstrap rejected the isolated data root.'
+                  }
+                  if ($privateLog -and $privateLog.Contains('Configure one approved HTTPS Python index')) {
+                      throw 'The signed PowerShell bootstrap rejected the configured Python feed.'
+                  }
+              }
               throw 'The signed PowerShell bootstrap did not install the verified build.'
           }
           if ((Get-Content -LiteralPath $log -Raw) -notmatch

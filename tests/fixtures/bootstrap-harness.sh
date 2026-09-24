@@ -195,6 +195,35 @@ if [[ "${TEST_HARNESS_NO_PIPX:-0}" == 1 ]]; then
 fi
 
 arguments=(--release siteops/v1.0.0b1 --source-commit "$(printf 'c%.0s' {1..40})" --yes)
+export TEST_UNTRUSTED_LOG="$root/untrusted-pipx-calls"
+cat > "$root/untrusted-pipx" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$TEST_UNTRUSTED_LOG"
+echo 1.17.2
+SH
+chmod +x "$root/untrusted-pipx"
+shared="$root/shared-data"
+mkdir -p "$shared/siteops/tools/pipx/bin"
+cp "$root/untrusted-pipx" "$shared/siteops/tools/pipx/bin/pipx"
+chmod 0777 "$shared"
+if XDG_DATA_HOME="$shared" bash "$bootstrap" "${arguments[@]}" > "$root/shared-root.log" 2>&1; then
+  echo "A shared data root was accepted." >&2
+  exit 1
+fi
+[[ ! -s "$TEST_UNTRUSTED_LOG" ]] ||
+  { echo "A shared data root executed an untrusted pipx." >&2; exit 1; }
+grep -q 'private Site Ops data root' "$root/shared-root.log"
+private="$root/private-data"
+mkdir -p "$private/siteops/tools/pipx/bin"
+cp "$root/untrusted-pipx" "$private/siteops/tools/pipx/bin/pipx"
+ln -s "$private" "$root/linked-data"
+if XDG_DATA_HOME="$root/linked-data" bash "$bootstrap" "${arguments[@]}" > "$root/linked-root.log" 2>&1; then
+  echo "A symlinked data root was accepted." >&2
+  exit 1
+fi
+[[ ! -s "$TEST_UNTRUSTED_LOG" ]] ||
+  { echo "A symlinked data root executed an untrusted pipx." >&2; exit 1; }
+grep -q 'private Site Ops data root' "$root/linked-root.log"
 if [[ "${TEST_HARNESS_MANAGED:-0}" == 1 ]]; then
   export TEST_OLD_GH=1
   if bash "$bootstrap" "${arguments[@]}" > "$root/old-gh.log" 2>&1; then

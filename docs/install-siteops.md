@@ -258,9 +258,22 @@ before any required pipx or shared backend download. The script checks this
 configuration without printing the index URL or credentials and rejects
 extra indexes, find-links and trusted hosts. It does not silently select
 the public default index. Keep package configuration and diagnostic output
-private. Check whether your Cloud Shell storage persists `$HOME`. An idle
+private. The Windows bootstrap applies the same check when it provisions
+pipx or its shared backend. The configured HTTPS index is an operator
+approval, not a publisher identity inferred by the script. Check whether
+your Cloud Shell storage persists `$HOME`. An idle
 or interrupted session may end a long deployment. Confirm the current Azure
 identity and subscription privately before resource reads or deployment.
+
+The Bash bootstrap keeps retained files under
+`${XDG_DATA_HOME:-$HOME/.local/share}/siteops`. The directory must be private
+to the current user, and its ancestors must not be untrusted or symlinked.
+If your XDG data path is shared, select a private user-owned location with
+trusted ancestors before installing. The script rejects an unsafe root
+before choosing a retained pipx executable or reading cached assets.
+The Windows bootstrap checks the same boundary for its
+`LOCALAPPDATA\siteops` directory, including ancestor write access and
+reparse points, before using retained tools or downloads.
 
 The `Azure-Samples/explore-iot-operations` Codespace may use Ubuntu 24.04,
 but its base image can change. Check `/etc/os-release` and tool versions in

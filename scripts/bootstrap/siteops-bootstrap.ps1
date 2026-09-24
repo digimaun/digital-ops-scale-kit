@@ -104,6 +104,124 @@ function AzureCli {
     if ($launcher -and $launcher.Source -like '*.cmd') { return $launcher.Source }
     return $null
 }
+function Require-ApprovedPythonIndex([string]$Python) {
+    $check = @'
+import ast
+import subprocess
+import sys
+from urllib.parse import urlsplit
+
+try:
+    config = subprocess.run(
+        [sys.executable, "-m", "pip", "config", "list"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL, timeout=20,
+    )
+except (OSError, subprocess.TimeoutExpired):
+    raise SystemExit(1)
+if config.returncode or len(config.stdout) > 65536:
+    raise SystemExit(1)
+try:
+    lines = config.stdout.decode("utf-8").splitlines()
+except UnicodeError:
+    raise SystemExit(1)
+settings = {}
+for line in lines:
+    key, separator, raw = line.partition("=")
+    if not separator:
+        continue
+    try:
+        value = ast.literal_eval(raw.strip())
+    except (SyntaxError, ValueError):
+        raise SystemExit(1)
+    if not isinstance(value, str):
+        raise SystemExit(1)
+    settings[key.strip()] = value
+if any(value for key, value in settings.items()
+       if key.endswith((".extra-index-url", ".find-links", ".trusted-host"))):
+    raise SystemExit(1)
+index = next((settings[key] for key in
+              (":env:.index-url", "install.index-url", "global.index-url")
+              if settings.get(key)), "")
+try:
+    parsed = urlsplit(index)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise SystemExit(1)
+except ValueError:
+    raise SystemExit(1)
+'@
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $check | & $Python - >$null 2>$null
+        $checkExit = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+    if ($checkExit -ne 0) {
+        Fail 'Configure one approved HTTPS Python index in pip settings or PIP_INDEX_URL, without extra indexes, find-links, or trusted hosts.'
+    }
+}
+function Require-PrivateDataRoot([string]$Path) {
+    if ($Path -cnotmatch '^[A-Za-z]:\\' -or [IO.Path]::GetFullPath($Path) -cne $Path) {
+        Fail 'Configure a private Site Ops data root under trusted, non-symlinked directories.'
+    }
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $trusted = @($sid, 'S-1-5-18', 'S-1-5-32-544', 'S-1-3-4')
+    # The system volume can be owned by Windows Modules Installer.
+    $trustedOwners = $trusted + 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
+    $ancestors = [Collections.Generic.List[string]]::new()
+    $parent = Split-Path -Parent $Path
+    while ($parent) {
+        $ancestors.Add($parent)
+        $next = Split-Path -Parent $parent
+        if (-not $next -or $next -eq $parent) { break }
+        $parent = $next
+    }
+    $ancestors.Reverse()
+    foreach ($ancestor in $ancestors) {
+        $node = Get-Item -LiteralPath $ancestor -Force -ErrorAction Stop
+        if (-not $node.PSIsContainer -or
+            ($node.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            Fail 'Configure a private Site Ops data root under trusted, non-symlinked directories.'
+        }
+        $acl = [IO.Directory]::GetAccessControl($ancestor)
+        $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+        if ($owner -notin $trustedOwners) {
+            Fail 'Configure a private Site Ops data root under trusted, non-symlinked directories.'
+        }
+        foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+            if ($rule.AccessControlType -ne 'Allow' -or $rule.IdentityReference.Value -in $trusted -or
+                ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly)) {
+                continue
+            }
+            # An ancestor must not let another user replace or relabel our private child.
+            if ([int]$rule.FileSystemRights -band 0x500D0140) {
+                Fail 'Configure a private Site Ops data root under trusted, non-symlinked directories.'
+            }
+        }
+    }
+    if (-not (Test-Path -LiteralPath $Path)) {
+        New-Item -ItemType Directory -Path $Path -ErrorAction Stop | Out-Null
+        & icacls.exe $Path /inheritance:r /grant:r "*${sid}:(OI)(CI)F" | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Fail 'The Site Ops data root could not be protected.'
+        }
+    }
+    $node = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (-not $node.PSIsContainer -or ($node.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        Fail 'Configure a private Site Ops data root under trusted, non-symlinked directories.'
+    }
+    $acl = [IO.Directory]::GetAccessControl($Path)
+    if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -cne $sid) {
+        Fail 'Configure a private Site Ops data root under trusted, non-symlinked directories.'
+    }
+    foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -eq 'Allow' -and $rule.IdentityReference.Value -notin $trusted) {
+            Fail 'Configure a private Site Ops data root under trusted, non-symlinked directories.'
+        }
+    }
+}
 function WinGetPackage([string]$Id, [bool]$UserScope = $true) {
     $winget = Native 'winget.exe'
     if (-not $winget) { Fail "Use an approved software channel to install $Id. WinGet is unavailable." }
@@ -128,6 +246,8 @@ function PythonCommand {
     }
     return $candidate
 }
+$data = Join-Path $env:LOCALAPPDATA 'siteops'
+Require-PrivateDataRoot $data
 $python = PythonCommand
 if (-not $python) {
     WinGetPackage 'Python.Python.3.12'
@@ -163,10 +283,6 @@ if ($WithAzureCli -and -not (AzureCli)) {
     }
 }
 
-$data = Join-Path $env:LOCALAPPDATA 'siteops'
-if (-not (Test-Path -LiteralPath $data)) {
-    New-Item -ItemType Directory -Path $data | Out-Null
-}
 $pipx = Native 'pipx.exe'
 $privatePipx = Join-Path $data 'tools\pipx\Scripts\pipx.exe'
 if (Test-Path -LiteralPath $privatePipx -PathType Leaf) { $pipx = $privatePipx }
@@ -186,6 +302,7 @@ if ($pipxVersion -cne '1.17.2') {
         if ($LASTEXITCODE -ne 0) { Fail 'The user pipx environment could not be created.' }
     }
     $toolPython = Join-Path $installed 'Scripts\python.exe'
+    Require-ApprovedPythonIndex $toolPython
     & $toolPython -m pip install --only-binary=:all: --no-cache-dir 'pipx==1.17.2'
     if ($LASTEXITCODE -ne 0) { Fail 'pipx could not be installed from the configured feed.' }
     $pipx = Join-Path $installed 'Scripts\pipx.exe'
@@ -411,7 +528,9 @@ try {
         $backendTools = Join-Path $download 'backend-tools'
         & $python -m venv $backendTools
         if ($LASTEXITCODE -ne 0) { Fail 'Python venv is unavailable.' }
-        & (Join-Path $backendTools 'Scripts\python.exe') -m pip download 'pip==26.2.1' `
+        $backendPython = Join-Path $backendTools 'Scripts\python.exe'
+        Require-ApprovedPythonIndex $backendPython
+        & $backendPython -m pip download 'pip==26.2.1' `
             --no-deps --only-binary=:all: --dest $wheelhouse
         if ($LASTEXITCODE -ne 0) { Fail 'The approved pip backend is unavailable.' }
         $wheels = @(Get-ChildItem -LiteralPath $wheelhouse -Filter 'pip-26.2.1-*.whl' -File)

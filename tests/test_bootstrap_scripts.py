@@ -62,6 +62,171 @@ def test_bootstrap_requires_configured_secure_index_before_python_download():
     assert '> "$staging/pip-download.log" 2>&1' in bash
 
 
+def test_windows_bootstrap_checks_python_index_before_tool_downloads():
+    powershell = (SCRIPTS / "siteops-bootstrap.ps1").read_text(encoding="utf-8")
+    assert "function Require-ApprovedPythonIndex(" in powershell
+    assert powershell.index("Require-ApprovedPythonIndex $toolPython") < powershell.index(
+        "& $toolPython -m pip install",
+    )
+    assert powershell.index("Require-ApprovedPythonIndex $backendPython") < powershell.index(
+        "& $backendPython -m pip download",
+    )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Native pip config requires Windows PowerShell 5.1.")
+@pytest.mark.parametrize(
+    ("index", "extra", "find_links", "trusted_host", "accepted"),
+    [
+        ("https://packages.example.invalid/simple/", "", "", "", True),
+        ("", "", "", "", False),
+        ("http://packages.example.invalid/simple/", "", "", "", False),
+        ("https://packages.example.invalid/simple/", "https://other.example.invalid/simple/", "", "", False),
+        ("https://packages.example.invalid/simple/", "", "https://wheels.example.invalid/", "", False),
+        ("https://packages.example.invalid/simple/", "", "", "packages.example.invalid", False),
+    ],
+)
+def test_windows_bootstrap_python_index_check(
+    tmp_path, index, extra, find_links, trusted_host, accepted,
+):
+    source = (SCRIPTS / "siteops-bootstrap.ps1").read_text(encoding="utf-8")
+    helper = re.search(r"(?ms)^function Require-ApprovedPythonIndex\([^\n]*\) \{.*?^\}", source)
+    assert helper, "The Windows Python feed admission helper is missing."
+    wrapper = tmp_path / "check-index.ps1"
+    wrapper.write_text(
+        'function Fail([string]$message) { throw "Site Ops installation: $message" }\n'
+        + helper.group(0) + "\n"
+        "$ErrorActionPreference = 'Stop'\n"
+        "Require-ApprovedPythonIndex $env:TEST_PYTHON\n"
+        "'INDEX_ACCEPTED'\n",
+        encoding="utf-8",
+    )
+    env = {
+        **os.environ,
+        "PIP_CONFIG_FILE": os.devnull,
+        "PIP_INDEX_URL": index,
+        "PIP_EXTRA_INDEX_URL": extra,
+        "PIP_FIND_LINKS": find_links,
+        "PIP_TRUSTED_HOST": trusted_host,
+        "TEST_PYTHON": sys.executable,
+    }
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(wrapper)],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert (result.returncode == 0) is accepted, result.stdout + result.stderr
+    assert ("INDEX_ACCEPTED" in result.stdout) is accepted
+    assert "packages.example.invalid" not in result.stdout + result.stderr
+
+
+def test_bash_bootstrap_admits_private_data_root_before_retained_tool_use():
+    bash = (SCRIPTS / "siteops-bootstrap.sh").read_text(encoding="utf-8")
+    assert bash.index('require_private_data_root "$data"') < bash.index(
+        'pipx_bin="$(command -v pipx || true)"',
+    )
+
+
+def test_windows_bootstrap_admits_private_data_root_before_retained_tool_use():
+    powershell = (SCRIPTS / "siteops-bootstrap.ps1").read_text(encoding="utf-8")
+    assert "function Require-PrivateDataRoot(" in powershell
+    assert powershell.index("Require-PrivateDataRoot $data") < powershell.index(
+        "$candidate = Join-Path $env:LOCALAPPDATA 'Programs\\Python\\Python312\\python.exe'",
+    )
+    assert powershell.index("Require-PrivateDataRoot $data") < powershell.index(
+        "if (Test-Path -LiteralPath $privatePipx -PathType Leaf)",
+    )
+
+
+def _windows_private_root_wrapper(tmp_path: Path) -> Path:
+    source = (SCRIPTS / "siteops-bootstrap.ps1").read_text(encoding="utf-8")
+    helper = re.search(r"(?ms)^function Require-PrivateDataRoot\([^\n]*\) \{.*?^\}", source)
+    assert helper, "The Windows private data-root helper is missing."
+    wrapper = tmp_path / "check-data-root.ps1"
+    wrapper.write_text(
+        'function Fail([string]$message) { throw "Site Ops installation: $message" }\n'
+        + helper.group(0) + "\n"
+        "$ErrorActionPreference = 'Stop'\n"
+        "Require-PrivateDataRoot $env:TEST_DATA_ROOT\n"
+        "'PRIVATE_ROOT_ACCEPTED'\n",
+        encoding="utf-8",
+    )
+    return wrapper
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows ACL and junction rules need Windows.")
+def test_windows_bootstrap_rejects_shared_root_without_changing_it(tmp_path):
+    wrapper = _windows_private_root_wrapper(tmp_path)
+    safe = tmp_path / "safe"
+    safe.mkdir()
+    valid = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(wrapper)],
+        cwd=tmp_path, env={**os.environ, "TEST_DATA_ROOT": str(safe / "siteops")},
+        capture_output=True, text=True, timeout=20,
+    )
+    assert valid.returncode == 0, valid.stdout + valid.stderr
+    assert "PRIVATE_ROOT_ACCEPTED" in valid.stdout
+    assert (safe / "siteops").is_dir()
+    repeated = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(wrapper)],
+        cwd=tmp_path, env={**os.environ, "TEST_DATA_ROOT": str(safe / "siteops")},
+        capture_output=True, text=True, timeout=20,
+    )
+    assert repeated.returncode == 0, repeated.stdout + repeated.stderr
+
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    users = "*S-1-5-32-545"
+    grant = subprocess.run(
+        ["icacls.exe", str(shared), "/grant", f"{users}:(OI)(CI)M"],
+        capture_output=True, text=True, timeout=20,
+    )
+    if grant.returncode:
+        pytest.skip("The local test user cannot change the fixture directory ACL.")
+    try:
+        rejected = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(wrapper)],
+            cwd=tmp_path, env={**os.environ, "TEST_DATA_ROOT": str(shared / "siteops")},
+            capture_output=True, text=True, timeout=20,
+        )
+        assert rejected.returncode != 0
+        assert "private Site Ops data root" in rejected.stderr
+        assert "PRIVATE_ROOT_ACCEPTED" not in rejected.stdout
+        assert not (shared / "siteops").exists()
+    finally:
+        subprocess.run(
+            ["icacls.exe", str(shared), "/remove:g", users],
+            capture_output=True, text=True, check=True, timeout=20,
+        )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows reparse rules need Windows.")
+def test_windows_bootstrap_rejects_symlinked_data_ancestor(tmp_path):
+    wrapper = _windows_private_root_wrapper(tmp_path)
+    private = tmp_path / "private"
+    private.mkdir()
+    alias = tmp_path / "alias"
+    try:
+        alias.symlink_to(private, target_is_directory=True)
+    except OSError:
+        junction = subprocess.run(
+            [
+                "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                "New-Item -ItemType Junction -Path $env:TEST_ALIAS -Target $env:TEST_TARGET | Out-Null",
+            ],
+            env={**os.environ, "TEST_ALIAS": str(alias), "TEST_TARGET": str(private)},
+            capture_output=True, text=True, timeout=20,
+        )
+        if junction.returncode:
+            pytest.skip("Creating a test reparse point is unavailable on this host.")
+    rejected = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(wrapper)],
+        cwd=tmp_path, env={**os.environ, "TEST_DATA_ROOT": str(alias / "siteops")},
+        capture_output=True, text=True, timeout=20,
+    )
+    assert rejected.returncode != 0
+    assert "private Site Ops data root" in rejected.stderr
+    assert not (private / "siteops").exists()
+
+
 def test_existing_siteops_build_is_rejected_before_any_shared_backend_change():
     bash = (SCRIPTS / "siteops-bootstrap.sh").read_text(encoding="utf-8")
     powershell = (SCRIPTS / "siteops-bootstrap.ps1").read_text(encoding="utf-8")

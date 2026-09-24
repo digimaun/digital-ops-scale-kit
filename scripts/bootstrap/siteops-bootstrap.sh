@@ -13,6 +13,43 @@ private_dir() {
   [[ "$owner" == "$(id -u)" ]] && (( (8#$mode & 077) == 0 )) ||
     fail "A retained installation directory must be owned by the current user and private."
 }
+require_private_data_root() {
+  if ! python3 - "$1" >/dev/null 2>&1 <<'PY'
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+parts = path.split("/")[1:]
+if not os.path.isabs(path) or not parts or any(part in {".", ".."} for part in parts):
+    raise SystemExit(1)
+uid = os.getuid()
+directory = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+try:
+    for part in (part for part in parts if part):
+        parent = os.fstat(directory)
+        trusted_owner = parent.st_uid in {0, uid}
+        writable = stat.S_IMODE(parent.st_mode) & 0o022
+        # A sticky shared parent cannot replace another user's private child.
+        if not trusted_owner or (writable and not parent.st_mode & stat.S_ISVTX):
+            raise SystemExit(1)
+        try:
+            os.mkdir(part, mode=0o700, dir_fd=directory)
+        except FileExistsError:
+            pass
+        child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+        os.close(directory)
+        directory = child
+    root = os.fstat(directory)
+    if root.st_uid != uid or stat.S_IMODE(root.st_mode) & 0o077:
+        raise SystemExit(1)
+finally:
+    os.close(directory)
+PY
+  then
+    fail "Configure a private Site Ops data root under trusted, non-symlinked directories."
+  fi
+}
 command -v bash >/dev/null || fail "Bash is required."
 
 release=""
@@ -155,6 +192,7 @@ if ! command -v python3 >/dev/null ||
 fi
 python3 -c 'import sys; raise SystemExit(not ((3, 10) <= sys.version_info[:2] <= (3, 14) and sys.maxsize > 2**32))' 2>/dev/null ||
   fail "The available Python must be a supported 64-bit interpreter."
+require_private_data_root "$data"
 venv_check="$(mktemp -d)"
 trap 'rm -rf -- "$venv_check"' EXIT
 venv_tool=(python3 -m venv)

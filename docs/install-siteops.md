@@ -273,7 +273,12 @@ trusted ancestors before installing. The script rejects an unsafe root
 before choosing a retained pipx executable or reading cached assets.
 The Windows bootstrap checks the same boundary for its
 `LOCALAPPDATA\siteops` directory, including ancestor write access and
-reparse points, before using retained tools or downloads.
+reparse points, before using retained tools or downloads. Its fixed
+`ROOT_PATH`, `ROOT_ANCESTOR_*` and `ROOT_DATA_*` error categories
+distinguish a path, ancestor or data directory rejection without
+printing the directory or account identity. Inspect the affected
+directory and its ACL locally. Select private user storage beneath
+trusted ancestors rather than relaxing permissions on shared storage.
 
 The `Azure-Samples/explore-iot-operations` Codespace may use Ubuntu 24.04,
 but its base image can change. Check `/etc/os-release` and tool versions in

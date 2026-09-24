@@ -189,6 +189,7 @@ def test_windows_bootstrap_rejects_shared_root_without_changing_it(tmp_path):
         )
         assert rejected.returncode != 0
         assert "private Site Ops data root" in rejected.stderr
+        assert "ROOT_ANCESTOR_ACL" in rejected.stderr
         assert "PRIVATE_ROOT_ACCEPTED" not in rejected.stdout
         assert not (shared / "siteops").exists()
     finally:
@@ -224,6 +225,7 @@ def test_windows_bootstrap_rejects_symlinked_data_ancestor(tmp_path):
     )
     assert rejected.returncode != 0
     assert "private Site Ops data root" in rejected.stderr
+    assert "ROOT_ANCESTOR_TYPE" in rejected.stderr
     assert not (private / "siteops").exists()
 
 

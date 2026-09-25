@@ -104,7 +104,7 @@ function AzureCli {
     if ($launcher -and $launcher.Source -like '*.cmd') { return $launcher.Source }
     return $null
 }
-function Require-ApprovedPythonIndex([string]$Python) {
+function Require-ApprovedPythonIndex([string]$Python, [ValidateSet('install', 'download')][string]$Command) {
     $check = @'
 import ast
 import subprocess
@@ -141,7 +141,7 @@ if any(value for key, value in settings.items()
        if key.endswith((".extra-index-url", ".find-links", ".trusted-host"))):
     raise SystemExit(1)
 index = next((settings[key] for key in
-              (":env:.index-url", "install.index-url", "global.index-url")
+              (":env:.index-url", f"{sys.argv[1]}.index-url", "global.index-url")
               if settings.get(key)), "")
 try:
     parsed = urlsplit(index)
@@ -153,7 +153,7 @@ except ValueError:
     $previousPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        $check | & $Python - >$null 2>$null
+        $check | & $Python - $Command >$null 2>$null
         $checkExit = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previousPreference
@@ -166,7 +166,26 @@ function Require-PrivateDataRoot([string]$Path) {
     function Reject([string]$Code) {
         Fail "Configure a private Site Ops data root. $Code Use trusted, non-symlinked directories."
     }
-    if ($Path -cnotmatch '^[A-Za-z]:\\' -or [IO.Path]::GetFullPath($Path) -cne $Path) {
+    function Read-DirectoryAcl([string]$Directory, [string]$Code) {
+        try {
+            $acl = [IO.Directory]::GetAccessControl($Directory)
+            return [pscustomobject]@{
+                Owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+                Rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+            }
+        } catch {
+            Reject $Code
+        }
+    }
+    if ($Path -cnotmatch '^[A-Za-z]:\\') {
+        Reject 'ROOT_PATH'
+    }
+    try {
+        $fullPath = [IO.Path]::GetFullPath($Path)
+    } catch {
+        Reject 'ROOT_PATH'
+    }
+    if ($fullPath -cne $Path) {
         Reject 'ROOT_PATH'
     }
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
@@ -183,17 +202,20 @@ function Require-PrivateDataRoot([string]$Path) {
     }
     $ancestors.Reverse()
     foreach ($ancestor in $ancestors) {
-        $node = Get-Item -LiteralPath $ancestor -Force -ErrorAction Stop
+        try {
+            $node = Get-Item -LiteralPath $ancestor -Force -ErrorAction Stop
+        } catch {
+            Reject 'ROOT_ANCESTOR_TYPE'
+        }
         if (-not $node.PSIsContainer -or
             ($node.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
             Reject 'ROOT_ANCESTOR_TYPE'
         }
-        $acl = [IO.Directory]::GetAccessControl($ancestor)
-        $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
-        if ($owner -notin $trustedOwners) {
+        $access = Read-DirectoryAcl $ancestor 'ROOT_ANCESTOR_ACL'
+        if ($access.Owner -notin $trustedOwners) {
             Reject 'ROOT_ANCESTOR_OWNER'
         }
-        foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        foreach ($rule in $access.Rules) {
             if ($rule.AccessControlType -ne 'Allow' -or $rule.IdentityReference.Value -in $trusted -or
                 ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly)) {
                 continue
@@ -204,22 +226,44 @@ function Require-PrivateDataRoot([string]$Path) {
             }
         }
     }
-    if (-not (Test-Path -LiteralPath $Path)) {
-        New-Item -ItemType Directory -Path $Path -ErrorAction Stop | Out-Null
-        & icacls.exe $Path /inheritance:r /grant:r "*${sid}:(OI)(CI)F" | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            Fail 'The Site Ops data root could not be protected.'
+    try {
+        $exists = Test-Path -LiteralPath $Path -ErrorAction Stop
+    } catch {
+        Reject 'ROOT_DATA_TYPE'
+    }
+    if (-not $exists) {
+        try {
+            New-Item -ItemType Directory -Path $Path -ErrorAction Stop | Out-Null
+        } catch {
+            Reject 'ROOT_DATA_CREATE'
+        }
+        $previousPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            & icacls.exe $Path /inheritance:r /grant:r "*${sid}:(OI)(CI)F" *> $null
+            $protected = $LASTEXITCODE -eq 0
+        } catch {
+            Reject 'ROOT_DATA_ACL'
+        } finally {
+            $ErrorActionPreference = $previousPreference
+        }
+        if (-not $protected) {
+            Reject 'ROOT_DATA_ACL'
         }
     }
-    $node = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    try {
+        $node = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    } catch {
+        Reject 'ROOT_DATA_TYPE'
+    }
     if (-not $node.PSIsContainer -or ($node.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
         Reject 'ROOT_DATA_TYPE'
     }
-    $acl = [IO.Directory]::GetAccessControl($Path)
-    if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -cne $sid) {
+    $access = Read-DirectoryAcl $Path 'ROOT_DATA_ACL'
+    if ($access.Owner -cne $sid) {
         Reject 'ROOT_DATA_OWNER'
     }
-    foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+    foreach ($rule in $access.Rules) {
         if ($rule.AccessControlType -eq 'Allow' -and $rule.IdentityReference.Value -notin $trusted) {
             Reject 'ROOT_DATA_ACL'
         }
@@ -305,7 +349,7 @@ if ($pipxVersion -cne '1.17.2') {
         if ($LASTEXITCODE -ne 0) { Fail 'The user pipx environment could not be created.' }
     }
     $toolPython = Join-Path $installed 'Scripts\python.exe'
-    Require-ApprovedPythonIndex $toolPython
+    Require-ApprovedPythonIndex $toolPython install
     & $toolPython -m pip install --only-binary=:all: --no-cache-dir 'pipx==1.17.2'
     if ($LASTEXITCODE -ne 0) { Fail 'pipx could not be installed from the configured feed.' }
     $pipx = Join-Path $installed 'Scripts\pipx.exe'
@@ -532,7 +576,7 @@ try {
         & $python -m venv $backendTools
         if ($LASTEXITCODE -ne 0) { Fail 'Python venv is unavailable.' }
         $backendPython = Join-Path $backendTools 'Scripts\python.exe'
-        Require-ApprovedPythonIndex $backendPython
+        Require-ApprovedPythonIndex $backendPython download
         & $backendPython -m pip download 'pip==26.2.1' `
             --no-deps --only-binary=:all: --dest $wheelhouse
         if ($LASTEXITCODE -ne 0) { Fail 'The approved pip backend is unavailable.' }

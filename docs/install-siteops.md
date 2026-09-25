@@ -256,7 +256,9 @@ fails with a remedy if a required tool is missing.
 Configure an approved HTTPS Python index in pip settings or `PIP_INDEX_URL`
 before any required pipx or shared backend download. The script checks this
 configuration without printing the index URL or credentials and rejects
-extra indexes, find-links and trusted hosts. It does not silently select
+extra indexes, find-links and trusted hosts. The check uses pip's effective
+index for each tool installation or backend download, including any
+command-specific configuration. It does not silently select
 the public default index. Keep package configuration and diagnostic output
 private. The Windows bootstrap applies the same check when it provisions
 pipx or its shared backend. The configured HTTPS index is an operator

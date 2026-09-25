@@ -266,6 +266,44 @@ def test_installed_acquired_aio_manual_inputs_and_configured_site(installed_acqu
         assert selected["status"] == "planned"
         assert [target["name"] for target in selected["plan"]["targets"]] == ["plant-one"]
 
+    older = {
+        **manual,
+        "siteName": "plant-two",
+        "resourceGroup": "rg-second",
+        "clusterName": "arc-second",
+        "aioRelease": "2607",
+    }
+    inline_older = [
+        item for name, value in older.items() for item in ("--input", f"{name}={value}")
+    ]
+    preview = json.loads(app.run(
+        *options, "inputs", "aio-install", *inline_older, "--offline", "--output", "json",
+    ).stdout)
+    assert preview["resolution"]["site"]["properties"]["aioRelease"] == "2607"
+    older_plan = json.loads(app.run(
+        *options, "plan", "aio-install", "--describe", *inline_older,
+        "--offline", "--output", "json",
+    ).stdout)
+    assert older_plan["status"] == "planned"
+    assert [target["name"] for target in older_plan["plan"]["targets"]] == ["plant-two"]
+    saved_older = project / "sites" / "plant-two.yaml"
+    app.run(
+        *options, "inputs", "aio-install", *inline_older,
+        "--save-site", str(saved_older), "--offline",
+    )
+    assert yaml.safe_load(saved.read_text(encoding="utf-8"))["properties"]["aioRelease"] == "2608"
+    assert yaml.safe_load(saved_older.read_text(encoding="utf-8"))["properties"]["aioRelease"] == "2607"
+    fleet = json.loads(app.run(
+        *options, "plan", "aio-install", "--describe",
+        "-l", "environment=dev", "--offline", "--output", "json",
+    ).stdout)
+    assert fleet["status"] == "planned"
+    assert fleet["summary"]["targetCount"] == 2
+    assert {target["name"] for target in fleet["plan"]["targets"]} == {
+        "plant-one", "plant-two",
+    }
+    assert fleet["plan"]["manifest"]["cliSelector"] == "environment=dev"
+
     cluster = (
         "/subscriptions/00000000-0000-0000-0000-000000000001/"
         "resourceGroups/rg-existing/providers/Microsoft.Kubernetes/"

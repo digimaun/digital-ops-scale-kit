@@ -1150,6 +1150,54 @@ def test_aio_enabled_observes_prerequisites_before_one_plan(
         assert document["diagnostics"][0]["code"] == "inputs.resource.requirement-unmet"
 
 
+@pytest.mark.parametrize(
+    ("cluster", "release"),
+    [("arc-2608", "2608"), ("arc-2607", "2607")],
+)
+def test_inline_aio_release_selects_one_cluster_for_each_deploy(
+    cluster, release, capsys,
+):
+    workspace = Path(__file__).resolve().parents[1] / "workspaces" / "iot-operations"
+    cluster_id = _CLUSTER_ID.replace("arc-first", cluster)
+    observed = []
+
+    class Reader:
+        identity = SimpleNamespace(name="azure-cli", version=None)
+
+        def read(self, ref, *, facts=frozenset()):
+            observed.append((ref.resource_id, facts))
+            return ArmResourceObservation(
+                cluster_id, "Microsoft.Kubernetes/connectedClusters",
+                "eastus", cluster, {},
+            )
+
+    with (
+        patch("siteops.cli.new_arm_reader", return_value=Reader()),
+        patch.object(
+            Orchestrator, "deploy", return_value=SimpleNamespace(exit_code=0),
+        ) as deploy,
+        patch("siteops.cli._write_run_result"),
+    ):
+        assert _invoke([
+            "-w", str(workspace), "deploy", "aio-install",
+            "--input", f"siteName=plant-{release}",
+            "--input", f"cluster={cluster_id}",
+            "--input", "environment=dev",
+            "--input", "country=US",
+            "--input", f"aioRelease={release}",
+            "--read-resources",
+        ]) == 0
+    capsys.readouterr()
+    assert observed == [(cluster_id, frozenset())]
+    deploy.assert_called_once()
+    assert deploy.call_args.kwargs["selector"] is None
+    sites = deploy.call_args.kwargs["sites"]
+    assert len(sites) == 1
+    assert sites[0].name == f"plant-{release}"
+    assert sites[0].parameters["clusterName"] == cluster
+    assert sites[0].properties["aioRelease"] == release
+
+
 @pytest.mark.parametrize("workload_ready", [False, True])
 def test_enabled_deploy_read_gate_precedes_executor(
     capsys, workload_ready,
@@ -1268,7 +1316,9 @@ def test_aio_existing_vault_sub_mismatch_stops_before_any_read(capsys):
     assert result["diagnostics"][0]["code"] == "inputs.resource.subscription-mismatch"
 
 
-def _aio_template_session(tmp_path: Path) -> TemplateCompilationSession:
+def _aio_template_session(
+    tmp_path: Path, *, include_aio_version: bool = False,
+) -> TemplateCompilationSession:
     def runner(argv: tuple[str, ...], timeout: int) -> subprocess.CompletedProcess[str]:
         if argv[1:] == ("version", "--output", "json"):
             return subprocess.CompletedProcess(argv, 0, '{"azure-cli":"test"}', "")
@@ -1284,6 +1334,8 @@ def _aio_template_session(tmp_path: Path) -> TemplateCompilationSession:
             else {"existingKeyVaultResourceId": {"type": "string", "defaultValue": ""}}
             if source.name == "enable-secretsync.bicep" else {}
         )
+        if include_aio_version and source.name == "instance.bicep":
+            parameters = {"aioVersion": {"type": "string"}}
         outputs = {
             name: {"type": "string"} for name in (
                 "customLocationId", "customLocationName", "customLocationNamespace",
@@ -1317,6 +1369,45 @@ def _aio_template_session(tmp_path: Path) -> TemplateCompilationSession:
         command_runner=runner,
         tool_resolver=lambda name: str(tmp_path / "tools" / name),
     )
+
+
+def test_aio_preparation_selects_each_site_release_configuration(tmp_path):
+    workspace = Path(__file__).resolve().parents[1] / "workspaces" / "iot-operations"
+    manifest = workspace / "manifests" / "aio-install" / "manifest.yaml"
+    contract = load_contract(manifest)
+    sites = [
+        contract.resolve(inline=[
+            f"siteName=plant-{release}",
+            "subscription=00000000-0000-0000-0000-000000000001",
+            f"resourceGroup=rg-{release}",
+            "location=eastus",
+            f"clusterName=arc-{release}",
+            "environment=dev", "country=US",
+            f"aioRelease={release}",
+        ])
+        for release in ("2608", "2607")
+    ]
+    session = _aio_template_session(tmp_path, include_aio_version=True)
+    with patch("siteops.orchestrator.TemplateCompilationSession", return_value=session):
+        result = Orchestrator(workspace).build_plan(
+            manifest, sites=sites, intent=PlanIntent.EXECUTABLE,
+        )
+    assert result.status is PlanStatus.PLANNED, result.diagnostics
+    assert result.plan is not None
+    selected = {}
+    for target in result.plan.targets:
+        instance = next(
+            operation for operation in target.operations
+            if operation.identity.step == "aio-instance"
+        )
+        assert isinstance(instance.details, DeploymentOperation)
+        assert instance.details.parameters is not None
+        value = next(
+            entry.value for entry in instance.details.parameters.entries
+            if isinstance(entry.key, LiteralValue) and entry.key.value == "aioVersion"
+        )
+        selected[target.name] = resolve_plan_value(value, {})
+    assert selected == {"plant-2608": "1.4.73", "plant-2607": "1.4.41"}
 
 
 def test_aio_executable_preparation_resolves_country_and_environment_tags(

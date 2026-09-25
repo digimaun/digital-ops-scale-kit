@@ -186,6 +186,11 @@ the inspector.
 
 Conventional discovery covers YAML manifests beneath `manifests` and
 `manifest.yaml`, `manifest.yml` and underscore partials beneath `samples`.
+In a nested `manifests/` directory, `inputs.yaml` is a discoverable manifest
+unless the same directory has `manifest.yaml` or `manifest.yml`; alongside
+either of those names, it is reserved for that manifest's typed input
+contract. To browse an actual manifest named `inputs.yaml` in that ambiguous
+layout, list its path explicitly in `content.yaml`.
 Metadata files are excluded. The engine does not crawl arbitrary template or
 script trees. To list additional manifests, optionally name them in the
 workspace's `content.yaml`:

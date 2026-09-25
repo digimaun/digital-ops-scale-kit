@@ -408,7 +408,9 @@ def _aggregate_run_status(
         return RunStatus.CANCELLED
     if SiteStatus.NOT_RUN in statuses:
         return RunStatus.CANCELLED if interrupted else RunStatus.NOT_RUN
-    if not sites or statuses == {SiteStatus.SKIPPED}:
+    if not sites:
+        return RunStatus.CANCELLED if interrupted else RunStatus.SKIPPED
+    if statuses == {SiteStatus.SKIPPED}:
         return RunStatus.SKIPPED
     return RunStatus.SUCCEEDED
 

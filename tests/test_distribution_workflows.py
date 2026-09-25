@@ -644,7 +644,8 @@ def _run_windows_bootstrap_qualifier(
             )
             for code in (
                 "ROOT_PATH", "ROOT_ANCESTOR_TYPE", "ROOT_ANCESTOR_OWNER",
-                "ROOT_ANCESTOR_ACL", "ROOT_DATA_TYPE", "ROOT_DATA_OWNER", "ROOT_DATA_ACL",
+                "ROOT_ANCESTOR_ACL", "ROOT_DATA_CREATE", "ROOT_DATA_TYPE",
+                "ROOT_DATA_OWNER", "ROOT_DATA_ACL",
             )
         ],
         (

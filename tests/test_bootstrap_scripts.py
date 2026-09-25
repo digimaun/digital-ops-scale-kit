@@ -51,12 +51,14 @@ def test_pipx_managed_directories_are_isolated_before_package_operations():
 
 def test_bootstrap_requires_configured_secure_index_before_python_download():
     bash = (SCRIPTS / "siteops-bootstrap.sh").read_text(encoding="utf-8")
-    assert 'pip_configuration="$("$venv_check/check/bin/python" -m pip config list 2>/dev/null)"' in bash
+    assert 'pip_configuration="$("$1" -m pip config list 2>/dev/null)"' in bash
     assert "parsed.scheme != \"https\"" in bash
-    assert bash.index("  require_approved_python_index\n") < bash.index(
+    assert bash.index('  require_approved_python_index "$tools/pipx/bin/python" install\n') < bash.index(
         '"$tools/pipx/bin/python" -m pip install',
     )
-    assert bash.rindex("  require_approved_python_index\n") < bash.index(
+    assert bash.rindex(
+        '  require_approved_python_index "$staging/backend-tools/bin/python" download\n',
+    ) < bash.index(
         '"$staging/backend-tools/bin/python" -m pip download',
     )
     assert '> "$staging/pip-download.log" 2>&1' in bash
@@ -65,12 +67,28 @@ def test_bootstrap_requires_configured_secure_index_before_python_download():
 def test_windows_bootstrap_checks_python_index_before_tool_downloads():
     powershell = (SCRIPTS / "siteops-bootstrap.ps1").read_text(encoding="utf-8")
     assert "function Require-ApprovedPythonIndex(" in powershell
-    assert powershell.index("Require-ApprovedPythonIndex $toolPython") < powershell.index(
+    assert powershell.index("Require-ApprovedPythonIndex $toolPython install") < powershell.index(
         "& $toolPython -m pip install",
     )
-    assert powershell.index("Require-ApprovedPythonIndex $backendPython") < powershell.index(
+    assert powershell.index("Require-ApprovedPythonIndex $backendPython download") < powershell.index(
         "& $backendPython -m pip download",
     )
+
+
+def _windows_python_index_wrapper(tmp_path: Path) -> Path:
+    source = (SCRIPTS / "siteops-bootstrap.ps1").read_text(encoding="utf-8")
+    helper = re.search(r"(?ms)^function Require-ApprovedPythonIndex\([^\n]*\) \{.*?^\}", source)
+    assert helper, "The Windows Python feed admission helper is missing."
+    wrapper = tmp_path / "check-index.ps1"
+    wrapper.write_text(
+        'function Fail([string]$message) { throw "Site Ops installation: $message" }\n'
+        + helper.group(0) + "\n"
+        "$ErrorActionPreference = 'Stop'\n"
+        "Require-ApprovedPythonIndex $env:TEST_PYTHON $env:TEST_COMMAND\n"
+        "'INDEX_ACCEPTED'\n",
+        encoding="utf-8",
+    )
+    return wrapper
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Native pip config requires Windows PowerShell 5.1.")
@@ -88,18 +106,7 @@ def test_windows_bootstrap_checks_python_index_before_tool_downloads():
 def test_windows_bootstrap_python_index_check(
     tmp_path, index, extra, find_links, trusted_host, accepted,
 ):
-    source = (SCRIPTS / "siteops-bootstrap.ps1").read_text(encoding="utf-8")
-    helper = re.search(r"(?ms)^function Require-ApprovedPythonIndex\([^\n]*\) \{.*?^\}", source)
-    assert helper, "The Windows Python feed admission helper is missing."
-    wrapper = tmp_path / "check-index.ps1"
-    wrapper.write_text(
-        'function Fail([string]$message) { throw "Site Ops installation: $message" }\n'
-        + helper.group(0) + "\n"
-        "$ErrorActionPreference = 'Stop'\n"
-        "Require-ApprovedPythonIndex $env:TEST_PYTHON\n"
-        "'INDEX_ACCEPTED'\n",
-        encoding="utf-8",
-    )
+    wrapper = _windows_python_index_wrapper(tmp_path)
     env = {
         **os.environ,
         "PIP_CONFIG_FILE": os.devnull,
@@ -108,6 +115,7 @@ def test_windows_bootstrap_python_index_check(
         "PIP_FIND_LINKS": find_links,
         "PIP_TRUSTED_HOST": trusted_host,
         "TEST_PYTHON": sys.executable,
+        "TEST_COMMAND": "install",
     }
     result = subprocess.run(
         ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(wrapper)],
@@ -116,6 +124,48 @@ def test_windows_bootstrap_python_index_check(
     assert (result.returncode == 0) is accepted, result.stdout + result.stderr
     assert ("INDEX_ACCEPTED" in result.stdout) is accepted
     assert "packages.example.invalid" not in result.stdout + result.stderr
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Native pip config requires Windows PowerShell 5.1.")
+@pytest.mark.parametrize(
+    ("command", "global_index", "install_index", "download_index", "accepted"),
+    [
+        ("download", "https://approved.example.invalid/simple", "https://approved.example.invalid/simple",
+         "http://other.example.invalid/simple", False),
+        ("download", "http://other.example.invalid/simple", "https://approved.example.invalid/simple",
+         None, False),
+        ("download", "http://other.example.invalid/simple", "http://other.example.invalid/simple",
+         "https://approved.example.invalid/simple", True),
+        ("install", "https://approved.example.invalid/simple", "https://approved.example.invalid/simple",
+         "http://other.example.invalid/simple", True),
+        ("install", "https://approved.example.invalid/simple", "http://other.example.invalid/simple",
+         "https://approved.example.invalid/simple", False),
+    ],
+)
+def test_windows_bootstrap_index_check_uses_effective_command_section(
+    tmp_path, command, global_index, install_index, download_index, accepted,
+):
+    wrapper = _windows_python_index_wrapper(tmp_path)
+    config = tmp_path / "pip.ini"
+    config.write_text(
+        "[global]\nindex-url = " + global_index + "\n"
+        "[install]\nindex-url = " + install_index + "\n"
+        + ("[download]\nindex-url = " + download_index + "\n" if download_index else ""),
+        encoding="utf-8",
+    )
+    env = {
+        **os.environ, "PIP_CONFIG_FILE": str(config),
+        "TEST_PYTHON": sys.executable, "TEST_COMMAND": command,
+    }
+    for name in ("PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_FIND_LINKS", "PIP_TRUSTED_HOST"):
+        env.pop(name, None)
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(wrapper)],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert (result.returncode == 0) is accepted, "The command-specific index check disagreed."
+    assert ("INDEX_ACCEPTED" in result.stdout) is accepted
+    assert "example.invalid" not in result.stdout + result.stderr
 
 
 def test_bash_bootstrap_admits_private_data_root_before_retained_tool_use():
@@ -136,13 +186,14 @@ def test_windows_bootstrap_admits_private_data_root_before_retained_tool_use():
     )
 
 
-def _windows_private_root_wrapper(tmp_path: Path) -> Path:
+def _windows_private_root_wrapper(tmp_path: Path, setup: str = "") -> Path:
     source = (SCRIPTS / "siteops-bootstrap.ps1").read_text(encoding="utf-8")
     helper = re.search(r"(?ms)^function Require-PrivateDataRoot\([^\n]*\) \{.*?^\}", source)
     assert helper, "The Windows private data-root helper is missing."
     wrapper = tmp_path / "check-data-root.ps1"
     wrapper.write_text(
         'function Fail([string]$message) { throw "Site Ops installation: $message" }\n'
+        + setup
         + helper.group(0) + "\n"
         "$ErrorActionPreference = 'Stop'\n"
         "Require-PrivateDataRoot $env:TEST_DATA_ROOT\n"
@@ -227,6 +278,49 @@ def test_windows_bootstrap_rejects_symlinked_data_ancestor(tmp_path):
     assert "private Site Ops data root" in rejected.stderr
     assert "ROOT_ANCESTOR_TYPE" in rejected.stderr
     assert not (private / "siteops").exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Native Windows filesystem errors need PowerShell 5.1.")
+@pytest.mark.parametrize(
+    ("case", "category"),
+    [
+        ("invalid-path", "ROOT_PATH"),
+        ("missing-ancestor", "ROOT_ANCESTOR_TYPE"),
+        ("ancestor-error", "ROOT_ANCESTOR_TYPE"),
+        ("root-probe-error", "ROOT_DATA_TYPE"),
+        ("creation-error", "ROOT_DATA_CREATE"),
+        ("protection-error", "ROOT_DATA_ACL"),
+    ],
+)
+def test_windows_bootstrap_root_filesystem_errors_are_bounded(tmp_path, case, category):
+    marker = "PRIVATE_DATA_PATH_MARKER"
+    target = tmp_path / "siteops"
+    setup = ""
+    if case == "invalid-path":
+        target = Path(f"C:\\{marker}<\\siteops")
+    elif case == "missing-ancestor":
+        target = tmp_path / f"missing-{marker}" / "siteops"
+    elif case == "ancestor-error":
+        setup = f"function Get-Item {{ throw '{marker}' }}\n"
+    elif case == "root-probe-error":
+        setup = f"function Test-Path {{ throw '{marker}' }}\n"
+    elif case == "creation-error":
+        setup = f"function New-Item {{ throw '{marker}' }}\n"
+    else:
+        setup = (
+            f"function icacls.exe {{ Write-Error '{marker}'; "
+            "$global:LASTEXITCODE = 5 }\n"
+        )
+    wrapper = _windows_private_root_wrapper(tmp_path, setup)
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(wrapper)],
+        cwd=tmp_path, env={**os.environ, "TEST_DATA_ROOT": str(target)},
+        capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode != 0
+    assert category in result.stderr
+    assert marker not in result.stdout + result.stderr
+    assert "PRIVATE_ROOT_ACCEPTED" not in result.stdout
 
 
 def test_existing_siteops_build_is_rejected_before_any_shared_backend_change():

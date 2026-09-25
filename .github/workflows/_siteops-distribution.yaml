@@ -918,8 +918,8 @@ jobs:
               if ((Get-Item -LiteralPath $log).Length -le 65536) {
                   $privateLog = Get-Content -LiteralPath $log -Raw
                   foreach ($code in @('ROOT_PATH', 'ROOT_ANCESTOR_TYPE', 'ROOT_ANCESTOR_OWNER',
-                                      'ROOT_ANCESTOR_ACL', 'ROOT_DATA_TYPE', 'ROOT_DATA_OWNER',
-                                      'ROOT_DATA_ACL')) {
+                                      'ROOT_ANCESTOR_ACL', 'ROOT_DATA_CREATE', 'ROOT_DATA_TYPE',
+                                      'ROOT_DATA_OWNER', 'ROOT_DATA_ACL')) {
                       if ($privateLog -and $privateLog.Contains(
                           "Configure a private Site Ops data root. $code"
                       )) {

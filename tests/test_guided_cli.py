@@ -702,9 +702,11 @@ def test_ci_deploy_missing_input_reports_safe_field_name(
     assert "subscription" in output["diagnostics"][0]["summary"]
 
 
+@pytest.mark.parametrize("redacted", [False, True])
 def test_saved_site_is_normal_config_and_not_overwritten(
-    guided_workspace, tmp_path, capsys,
+    guided_workspace, tmp_path, capsys, monkeypatch, redacted,
 ):
+    monkeypatch.setenv("SITEOPS_REDACT_OUTPUT", "1" if redacted else "0")
     answers = _input_file(tmp_path / "answers.yaml")
     site_file = guided_workspace / "sites" / "one.yaml"
     args = [
@@ -716,13 +718,16 @@ def test_saved_site_is_normal_config_and_not_overwritten(
     site = Site.from_file(site_file)
     assert site.name == "one"
     assert site.location == "eastus"
+    saved_bytes = site_file.read_bytes()
     assert _invoke([
         "-w", str(guided_workspace), "plan", _manifest(guided_workspace),
         "-l", "name=one", "--describe",
     ]) == 0
     capsys.readouterr()
     assert _invoke(args) == 1
-    assert "exists" in capsys.readouterr().err.lower()
+    error = capsys.readouterr().err.lower()
+    assert ("could not be loaded" if redacted else "exists") in error
+    assert site_file.read_bytes() == saved_bytes
 
 
 @pytest.mark.parametrize(("name", "filename"), [

@@ -215,6 +215,16 @@ with its private pre-run snapshot before selecting resources. It rejects
 missing or ambiguous run-owned resources without publishing their identities.
 Secret Sync infrastructure enablement does not prove secret materialization.
 
+Within the guided disabled cell, the installed engine prepares resource-backed,
+manual-file and inline-input plans from the verified package.
+The manual and inline routes do not authorize a cluster resource read. A
+complete manual Site is also saved to the operator project and planned with a
+bounded configured-Site selector. The cell compares the selected target and
+operation identities and dispositions in private runner files, then deploys
+only the resource-backed target. These additional preparations do not prove
+byte-identical parameter values, a second deployment, or live readiness for
+the other input routes.
+
 Example guided qualification in one dedicated existing RG. Supply an
 approved published tag and its exact full main commit before running:
 

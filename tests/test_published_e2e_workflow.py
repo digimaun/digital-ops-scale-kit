@@ -77,6 +77,7 @@ def _embedded_python(run: str) -> list[str]:
 
 @pytest.mark.parametrize(("step", "minimum_python"), [
     ("Prepare guided AIO answers and plan", 5),
+    ("Check published guided disabled Site routes", 2),
     ("Deploy AIO through the published engine and package", 1),
     ("Observe bounded AIO readiness", 3),
 ])
@@ -358,6 +359,203 @@ def test_guided_published_plan_waits_for_arc_and_keeps_private_data_local():
         assert value in step
     assert "cat \"$RUNNER_TEMP/" not in step
     assert " -w workspaces/" not in step
+
+
+def test_guided_disabled_cell_checks_manual_inline_and_configured_site_without_reads():
+    workflow = yaml.safe_load(_workflow())
+    steps = workflow["jobs"]["e2e"]["steps"]
+    control = next(
+        item for item in steps
+        if item.get("name") == "Check published guided disabled Site routes"
+    )
+    assert control["if"] == (
+        "needs.prep.outputs.published-mode == 'true' && "
+        "needs.prep.outputs.published-journey == 'guided' && "
+        "matrix.secret-sync-mode == 'disabled'"
+    )
+    assert steps.index(control) > next(
+        index for index, item in enumerate(steps)
+        if item.get("name") == "Prepare guided AIO answers and plan"
+    )
+    assert steps.index(control) < next(
+        index for index, item in enumerate(steps)
+        if item.get("name") == "Deploy AIO through the published engine and package"
+    )
+    assert control["env"]["E2E_LOCATION"] == "${{ steps.loc.outputs.location }}"
+    run = control["run"]
+    for value in (
+        'published-manual-answers.json',
+        '--input-file "$RUNNER_TEMP/published-manual-answers.json"',
+        '--input "siteName=$E2E_SITE_NAME"',
+        'inputs aio-install --offline',
+        '--save-site "$site"',
+        '-l "name=$E2E_SITE_NAME"',
+        'SITEOPS_REDACT_OUTPUT=0 siteops',
+        'published-guided-plan.json',
+        'site_before="$(sha256sum "$site"',
+        'site_after="$(sha256sum "$site"',
+    ):
+        assert value in run
+    assert "--read-resources" not in run
+    assert "cat \"$RUNNER_TEMP/" not in run
+    assert " -w workspaces/" not in run
+
+
+def test_guided_disabled_manual_answers_are_complete_and_resource_free(tmp_path):
+    script = _embedded_python(_step_run("Check published guided disabled Site routes"))[0]
+    resource_id = (
+        "/subscriptions/fixture/resourceGroups/fixture-rg/providers/"
+        "Microsoft.Kubernetes/connectedClusters/fixture-arc"
+    )
+    source = {
+        "apiVersion": "siteops.inputs/v1",
+        "kind": "SiteInputValues",
+        "values": {
+            "siteName": "fixture-site", "subscription": None, "resourceGroup": None,
+            "location": None, "clusterName": None, "environment": "e2e",
+            "country": "US", "enableSecretSync": False, "aioRelease": "2608",
+            "brokerMemoryProfile": "Low", "cluster": resource_id,
+        },
+    }
+    environment = {
+        "RUNNER_TEMP": str(tmp_path), "E2E_SUBSCRIPTION": "fixture",
+        "E2E_RESOURCE_GROUP": "fixture-rg", "E2E_LOCATION": "eastus",
+        "E2E_CLUSTER_NAME": "fixture-arc",
+    }
+    if os.name == "nt":
+        environment["SystemRoot"] = os.environ["SystemRoot"]
+    (tmp_path / "published-answers.json").write_text(
+        json.dumps(source), encoding="utf-8",
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], env=environment,
+        capture_output=True, text=True, timeout=15, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    manual = json.loads((tmp_path / "published-manual-answers.json").read_text(
+        encoding="utf-8",
+    ))
+    assert manual["values"]["cluster"] is None
+    assert manual["values"]["subscription"] == "fixture"
+    assert manual["values"]["resourceGroup"] == "fixture-rg"
+    assert manual["values"]["location"] == "eastus"
+    assert manual["values"]["clusterName"] == "fixture-arc"
+    assert manual["values"]["enableSecretSync"] is False
+    assert manual["values"]["siteName"] == source["values"]["siteName"]
+    assert resource_id not in result.stdout + result.stderr
+
+    invalid_root = tmp_path / "invalid"
+    invalid_root.mkdir()
+    source["values"]["enableSecretSync"] = True
+    (invalid_root / "published-answers.json").write_text(
+        json.dumps(source), encoding="utf-8",
+    )
+    invalid = subprocess.run(
+        [sys.executable, "-c", script],
+        env={**environment, "RUNNER_TEMP": str(invalid_root)},
+        capture_output=True, text=True, timeout=15, check=False,
+    )
+    assert invalid.returncode != 0
+    assert "Guided disabled answers are invalid." in invalid.stderr
+    assert resource_id not in invalid.stderr
+    assert not (invalid_root / "published-manual-answers.json").exists()
+
+
+def test_guided_disabled_plan_comparison_rejects_wrong_target_and_operations(tmp_path):
+    scripts = _embedded_python(_step_run("Check published guided disabled Site routes"))
+    comparison = next(script for script in scripts if "expected_operations" in script)
+    site = "private-site"
+    steps = (
+        "global-edge-site", "edge-site", "schema-registry", "adr-ns",
+        "aio-enablement", "aio-instance", "schema-registry-role", "resolve-aio",
+        "secretsync",
+    )
+
+    def document(selection):
+        return {
+            "apiVersion": "siteops/v1alpha1",
+            "kind": "DeploymentPlan",
+            "status": "planned",
+            "executable": True,
+            "engine": {"version": "fixture-engine"},
+            "summary": {"targetCount": 1, "operationCount": 9},
+            "plan": {
+                "manifest": (
+                    {"cliSelector": f"name={site}"}
+                    if selection == "configured" else
+                    {"targetSelection": "explicit-site", "cliSelector": None}
+                ),
+                "submission": {"mode": "arm-json", "compilationBinding": "package-artifact"},
+                "targets": [{
+                    "name": site,
+                    "kind": "resource-group",
+                    "subscription": "fixture",
+                    "resourceGroup": "fixture-rg",
+                    "location": "eastus",
+                    "operations": [{
+                        "identity": {"target": site, "step": step},
+                        "kind": "deployment", "scope": "resource-group",
+                        "disposition": "skip" if step in {
+                            "global-edge-site", "edge-site", "resolve-aio", "secretsync",
+                        } else "execute",
+                    } for step in steps],
+                }],
+            },
+        }
+
+    files = {
+        "published-guided-plan.json": document("resource"),
+        "published-manual-plan.json": document("manual"),
+        "published-inline-plan.json": document("inline"),
+        "published-configured-plan.json": document("configured"),
+    }
+    for name, content in files.items():
+        (tmp_path / name).write_text(json.dumps(content), encoding="utf-8")
+    environment = {
+        "RUNNER_TEMP": str(tmp_path),
+        "E2E_SITE_NAME": site,
+        "SITEOPS_E2E_ENGINE_VERSION": "fixture-engine",
+    }
+    if os.name == "nt":
+        environment["SystemRoot"] = os.environ["SystemRoot"]
+
+    def compare():
+        return subprocess.run(
+            [sys.executable, "-c", comparison], env=environment,
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+
+    assert compare().returncode == 0
+    files["published-manual-plan.json"]["plan"]["targets"][0]["name"] = "wrong-site"
+    (tmp_path / "published-manual-plan.json").write_text(
+        json.dumps(files["published-manual-plan.json"]), encoding="utf-8",
+    )
+    wrong_target = compare()
+    assert wrong_target.returncode != 0
+    assert "wrong-site" not in wrong_target.stderr
+
+    files["published-manual-plan.json"] = document("manual")
+    (tmp_path / "published-manual-plan.json").write_text(
+        json.dumps(files["published-manual-plan.json"]), encoding="utf-8",
+    )
+    files["published-configured-plan.json"]["plan"]["targets"][0]["operations"][5][
+        "disposition"
+    ] = "skip"
+    (tmp_path / "published-configured-plan.json").write_text(
+        json.dumps(files["published-configured-plan.json"]), encoding="utf-8",
+    )
+    wrong_operation = compare()
+    assert wrong_operation.returncode != 0
+    assert site not in wrong_operation.stderr
+
+    files["published-configured-plan.json"] = document("configured")
+    files["published-configured-plan.json"]["plan"]["manifest"]["cliSelector"] = None
+    (tmp_path / "published-configured-plan.json").write_text(
+        json.dumps(files["published-configured-plan.json"]), encoding="utf-8",
+    )
+    wrong_selector = compare()
+    assert wrong_selector.returncode != 0
+    assert site not in wrong_selector.stderr
 
 
 def test_guided_published_deploy_uses_answers_and_read_gate():

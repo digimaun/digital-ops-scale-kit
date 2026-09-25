@@ -914,6 +914,175 @@ jobs:
               raise SystemExit("Guided installed AIO plan has unexpected operations.")
           PY
 
+      - name: Check published guided disabled Site routes
+        if: needs.prep.outputs.published-mode == 'true' && needs.prep.outputs.published-journey == 'guided' && matrix.secret-sync-mode == 'disabled'
+        shell: bash
+        env:
+          E2E_SITE_NAME: ${{ steps.names.outputs.site_name }}
+          E2E_SUBSCRIPTION: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          E2E_RESOURCE_GROUP: ${{ steps.names.outputs.rg }}
+          E2E_LOCATION: ${{ steps.loc.outputs.location }}
+          E2E_CLUSTER_NAME: ${{ steps.names.outputs.cluster }}
+          E2E_AIO_RELEASE: ${{ matrix.aio-release }}
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"])
+          source = json.loads((root / "published-answers.json").read_text(encoding="utf-8"))
+          values = source.get("values")
+          if (
+              source.get("apiVersion") != "siteops.inputs/v1"
+              or source.get("kind") != "SiteInputValues"
+              or not isinstance(values, dict)
+              or values.get("enableSecretSync") is not False
+              or not values.get("cluster")
+          ):
+              raise SystemExit("Guided disabled answers are invalid.")
+          manual = {
+              **values,
+              "subscription": os.environ["E2E_SUBSCRIPTION"],
+              "resourceGroup": os.environ["E2E_RESOURCE_GROUP"],
+              "location": os.environ["E2E_LOCATION"],
+              "clusterName": os.environ["E2E_CLUSTER_NAME"],
+              "cluster": None,
+          }
+          destination = root / "published-manual-answers.json"
+          fd = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+          with os.fdopen(fd, "w", encoding="utf-8") as stream:
+              json.dump({**source, "values": manual}, stream, sort_keys=True)
+          PY
+          if ! SITEOPS_REDACT_OUTPUT=0 siteops \
+            --project "$SITEOPS_E2E_PROJECT" --approved-source guided \
+            plan aio-install --offline \
+            --input-file "$RUNNER_TEMP/published-manual-answers.json" \
+            --output json --projection local-private \
+            > "$RUNNER_TEMP/published-manual-plan.json" \
+            2> "$RUNNER_TEMP/published-manual-plan.err"; then
+            echo "::error::The published guided manual plan failed."
+            exit 1
+          fi
+          if ! SITEOPS_REDACT_OUTPUT=0 siteops \
+            --project "$SITEOPS_E2E_PROJECT" --approved-source guided \
+            plan aio-install --offline \
+            --input "siteName=$E2E_SITE_NAME" \
+            --input "subscription=$E2E_SUBSCRIPTION" \
+            --input "resourceGroup=$E2E_RESOURCE_GROUP" \
+            --input "location=$E2E_LOCATION" \
+            --input "clusterName=$E2E_CLUSTER_NAME" \
+            --input environment=e2e --input country=US \
+            --input "aioRelease=$E2E_AIO_RELEASE" \
+            --input brokerMemoryProfile=Low --input enableSecretSync=false \
+            --output json --projection local-private \
+            > "$RUNNER_TEMP/published-inline-plan.json" \
+            2> "$RUNNER_TEMP/published-inline-plan.err"; then
+            echo "::error::The published guided inline plan failed."
+            exit 1
+          fi
+          mkdir "$SITEOPS_E2E_PROJECT/sites"
+          site="$SITEOPS_E2E_PROJECT/sites/$E2E_SITE_NAME.yaml"
+          if ! siteops \
+            --project "$SITEOPS_E2E_PROJECT" --approved-source guided \
+            inputs aio-install --offline \
+            --input-file "$RUNNER_TEMP/published-manual-answers.json" \
+            --save-site "$site" \
+            > "$RUNNER_TEMP/published-saved-site.txt" \
+            2> "$RUNNER_TEMP/published-saved-site.err"; then
+            echo "::error::The published guided Site could not be saved."
+            exit 1
+          fi
+          site_before="$(sha256sum "$site" | cut -d ' ' -f 1)"
+          if ! SITEOPS_REDACT_OUTPUT=0 siteops \
+            --project "$SITEOPS_E2E_PROJECT" --approved-source guided \
+            plan aio-install --offline -l "name=$E2E_SITE_NAME" \
+            --output json --projection local-private \
+            > "$RUNNER_TEMP/published-configured-plan.json" \
+            2> "$RUNNER_TEMP/published-configured-plan.err"; then
+            echo "::error::The published configured Site plan failed."
+            exit 1
+          fi
+          site_after="$(sha256sum "$site" | cut -d ' ' -f 1)"
+          if [[ "$site_before" != "$site_after" ]]; then
+            echo "::error::Published planning changed the configured Site."
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"])
+          site = os.environ["E2E_SITE_NAME"]
+          version = os.environ["SITEOPS_E2E_ENGINE_VERSION"]
+
+          def shape(filename, *, configured=False):
+              raw = json.loads((root / filename).read_text(encoding="utf-8"))
+              plan = raw["plan"]
+              manifest = plan["manifest"]
+              targets = plan["targets"]
+              if configured:
+                  selection_matches = (
+                      manifest.get("cliSelector") == f"name={site}"
+                      and manifest.get("targetSelection") is None
+                  )
+              else:
+                  selection_matches = (
+                      manifest.get("cliSelector") is None
+                      and manifest.get("targetSelection") == "explicit-site"
+                  )
+              if (
+                  raw.get("apiVersion") != "siteops/v1alpha1"
+                  or raw.get("kind") != "DeploymentPlan"
+                  or raw.get("status") != "planned"
+                  or raw.get("executable") is not True
+                  or raw.get("engine", {}).get("version") != version
+                  or raw.get("summary", {}).get("targetCount") != 1
+                  or len(targets) != 1
+                  or targets[0]["name"] != site
+                  or plan["submission"] != {
+                      "mode": "arm-json", "compilationBinding": "package-artifact"
+                  }
+                  or not selection_matches
+              ):
+                  raise ValueError("Plan shape differs.")
+              operations = targets[0]["operations"]
+              if len(operations) != 9 or raw["summary"]["operationCount"] != len(operations):
+                  raise ValueError("Operation count differs.")
+              target = targets[0]
+              identity = tuple(
+                  target[key] for key in (
+                      "name", "kind", "subscription", "resourceGroup", "location"
+                  )
+              )
+              steps = tuple(
+                  (
+                      item["identity"]["target"], item["identity"]["step"],
+                      item["kind"], item["scope"], item["disposition"]
+                  )
+                  for item in operations
+              )
+              if any(not isinstance(value, str) or not value for value in identity):
+                  raise ValueError("Target identity is incomplete.")
+              return identity, steps
+
+          try:
+              expected_target, expected_operations = shape("published-guided-plan.json")
+              for filename, configured in (
+                  ("published-manual-plan.json", False),
+                  ("published-inline-plan.json", False),
+                  ("published-configured-plan.json", True),
+              ):
+                  target, operations = shape(filename, configured=configured)
+                  if target != expected_target or operations != expected_operations:
+                      raise ValueError("Selected operations differ.")
+          except (OSError, ValueError, KeyError, TypeError, IndexError):
+              raise SystemExit("Published guided disabled Site controls differ.") from None
+          PY
+
       - name: Check for kubectl manifest steps
         id: rbac-check
         if: needs.prep.outputs.published-mode != 'true'

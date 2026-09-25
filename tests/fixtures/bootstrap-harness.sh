@@ -81,6 +81,32 @@ case "$1 $2" in
   *) exit 99 ;;
 esac
 SH
+cat > "$root/bin/pip-config" <<'SH'
+#!/usr/bin/env bash
+interpreter="$1"
+if [[ "${TEST_NO_INDEX:-0}" != 1 ]]; then
+  if [[ "${TEST_INSECURE_INDEX:-0}" == 1 ]]; then
+    echo "global.index-url='http://packages.example.invalid/private-fixture/'"
+  else
+    echo "global.index-url='https://packages.example.invalid/private-fixture/'"
+  fi
+  if [[ "${TEST_EXTRA_INDEX:-0}" == 1 ]]; then
+    echo "global.extra-index-url='https://other.example.invalid/simple/'"
+  fi
+  if [[ "${TEST_DOWNLOAD_INDEX:-0}" == unsafe ]]; then
+    echo "download.index-url='http://other.example.invalid/simple/'"
+  elif [[ "${TEST_DOWNLOAD_INDEX:-0}" == secure ]]; then
+    echo "download.index-url='https://packages.example.invalid/approved-download/'"
+  fi
+  if [[ "$interpreter" == */backend-tools/bin/python ]]; then
+    if [[ "${TEST_BACKEND_INDEX:-0}" == unsafe ]]; then
+      echo "download.index-url='http://other.example.invalid/backend-only/'"
+    elif [[ "${TEST_BACKEND_INDEX:-0}" == secure ]]; then
+      echo "download.index-url='https://packages.example.invalid/backend-only/'"
+    fi
+  fi
+fi
+SH
 cat > "$root/bin/python3" <<'SH'
 #!/usr/bin/env bash
 if [[ "$1" == -m && ( "$2" == venv || "$2" == virtualenv ) ]]; then
@@ -100,16 +126,7 @@ if [[ "$1" == -m && ( "$2" == venv || "$2" == virtualenv ) ]]; then
 if [[ "$1 $2 $3" == "-m pip --version" ]]; then
   echo 'pip 26.2.1 from controlled fixture'
 elif [[ "$1 $2 $3 $4" == "-m pip config list" ]]; then
-  if [[ "${TEST_NO_INDEX:-0}" != 1 ]]; then
-    if [[ "${TEST_INSECURE_INDEX:-0}" == 1 ]]; then
-      echo "global.index-url='http://packages.example.invalid/private-fixture/'"
-    else
-      echo "global.index-url='https://packages.example.invalid/private-fixture/'"
-    fi
-    if [[ "${TEST_EXTRA_INDEX:-0}" == 1 ]]; then
-      echo "global.extra-index-url='https://other.example.invalid/simple/'"
-    fi
-  fi
+  "$TEST_BIN_DIR/pip-config" "$0"
 elif [[ "$1 $2 $3" == "-m pip install" ]]; then
   [[ -n "${TEST_PIPX_TEMPLATE:-}" ]] || exit 99
   cp "$TEST_PIPX_TEMPLATE" "$(dirname "$0")/pipx"
@@ -123,7 +140,10 @@ PYTOOL
   fi
   cat > "$target/bin/python" <<'PYTOOL'
 #!/usr/bin/env bash
-[[ "$1 $2" == "-m pip" && "$3" == download ]] || exit 99
+  if [[ "$1 $2 $3 $4" == "-m pip config list" ]]; then
+    exec "$TEST_BIN_DIR/pip-config" "$0"
+  fi
+  [[ "$1 $2" == "-m pip" && "$3" == download ]] || exit 99
 [[ "${TEST_FAIL_PIP:-0}" != 1 ]] || exit 7
 while (($#)); do
   if [[ "$1" == --dest ]]; then dest="$2"; shift 2; else shift; fi
@@ -195,6 +215,35 @@ if [[ "${TEST_HARNESS_NO_PIPX:-0}" == 1 ]]; then
 fi
 
 arguments=(--release siteops/v1.0.0b1 --source-commit "$(printf 'c%.0s' {1..40})" --yes)
+export TEST_UNTRUSTED_LOG="$root/untrusted-pipx-calls"
+cat > "$root/untrusted-pipx" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$TEST_UNTRUSTED_LOG"
+echo 1.17.2
+SH
+chmod +x "$root/untrusted-pipx"
+shared="$root/shared-data"
+mkdir -p "$shared/siteops/tools/pipx/bin"
+cp "$root/untrusted-pipx" "$shared/siteops/tools/pipx/bin/pipx"
+chmod 0777 "$shared"
+if XDG_DATA_HOME="$shared" bash "$bootstrap" "${arguments[@]}" > "$root/shared-root.log" 2>&1; then
+  echo "A shared data root was accepted." >&2
+  exit 1
+fi
+[[ ! -s "$TEST_UNTRUSTED_LOG" ]] ||
+  { echo "A shared data root executed an untrusted pipx." >&2; exit 1; }
+grep -q 'private Site Ops data root' "$root/shared-root.log"
+private="$root/private-data"
+mkdir -p "$private/siteops/tools/pipx/bin"
+cp "$root/untrusted-pipx" "$private/siteops/tools/pipx/bin/pipx"
+ln -s "$private" "$root/linked-data"
+if XDG_DATA_HOME="$root/linked-data" bash "$bootstrap" "${arguments[@]}" > "$root/linked-root.log" 2>&1; then
+  echo "A symlinked data root was accepted." >&2
+  exit 1
+fi
+[[ ! -s "$TEST_UNTRUSTED_LOG" ]] ||
+  { echo "A symlinked data root executed an untrusted pipx." >&2; exit 1; }
+grep -q 'private Site Ops data root' "$root/linked-root.log"
 if [[ "${TEST_HARNESS_MANAGED:-0}" == 1 ]]; then
   export TEST_OLD_GH=1
   if bash "$bootstrap" "${arguments[@]}" > "$root/old-gh.log" 2>&1; then
@@ -265,6 +314,38 @@ for setting in TEST_INSECURE_INDEX TEST_EXTRA_INDEX; do
     { echo "An unapproved index changed pipx tooling." >&2; exit 1; }
   export "$setting"=0
 done
+export TEST_DOWNLOAD_INDEX=unsafe
+if bash "$bootstrap" "${arguments[@]}" > "$root/invalid-download-index.log" 2>&1; then
+  echo "An unapproved download index was accepted." >&2
+  exit 1
+fi
+grep -q 'Configure one approved HTTPS Python index' "$root/invalid-download-index.log" ||
+  { echo "An unapproved download index reached the backend path." >&2; exit 1; }
+[[ ! -s "$TEST_LOG" ]] ||
+  { echo "An unapproved download index changed pipx tooling." >&2; exit 1; }
+export TEST_DOWNLOAD_INDEX=secure
+if bash "$bootstrap" "${arguments[@]}" > "$root/approved-download-index.log" 2>&1; then
+  echo "The controlled backend download unexpectedly succeeded." >&2
+  exit 1
+fi
+grep -q 'shared backend could not be downloaded' "$root/approved-download-index.log"
+export TEST_DOWNLOAD_INDEX=
+export TEST_BACKEND_INDEX=unsafe
+if bash "$bootstrap" "${arguments[@]}" > "$root/invalid-backend-index.log" 2>&1; then
+  echo "A backend-specific unapproved index was accepted." >&2
+  exit 1
+fi
+grep -q 'Configure one approved HTTPS Python index' "$root/invalid-backend-index.log" ||
+  { echo "An unapproved backend interpreter index reached the backend path." >&2; exit 1; }
+[[ ! -s "$TEST_LOG" ]] ||
+  { echo "An unapproved backend interpreter index changed pipx tooling." >&2; exit 1; }
+export TEST_BACKEND_INDEX=secure
+if bash "$bootstrap" "${arguments[@]}" > "$root/approved-backend-index.log" 2>&1; then
+  echo "The controlled backend download unexpectedly succeeded." >&2
+  exit 1
+fi
+grep -q 'shared backend could not be downloaded' "$root/approved-backend-index.log"
+export TEST_BACKEND_INDEX=
 if bash "$bootstrap" "${arguments[@]}" > "$root/failed-feed.log" 2>&1; then
   echo "A missing backend wheel was accepted." >&2
   exit 1

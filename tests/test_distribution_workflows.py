@@ -508,22 +508,106 @@ def test_windows_bootstrap_qualification_captures_native_stderr_then_checks_exit
     assert "if ($bootstrapStatus -ne 0)" in script
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="Native stderr needs Windows PowerShell 5.1.")
-@pytest.mark.parametrize("bootstrap_exit", [0, 7])
-def test_windows_qualification_preserves_child_exit_with_private_stderr(
-    tmp_path, bootstrap_exit,
-):
-    step = _script(REUSABLE["jobs"]["qualify"], "Install with the signed PowerShell bootstrap")
-    block = step.split("$log = Join-Path $owned 'logs\\bootstrap-ps1.log'\n", 1)[1].split(
+def test_windows_bootstrap_qualification_selects_private_user_profile_before_cache():
+    script = _script(REUSABLE["jobs"]["qualify"], "Install with the signed PowerShell bootstrap")
+    profile = "$profileHome = [Environment]::GetFolderPath('UserProfile')"
+    selection = "$env:LOCALAPPDATA = Join-Path $profileHome 'siteops-qualification-bootstrap'"
+    assert profile in script and selection in script
+    assert script.index(selection) < script.index('$cache = Join-Path $env:LOCALAPPDATA')
+    assert script.index("$bootstrapData = Join-Path $env:LOCALAPPDATA 'siteops'") < script.index(
+        '$cache = Join-Path $env:LOCALAPPDATA',
+    )
+    assert script.index("& icacls.exe $directory /inheritance:r") < script.index(
+        '$cache = Join-Path $env:LOCALAPPDATA',
+    )
+    assert script.index("& icacls.exe $directory /setowner") < script.index(
+        '$cache = Join-Path $env:LOCALAPPDATA',
+    )
+    assert "$env:LOCALAPPDATA = Join-Path $owned 'bootstrap-user'" not in script
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows ACL rules need Windows PowerShell 5.1.")
+@pytest.mark.parametrize("preexisting", [False, True])
+def test_windows_bootstrap_qualification_protects_preseeded_data_root(tmp_path, preexisting):
+    script = _script(REUSABLE["jobs"]["qualify"], "Install with the signed PowerShell bootstrap")
+    setup = script.split(
+        "$profileHome = [Environment]::GetFolderPath('UserProfile')\n", 1,
+    )[1].split("if ($env:BUILDER_IDENTITY -notmatch", 1)[0]
+    source = (REPO_ROOT / "scripts" / "bootstrap" / "siteops-bootstrap.ps1").read_text(
+        encoding="utf-8",
+    )
+    helper = re.search(r"(?ms)^function Require-PrivateDataRoot\([^\n]*\) \{.*?^\}", source)
+    assert helper is not None
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    grant = subprocess.run(
+        ["icacls.exe", str(profile), "/grant", "*S-1-5-32-545:(OI)(CI)RX"],
+        capture_output=True, text=True, timeout=20,
+    )
+    if grant.returncode:
+        pytest.skip("The local test user cannot set the fixture ACL.")
+    try:
+        existing = profile / "siteops-qualification-bootstrap"
+        if preexisting:
+            existing.mkdir()
+            (existing / "sentinel").write_text("keep", encoding="utf-8")
+        owned = tmp_path / "owned"
+        owned.mkdir()
+        wrapper = tmp_path / "qualify-root.ps1"
+        wrapper.write_text(
+            "$ErrorActionPreference='Stop'\n"
+            "$owned=$env:TEST_OWNED\n"
+            "$profileHome=$env:TEST_PROFILE_HOME\n"
+            + setup
+            + "\nfunction Fail([string]$message) { throw \"Site Ops installation: $message\" }\n"
+            + helper.group(0)
+            + "\n$cache=Join-Path $env:LOCALAPPDATA 'siteops\\install-downloads\\fixture'\n"
+            "New-Item -ItemType Directory -Path $cache -Force | Out-Null\n"
+            "Require-PrivateDataRoot (Join-Path $env:LOCALAPPDATA 'siteops')\n"
+            "'PRIVATE_ROOT_ACCEPTED'\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(wrapper)],
+            cwd=tmp_path,
+            env={
+                **os.environ,
+                "TEST_PROFILE_HOME": str(profile),
+                "TEST_OWNED": str(owned),
+                "PYTHON": sys.executable,
+            },
+            capture_output=True, text=True, timeout=30,
+        )
+        if preexisting:
+            assert result.returncode != 0
+            assert "The Windows qualification data root was not fresh." in result.stderr
+            assert (existing / "sentinel").read_text(encoding="utf-8") == "keep"
+        else:
+            assert result.returncode == 0, "The preseeded qualification root was not private."
+            assert "PRIVATE_ROOT_ACCEPTED" in result.stdout
+    finally:
+        subprocess.run(
+            ["icacls.exe", str(profile), "/remove:g", "*S-1-5-32-545"],
+            capture_output=True, text=True, check=True, timeout=20,
+        )
+
+
+def _run_windows_bootstrap_qualifier(
+    tmp_path: Path,
+    child: str,
+    extra_env: dict[str, str],
+    *,
+    success_marker: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    script = _script(REUSABLE["jobs"]["qualify"], "Install with the signed PowerShell bootstrap")
+    block = script.split("$log = Join-Path $owned 'logs\\bootstrap-ps1.log'\n", 1)[1].split(
         "if ((Get-Content -LiteralPath $log -Raw) -notmatch", 1,
     )[0]
     (tmp_path / "logs").mkdir()
     fake = tmp_path / "bootstrap.ps1"
     fake.write_text(
         "param([string]$Release,[string]$SourceCommit,[string]$Repository,"
-        "[string]$SourceRef,[string]$Caller,[switch]$Yes)\n"
-        "[Console]::Error.WriteLine('controlled benign diagnostic')\n"
-        "exit [int]$env:TEST_BOOTSTRAP_EXIT\n",
+        "[string]$SourceRef,[string]$Caller,[switch]$Yes)\n" + child,
         encoding="utf-8",
     )
     wrapper = tmp_path / "qualify.ps1"
@@ -533,18 +617,110 @@ def test_windows_qualification_preserves_child_exit_with_private_stderr(
         "$script=Join-Path $download $env:BOOTSTRAP_PS1\n"
         "$log=Join-Path $owned 'logs\\bootstrap-ps1.log'\n"
         "$release='siteops/v0.0.0-ci';$caller='ci.yaml'\n"
-        + block + "\n'CAPTURE_ACCEPTED'\n",
+        + block + ("\n'CAPTURE_ACCEPTED'\n" if success_marker else "\n"),
         encoding="utf-8",
     )
-    result = subprocess.run(
+    return subprocess.run(
         ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(wrapper)],
-        cwd=tmp_path, env={
+        cwd=tmp_path,
+        env={
             **os.environ, "TEST_ROOT": str(tmp_path), "BOOTSTRAP_PS1": fake.name,
-            "TEST_BOOTSTRAP_EXIT": str(bootstrap_exit),
             "SOURCE_SHA": "c" * 40, "SOURCE_REPOSITORY": "example/publisher",
             "SOURCE_REF": "refs/heads/feat/siteops-guided-inputs",
+            **extra_env,
         },
         capture_output=True, text=True, timeout=30,
+    )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Native PowerShell 5.1 redirects the private child log.")
+@pytest.mark.parametrize(
+    ("private_message", "public_message"),
+    [
+        *[
+            (
+                f"Configure a private Site Ops data root. {code} PRIVATE_PATH",
+                f"The signed PowerShell bootstrap rejected the isolated data root ({code}).",
+            )
+            for code in (
+                "ROOT_PATH", "ROOT_ANCESTOR_TYPE", "ROOT_ANCESTOR_OWNER",
+                "ROOT_ANCESTOR_ACL", "ROOT_DATA_CREATE", "ROOT_DATA_TYPE",
+                "ROOT_DATA_OWNER", "ROOT_DATA_ACL",
+            )
+        ],
+        (
+            "Configure a private Site Ops data root. PRIVATE_PATH",
+            "The signed PowerShell bootstrap rejected the isolated data root.",
+        ),
+        (
+            "Configure one approved HTTPS Python index. PRIVATE_URL",
+            "The signed PowerShell bootstrap rejected the configured Python feed.",
+        ),
+    ],
+)
+def test_windows_bootstrap_qualification_reports_only_bounded_failure(
+    tmp_path, private_message, public_message,
+):
+    result = _run_windows_bootstrap_qualifier(
+        tmp_path,
+        "function Fail([string]$message) { throw \"Site Ops installation: $message\" }\n"
+        "Fail $env:TEST_PRIVATE_MESSAGE\n",
+        {"TEST_PRIVATE_MESSAGE": private_message},
+    )
+    assert result.returncode != 0
+    assert public_message in result.stderr
+    assert "PRIVATE_PATH" not in result.stdout + result.stderr
+    assert "PRIVATE_URL" not in result.stdout + result.stderr
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Native PowerShell 5.1 formats root errors.")
+def test_windows_bootstrap_qualification_classifies_real_acl_failure(tmp_path):
+    source = (REPO_ROOT / "scripts" / "bootstrap" / "siteops-bootstrap.ps1").read_text(
+        encoding="utf-8",
+    )
+    helper = re.search(r"(?ms)^function Require-PrivateDataRoot\([^\n]*\) \{.*?^\}", source)
+    assert helper is not None
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    grant = subprocess.run(
+        ["icacls.exe", str(shared), "/grant", "*S-1-5-32-545:(OI)(CI)M"],
+        capture_output=True, text=True, timeout=20,
+    )
+    if grant.returncode:
+        pytest.skip("The local test user cannot change the fixture ACL.")
+    try:
+        result = _run_windows_bootstrap_qualifier(
+            tmp_path,
+            "function Fail([string]$message) { throw \"Site Ops installation: $message\" }\n"
+            + helper.group(0)
+            + "\nRequire-PrivateDataRoot $env:TEST_DATA_ROOT\n",
+            {"TEST_DATA_ROOT": str(shared / "siteops")},
+        )
+        assert result.returncode != 0
+        assert "rejected the isolated data root (ROOT_ANCESTOR_ACL)" in result.stderr
+        assert str(shared) not in result.stdout + result.stderr
+    finally:
+        subprocess.run(
+            ["icacls.exe", str(shared), "/remove:g", "*S-1-5-32-545"],
+            capture_output=True, text=True, check=True, timeout=20,
+        )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Native stderr needs Windows PowerShell 5.1.")
+@pytest.mark.parametrize(("bootstrap_exit", "emit_diagnostic"), [(0, True), (7, True), (7, False)])
+def test_windows_qualification_preserves_child_exit_with_private_stderr(
+    tmp_path, bootstrap_exit, emit_diagnostic,
+):
+    result = _run_windows_bootstrap_qualifier(
+        tmp_path,
+        "if ($env:TEST_EMIT_DIAGNOSTIC -eq '1') { "
+        "[Console]::Error.WriteLine('controlled benign diagnostic') }\n"
+        "exit [int]$env:TEST_BOOTSTRAP_EXIT\n",
+        {
+            "TEST_BOOTSTRAP_EXIT": str(bootstrap_exit),
+            "TEST_EMIT_DIAGNOSTIC": "1" if emit_diagnostic else "0",
+        },
+        success_marker=True,
     )
     assert (result.returncode == 0) is (bootstrap_exit == 0), result.stdout + result.stderr
     if bootstrap_exit:
@@ -553,9 +729,10 @@ def test_windows_qualification_preserves_child_exit_with_private_stderr(
     else:
         assert "CAPTURE_ACCEPTED" in result.stdout
         assert "controlled benign diagnostic" not in result.stdout + result.stderr
-    assert "controlled benign diagnostic" in (tmp_path / "logs" / "bootstrap-ps1.log").read_text(
-        encoding="utf-16",
-    )
+    if emit_diagnostic:
+        assert "controlled benign diagnostic" in (tmp_path / "logs" / "bootstrap-ps1.log").read_text(
+            encoding="utf-16",
+        )
 
 
 def test_bootstrap_qualification_shells_parse():

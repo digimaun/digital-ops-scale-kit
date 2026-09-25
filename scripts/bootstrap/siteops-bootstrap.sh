@@ -13,6 +13,43 @@ private_dir() {
   [[ "$owner" == "$(id -u)" ]] && (( (8#$mode & 077) == 0 )) ||
     fail "A retained installation directory must be owned by the current user and private."
 }
+require_private_data_root() {
+  if ! python3 - "$1" >/dev/null 2>&1 <<'PY'
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+parts = path.split("/")[1:]
+if not os.path.isabs(path) or not parts or any(part in {".", ".."} for part in parts):
+    raise SystemExit(1)
+uid = os.getuid()
+directory = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+try:
+    for part in (part for part in parts if part):
+        parent = os.fstat(directory)
+        trusted_owner = parent.st_uid in {0, uid}
+        writable = stat.S_IMODE(parent.st_mode) & 0o022
+        # A sticky shared parent cannot replace another user's private child.
+        if not trusted_owner or (writable and not parent.st_mode & stat.S_ISVTX):
+            raise SystemExit(1)
+        try:
+            os.mkdir(part, mode=0o700, dir_fd=directory)
+        except FileExistsError:
+            pass
+        child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+        os.close(directory)
+        directory = child
+    root = os.fstat(directory)
+    if root.st_uid != uid or stat.S_IMODE(root.st_mode) & 0o077:
+        raise SystemExit(1)
+finally:
+    os.close(directory)
+PY
+  then
+    fail "Configure a private Site Ops data root under trusted, non-symlinked directories."
+  fi
+}
 command -v bash >/dev/null || fail "Bash is required."
 
 release=""
@@ -155,6 +192,7 @@ if ! command -v python3 >/dev/null ||
 fi
 python3 -c 'import sys; raise SystemExit(not ((3, 10) <= sys.version_info[:2] <= (3, 14) and sys.maxsize > 2**32))' 2>/dev/null ||
   fail "The available Python must be a supported 64-bit interpreter."
+require_private_data_root "$data"
 venv_check="$(mktemp -d)"
 trap 'rm -rf -- "$venv_check"' EXIT
 venv_tool=(python3 -m venv)
@@ -177,12 +215,15 @@ if ! "${venv_tool[@]}" "$venv_check/check" >/dev/null 2>&1 ||
   "$venv_check/check/bin/python" -m pip --version >/dev/null 2>&1 ||
     fail "The Python environment must include pip."
 fi
-pip_configuration="$("$venv_check/check/bin/python" -m pip config list 2>/dev/null)" ||
-  pip_configuration=""
 rm -rf -- "$venv_check"
 trap - EXIT
 
 require_approved_python_index() {
+  [[ "$2" == install || "$2" == download ]] ||
+    fail "The Python package command has an unsupported index policy."
+  local pip_configuration
+  pip_configuration="$("$1" -m pip config list 2>/dev/null)" ||
+    fail "The selected Python environment's package settings could not be inspected."
   printf '%s\n' "$pip_configuration" | python3 -c '
 import ast
 import sys
@@ -204,7 +245,7 @@ if any(value for key, value in settings.items()
        if key.endswith((".extra-index-url", ".find-links", ".trusted-host"))):
     raise SystemExit(1)
 index = next((settings[key] for key in
-              (":env:.index-url", "install.index-url", "global.index-url")
+              (":env:.index-url", f"{sys.argv[1]}.index-url", "global.index-url")
               if settings.get(key)), "")
 try:
     parsed = urlsplit(index)
@@ -212,7 +253,7 @@ try:
         raise SystemExit(1)
 except ValueError:
     raise SystemExit(1)
-' || fail "Configure one approved HTTPS Python index in pip settings or PIP_INDEX_URL, without extra indexes, find-links, or trusted hosts."
+' "$2" || fail "Configure one approved HTTPS Python index in pip settings or PIP_INDEX_URL, without extra indexes, find-links, or trusted hosts."
 }
 
 gh_ready=false
@@ -300,7 +341,7 @@ if [[ -z "$pipx_bin" || "$("$pipx_bin" --version 2>/dev/null)" != 1.17.2 ]]; the
   else
     "${venv_tool[@]}" "$tools/pipx" || fail "The user pipx environment could not be created."
   fi
-  require_approved_python_index
+  require_approved_python_index "$tools/pipx/bin/python" install
   pip_install_log="$(mktemp)"
   trap 'rm -f -- "$pip_install_log"' EXIT
   "$tools/pipx/bin/python" -m pip install --only-binary=:all: --no-cache-dir 'pipx==1.17.2' \
@@ -513,7 +554,7 @@ else
   wheelhouse="$(mktemp -d)"
   trap 'rm -rf -- "$staging" "$wheelhouse"' EXIT
   "${venv_tool[@]}" "$staging/backend-tools" || fail "Python venv is unavailable."
-  require_approved_python_index
+  require_approved_python_index "$staging/backend-tools/bin/python" download
   "$staging/backend-tools/bin/python" -m pip download 'pip==26.2.1' \
     --no-deps --only-binary=:all: --dest "$wheelhouse" > "$staging/pip-download.log" 2>&1 ||
     fail "The shared backend could not be downloaded from the configured Python index."

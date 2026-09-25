@@ -128,7 +128,7 @@ def test_published_input_contract_accepts_only_the_bounded_shape():
         INPUT_TESTS="aio-install",
         INPUT_PUBLISHED_RELEASE="v0.0.4.dev20260919",
         INPUT_PUBLISHED_SOURCE_SHA="a" * 40,
-        INPUT_RG="paymauntarget3",
+        INPUT_RG="rg-example",
     )
 
     assert result.returncode == 0, result.stderr
@@ -137,7 +137,7 @@ def test_published_input_contract_accepts_only_the_bounded_shape():
     assert f"published_source_sha={'a' * 40}" in result.stdout
     assert "max_parallel=1" in result.stdout
     assert "persistent=true" in result.stdout
-    assert "rg_in=paymauntarget3" in result.stdout
+    assert "rg_in=rg-example" in result.stdout
 
 
 def test_published_guided_journey_accepts_bounded_enabled_and_disabled_modes():
@@ -147,7 +147,7 @@ def test_published_guided_journey_accepts_bounded_enabled_and_disabled_modes():
         INPUT_PUBLISHED_RELEASE="v0.0.4.dev20260919",
         INPUT_PUBLISHED_SOURCE_SHA="a" * 40,
         INPUT_PUBLISHED_JOURNEY="guided",
-        INPUT_RG="paymauntarget3",
+        INPUT_RG="rg-example",
     )
     assert result.returncode == 0, result.stderr
     assert "published_journey=guided" in result.stdout
@@ -169,7 +169,7 @@ def test_guided_published_journey_pins_qualified_aio_version():
         INPUT_PUBLISHED_RELEASE="v0.0.4.dev20260919",
         INPUT_PUBLISHED_SOURCE_SHA="a" * 40,
         INPUT_PUBLISHED_JOURNEY="guided",
-        INPUT_RG="paymauntarget3",
+        INPUT_RG="rg-example",
     )
     assert result.returncode != 0
     assert "Published guided E2E currently requires aio-releases=2608" in result.stderr
@@ -191,7 +191,7 @@ def test_guided_published_journey_pins_qualified_aio_version():
             "aio-releases entry must be bounded text without whitespace or controls",
         ),
         (
-            {"INPUT_RG": "paymauntarget3\npersistent=false"},
+            {"INPUT_RG": "rg-example\npersistent=false"},
             "resource-group must be bounded text without whitespace or controls",
         ),
         (
@@ -238,7 +238,7 @@ def test_published_input_contract_rejects_scope_expansion(changes, message):
         "INPUT_TESTS": "aio-install",
         "INPUT_PUBLISHED_RELEASE": "v0.0.4.dev20260919",
         "INPUT_PUBLISHED_SOURCE_SHA": "a" * 40,
-        "INPUT_RG": "paymauntarget3",
+        "INPUT_RG": "rg-example",
         **changes,
     }
     result = _parse_inputs(**values)
@@ -516,8 +516,89 @@ def test_guided_enabled_readiness_requires_live_secret_sync_resources():
         "--api-version 2026-07-01",
         "defaultSecretProviderClassRef",
         "secretSyncEnabled",
+        "published-owned-resources.json",
+        "e2e-teardown/pre-ids.txt",
     ):
         assert value in step
+
+
+def test_guided_enabled_observation_uses_run_delta_instead_of_site_tags(tmp_path):
+    scripts = _embedded_python(_step_run("Observe bounded AIO readiness"))
+    selection = next(script for script in scripts if "for resource_type in" in script)
+    ownership = next((script for script in scripts if "prior_ids" in script), None)
+    assert ownership is not None, "The published observer does not bind resources to this run."
+
+    old_instance = "/subscriptions/example/resourceGroups/rg/providers/Microsoft.IoTOperations/instances/old"
+    old_identity = "/subscriptions/example/resourceGroups/rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/old"
+    new_instance = "/subscriptions/example/resourceGroups/rg/providers/Microsoft.IoTOperations/instances/new"
+    new_identity = "/subscriptions/example/resourceGroups/rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/new"
+    resources = [
+        {"id": old_instance, "name": "old", "type": "Microsoft.IoTOperations/instances",
+         "tags": {"site": "test-site"}},
+        {"id": old_identity, "name": "old", "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+         "tags": {"site": "test-site"}},
+        {"id": new_instance, "name": "new", "type": "Microsoft.IoTOperations/instances"},
+        {"id": new_identity, "name": "new", "type": "Microsoft.ManagedIdentity/userAssignedIdentities"},
+    ]
+    observed = tmp_path / "published-resources.json"
+    observed.write_text(json.dumps(resources), encoding="utf-8")
+    snapshot = tmp_path / "pre-ids.txt"
+    snapshot.write_text(old_instance.upper() + "\n" + old_identity + "\n", encoding="utf-8")
+    owned = tmp_path / "published-owned-resources.json"
+    environment = {"RUNNER_TEMP": str(tmp_path), "E2E_SITE_NAME": "test-site"}
+    if os.name == "nt":
+        environment["SystemRoot"] = os.environ["SystemRoot"]
+
+    def run(script: str, *paths: Path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-c", script, *(str(path) for path in paths)],
+            env=environment, capture_output=True, text=True, timeout=15, check=False,
+        )
+
+    missing = run(ownership, observed, tmp_path / "missing-snapshot", owned)
+    assert missing.returncode != 0
+    assert "ownership snapshot is unavailable" in missing.stderr
+    assert not owned.exists()
+
+    malformed = tmp_path / "malformed-resources.json"
+    malformed.write_text(json.dumps([*resources, {
+        "id": new_identity + "-invalid",
+        "name": None,
+        "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+    }]), encoding="utf-8")
+    invalid_output = tmp_path / "invalid-owned.json"
+    invalid = run(ownership, malformed, snapshot, invalid_output)
+    assert invalid.returncode != 0
+    assert "Azure resource observation is invalid." in invalid.stderr
+    assert "new-invalid" not in invalid.stderr
+    assert not invalid_output.exists()
+
+    created = run(ownership, observed, snapshot, owned)
+    assert created.returncode == 0, "The run-owned resource observation failed."
+    assert {item["id"] for item in json.loads(owned.read_text(encoding="utf-8"))} == {
+        new_instance, new_identity,
+    }
+    chosen = run(selection, owned)
+    assert chosen.returncode == 0
+    assert chosen.stdout.splitlines() == ["new", new_instance]
+
+    current = json.loads(owned.read_text(encoding="utf-8"))
+    owned.write_text(json.dumps([
+        item for item in current if item["type"] == "Microsoft.ManagedIdentity/userAssignedIdentities"
+    ]), encoding="utf-8")
+    missing_instance = run(selection, owned)
+    assert missing_instance.returncode != 0
+    assert "Guided Secret Sync AIO instance selection is incomplete." in missing_instance.stderr
+
+    owned.write_text(json.dumps([*current, {
+        "id": new_identity + "-duplicate",
+        "name": "second",
+        "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+    }]), encoding="utf-8")
+    duplicate = run(selection, owned)
+    assert duplicate.returncode != 0
+    assert "Guided Secret Sync managed identity selection is incomplete." in duplicate.stderr
+    assert "new-duplicate" not in duplicate.stderr
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -529,16 +610,18 @@ def test_guided_readiness_receipt_asserts_enabled_state_without_private_ids(
     spc_id = "/subscriptions/private/spc/private-name"
     resources = [
         {"type": "Microsoft.IoTOperations/instances", "name": "private-instance",
-         "id": "/subscriptions/private/instance/private-name", "tags": {"site": site}},
+         "id": "/subscriptions/private/instance/private-name"},
         {"type": "Microsoft.DeviceRegistry/schemaRegistries"},
         {"type": "Microsoft.DeviceRegistry/namespaces"},
     ]
     if enabled:
         resources.extend([
             {"type": "Microsoft.SecretSyncController/azureKeyVaultSecretProviderClasses",
-             "id": spc_id, "tags": {"site": site}},
-            {"type": "Microsoft.ManagedIdentity/userAssignedIdentities", "tags": {"site": site}},
-            {"type": "Microsoft.KeyVault/vaults", "tags": {"site": site}},
+             "id": spc_id},
+            {"type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+             "id": "/subscriptions/private/identity/private-name"},
+            {"type": "Microsoft.KeyVault/vaults",
+             "id": "/subscriptions/private/vault/private-name"},
         ])
         (tmp_path / "published-federated.json").write_text(
             json.dumps([{"name": "private-credential"}]), encoding="utf-8",
@@ -549,6 +632,13 @@ def test_guided_readiness_receipt_asserts_enabled_state_without_private_ids(
             }}),
             encoding="utf-8",
         )
+    owned_resources = list(resources)
+    if not enabled:
+        resources.append({
+            "type": "Microsoft.SecretSyncController/azureKeyVaultSecretProviderClasses",
+            "id": "/subscriptions/private/spc/from-prior-run",
+            "tags": {"site": site},
+        })
     pods = {"items": [{
         "status": {"phase": "Running", "conditions": [
             {"type": "Ready", "status": "True"},
@@ -562,6 +652,9 @@ def test_guided_readiness_receipt_asserts_enabled_state_without_private_ids(
     ):
         (tmp_path / filename).write_text(json.dumps(document), encoding="utf-8")
     output = tmp_path / "readiness.json"
+    (tmp_path / "published-owned-resources.json").write_text(
+        json.dumps(owned_resources), encoding="utf-8",
+    )
     environment = {
         "RUNNER_TEMP": str(tmp_path), "E2E_SITE_NAME": site,
         "E2E_JOURNEY": "guided",

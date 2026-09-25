@@ -19,6 +19,13 @@ The project pin cannot authorize its own source policy. A local
 checkout selected with `-w` also works for authoring without a pin
 or package trust options.
 
+Existing local `-w` workspaces and configured Sites remain supported; there
+is no required migration to a project pin or typed answers. Use
+`siteops inputs` when a manifest declares a typed contract and you want one
+explicit Site without first configuring it. Do not combine `--input-file`, `--input`
+or `--site-file` targeting with a configured-Site `-l` selector. Saved Sites
+can later be selected with the same explicit fleet selectors as before.
+
 ## Inspect and fill the inputs
 
 Pin the approved content release for your project as described in

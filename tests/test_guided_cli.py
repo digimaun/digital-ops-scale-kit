@@ -435,6 +435,74 @@ def test_redacted_resource_failure_does_not_reveal_id_or_target(
     assert "rg-first" not in output.out + output.err
 
 
+@pytest.mark.parametrize("command", ["inputs", "plan", "deploy"])
+@pytest.mark.parametrize(
+    ("read_error", "expected_exit"), [("CANCELLED", 130), ("FORBIDDEN", 1)],
+)
+def test_guided_resource_read_failure_stops_before_plan_or_execution(
+    guided_workspace, tmp_path, capsys, command, read_error, expected_exit,
+):
+    workspace = _resource_workspace(guided_workspace)
+    answers = _resource_answers(tmp_path / "answers.yaml")
+    reads = []
+
+    class Reader:
+        identity = SimpleNamespace(name="azure-cli", version=None)
+
+        def read(self, ref, *, facts=frozenset()):
+            reads.append(ref.resource_id)
+            raise ArmResourceError(read_error)
+
+    args = [
+        "-w", str(workspace), command, _manifest(workspace),
+        "--input-file", str(answers), "--read-resources", "--output", "json",
+    ]
+    if command == "plan":
+        args.append("--describe")
+    with (
+        patch("siteops.cli.new_arm_reader", return_value=Reader()),
+        patch.object(Orchestrator, "build_plan", side_effect=AssertionError("No plan")),
+        patch.object(Orchestrator, "deploy", side_effect=AssertionError("No execution")),
+        patch("siteops.cli.write_yaml_exclusive", side_effect=AssertionError("No write")),
+    ):
+        assert _invoke(args) == expected_exit
+    assert reads == [_CLUSTER_ID]
+    output = capsys.readouterr()
+    assert _CLUSTER_ID not in output.out + output.err
+    code = f"inputs.resource.{read_error.lower()}"
+    if command == "inputs":
+        assert not output.out
+        assert code in output.err
+    else:
+        result = json.loads(output.out)
+        assert result["diagnostics"][0]["code"] == code
+        if command == "deploy":
+            assert result["status"] == ("cancelled" if read_error == "CANCELLED" else "invalid")
+            assert result["summary"]["interrupted"] is (read_error == "CANCELLED")
+            assert result["exitCode"] == expected_exit
+            assert result["sites"] == []
+        else:
+            assert result["status"] == "invalid"
+
+
+def test_cancelled_reader_setup_is_not_reported_as_provider_unavailable(
+    guided_workspace, tmp_path, capsys,
+):
+    workspace = _resource_workspace(guided_workspace)
+    answers = _resource_answers(tmp_path / "answers.yaml")
+    with (
+        patch("siteops.cli.new_arm_reader", side_effect=ArmResourceError("CANCELLED")),
+        patch.object(Orchestrator, "deploy", side_effect=AssertionError("No execution")),
+    ):
+        assert _invoke([
+            "-w", str(workspace), "deploy", _manifest(workspace),
+            "--input-file", str(answers), "--read-resources", "--output", "json",
+        ]) == 130
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "cancelled"
+    assert result["diagnostics"][0]["code"] == "inputs.resource.cancelled"
+
+
 def test_incomplete_input_preview_fails_without_writing(
     guided_workspace, tmp_path, capsys,
 ):
@@ -469,6 +537,23 @@ def test_plain_input_inspection_escapes_authored_terminal_controls(
     output = capsys.readouterr().out
     assert "\x1b" not in output
     assert r"\u001b" in output
+
+
+def test_plain_input_inspection_wraps_long_authored_descriptions(guided_workspace, capsys):
+    path = contract_path(guided_workspace / "manifests" / "test-manifest.yaml")
+    contract = yaml.safe_load(path.read_text(encoding="utf-8"))
+    contract["inputs"][0]["description"] = (
+        "A long operator explanation about selecting the intended Site name "
+        "and checking its identity before any deployment is attempted."
+    )
+    path.write_text(yaml.safe_dump(contract), encoding="utf-8")
+
+    assert _invoke([
+        "-w", str(guided_workspace), "inputs", _manifest(guided_workspace),
+    ]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert "selecting the intended Site name" in " ".join(lines)
+    assert max(map(len, lines)) <= 72
 
 
 def test_input_file_and_inline_override_manifest_fleet_target(

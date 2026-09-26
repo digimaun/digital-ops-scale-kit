@@ -435,6 +435,74 @@ def test_redacted_resource_failure_does_not_reveal_id_or_target(
     assert "rg-first" not in output.out + output.err
 
 
+@pytest.mark.parametrize("command", ["inputs", "plan", "deploy"])
+@pytest.mark.parametrize(
+    ("read_error", "expected_exit"), [("CANCELLED", 130), ("FORBIDDEN", 1)],
+)
+def test_guided_resource_read_failure_stops_before_plan_or_execution(
+    guided_workspace, tmp_path, capsys, command, read_error, expected_exit,
+):
+    workspace = _resource_workspace(guided_workspace)
+    answers = _resource_answers(tmp_path / "answers.yaml")
+    reads = []
+
+    class Reader:
+        identity = SimpleNamespace(name="azure-cli", version=None)
+
+        def read(self, ref, *, facts=frozenset()):
+            reads.append(ref.resource_id)
+            raise ArmResourceError(read_error)
+
+    args = [
+        "-w", str(workspace), command, _manifest(workspace),
+        "--input-file", str(answers), "--read-resources", "--output", "json",
+    ]
+    if command == "plan":
+        args.append("--describe")
+    with (
+        patch("siteops.cli.new_arm_reader", return_value=Reader()),
+        patch.object(Orchestrator, "build_plan", side_effect=AssertionError("No plan")),
+        patch.object(Orchestrator, "deploy", side_effect=AssertionError("No execution")),
+        patch("siteops.cli.write_yaml_exclusive", side_effect=AssertionError("No write")),
+    ):
+        assert _invoke(args) == expected_exit
+    assert reads == [_CLUSTER_ID]
+    output = capsys.readouterr()
+    assert _CLUSTER_ID not in output.out + output.err
+    code = f"inputs.resource.{read_error.lower()}"
+    if command == "inputs":
+        assert not output.out
+        assert code in output.err
+    else:
+        result = json.loads(output.out)
+        assert result["diagnostics"][0]["code"] == code
+        if command == "deploy":
+            assert result["status"] == ("cancelled" if read_error == "CANCELLED" else "invalid")
+            assert result["summary"]["interrupted"] is (read_error == "CANCELLED")
+            assert result["exitCode"] == expected_exit
+            assert result["sites"] == []
+        else:
+            assert result["status"] == "invalid"
+
+
+def test_cancelled_reader_setup_is_not_reported_as_provider_unavailable(
+    guided_workspace, tmp_path, capsys,
+):
+    workspace = _resource_workspace(guided_workspace)
+    answers = _resource_answers(tmp_path / "answers.yaml")
+    with (
+        patch("siteops.cli.new_arm_reader", side_effect=ArmResourceError("CANCELLED")),
+        patch.object(Orchestrator, "deploy", side_effect=AssertionError("No execution")),
+    ):
+        assert _invoke([
+            "-w", str(workspace), "deploy", _manifest(workspace),
+            "--input-file", str(answers), "--read-resources", "--output", "json",
+        ]) == 130
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "cancelled"
+    assert result["diagnostics"][0]["code"] == "inputs.resource.cancelled"
+
+
 def test_incomplete_input_preview_fails_without_writing(
     guided_workspace, tmp_path, capsys,
 ):
@@ -469,6 +537,23 @@ def test_plain_input_inspection_escapes_authored_terminal_controls(
     output = capsys.readouterr().out
     assert "\x1b" not in output
     assert r"\u001b" in output
+
+
+def test_plain_input_inspection_wraps_long_authored_descriptions(guided_workspace, capsys):
+    path = contract_path(guided_workspace / "manifests" / "test-manifest.yaml")
+    contract = yaml.safe_load(path.read_text(encoding="utf-8"))
+    contract["inputs"][0]["description"] = (
+        "A long operator explanation about selecting the intended Site name "
+        "and checking its identity before any deployment is attempted."
+    )
+    path.write_text(yaml.safe_dump(contract), encoding="utf-8")
+
+    assert _invoke([
+        "-w", str(guided_workspace), "inputs", _manifest(guided_workspace),
+    ]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert "selecting the intended Site name" in " ".join(lines)
+    assert max(map(len, lines)) <= 72
 
 
 def test_input_file_and_inline_override_manifest_fleet_target(
@@ -617,9 +702,11 @@ def test_ci_deploy_missing_input_reports_safe_field_name(
     assert "subscription" in output["diagnostics"][0]["summary"]
 
 
+@pytest.mark.parametrize("redacted", [False, True])
 def test_saved_site_is_normal_config_and_not_overwritten(
-    guided_workspace, tmp_path, capsys,
+    guided_workspace, tmp_path, capsys, monkeypatch, redacted,
 ):
+    monkeypatch.setenv("SITEOPS_REDACT_OUTPUT", "1" if redacted else "0")
     answers = _input_file(tmp_path / "answers.yaml")
     site_file = guided_workspace / "sites" / "one.yaml"
     args = [
@@ -631,13 +718,16 @@ def test_saved_site_is_normal_config_and_not_overwritten(
     site = Site.from_file(site_file)
     assert site.name == "one"
     assert site.location == "eastus"
+    saved_bytes = site_file.read_bytes()
     assert _invoke([
         "-w", str(guided_workspace), "plan", _manifest(guided_workspace),
         "-l", "name=one", "--describe",
     ]) == 0
     capsys.readouterr()
     assert _invoke(args) == 1
-    assert "exists" in capsys.readouterr().err.lower()
+    error = capsys.readouterr().err.lower()
+    assert ("could not be loaded" if redacted else "exists") in error
+    assert site_file.read_bytes() == saved_bytes
 
 
 @pytest.mark.parametrize(("name", "filename"), [
@@ -1060,6 +1150,54 @@ def test_aio_enabled_observes_prerequisites_before_one_plan(
         assert document["diagnostics"][0]["code"] == "inputs.resource.requirement-unmet"
 
 
+@pytest.mark.parametrize(
+    ("cluster", "release"),
+    [("arc-2608", "2608"), ("arc-2607", "2607")],
+)
+def test_inline_aio_release_selects_one_cluster_for_each_deploy(
+    cluster, release, capsys,
+):
+    workspace = Path(__file__).resolve().parents[1] / "workspaces" / "iot-operations"
+    cluster_id = _CLUSTER_ID.replace("arc-first", cluster)
+    observed = []
+
+    class Reader:
+        identity = SimpleNamespace(name="azure-cli", version=None)
+
+        def read(self, ref, *, facts=frozenset()):
+            observed.append((ref.resource_id, facts))
+            return ArmResourceObservation(
+                cluster_id, "Microsoft.Kubernetes/connectedClusters",
+                "eastus", cluster, {},
+            )
+
+    with (
+        patch("siteops.cli.new_arm_reader", return_value=Reader()),
+        patch.object(
+            Orchestrator, "deploy", return_value=SimpleNamespace(exit_code=0),
+        ) as deploy,
+        patch("siteops.cli._write_run_result"),
+    ):
+        assert _invoke([
+            "-w", str(workspace), "deploy", "aio-install",
+            "--input", f"siteName=plant-{release}",
+            "--input", f"cluster={cluster_id}",
+            "--input", "environment=dev",
+            "--input", "country=US",
+            "--input", f"aioRelease={release}",
+            "--read-resources",
+        ]) == 0
+    capsys.readouterr()
+    assert observed == [(cluster_id, frozenset())]
+    deploy.assert_called_once()
+    assert deploy.call_args.kwargs["selector"] is None
+    sites = deploy.call_args.kwargs["sites"]
+    assert len(sites) == 1
+    assert sites[0].name == f"plant-{release}"
+    assert sites[0].parameters["clusterName"] == cluster
+    assert sites[0].properties["aioRelease"] == release
+
+
 @pytest.mark.parametrize("workload_ready", [False, True])
 def test_enabled_deploy_read_gate_precedes_executor(
     capsys, workload_ready,
@@ -1178,7 +1316,9 @@ def test_aio_existing_vault_sub_mismatch_stops_before_any_read(capsys):
     assert result["diagnostics"][0]["code"] == "inputs.resource.subscription-mismatch"
 
 
-def _aio_template_session(tmp_path: Path) -> TemplateCompilationSession:
+def _aio_template_session(
+    tmp_path: Path, *, include_aio_version: bool = False,
+) -> TemplateCompilationSession:
     def runner(argv: tuple[str, ...], timeout: int) -> subprocess.CompletedProcess[str]:
         if argv[1:] == ("version", "--output", "json"):
             return subprocess.CompletedProcess(argv, 0, '{"azure-cli":"test"}', "")
@@ -1194,6 +1334,8 @@ def _aio_template_session(tmp_path: Path) -> TemplateCompilationSession:
             else {"existingKeyVaultResourceId": {"type": "string", "defaultValue": ""}}
             if source.name == "enable-secretsync.bicep" else {}
         )
+        if include_aio_version and source.name == "instance.bicep":
+            parameters = {"aioVersion": {"type": "string"}}
         outputs = {
             name: {"type": "string"} for name in (
                 "customLocationId", "customLocationName", "customLocationNamespace",
@@ -1227,6 +1369,45 @@ def _aio_template_session(tmp_path: Path) -> TemplateCompilationSession:
         command_runner=runner,
         tool_resolver=lambda name: str(tmp_path / "tools" / name),
     )
+
+
+def test_aio_preparation_selects_each_site_release_configuration(tmp_path):
+    workspace = Path(__file__).resolve().parents[1] / "workspaces" / "iot-operations"
+    manifest = workspace / "manifests" / "aio-install" / "manifest.yaml"
+    contract = load_contract(manifest)
+    sites = [
+        contract.resolve(inline=[
+            f"siteName=plant-{release}",
+            "subscription=00000000-0000-0000-0000-000000000001",
+            f"resourceGroup=rg-{release}",
+            "location=eastus",
+            f"clusterName=arc-{release}",
+            "environment=dev", "country=US",
+            f"aioRelease={release}",
+        ])
+        for release in ("2608", "2607")
+    ]
+    session = _aio_template_session(tmp_path, include_aio_version=True)
+    with patch("siteops.orchestrator.TemplateCompilationSession", return_value=session):
+        result = Orchestrator(workspace).build_plan(
+            manifest, sites=sites, intent=PlanIntent.EXECUTABLE,
+        )
+    assert result.status is PlanStatus.PLANNED, result.diagnostics
+    assert result.plan is not None
+    selected = {}
+    for target in result.plan.targets:
+        instance = next(
+            operation for operation in target.operations
+            if operation.identity.step == "aio-instance"
+        )
+        assert isinstance(instance.details, DeploymentOperation)
+        assert instance.details.parameters is not None
+        value = next(
+            entry.value for entry in instance.details.parameters.entries
+            if isinstance(entry.key, LiteralValue) and entry.key.value == "aioVersion"
+        )
+        selected[target.name] = resolve_plan_value(value, {})
+    assert selected == {"plant-2608": "1.4.73", "plant-2607": "1.4.41"}
 
 
 def test_aio_executable_preparation_resolves_country_and_environment_tags(

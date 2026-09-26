@@ -19,6 +19,13 @@ The project pin cannot authorize its own source policy. A local
 checkout selected with `-w` also works for authoring without a pin
 or package trust options.
 
+Existing local `-w` workspaces and configured Sites remain supported. There
+is no required migration to a project pin or typed answers. Use
+`siteops inputs` when a manifest declares a typed contract and you want one
+explicit Site without first configuring it. Do not combine `--input-file`, `--input`
+or `--site-file` targeting with a configured-Site `-l` selector. Saved Sites
+can later be selected with the same explicit fleet selectors as before.
+
 ## Inspect and fill the inputs
 
 Pin the approved content release for your project as described in
@@ -128,6 +135,28 @@ according to the selected contract. Do not put secrets in process arguments
 or shell history. The initial typed route rejects contracts with protected
 inputs. Duplicate and unknown answer names fail.
 
+## Deploy a selected AIO release to each cluster
+
+`aioRelease` is a typed answer mapped to the selected Site's
+`properties.aioRelease`. The bundled IoT Operations workspace supplies
+release configurations for `2607` and `2608`, with `2608` as the current
+default. To use different releases without saving Site files, prepare and
+deploy each existing Arc cluster in a separate invocation:
+
+```text
+siteops --approved-source official --project ./factory plan aio-install --input siteName=plant-2608 --input "cluster=<Arc-ID-A>" --input environment=dev --input country=US --input aioRelease=2608 --read-resources
+siteops --approved-source official --project ./factory deploy aio-install --input siteName=plant-2608 --input "cluster=<Arc-ID-A>" --input environment=dev --input country=US --input aioRelease=2608 --read-resources
+siteops --approved-source official --project ./factory plan aio-install --input siteName=plant-2607 --input "cluster=<Arc-ID-B>" --input environment=dev --input country=US --input aioRelease=2607 --read-resources
+siteops --approved-source official --project ./factory deploy aio-install --input siteName=plant-2607 --input "cluster=<Arc-ID-B>" --input environment=dev --input country=US --input aioRelease=2607 --read-resources
+```
+
+Replace the two placeholders with distinct full connected-cluster ARM IDs.
+Each command constructs one Site in memory and selects the corresponding
+release parameters from the verified workspace. Review each plan before its
+deploy command. These examples use the default Secret Sync disabled setting.
+Run `aio-upgrade`, not `aio-install`, to change an existing installation's
+release.
+
 ## Keep a Site for later
 
 To retain the resolved configuration, create the project's `sites` directory
@@ -193,6 +222,22 @@ three concurrent Sites by default. For four concurrent Sites, pass
 new cohort and excludes plant-one. `parallel` limits concurrent work,
 not the number of Sites selected. Saved Sites do not repeat guided
 OIDC and workload identity checks when Secret Sync is enabled.
+
+For an established dev fleet, each configured Site keeps its own
+`properties.aioRelease`. One plan and one deploy can select all matching
+Sites even when some request `2607` and others `2608`:
+
+```text
+siteops --approved-source official --project ./factory plan aio-install -l environment=dev
+siteops --approved-source official --project ./factory deploy aio-install -l environment=dev
+```
+
+`-l environment=dev` selects every configured Site labeled `dev`, including
+Sites that already run AIO. Review the exact target names and operations in
+the plan and the `aioRelease` value in each selected Site before deploying.
+For only two or three new clusters, use the
+bounded `name=` selector above so a previously deployed Site is not
+reinstalled.
 
 An explicit Site replaces the manifest's default selector or `sites:` list.
 Combining `--site-file`, `--input-file`, or `--input` with `-l` fails rather than

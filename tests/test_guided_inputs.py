@@ -325,6 +325,43 @@ def test_enabled_resource_requirement_needs_cluster_read_before_site_constructio
         contract.bind(inline=[*manual, "enableSecretSync=true"])
 
 
+def test_inactive_resource_does_not_enforce_its_unconditional_requirement(tmp_path):
+    enabled = _field(
+        "enabled", "properties.enabled", type="boolean", default=False,
+    )
+    manifest, _ = _manifest_and_contract(
+        tmp_path,
+        fields=[
+            *_manual_resource_fields(),
+            enabled,
+            _resource_role(
+                when={"input": "enabled", "equals": True},
+                sitePath="properties.cluster",
+                derive={},
+                requires=[{
+                    "fact": "connectedClusters.oidcIssuerAvailable",
+                    "description": "Existing cluster has an OIDC issuer.",
+                }],
+            ),
+        ],
+    )
+    contract = load_contract(manifest)
+    manual = [
+        "subscription=00000000-0000-0000-0000-000000000001",
+        "resourceGroup=rg-example", "location=eastus", "clusterName=arc-example",
+    ]
+    assert contract.resolve(inline=manual).properties["enabled"] is False
+    with pytest.raises(ValueError, match="requirement-unverified"):
+        contract.bind(inline=[*manual, "enabled=true"])
+    cluster_id = (
+        "/subscriptions/00000000-0000-0000-0000-000000000001/"
+        "resourceGroups/rg-example/providers/Microsoft.Kubernetes/connectedClusters/arc-example"
+    )
+    bound = contract.bind(inline=[*manual, "enabled=true", f"cluster={cluster_id}"])
+    assert len(bound.resources) == 1
+    assert bound.resources[0].ref.resource_id == cluster_id
+
+
 def test_two_named_resources_bind_independently_without_forcing_same_group(tmp_path):
     cluster_id = (
         "/subscriptions/00000000-0000-0000-0000-000000000001/"

@@ -670,6 +670,11 @@ class InputContract:
         for field in self.fields:
             if field.resource is None:
                 continue
+            if (
+                field.when is not None
+                and active_values.get(field.when.input) != field.when.equals
+            ):
+                continue
             for check in field.resource.requires:
                 if (
                     check.when is None

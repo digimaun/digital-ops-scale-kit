@@ -1306,6 +1306,8 @@ jobs:
           az resource list --resource-group "$RG" --output json \
             > "$RUNNER_TEMP/published-resources.json"
           if [[ "$E2E_JOURNEY" == "guided" ]]; then
+            # Parse inputs requires an existing RG for published guided runs.
+            # The persistent snapshot precedes Arc connection. Missing state stays fatal.
             python3 - \
               "$RUNNER_TEMP/published-resources.json" \
               "$RUNNER_TEMP/e2e-teardown/pre-ids.txt" \

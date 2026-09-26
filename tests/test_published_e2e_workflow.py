@@ -156,6 +156,44 @@ def test_published_guided_journey_accepts_bounded_enabled_and_disabled_modes():
     assert "max_parallel=1" in result.stdout
 
 
+def test_guided_published_run_requires_persistent_snapshot_before_observation():
+    workflow = yaml.safe_load(_workflow())
+    job = workflow["jobs"]["e2e"]
+    assert job["needs"] == "prep"
+    assert job["env"]["PERSISTENT_RG"] == "${{ needs.prep.outputs.persistent }}"
+    steps = job["steps"]
+    snapshot = next(
+        step for step in steps
+        if step.get("name") == "Snapshot RG resources (persistent mode)"
+    )
+    assert snapshot["if"] == "env.PERSISTENT_RG == 'true'"
+    assert steps.index(snapshot) < next(
+        index for index, step in enumerate(steps)
+        if step.get("uses") == "./.github/actions/connect-arc"
+    )
+    assert steps.index(snapshot) < next(
+        index for index, step in enumerate(steps)
+        if step.get("name") == "Observe bounded AIO readiness"
+    )
+
+    options = {
+        "INPUT_SECRET_SYNC_MODES": "disabled,enabled",
+        "INPUT_TESTS": "aio-install",
+        "INPUT_PUBLISHED_RELEASE": "v0.0.5.dev20260925",
+        "INPUT_PUBLISHED_SOURCE_SHA": "a" * 40,
+        "INPUT_PUBLISHED_JOURNEY": "guided",
+    }
+    rejected = _parse_inputs(**options, INPUT_RG="")
+    assert rejected.returncode != 0
+    assert not rejected.stdout
+    assert "Published E2E requires an existing resource group" in rejected.stderr
+
+    admitted = _parse_inputs(**options, INPUT_RG="rg-example")
+    assert admitted.returncode == 0, admitted.stderr
+    assert "persistent=true" in admitted.stdout
+    assert "published_journey=guided" in admitted.stdout
+
+
 def test_guided_published_journey_is_not_inferred_from_source_checkout():
     result = _parse_inputs(INPUT_PUBLISHED_JOURNEY="guided")
     assert result.returncode != 0

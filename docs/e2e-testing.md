@@ -261,9 +261,12 @@ Persistent teardown deletes the Arc cluster only if it was not present in the pr
 
 For the published persistent snapshot and teardown, public logs and summaries
 report fixed reasons and aggregate counts. Those steps keep resource ID lists
-and provider diagnostics in private runner files. Review them in the selected
-environment when cleanup reports an incomplete or unknown result. A
-successful cleanup step is not an independent RG inventory check.
+and provider diagnostics in private runner files. The published Arc connection
+also keeps provider diagnostics on the runner instead of printing arbitrary
+errors publicly. These files are not uploaded and disappear with the runner.
+When cleanup reports an incomplete or unknown result, inspect the dedicated
+RG privately through an authorized Azure inventory. A successful cleanup
+step is not an independent RG inventory check.
 
 A JUnit XML artifact is uploaded per source-mode matrix cell
 (`e2e-results-<release>-secretsync-<mode>.xml`). When `upgrade-to` is set and

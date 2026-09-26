@@ -752,6 +752,7 @@ jobs:
           resource-group: ${{ steps.names.outputs.rg }}
           location: ${{ steps.loc.outputs.location }}
           custom-locations-oid: ${{ inputs.custom-locations-oid != '' && inputs.custom-locations-oid || secrets.CUSTOM_LOCATIONS_OID }}
+          private-provider-errors: ${{ needs.prep.outputs.published-mode }}
           # Secret Sync requires OIDC issuer and workload identity, so one
           # matrix axis intentionally controls all three settings.
           enable-workload-identity: ${{ matrix.secret-sync-mode == 'enabled' && 'true' || 'false' }}

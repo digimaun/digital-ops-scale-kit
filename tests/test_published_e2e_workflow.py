@@ -849,6 +849,32 @@ def test_published_target_ids_are_masked_before_snapshot_and_arc():
     assert "::add-mask::$CLUSTER" in masking["run"]
 
 
+def test_published_arc_connection_keeps_provider_errors_private():
+    workflow = yaml.safe_load(_workflow())
+    action = yaml.safe_load(
+        (
+            ROOT / ".github" / "actions" / "connect-arc" / "action.yaml"
+        ).read_text(encoding="utf-8")
+    )
+    connect = next(
+        step for step in workflow["jobs"]["e2e"]["steps"]
+        if step.get("uses") == "./.github/actions/connect-arc"
+    )
+    assert connect["with"]["private-provider-errors"] == (
+        "${{ needs.prep.outputs.published-mode }}"
+    )
+    assert action["inputs"]["private-provider-errors"]["default"] == "false"
+    for name in (
+        "Connect cluster to Arc + enable features",
+        "Enable OIDC issuer + workload identity",
+        "Capture OIDC issuer URL",
+    ):
+        step = next(item for item in action["runs"]["steps"] if item.get("name") == name)
+        assert step["env"]["PRIVATE_PROVIDER_ERRORS"] == (
+            "${{ inputs.private-provider-errors }}"
+        )
+
+
 @pytest.mark.parametrize("mode", ["snapshot-success", "snapshot-failure"])
 def test_persistent_snapshot_keeps_identifiers_and_provider_errors_private(tmp_path, mode):
     result, public, resource_id = _run_persistent_step(

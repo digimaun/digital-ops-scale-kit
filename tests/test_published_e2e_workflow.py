@@ -8,6 +8,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -47,7 +48,6 @@ def _parse_inputs(**changes: str) -> subprocess.CompletedProcess[str]:
     match = re.search(r"<<'PY' >> \"\$GITHUB_OUTPUT\"\n(.*?)\n\s*PY", step["run"], re.S)
     assert match is not None
     environment = {
-        **os.environ,
         "INPUT_RELEASES": "2608",
         "INPUT_RG": "",
         "INPUT_CLUSTER": "",
@@ -62,14 +62,23 @@ def _parse_inputs(**changes: str) -> subprocess.CompletedProcess[str]:
         "RUN_ID": "42",
         **changes,
     }
-    return subprocess.run(
-        [sys.executable, "-c", match.group(1)],
-        cwd=ROOT,
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    target = {
+        "resource-group": environment.pop("INPUT_RG"),
+        "cluster-name": environment.pop("INPUT_CLUSTER"),
+    }
+    with tempfile.TemporaryDirectory() as directory:
+        event_path = Path(directory) / "event.json"
+        event_path.write_text(
+            json.dumps({"inputs": target}), encoding="utf-8",
+        )
+        return subprocess.run(
+            [sys.executable, "-c", match.group(1)],
+            cwd=ROOT,
+            env={**os.environ, **environment, "GITHUB_EVENT_PATH": str(event_path)},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
 
 
 def _embedded_python(run: str) -> list[str]:
@@ -89,7 +98,8 @@ def _bash_executable() -> Path:
 
 
 @pytest.mark.parametrize(("step", "minimum_python"), [
-    ("Mask published target identities", 0),
+    ("Mask operator target inputs", 1),
+    ("Compute names", 0),
     ("Snapshot RG resources (persistent mode)", 0),
     ("Preflight Arc cluster name is unused (persistent mode)", 0),
     ("Prepare guided AIO answers and plan", 5),
@@ -131,6 +141,155 @@ def test_published_mode_is_explicit_and_bounded():
         assert value in workflow
 
 
+def test_operator_target_inputs_are_masked_before_step_headers():
+    jobs = yaml.safe_load(_workflow())["jobs"]
+    prep = next(
+        step for step in jobs["prep"]["steps"]
+        if step.get("name") == "Parse inputs"
+    )
+    assert "INPUT_RG" not in prep["env"]
+    assert "INPUT_CLUSTER" not in prep["env"]
+    assert "GITHUB_EVENT_PATH" in prep["run"]
+    assert 'print(f"rg_in=' not in prep["run"]
+    assert 'print(f"cluster_in=' not in prep["run"]
+    assert "rg-in" not in jobs["prep"]["outputs"]
+    assert "cluster-in" not in jobs["prep"]["outputs"]
+
+    steps = jobs["e2e"]["steps"]
+    mask = steps[0]
+    assert mask["name"] == "Mask operator target inputs"
+    assert mask["id"] == "target-inputs"
+    assert "GITHUB_EVENT_PATH" in mask["run"]
+    assert "inputs.resource-group" not in mask["run"]
+    assert "inputs.cluster-name" not in mask["run"]
+    compute = next(step for step in steps if step.get("name") == "Compute names")
+    assert steps.index(mask) < steps.index(compute)
+    assert compute["env"]["RG_IN"] == "${{ steps.target-inputs.outputs.rg_in }}"
+    assert compute["env"]["CL_IN"] == "${{ steps.target-inputs.outputs.cluster_in }}"
+    assert "needs.prep.outputs.rg-in" not in _workflow()
+    assert "needs.prep.outputs.cluster-in" not in _workflow()
+
+
+@pytest.mark.parametrize(
+    ("rg", "cluster", "expected_mask", "expected_outputs"),
+    [
+        (
+            " rg-private-marker ",
+            " arc-private-marker ",
+            ["::add-mask::rg-private-marker", "::add-mask::arc-private-marker"],
+            "rg_in=rg-private-marker\ncluster_in=arc-private-marker\n",
+        ),
+        ("", "", [], "rg_in=\ncluster_in=\n"),
+    ],
+)
+def test_target_input_mask_precedes_local_step_outputs(
+    tmp_path, rg, cluster, expected_mask, expected_outputs,
+):
+    event_path = tmp_path / "event.json"
+    outputs = tmp_path / "outputs.txt"
+    event_path.write_text(
+        json.dumps({"inputs": {"resource-group": rg, "cluster-name": cluster}}),
+        encoding="utf-8",
+    )
+    block = _embedded_python(_step_run("Mask operator target inputs"))
+    assert len(block) == 1
+    result = subprocess.run(
+        [sys.executable, "-c", block[0]],
+        env={
+            **os.environ,
+            "GITHUB_EVENT_PATH": str(event_path),
+            "GITHUB_OUTPUT": str(outputs),
+        },
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == expected_mask
+    assert outputs.read_text(encoding="utf-8") == expected_outputs
+
+
+@pytest.mark.parametrize(
+    ("rg", "cluster"),
+    [
+        ("rg-private\n::warning::forged", ""),
+        ("", "arc-private\r\n::error::forged"),
+        (17, ""),
+    ],
+)
+def test_target_input_mask_rejects_unsafe_values_without_echo(tmp_path, rg, cluster):
+    event_path = tmp_path / "event.json"
+    outputs = tmp_path / "outputs.txt"
+    event_path.write_text(
+        json.dumps({"inputs": {"resource-group": rg, "cluster-name": cluster}}),
+        encoding="utf-8",
+    )
+    block = _embedded_python(_step_run("Mask operator target inputs"))
+    result = subprocess.run(
+        [sys.executable, "-c", block[0]],
+        env={
+            **os.environ,
+            "GITHUB_EVENT_PATH": str(event_path),
+            "GITHUB_OUTPUT": str(outputs),
+        },
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "private" not in result.stderr
+    assert not outputs.exists()
+
+
+@pytest.mark.parametrize(
+    ("published", "cluster_in"),
+    [("true", ""), ("false", "arc-private-marker")],
+)
+def test_computed_target_is_masked_only_for_published_mode(
+    tmp_path, published, cluster_in,
+):
+    output = tmp_path / "names.txt"
+    result = subprocess.run(
+        [str(_bash_executable()), "-c", _step_run("Compute names")],
+        env={
+            **os.environ,
+            "RG_IN": "rg-private-marker",
+            "CL_IN": cluster_in,
+            "PUBLISHED_MODE": published,
+            "RELEASE": "2608",
+            "SECRET_SYNC_MODE": "disabled",
+            "RUN_ID": "1234567890",
+            "RUN_ATTEMPT": "1",
+            "GITHUB_OUTPUT": _bash_path(output),
+        },
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    values = dict(
+        line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines()
+    )
+    assert values["rg"] == "rg-private-marker"
+    if cluster_in:
+        assert values["cluster"] == cluster_in
+    else:
+        assert values["cluster"].startswith("e2e-")
+    assert values["site_name"].startswith("e2e-")
+    assert f"::add-mask::{values['site_name']}" in result.stdout
+    for value in ("rg", "cluster"):
+        assert (f"::add-mask::{values[value]}" in result.stdout) is (
+            published == "true"
+        )
+
+
+def test_persistent_target_concurrency_key_hides_identifier():
+    first = _parse_inputs(INPUT_RG="rg-private-marker")
+    repeated = _parse_inputs(INPUT_RG="rg-private-marker")
+    other = _parse_inputs(INPUT_RG="rg-other-marker")
+    assert all(result.returncode == 0 for result in (first, repeated, other))
+    key = re.search(r"^rg_key=(.+)$", first.stdout, re.M).group(1)
+    assert re.fullmatch(r"persistent-[0-9a-f]{64}", key)
+    assert "private-marker" not in first.stdout
+    assert key in repeated.stdout
+    assert key not in other.stdout
+
+
 def test_published_input_contract_accepts_only_the_bounded_shape():
     result = _parse_inputs(
         INPUT_SECRET_SYNC_MODES="disabled",
@@ -146,7 +305,8 @@ def test_published_input_contract_accepts_only_the_bounded_shape():
     assert f"published_source_sha={'a' * 40}" in result.stdout
     assert "max_parallel=1" in result.stdout
     assert "persistent=true" in result.stdout
-    assert "rg_in=rg-example" in result.stdout
+    assert re.search(r"^rg_key=persistent-[0-9a-f]{64}$", result.stdout, re.M)
+    assert "rg-example" not in result.stdout
 
 
 def test_published_guided_journey_accepts_bounded_enabled_and_disabled_modes():
@@ -847,18 +1007,23 @@ exit 99
 def test_published_target_ids_are_masked_before_snapshot_and_arc():
     steps = yaml.safe_load(_workflow())["jobs"]["e2e"]["steps"]
     names = [step.get("name") for step in steps]
-    masking = steps[names.index("Mask published target identities")]
-    assert masking["if"] == "needs.prep.outputs.published-mode == 'true'"
-    assert names.index("Compute names") < names.index("Mask published target identities")
-    assert names.index("Mask published target identities") < names.index(
+    assert names.index("Mask operator target inputs") < names.index("Compute names")
+    assert names.index("Compute names") < names.index(
         "Snapshot RG resources (persistent mode)"
     )
-    assert steps.index(masking) < next(
+    compute = steps[names.index("Compute names")]
+    assert compute["env"]["PUBLISHED_MODE"] == (
+        "${{ needs.prep.outputs.published-mode }}"
+    )
+    for value, output in (("RG", "rg"), ("CL", "cluster")):
+        assert compute["run"].index(f'echo "::add-mask::${value}"') < (
+            compute["run"].index(f'echo "{output}=${value}" >> "$GITHUB_OUTPUT"')
+        )
+    assert "::add-mask::$SN" in compute["run"]
+    assert steps.index(compute) < next(
         index for index, step in enumerate(steps)
         if step.get("uses") == "./.github/actions/connect-arc"
     )
-    assert "::add-mask::$RG" in masking["run"]
-    assert "::add-mask::$CLUSTER" in masking["run"]
 
 
 def test_published_arc_connection_keeps_provider_errors_private():

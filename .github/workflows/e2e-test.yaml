@@ -100,8 +100,6 @@ jobs:
       versions: ${{ steps.v.outputs.versions }}
       persistent: ${{ steps.v.outputs.persistent }}
       rg-key: ${{ steps.v.outputs.rg_key }}
-      rg-in: ${{ steps.v.outputs.rg_in }}
-      cluster-in: ${{ steps.v.outputs.cluster_in }}
       upgrade-to: ${{ steps.v.outputs.upgrade_to }}
       pytest-paths: ${{ steps.v.outputs.pytest_paths }}
       isolate-dataflow-sample: ${{ steps.v.outputs.isolate_dataflow_sample }}
@@ -129,8 +127,6 @@ jobs:
         shell: bash
         env:
           INPUT_RELEASES: "${{ inputs.aio-releases }}"
-          INPUT_RG: "${{ inputs.resource-group }}"
-          INPUT_CLUSTER: "${{ inputs.cluster-name }}"
           INPUT_UPGRADE_TO: "${{ inputs.upgrade-to }}"
           INPUT_SECRET_SYNC_MODES: "${{ inputs.secret-sync-modes }}"
           INPUT_TESTS: "${{ inputs.tests }}"
@@ -142,7 +138,7 @@ jobs:
           RUN_ID: "${{ github.run_id }}"
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import json, os, re, sys, unicodedata
+          import hashlib, json, os, re, sys, unicodedata
           from pathlib import Path
 
           def output_token(value, label, maximum=256):
@@ -198,8 +194,17 @@ jobs:
                       f"{releases_dir}/<release>.yaml: {missing}. "
                       f"Available: {available}."
                   )
-          rg_in = output_token(os.environ["INPUT_RG"].strip(), "resource-group")
-          cl_in = output_token(os.environ["INPUT_CLUSTER"].strip(), "cluster-name")
+          target_inputs = json.loads(
+              Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8")
+          ).get("inputs")
+          if not isinstance(target_inputs, dict):
+              sys.exit("Workflow target inputs are unavailable.")
+          rg_in = target_inputs.get("resource-group", "")
+          cl_in = target_inputs.get("cluster-name", "")
+          if not isinstance(rg_in, str) or not isinstance(cl_in, str):
+              sys.exit("Workflow target inputs must be text.")
+          rg_in = output_token(rg_in.strip(), "resource-group")
+          cl_in = output_token(cl_in.strip(), "cluster-name")
           upgrade_to = output_token(
               os.environ["INPUT_UPGRADE_TO"].strip(), "upgrade-to", maximum=64,
           )
@@ -350,11 +355,6 @@ jobs:
           print(f"published_journey={published_journey}")
           print(f"published_release={published_release}")
           print(f"published_source_sha={published_source_sha}")
-          # Emit trimmed operator inputs so downstream steps use the exact
-          # values the validation was done against (no trailing-whitespace
-          # mismatch between prep and `Compute names`).
-          print(f"rg_in={rg_in}")
-          print(f"cluster_in={cl_in}")
           print(f"pytest_paths={pytest_paths}")
           print(
               "isolate_dataflow_sample="
@@ -367,7 +367,10 @@ jobs:
           #    runs' delta snapshots each see the other's in-flight resources.
           #  - ephemeral:  per-run key. Matrix cells parallelize via the
           #    matrix.aio-release suffix applied at the job level.
-          rg_key = f"persistent-{rg_in}" if persistent else f"ephemeral-{os.environ['RUN_ID']}"
+          rg_key = (
+              "persistent-" + hashlib.sha256(rg_in.encode("utf-8")).hexdigest()
+              if persistent else f"ephemeral-{os.environ['RUN_ID']}"
+          )
           print(f"rg_key={rg_key}")
           PY
 
@@ -397,6 +400,50 @@ jobs:
       PUBLISHED_JOURNEY: ${{ needs.prep.outputs.published-journey }}
       DEBUG_USER_OID: ${{ secrets.DEBUG_USER_OID }}
     steps:
+      # Step headers show env values before shell commands can mask them.
+      - name: Mask operator target inputs
+        id: target-inputs
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import unicodedata
+          from pathlib import Path
+
+          event = json.loads(
+              Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8")
+          )
+          inputs = event.get("inputs")
+          if not isinstance(inputs, dict):
+              raise SystemExit("Workflow target inputs are unavailable.")
+          values = {}
+          for name, output_name in (
+              ("resource-group", "rg_in"),
+              ("cluster-name", "cluster_in"),
+          ):
+              value = inputs.get(name, "")
+              if not isinstance(value, str):
+                  raise SystemExit(f"{name} must be text.")
+              value = value.strip()
+              if value and (
+                  len(value) > 256
+                  or any(
+                      character.isspace()
+                      or unicodedata.category(character).startswith("C")
+                      for character in value
+                  )
+              ):
+                  raise SystemExit(f"{name} must be bounded text without whitespace or controls.")
+              if value:
+                  print(f"::add-mask::{value}", flush=True)
+              values[output_name] = value
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              for name, value in values.items():
+                  print(f"{name}={value}", file=output)
+          PY
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -405,8 +452,9 @@ jobs:
         id: names
         shell: bash
         env:
-          RG_IN: "${{ needs.prep.outputs.rg-in }}"
-          CL_IN: "${{ needs.prep.outputs.cluster-in }}"
+          RG_IN: "${{ steps.target-inputs.outputs.rg_in }}"
+          CL_IN: "${{ steps.target-inputs.outputs.cluster_in }}"
+          PUBLISHED_MODE: "${{ needs.prep.outputs.published-mode }}"
           RELEASE: "${{ matrix.aio-release }}"
           SECRET_SYNC_MODE: "${{ matrix.secret-sync-mode }}"
           RUN_ID: "${{ github.run_id }}"
@@ -433,22 +481,15 @@ jobs:
           RG="${RG_IN:-rg-e2e-$LONG_SUFFIX}"
           CL="${CL_IN:-e2e-$RESOURCE_SUFFIX}"
           SN="e2e-$RESOURCE_SUFFIX"
+          if [[ "$PUBLISHED_MODE" == "true" ]]; then
+            echo "::add-mask::$RG"
+            echo "::add-mask::$CL"
+          fi
           echo "::add-mask::$SN"
           echo "rg=$RG" >> "$GITHUB_OUTPUT"
           echo "cluster=$CL" >> "$GITHUB_OUTPUT"
           echo "site_name=$SN" >> "$GITHUB_OUTPUT"
           echo "job_start_epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
-
-      - name: Mask published target identities
-        if: needs.prep.outputs.published-mode == 'true'
-        shell: bash
-        env:
-          RG: ${{ steps.names.outputs.rg }}
-          CLUSTER: ${{ steps.names.outputs.cluster }}
-        run: |
-          set -euo pipefail
-          echo "::add-mask::$RG"
-          echo "::add-mask::$CLUSTER"
 
       - uses: ./.github/actions/setup-published-siteops
         if: needs.prep.outputs.published-mode == 'true'

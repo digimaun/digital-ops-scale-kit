@@ -179,6 +179,18 @@ def test_operator_target_inputs_are_masked_before_step_headers():
             ["::add-mask::rg-private-marker", "::add-mask::arc-private-marker"],
             "rg_in=rg-private-marker\ncluster_in=arc-private-marker\n",
         ),
+        (
+            "rg%0Aprivate-marker",
+            "arc%0Dprivate-marker",
+            ["::add-mask::rg%250Aprivate-marker", "::add-mask::arc%250Dprivate-marker"],
+            "rg_in=rg%0Aprivate-marker\ncluster_in=arc%0Dprivate-marker\n",
+        ),
+        (
+            "rg%250Aprivate-marker",
+            "",
+            ["::add-mask::rg%25250Aprivate-marker"],
+            "rg_in=rg%250Aprivate-marker\ncluster_in=\n",
+        ),
         ("", "", [], "rg_in=\ncluster_in=\n"),
     ],
 )
@@ -242,7 +254,7 @@ def test_target_input_mask_rejects_unsafe_values_without_echo(tmp_path, rg, clus
     ("published", "cluster_in"),
     [("true", ""), ("false", "arc-private-marker")],
 )
-def test_computed_target_is_masked_only_for_published_mode(
+def test_computed_site_mask_preserves_published_and_source_targets(
     tmp_path, published, cluster_in,
 ):
     output = tmp_path / "names.txt"
@@ -250,9 +262,8 @@ def test_computed_target_is_masked_only_for_published_mode(
         [str(_bash_executable()), "-c", _step_run("Compute names")],
         env={
             **os.environ,
-            "RG_IN": "rg-private-marker",
+            "RG_IN": "rg%0Aprivate-marker" if published == "true" else "rg-private-marker",
             "CL_IN": cluster_in,
-            "PUBLISHED_MODE": published,
             "RELEASE": "2608",
             "SECRET_SYNC_MODE": "disabled",
             "RUN_ID": "1234567890",
@@ -265,28 +276,33 @@ def test_computed_target_is_masked_only_for_published_mode(
     values = dict(
         line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines()
     )
-    assert values["rg"] == "rg-private-marker"
+    assert values["rg"] == (
+        "rg%0Aprivate-marker" if published == "true" else "rg-private-marker"
+    )
     if cluster_in:
         assert values["cluster"] == cluster_in
     else:
         assert values["cluster"].startswith("e2e-")
     assert values["site_name"].startswith("e2e-")
-    assert f"::add-mask::{values['site_name']}" in result.stdout
-    for value in ("rg", "cluster"):
-        assert (f"::add-mask::{values[value]}" in result.stdout) is (
-            published == "true"
-        )
+    if published == "true":
+        assert values["cluster"] == values["site_name"]
+    assert result.stdout.splitlines() == [f"::add-mask::{values['site_name']}"]
 
 
 def test_persistent_target_concurrency_key_hides_identifier():
     first = _parse_inputs(INPUT_RG="rg-private-marker")
     repeated = _parse_inputs(INPUT_RG="rg-private-marker")
+    different_case = _parse_inputs(INPUT_RG="RG-PRIVATE-MARKER")
     other = _parse_inputs(INPUT_RG="rg-other-marker")
-    assert all(result.returncode == 0 for result in (first, repeated, other))
+    assert all(
+        result.returncode == 0
+        for result in (first, repeated, different_case, other)
+    )
     key = re.search(r"^rg_key=(.+)$", first.stdout, re.M).group(1)
     assert re.fullmatch(r"persistent-[0-9a-f]{64}", key)
     assert "private-marker" not in first.stdout
     assert key in repeated.stdout
+    assert key in different_case.stdout
     assert key not in other.stdout
 
 
@@ -1012,14 +1028,11 @@ def test_published_target_ids_are_masked_before_snapshot_and_arc():
         "Snapshot RG resources (persistent mode)"
     )
     compute = steps[names.index("Compute names")]
-    assert compute["env"]["PUBLISHED_MODE"] == (
-        "${{ needs.prep.outputs.published-mode }}"
-    )
-    for value, output in (("RG", "rg"), ("CL", "cluster")):
-        assert compute["run"].index(f'echo "::add-mask::${value}"') < (
-            compute["run"].index(f'echo "{output}=${value}" >> "$GITHUB_OUTPUT"')
-        )
+    assert "PUBLISHED_MODE" not in compute["env"]
     assert "::add-mask::$SN" in compute["run"]
+    assert compute["run"].index('echo "::add-mask::$SN"') < (
+        compute["run"].index('echo "cluster=$CL" >> "$GITHUB_OUTPUT"')
+    )
     assert steps.index(compute) < next(
         index for index, step in enumerate(steps)
         if step.get("uses") == "./.github/actions/connect-arc"

@@ -260,13 +260,13 @@ Persistent teardown deletes the Arc cluster only if it was not present in the pr
 **Use a dedicated RG for persistent mode.** Anything added to the RG between the snapshot and teardown (by operators, automation, or a `keep-cluster-alive-minutes` hold) appears in the delta and is deleted.
 
 Operator target names are masked before step environments can display them.
-Persistent runs serialize on a target-derived key that does not contain the
-resource group name. For the published persistent snapshot and teardown,
-public logs and summaries report fixed reasons and aggregate counts. Those
-steps keep resource ID lists and provider diagnostics in private runner files.
-The published Arc connection
-also keeps provider diagnostics on the runner instead of printing arbitrary
-errors publicly. These files are not uploaded and disappear with the runner.
+Persistent runs serialize on a case-insensitive target key that does not
+contain the resource group name. For the published persistent snapshot and
+teardown, public logs and summaries report fixed reasons and aggregate counts.
+Those steps keep resource ID lists and provider diagnostics in private runner
+files. The published Arc connection also keeps provider diagnostics on the
+runner instead of printing arbitrary errors publicly. These files are not
+uploaded and disappear with the runner.
 When cleanup reports an incomplete or unknown result, inspect the dedicated
 RG privately through an authorized Azure inventory. A successful cleanup
 step is not an independent RG inventory check.

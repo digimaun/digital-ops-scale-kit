@@ -368,7 +368,7 @@ jobs:
           #  - ephemeral:  per-run key. Matrix cells parallelize via the
           #    matrix.aio-release suffix applied at the job level.
           rg_key = (
-              "persistent-" + hashlib.sha256(rg_in.encode("utf-8")).hexdigest()
+              "persistent-" + hashlib.sha256(rg_in.casefold().encode("utf-8")).hexdigest()
               if persistent else f"ephemeral-{os.environ['RUN_ID']}"
           )
           print(f"rg_key={rg_key}")
@@ -437,7 +437,8 @@ jobs:
               ):
                   raise SystemExit(f"{name} must be bounded text without whitespace or controls.")
               if value:
-                  print(f"::add-mask::{value}", flush=True)
+                  # Workflow commands decode percent sequences before registering masks.
+                  print(f"::add-mask::{value.replace('%', '%25')}", flush=True)
               values[output_name] = value
           with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
               for name, value in values.items():
@@ -454,7 +455,6 @@ jobs:
         env:
           RG_IN: "${{ steps.target-inputs.outputs.rg_in }}"
           CL_IN: "${{ steps.target-inputs.outputs.cluster_in }}"
-          PUBLISHED_MODE: "${{ needs.prep.outputs.published-mode }}"
           RELEASE: "${{ matrix.aio-release }}"
           SECRET_SYNC_MODE: "${{ matrix.secret-sync-mode }}"
           RUN_ID: "${{ github.run_id }}"
@@ -481,10 +481,6 @@ jobs:
           RG="${RG_IN:-rg-e2e-$LONG_SUFFIX}"
           CL="${CL_IN:-e2e-$RESOURCE_SUFFIX}"
           SN="e2e-$RESOURCE_SUFFIX"
-          if [[ "$PUBLISHED_MODE" == "true" ]]; then
-            echo "::add-mask::$RG"
-            echo "::add-mask::$CL"
-          fi
           echo "::add-mask::$SN"
           echo "rg=$RG" >> "$GITHUB_OUTPUT"
           echo "cluster=$CL" >> "$GITHUB_OUTPUT"

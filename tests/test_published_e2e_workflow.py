@@ -800,13 +800,25 @@ if [[ "$1 $2" == "resource delete" ]]; then
   printf 'provider accepted %s\\n' "$FAKE_AZ_RESOURCE_ID"
   exit 0
 fi
+if [[ "$1 $2" == "extension add" ]]; then
+  exit 0
+fi
+if [[ "$1 $2" == "connectedk8s list" ]]; then
+  if [[ "$FAKE_AZ_MODE" == "preflight-failure" ]]; then
+    printf 'provider error for %s\\n' "$FAKE_AZ_RESOURCE_ID" >&2
+    exit 1
+  fi
+  printf '0\\n'
+  exit 0
+fi
 printf 'Unexpected Azure command\\n' >&2
 exit 99
 """, encoding="utf-8", newline="\n")
     az.chmod(0o700)
+    bash_tools = bash.parent.parent / "usr" / "bin" if os.name == "nt" else bash.parent
     env = {
         "HOME": _bash_path(tmp_path),
-        "PATH": os.pathsep.join((str(tools), str(bash.parent.parent / "usr" / "bin"))),
+        "PATH": os.pathsep.join((str(tools), str(bash_tools))),
         "RUNNER_TEMP": _bash_path(tmp_path),
         "RG": "rg-private-marker",
         "CLUSTER": "arc-private-marker",
@@ -866,13 +878,37 @@ def test_published_arc_connection_keeps_provider_errors_private():
     assert action["inputs"]["private-provider-errors"]["default"] == "false"
     for name in (
         "Connect cluster to Arc + enable features",
+        "Wait for Arc Connected status (initial)",
         "Enable OIDC issuer + workload identity",
         "Capture OIDC issuer URL",
+        "Wait for Arc Connected status (post-restart)",
     ):
         step = next(item for item in action["runs"]["steps"] if item.get("name") == name)
         assert step["env"]["PRIVATE_PROVIDER_ERRORS"] == (
             "${{ inputs.private-provider-errors }}"
         )
+
+
+@pytest.mark.parametrize("mode", ["preflight-failure", "preflight-unused"])
+def test_persistent_arc_preflight_keeps_provider_errors_private(tmp_path, mode):
+    name = "Preflight Arc cluster name is unused (persistent mode)"
+    run = _step_run(name)
+    assert "umask 077" in run.split("if ! COUNT=")[0]
+    result, public, resource_id = _run_persistent_step(name, tmp_path, mode)
+    assert "rg-private-marker" not in public
+    assert resource_id not in public
+    assert result.returncode == (1 if mode == "preflight-failure" else 0)
+    assert "connectedk8s list" in (
+        tmp_path / "az-calls.log"
+    ).read_text(encoding="utf-8")
+    diagnostic = tmp_path / "published-arc-preflight.err"
+    if mode == "preflight-failure":
+        assert "could not be checked" in public
+        assert resource_id in diagnostic.read_text(encoding="utf-8")
+        if os.name != "nt":
+            assert stat.S_IMODE(diagnostic.stat().st_mode) == 0o600
+    else:
+        assert diagnostic.read_text(encoding="utf-8") == ""
 
 
 @pytest.mark.parametrize("mode", ["snapshot-success", "snapshot-failure"])

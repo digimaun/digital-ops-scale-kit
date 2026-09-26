@@ -228,11 +228,13 @@ fi
         ("failed", 1, "Arc connectivity could not be queried"),
     ],
 )
+@pytest.mark.parametrize("private", ["true", "false"])
 def test_wait_connected_omits_private_status_errors_and_arguments(
     tmp_path,
     mode,
     expected_exit,
     expected_message,
+    private,
 ):
     bin_dir = _fake_bin(tmp_path)
     _write_executable(
@@ -276,6 +278,8 @@ esac
             "PRIVATE_SENTINEL": PRIVATE_SENTINEL,
             "FAKE_AZ_LOG": _bash_path(tmp_path / "queries.log"),
             "FAKE_SLEEP_LOG": _bash_path(tmp_path / "sleeps.log"),
+            "PRIVATE_PROVIDER_ERRORS": private,
+            "RUNNER_TEMP": _bash_path(tmp_path / "private-temp"),
         },
     )
 
@@ -291,7 +295,17 @@ esac
         assert (tmp_path / "sleeps.log").read_text(encoding="utf-8").splitlines() == (
             ["15"] * 19
         )
-    assert not list((tmp_path / "private-temp").iterdir())
+    if private == "true":
+        diagnostic = tmp_path / "private-temp" / "connectedk8s-diagnostics" / (
+            "wait-connected.err"
+        )
+        assert diagnostic.is_file()
+        if mode != "connected":
+            assert PRIVATE_SENTINEL in diagnostic.read_text(encoding="utf-8")
+        if os.name != "nt":
+            assert stat.S_IMODE(diagnostic.stat().st_mode) == 0o600
+    else:
+        assert not list((tmp_path / "private-temp").iterdir())
 
 
 def _oidc_verification_script() -> str:

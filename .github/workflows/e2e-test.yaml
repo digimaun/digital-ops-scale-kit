@@ -734,6 +734,7 @@ jobs:
         # `az connectedk8s connect` error out opaquely.
         run: |
           set -euo pipefail
+          umask 077
           az extension add --name connectedk8s --upgrade --yes --only-show-errors
           if ! COUNT=$(az connectedk8s list -g "$RG" \
             --query "length([?name=='$CLUSTER'])" -o tsv \

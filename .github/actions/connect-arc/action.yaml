@@ -142,6 +142,7 @@ runs:
       env:
         CLUSTER_NAME: ${{ inputs.cluster-name }}
         RESOURCE_GROUP: ${{ inputs.resource-group }}
+        PRIVATE_PROVIDER_ERRORS: ${{ inputs.private-provider-errors }}
       run: |
         set -euo pipefail
         bash "${GITHUB_ACTION_PATH}/wait-connected.sh" "${CLUSTER_NAME}" "${RESOURCE_GROUP}"
@@ -248,6 +249,7 @@ runs:
       env:
         CLUSTER_NAME: ${{ inputs.cluster-name }}
         RESOURCE_GROUP: ${{ inputs.resource-group }}
+        PRIVATE_PROVIDER_ERRORS: ${{ inputs.private-provider-errors }}
       run: |
         set -euo pipefail
         # Arc heartbeat can flap Offline during the API-server restart. Recheck

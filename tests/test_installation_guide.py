@@ -103,6 +103,20 @@ def test_project_source_renewal_and_saved_site_guide_are_executable():
     assert "separate fleet deployment" in normalized and "already runs AIO" in normalized
 
 
+def test_guided_guide_selects_release_per_inline_site_then_configured_fleet():
+    guided = (GUIDE.parent / "guided-inputs.md").read_text(encoding="utf-8")
+    assert "--input aioRelease=2608 --read-resources" in guided
+    assert "--input aioRelease=2607 --read-resources" in guided
+    assert "--input siteName=plant-2608" in guided
+    assert "--input siteName=plant-2607" in guided
+    assert "deploy aio-install --input siteName=plant-2608" in guided
+    assert "deploy aio-install --input siteName=plant-2607" in guided
+    assert "plan aio-install -l environment=dev" in guided
+    assert "deploy aio-install -l environment=dev" in guided
+    assert "every configured Site labeled `dev`" in guided
+    assert "already runs AIO" in guided
+
+
 def test_reference_distinguishes_required_inputs_from_resource_derivation():
     reference = (GUIDE.parent / "manifest-reference.md").read_text(encoding="utf-8")
     targeting = (GUIDE.parent / "targeting.md").read_text(encoding="utf-8")

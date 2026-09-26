@@ -914,6 +914,175 @@ jobs:
               raise SystemExit("Guided installed AIO plan has unexpected operations.")
           PY
 
+      - name: Check published guided disabled Site routes
+        if: needs.prep.outputs.published-mode == 'true' && needs.prep.outputs.published-journey == 'guided' && matrix.secret-sync-mode == 'disabled'
+        shell: bash
+        env:
+          E2E_SITE_NAME: ${{ steps.names.outputs.site_name }}
+          E2E_SUBSCRIPTION: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          E2E_RESOURCE_GROUP: ${{ steps.names.outputs.rg }}
+          E2E_LOCATION: ${{ steps.loc.outputs.location }}
+          E2E_CLUSTER_NAME: ${{ steps.names.outputs.cluster }}
+          E2E_AIO_RELEASE: ${{ matrix.aio-release }}
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"])
+          source = json.loads((root / "published-answers.json").read_text(encoding="utf-8"))
+          values = source.get("values")
+          if (
+              source.get("apiVersion") != "siteops.inputs/v1"
+              or source.get("kind") != "SiteInputValues"
+              or not isinstance(values, dict)
+              or values.get("enableSecretSync") is not False
+              or not values.get("cluster")
+          ):
+              raise SystemExit("Guided disabled answers are invalid.")
+          manual = {
+              **values,
+              "subscription": os.environ["E2E_SUBSCRIPTION"],
+              "resourceGroup": os.environ["E2E_RESOURCE_GROUP"],
+              "location": os.environ["E2E_LOCATION"],
+              "clusterName": os.environ["E2E_CLUSTER_NAME"],
+              "cluster": None,
+          }
+          destination = root / "published-manual-answers.json"
+          fd = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+          with os.fdopen(fd, "w", encoding="utf-8") as stream:
+              json.dump({**source, "values": manual}, stream, sort_keys=True)
+          PY
+          if ! SITEOPS_REDACT_OUTPUT=0 siteops \
+            --project "$SITEOPS_E2E_PROJECT" --approved-source guided \
+            plan aio-install --offline \
+            --input-file "$RUNNER_TEMP/published-manual-answers.json" \
+            --output json --projection local-private \
+            > "$RUNNER_TEMP/published-manual-plan.json" \
+            2> "$RUNNER_TEMP/published-manual-plan.err"; then
+            echo "::error::The published guided manual plan failed."
+            exit 1
+          fi
+          if ! SITEOPS_REDACT_OUTPUT=0 siteops \
+            --project "$SITEOPS_E2E_PROJECT" --approved-source guided \
+            plan aio-install --offline \
+            --input "siteName=$E2E_SITE_NAME" \
+            --input "subscription=$E2E_SUBSCRIPTION" \
+            --input "resourceGroup=$E2E_RESOURCE_GROUP" \
+            --input "location=$E2E_LOCATION" \
+            --input "clusterName=$E2E_CLUSTER_NAME" \
+            --input environment=e2e --input country=US \
+            --input "aioRelease=$E2E_AIO_RELEASE" \
+            --input brokerMemoryProfile=Low --input enableSecretSync=false \
+            --output json --projection local-private \
+            > "$RUNNER_TEMP/published-inline-plan.json" \
+            2> "$RUNNER_TEMP/published-inline-plan.err"; then
+            echo "::error::The published guided inline plan failed."
+            exit 1
+          fi
+          mkdir "$SITEOPS_E2E_PROJECT/sites"
+          site="$SITEOPS_E2E_PROJECT/sites/$E2E_SITE_NAME.yaml"
+          if ! siteops \
+            --project "$SITEOPS_E2E_PROJECT" --approved-source guided \
+            inputs aio-install --offline \
+            --input-file "$RUNNER_TEMP/published-manual-answers.json" \
+            --save-site "$site" \
+            > "$RUNNER_TEMP/published-saved-site.txt" \
+            2> "$RUNNER_TEMP/published-saved-site.err"; then
+            echo "::error::The published guided Site could not be saved."
+            exit 1
+          fi
+          site_before="$(sha256sum "$site" | cut -d ' ' -f 1)"
+          if ! SITEOPS_REDACT_OUTPUT=0 siteops \
+            --project "$SITEOPS_E2E_PROJECT" --approved-source guided \
+            plan aio-install --offline -l "name=$E2E_SITE_NAME" \
+            --output json --projection local-private \
+            > "$RUNNER_TEMP/published-configured-plan.json" \
+            2> "$RUNNER_TEMP/published-configured-plan.err"; then
+            echo "::error::The published configured Site plan failed."
+            exit 1
+          fi
+          site_after="$(sha256sum "$site" | cut -d ' ' -f 1)"
+          if [[ "$site_before" != "$site_after" ]]; then
+            echo "::error::Published planning changed the configured Site."
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"])
+          site = os.environ["E2E_SITE_NAME"]
+          version = os.environ["SITEOPS_E2E_ENGINE_VERSION"]
+
+          def shape(filename, *, configured=False):
+              raw = json.loads((root / filename).read_text(encoding="utf-8"))
+              plan = raw["plan"]
+              manifest = plan["manifest"]
+              targets = plan["targets"]
+              if configured:
+                  selection_matches = (
+                      manifest.get("cliSelector") == f"name={site}"
+                      and manifest.get("targetSelection") is None
+                  )
+              else:
+                  selection_matches = (
+                      manifest.get("cliSelector") is None
+                      and manifest.get("targetSelection") == "explicit-site"
+                  )
+              if (
+                  raw.get("apiVersion") != "siteops/v1alpha1"
+                  or raw.get("kind") != "DeploymentPlan"
+                  or raw.get("status") != "planned"
+                  or raw.get("executable") is not True
+                  or raw.get("engine", {}).get("version") != version
+                  or raw.get("summary", {}).get("targetCount") != 1
+                  or len(targets) != 1
+                  or targets[0]["name"] != site
+                  or plan["submission"] != {
+                      "mode": "arm-json", "compilationBinding": "package-artifact"
+                  }
+                  or not selection_matches
+              ):
+                  raise ValueError("Plan shape differs.")
+              operations = targets[0]["operations"]
+              if len(operations) != 9 or raw["summary"]["operationCount"] != len(operations):
+                  raise ValueError("Operation count differs.")
+              target = targets[0]
+              identity = tuple(
+                  target[key] for key in (
+                      "name", "kind", "subscription", "resourceGroup", "location"
+                  )
+              )
+              steps = tuple(
+                  (
+                      item["identity"]["target"], item["identity"]["step"],
+                      item["kind"], item["scope"], item["disposition"]
+                  )
+                  for item in operations
+              )
+              if any(not isinstance(value, str) or not value for value in identity):
+                  raise ValueError("Target identity is incomplete.")
+              return identity, steps
+
+          try:
+              expected_target, expected_operations = shape("published-guided-plan.json")
+              for filename, configured in (
+                  ("published-manual-plan.json", False),
+                  ("published-inline-plan.json", False),
+                  ("published-configured-plan.json", True),
+              ):
+                  target, operations = shape(filename, configured=configured)
+                  if target != expected_target or operations != expected_operations:
+                      raise ValueError("Selected operations differ.")
+          except (OSError, ValueError, KeyError, TypeError, IndexError):
+              raise SystemExit("Published guided disabled Site controls differ.") from None
+          PY
+
       - name: Check for kubectl manifest steps
         id: rbac-check
         if: needs.prep.outputs.published-mode != 'true'
@@ -1129,13 +1298,56 @@ jobs:
         shell: bash
         env:
           RG: ${{ steps.names.outputs.rg }}
-          E2E_SITE_NAME: ${{ steps.names.outputs.site_name }}
           E2E_JOURNEY: ${{ needs.prep.outputs.published-journey }}
           E2E_ENABLE_SECRET_SYNC: ${{ matrix.secret-sync-mode == 'enabled' && 'true' || 'false' }}
         run: |
           set -euo pipefail
+          umask 077
           az resource list --resource-group "$RG" --output json \
             > "$RUNNER_TEMP/published-resources.json"
+          if [[ "$E2E_JOURNEY" == "guided" ]]; then
+            # Parse inputs requires an existing RG for published guided runs.
+            # The persistent snapshot precedes Arc connection. Missing state stays fatal.
+            python3 - \
+              "$RUNNER_TEMP/published-resources.json" \
+              "$RUNNER_TEMP/e2e-teardown/pre-ids.txt" \
+              "$RUNNER_TEMP/published-owned-resources.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          try:
+              resources = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          except (OSError, UnicodeError, ValueError):
+              raise SystemExit("Azure resource observation is invalid.") from None
+          try:
+              prior_ids = {
+                  line.strip().rstrip("/").casefold()
+                  for line in Path(sys.argv[2]).read_text(encoding="utf-8").splitlines()
+                  if line.strip()
+              }
+          except (OSError, UnicodeError):
+              raise SystemExit("Published guided ownership snapshot is unavailable.") from None
+          if not isinstance(resources, list):
+              raise SystemExit("Azure resource observation is invalid.")
+          owned = []
+          for resource in resources:
+              if not isinstance(resource, dict) or any(
+                  not isinstance(resource.get(key), str) or not resource[key]
+                  for key in ("id", "name", "type")
+              ):
+                  raise SystemExit("Azure resource observation is invalid.")
+              if resource["id"].rstrip("/").casefold() not in prior_ids:
+                  owned.append({
+                      "id": resource["id"], "name": resource.get("name"),
+                      "type": resource.get("type"),
+                  })
+          try:
+              Path(sys.argv[3]).write_text(json.dumps(owned), encoding="utf-8")
+          except OSError:
+              raise SystemExit("Published guided resource observation could not be stored.") from None
+          PY
+          fi
           ready=false
           for _ in {1..60}; do
             kubectl get pods --namespace azure-iot-operations --output json \
@@ -1179,17 +1391,11 @@ jobs:
             exit 1
           fi
           if [[ "$E2E_JOURNEY" == "guided" && "$E2E_ENABLE_SECRET_SYNC" == "true" ]]; then
-            mapfile -t secret_resources < <(python3 - "$RUNNER_TEMP/published-resources.json" <<'PY'
+            mapfile -t secret_resources < <(python3 - "$RUNNER_TEMP/published-owned-resources.json" <<'PY'
           import json
-          import os
           import sys
           from pathlib import Path
-          resources = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          owned = [
-              item for item in resources if isinstance(item, dict)
-              and isinstance(item.get("tags"), dict)
-              and item["tags"].get("site") == os.environ["E2E_SITE_NAME"]
-          ]
+          owned = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
           for resource_type in (
               "microsoft.managedidentity/userassignedidentities",
               "microsoft.iotoperations/instances",
@@ -1199,7 +1405,12 @@ jobs:
                   if item.get("type", "").lower() == resource_type
               ]
               if len(matching) != 1:
-                  raise SystemExit("Guided Secret Sync resource selection is incomplete.")
+                  label = (
+                      "managed identity"
+                      if resource_type.startswith("microsoft.managedidentity/")
+                      else "AIO instance"
+                  )
+                  raise SystemExit(f"Guided Secret Sync {label} selection is incomplete.")
               print(matching[0]["name"] if resource_type.startswith("microsoft.managedidentity")
                     else matching[0]["id"])
           PY
@@ -1274,11 +1485,12 @@ jobs:
               "instanceCustomResources": custom_resource_count,
           }
           if os.environ["E2E_JOURNEY"] == "guided":
-              owned = [
-                  item for item in resources if isinstance(item, dict)
-                  and isinstance(item.get("tags"), dict)
-                  and item["tags"].get("site") == os.environ["E2E_SITE_NAME"]
-              ]
+              owned = json.loads(
+                  (Path(os.environ["RUNNER_TEMP"]) / "published-owned-resources.json")
+                  .read_text(encoding="utf-8")
+              )
+              if not isinstance(owned, list):
+                  raise SystemExit("Published guided resource observation is invalid.")
               owned_types = [item.get("type", "").lower() for item in owned]
               spcs = [
                   item for item in owned

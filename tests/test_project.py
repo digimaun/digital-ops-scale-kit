@@ -8,7 +8,7 @@ from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -335,3 +335,31 @@ def test_pin_rejects_cache_overlap_before_directory_creation(tmp_path, monkeypat
     assert "separate directory trees" in capsys.readouterr().err
     assert target.exists() is existing
     assert WorkspaceCache(cache.root).root == cache.root
+
+
+def test_pin_reports_progress_before_cold_acquisition(tmp_path, monkeypatch, capsys):
+    target = tmp_path / "factory"
+    monkeypatch.setenv("SITEOPS_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(sys, "argv", [
+        "siteops", "--trust-policy", str(tmp_path / "policy.json"),
+        "--trusted-root", str(tmp_path / "root.json"),
+        "project", "pin", str(target),
+        "--source", "github:example/content", "--release", "v1",
+    ])
+
+    def stop_acquisition(*args, **kwargs):
+        progress = capsys.readouterr().err
+        assert "Resolving and verifying" in progress
+        assert "may take time" in progress
+        assert str(target) not in progress
+        raise ProjectError("Fixture acquisition stopped.")
+
+    with (
+        patch("siteops.workspace_cache.default_cache_root", return_value=tmp_path / "cache"),
+        patch("siteops.workspace_cache.WorkspaceCache"),
+        patch("siteops.github_workspace_acquisition.GitHubWorkspaceAcquirer") as acquirer,
+    ):
+        acquirer.return_value.acquire.side_effect = stop_acquisition
+        with pytest.raises(SystemExit) as stopped:
+            cli.main()
+    assert stopped.value.code == 1

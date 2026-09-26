@@ -1350,6 +1350,15 @@ def test_install_notes_bind_downloads_and_commands_to_the_selected_release(candi
     assert "`--index-url <your approved index>`" in notes
     assert "packagefeedproxy.microsoft.io" not in notes
     assert "pipx does not automatically verify GitHub attestations" in notes
+    assert (
+        f"https://github.com/{REPO}/blob/{SHA}/docs/install-siteops.md#verify-the-bootstrap-script"
+        in notes
+    )
+    assert "with those identities before running it" in notes
+    assert "HTTPS download alone does not authenticate the publisher" in notes
+    assert "use this release's reviewed provenance values instead" in notes
+    assert "configured-Site fleet selectors remain supported" in notes
+    assert "a project pin selects content, not operator Site configuration" in notes
     assert "`--force`" in notes
     assert "downloads only the ZIP and its detached proof, authenticates the ZIP before extraction" in notes
     assert f"Expected publisher: `{REPO}`" in notes

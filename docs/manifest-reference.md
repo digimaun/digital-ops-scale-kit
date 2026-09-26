@@ -63,7 +63,11 @@ such as `manifests/storage.yaml` uses `manifests/storage.inputs.yaml` so
 several flat manifests cannot share one contract. The file is packaged with
 the workspace and checked against the acquired package's file inventory
 before Site Ops reads it. It is not a manifest, a browsing card, or a source
-of permission to deploy. Existing entry guidance remains descriptive.
+of permission to deploy. Without a sibling `manifest.yaml` or `manifest.yml`,
+a nested `manifests/.../inputs.yaml` is itself conventionally discoverable as
+a manifest; if an actual manifest uses that name alongside a sibling
+`manifest.yaml` or `manifest.yml`, list it explicitly in `content.yaml`.
+Existing entry guidance remains descriptive.
 
 ```yaml
 apiVersion: siteops.inputs/v1

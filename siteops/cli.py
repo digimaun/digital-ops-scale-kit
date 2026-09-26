@@ -91,6 +91,7 @@ from siteops.project import (
 )
 from siteops.reporting import (
     TextProgressReporter,
+    _wrap,
     render_plain_run,
     serialize_run_json,
 )
@@ -207,6 +208,11 @@ def cmd_project(args: argparse.Namespace) -> int:
             require_separate_cache(root, cache_root)
             previous = read_pin(root) if pin_exists(root) else None
             cache = WorkspaceCache(cache_root)
+            print(
+                "Resolving and verifying the selected workspace release; "
+                "fetching missing package bytes may take time.",
+                file=sys.stderr, flush=True,
+            )
             acquired = GitHubWorkspaceAcquirer(
                 cache, policy_file=policy, trusted_root=trusted_root,
             ).acquire(GitHubClient(reference), workspace=args.release_workspace)
@@ -547,6 +553,10 @@ def _guided_error_detail(error: Exception) -> str:
     return str(error) if isinstance(error, GuidedInputError) else report_site_load_error(error)
 
 
+def _is_cancelled_read(error: Exception) -> bool:
+    return isinstance(error, ResourceReadError) and error.code == "inputs.resource.cancelled"
+
+
 def _explicit_site_failure(
     args: argparse.Namespace,
     error: Exception,
@@ -691,6 +701,8 @@ def _resolve_typed_site(
     try:
         reader = new_arm_reader()
     except ArmResourceError as error:
+        if error.code == "CANCELLED":
+            raise ResourceReadError("cancelled", "The resource read was cancelled.") from None
         raise ResourceReadError(
             "provider-unavailable", f"The selected resource reader is unavailable ({error.code})."
         ) from None
@@ -816,39 +828,47 @@ def cmd_inputs(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
                     if not derived.intersection(required) or resource["name"] not in example_values:
                         continue
                     supplied = [name for name in required if name not in derived] + [resource["name"]]
-                    print(
+                    for line in _wrap(
                         f"Resource route: fill {_content_text(', '.join(supplied))}. "
                         f"Leave {_content_text(', '.join(name for name in required if name in derived))} "
-                        "empty. Use --read-resources to read the ID."
-                    )
+                        "empty. Use --read-resources to read the ID.",
+                    ):
+                        print(line)
                 for field in description["inputs"]:
                     status = field["status"]
                     if field.get("derivableFrom"):
                         status += " or derived from " + ", ".join(field["derivableFrom"])
-                    print(
-                        f"  {_content_text(field['name'])} "
+                    for line in _wrap(
+                        f"{_content_text(field['name'])} "
                         f"({_content_text(field['type'])}, {_content_text(status)})"
-                        f": {_content_text(field['description'])}"
-                    )
+                        f": {_content_text(field['description'])}",
+                        hanging="    ",
+                    ):
+                        print(line)
                     if "when" in field:
                         condition = field["when"]
-                        print(
-                            "    Active when "
+                        for line in _wrap(
+                            "Active when "
                             + _content_text(condition["input"])
                             + "="
-                            + _content_text(json.dumps(condition["equals"]))
-                        )
+                            + _content_text(json.dumps(condition["equals"])),
+                            indent="    ",
+                        ):
+                            print(line)
                     if "resource" in field:
-                        print(
-                            "    ARM type: "
+                        for line in _wrap(
+                            "ARM type: "
                             + _content_text(field["resource"]["type"])
-                            + ". Read only with --read-resources."
-                        )
+                            + ". Read only with --read-resources.",
+                            indent="    ",
+                        ):
+                            print(line)
                         if field.get("derive"):
-                            print(
-                                "    Derives: "
-                                + _content_text(", ".join(field["derive"].values()))
-                            )
+                            for line in _wrap(
+                                "Derives: " + _content_text(", ".join(field["derive"].values())),
+                                indent="    ",
+                            ):
+                                print(line)
                         for requirement in field.get("requires", []):
                             condition = requirement.get("when")
                             condition_text = (
@@ -856,22 +876,25 @@ def cmd_inputs(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
                                 f"{json.dumps(condition['equals'])}"
                                 if condition is not None else ""
                             )
-                            print(
-                                "    Prerequisite"
+                            for line in _wrap(
+                                "Prerequisite"
                                 + _content_text(condition_text)
                                 + ": "
-                                + _content_text(requirement["description"])
-                            )
+                                + _content_text(requirement["description"]),
+                                indent="    ",
+                            ):
+                                print(line)
                     if "default" in field:
                         value = field["default"]
                         shown = json.dumps(value) if isinstance(value, bool) else str(value)
-                        print(f"    Default: {_content_text(shown)}")
+                        for line in _wrap(f"Default: {_content_text(shown)}", indent="    "):
+                            print(line)
                 if not args.example:
                     print("Use --example FILE to write an incomplete answer file.")
             print("Review prerequisites and effects with `siteops browse`.")
     except (OSError, ValueError, yaml.YAMLError) as error:
         print(f"Error: {_guided_error_detail(error)}", file=sys.stderr)
-        return 1
+        return 130 if _is_cancelled_read(error) else 1
     return 0
 
 
@@ -898,7 +921,7 @@ def cmd_plan(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
     except (OSError, ValueError, yaml.YAMLError) as error:
         result = _explicit_site_failure(args, error, intent=intent)
         _write_plan_result(result, json_output=json_output, projection=projection)
-        return 1
+        return 130 if _is_cancelled_read(error) else 1
     if explicit_site is not None:
         _announce_explicit_site(args, explicit_site)
     try:
@@ -1020,6 +1043,14 @@ def cmd_deploy(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
     try:
         explicit_site = _explicit_site(args, manifest_path, orchestrator)
     except (OSError, ValueError, yaml.YAMLError) as error:
+        if _is_cancelled_read(error):
+            failed = _explicit_site_failure(args, error, intent=PlanIntent.EXECUTABLE)
+            result = RunResult.from_sites(
+                (), elapsed=0.0, interrupted=True,
+                diagnostics=preparation_failure_result(failed).diagnostics,
+            )
+            _write_run_result(result, json_output=json_output, projection=projection)
+            return result.exit_code
         if json_output:
             failed = _explicit_site_failure(args, error, intent=PlanIntent.EXECUTABLE)
             result = preparation_failure_result(failed)
@@ -1161,7 +1192,7 @@ def cmd_validate(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
         return 1
 
     print(f"\n✓ Manifest is valid: {manifest_path.name}\n")
-    if not selector and not manifest.sites and not manifest.site_selector:
+    if explicit_site is None and not selector and not manifest.sites and not manifest.site_selector:
         print(
             "  Note: library manifest (no `sites:` or `selector:`). "
             "Pass `-l <key>=<value>` at deploy time, or run "
@@ -1568,6 +1599,11 @@ def _parse_parallel(value: str) -> int:
     return n
 
 
+class _ExactArgumentParser(argparse.ArgumentParser):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, allow_abbrev=False, **kwargs)
+
+
 class _SingleValueOption(argparse.Action):
     def __call__(
         self,
@@ -1635,7 +1671,7 @@ def main() -> None:
                 stream.reconfigure(encoding="utf-8")
             except Exception:
                 pass
-    parser = argparse.ArgumentParser(
+    parser = _ExactArgumentParser(
         prog="siteops",
         description="Azure Site Ops: multi-site Azure IaC orchestration.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2064,7 +2100,10 @@ Examples:
                 "name", metavar="NAME", help="Lowercase name in private user configuration",
             )
         if name == "enroll":
-            command.add_argument("--source", required=True, help="Approved repository: github:OWNER/REPO")
+            command.add_argument(
+                "--source", required=True, action=_SingleValueOption,
+                help="Approved repository: github:OWNER/REPO",
+            )
 
     p_index = subparsers.add_parser(
         "index", help="Build a public content index and separate source bindings",

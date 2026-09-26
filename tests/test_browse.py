@@ -97,6 +97,8 @@ def test_selected_card_distinguishes_advice_from_input_contract(tmp_path):
     assert "Authored Site input guidance" in plain
     assert "descriptive, not the executable input contract" in plain
     assert "siteops inputs" in plain
+    assert "typed answers where available, or select a configured Site" in " ".join(plain.split())
+    assert "Next: choose a configured Site" not in plain
 
     remote = replace(
         local,
@@ -135,6 +137,46 @@ def test_root_manifest_named_inputs_remains_discoverable(tmp_path):
     result = inspect_content(tmp_path)
     assert [entry.name for entry in result.entries] == ["inputs"]
     assert result.status == "complete"
+
+
+def test_nested_inputs_manifest_remains_discoverable_without_a_sibling_entry(tmp_path):
+    manifest = _entry(tmp_path, "network", relative="manifests/network/inputs.yaml")
+    companion = _entry(tmp_path, "storage", relative="manifests/storage/manifest.yaml")
+    companion.with_name("inputs.yaml").write_text(
+        "apiVersion: siteops.inputs/v1\nkind: SiteInputContract\ninputs: []\n",
+        encoding="utf-8",
+    )
+
+    result = inspect_content(tmp_path)
+    assert result.status == "complete"
+    assert {entry.name for entry in result.entries} == {"network", "storage"}
+    assert next(entry.path for entry in result.entries if entry.name == "network") == (
+        "manifests/network/inputs.yaml"
+    )
+    assert cli.resolve_manifest_path("network", tmp_path) == manifest
+
+
+def test_ambiguous_nested_inputs_manifest_can_be_explicitly_listed(tmp_path):
+    _entry(tmp_path, "storage", relative="manifests/storage/manifest.yaml")
+    manifest = _entry(tmp_path, "network", relative="manifests/storage/inputs.yaml")
+    assert [entry.name for entry in inspect_content(tmp_path).entries] == ["storage"]
+
+    (tmp_path / "content.yaml").write_text(yaml.safe_dump({
+        "apiVersion": API_VERSION,
+        "kind": "WorkspaceContent",
+        "entries": ["manifests/storage/inputs.yaml"],
+    }), encoding="utf-8")
+    assert {entry.name for entry in inspect_content(tmp_path).entries} == {"network", "storage"}
+    assert cli.resolve_manifest_path("network", tmp_path) == manifest
+
+
+def test_nested_inputs_is_not_suppressed_by_a_sibling_directory(tmp_path):
+    _entry(tmp_path, "network", relative="manifests/network/inputs.yaml")
+    (tmp_path / "manifests" / "network" / "manifest.yaml").mkdir()
+
+    result = inspect_content(tmp_path)
+    assert result.status == "complete"
+    assert [entry.name for entry in result.entries] == ["network"]
 
 
 def test_flat_manifest_input_companion_preserves_name_lookup(tmp_path):

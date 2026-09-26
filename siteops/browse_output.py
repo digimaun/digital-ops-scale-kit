@@ -143,7 +143,14 @@ def _card(
             or not any(character in workspace + entry.path for character in "&|<>%!^")
         )
     )
-    if project is not None:
+    if project is not None and guidance.role == "standalone":
+        lines.extend((
+            "", "Use typed answers where available, or select a configured Site.",
+            "Inspect typed answers with `siteops inputs NAME`.",
+            "Use plan or deploy with the same project and source/trust options.",
+            "For configured Sites, choose an explicit selector and review the executable plan.",
+        ))
+    elif project is not None:
         lines.extend((
             "", "Use plan or deploy with the same project and source/trust options.",
             "Choose an explicit Site selector and review the executable plan before deployment.",
@@ -155,9 +162,10 @@ def _card(
         ))
     elif guidance.role == "standalone" and command_paths_safe:
         lines.extend((
-            "", "Next: choose a configured Site, then review its executable plan.",
-            f"{shell} commands (not Command Prompt):" if shell == "PowerShell"
-            else f"{shell} commands:",
+            "", "Next: use typed answers where available, or select a configured Site.",
+            "Inspect typed answers with `siteops inputs NAME`.",
+            f"Configured-Site {shell} commands (not Command Prompt):" if shell == "PowerShell"
+            else f"Configured-Site {shell} commands:",
             f"  siteops -w {_quote(workspace)} plan "
             f"{_quote(explicit_manifest_reference(entry.path))} -l 'name=<site>'",
             "After review, deploy with the same explicit target. Deployment prepares again.",

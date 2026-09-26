@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -75,27 +76,34 @@ def _embedded_python(run: str) -> list[str]:
     return re.findall(r"<<'PY'\n(.*?)\n\s*PY(?:\n|$)", run, re.S)
 
 
+def _bash_executable() -> Path:
+    if os.name == "nt":
+        bash = Path(os.environ.get("ProgramFiles", "")) / "Git" / "bin" / "bash.exe"
+        if not bash.is_file():
+            pytest.skip("Git Bash is needed for Windows workflow checks.")
+        return bash
+    resolved = shutil.which("bash")
+    if resolved is None:
+        pytest.skip("Bash is needed for workflow checks.")
+    return Path(resolved)
+
+
 @pytest.mark.parametrize(("step", "minimum_python"), [
+    ("Mask published target identities", 0),
+    ("Snapshot RG resources (persistent mode)", 0),
+    ("Preflight Arc cluster name is unused (persistent mode)", 0),
     ("Prepare guided AIO answers and plan", 5),
     ("Check published guided disabled Site routes", 2),
     ("Deploy AIO through the published engine and package", 1),
     ("Observe bounded AIO readiness", 3),
+    ("Teardown (persistent mode, delta cleanup, keep RG)", 0),
 ])
 def test_guided_workflow_shell_and_embedded_python_parse_without_execution(
     step, minimum_python,
 ):
-    if os.name == "nt":
-        bash = Path(os.environ.get("ProgramFiles", "")) / "Git" / "bin" / "bash.exe"
-        if not bash.is_file():
-            pytest.skip("Git Bash is needed for Windows shell syntax checks.")
-    else:
-        resolved = shutil.which("bash")
-        if resolved is None:
-            pytest.skip("Bash is needed for shell syntax checks.")
-        bash = Path(resolved)
     run = _step_run(step)
     checked = subprocess.run(
-        [str(bash), "-n"],
+        [str(_bash_executable()), "-n"],
         input=run, capture_output=True, text=True, timeout=15, check=False,
     )
     assert checked.returncode == 0, checked.stderr
@@ -738,6 +746,225 @@ def test_published_readiness_is_bounded_and_existing_teardown_is_retained():
         "operator-owned",
     ):
         assert value in workflow
+
+
+def test_published_guide_explains_private_persistent_cleanup_diagnostics():
+    guide = " ".join(
+        (ROOT / "docs" / "e2e-testing.md").read_text(encoding="utf-8").lower().split()
+    )
+    assert (
+        "for the published persistent snapshot and teardown, public logs and "
+        "summaries report fixed reasons and aggregate counts"
+    ) in guide
+    assert "those steps keep resource id lists and provider diagnostics in private runner files" in guide
+
+
+def _bash_path(path: Path) -> str:
+    return f"/{path.drive[0].lower()}{path.as_posix()[2:]}" if os.name == "nt" else str(path)
+
+
+def _run_persistent_step(name: str, tmp_path: Path, mode: str):
+    bash = _bash_executable()
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    resource_id = (
+        "/subscriptions/00000000-0000-0000-0000-000000000001/"
+        "resourceGroups/rg-private-marker/providers/Microsoft.DeviceRegistry/"
+        "schemaRegistries/private-resource"
+    )
+    az = tools / "az"
+    az.write_text("""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$FAKE_AZ_LOG"
+if [[ "$1 $2" == "resource list" ]]; then
+  if [[ "$FAKE_AZ_MODE" == "snapshot-failure" ]]; then
+    printf 'provider error for %s\\n' "$FAKE_AZ_RESOURCE_ID" >&2
+    exit 1
+  fi
+  if [[ "$FAKE_AZ_MODE" == "snapshot-success" ]]; then
+    printf '%s\\n' "$FAKE_AZ_RESOURCE_ID"
+    exit 0
+  fi
+  n=0
+  [[ ! -f "$FAKE_AZ_COUNT" ]] || n=$(cat "$FAKE_AZ_COUNT")
+  printf '%s\\n' "$((n + 1))" > "$FAKE_AZ_COUNT"
+  if [[ "$FAKE_AZ_MODE" == "teardown-failure" || "$n" == "0" ]]; then
+    printf '%s\\n' "$FAKE_AZ_RESOURCE_ID"
+  fi
+  exit 0
+fi
+if [[ "$1 $2" == "resource delete" ]]; then
+  if [[ "$FAKE_AZ_MODE" == "teardown-failure" ]]; then
+    printf 'provider error for %s\\n' "$FAKE_AZ_RESOURCE_ID" >&2
+    exit 1
+  fi
+  printf 'provider accepted %s\\n' "$FAKE_AZ_RESOURCE_ID"
+  exit 0
+fi
+if [[ "$1 $2" == "extension add" ]]; then
+  exit 0
+fi
+if [[ "$1 $2" == "connectedk8s list" ]]; then
+  if [[ "$FAKE_AZ_MODE" == "preflight-failure" ]]; then
+    printf 'provider error for %s\\n' "$FAKE_AZ_RESOURCE_ID" >&2
+    exit 1
+  fi
+  printf '0\\n'
+  exit 0
+fi
+printf 'Unexpected Azure command\\n' >&2
+exit 99
+""", encoding="utf-8", newline="\n")
+    az.chmod(0o700)
+    bash_tools = bash.parent.parent / "usr" / "bin" if os.name == "nt" else bash.parent
+    env = {
+        "HOME": _bash_path(tmp_path),
+        "PATH": os.pathsep.join((str(tools), str(bash_tools))),
+        "RUNNER_TEMP": _bash_path(tmp_path),
+        "RG": "rg-private-marker",
+        "CLUSTER": "arc-private-marker",
+        "GITHUB_STEP_SUMMARY": _bash_path(tmp_path / "summary.md"),
+        "FAKE_AZ_RESOURCE_ID": resource_id,
+        "FAKE_AZ_LOG": _bash_path(tmp_path / "az-calls.log"),
+        "FAKE_AZ_COUNT": _bash_path(tmp_path / "az-count.txt"),
+        "FAKE_AZ_MODE": mode,
+        "SystemRoot": os.environ.get("SystemRoot", ""),
+    }
+    run = _step_run(name)
+    if name == "Teardown (persistent mode, delta cleanup, keep RG)":
+        assert run.count("sleep 30") == 2
+        run = run.replace("sleep 30", ":")
+    result = subprocess.run(
+        [str(bash), "-c", run], cwd=tmp_path, env=env,
+        capture_output=True, text=True, timeout=30, check=False,
+    )
+    summary = tmp_path / "summary.md"
+    public = result.stdout + result.stderr + (
+        summary.read_text(encoding="utf-8") if summary.exists() else ""
+    )
+    return result, public, resource_id
+
+
+def test_published_target_ids_are_masked_before_snapshot_and_arc():
+    steps = yaml.safe_load(_workflow())["jobs"]["e2e"]["steps"]
+    names = [step.get("name") for step in steps]
+    masking = steps[names.index("Mask published target identities")]
+    assert masking["if"] == "needs.prep.outputs.published-mode == 'true'"
+    assert names.index("Compute names") < names.index("Mask published target identities")
+    assert names.index("Mask published target identities") < names.index(
+        "Snapshot RG resources (persistent mode)"
+    )
+    assert steps.index(masking) < next(
+        index for index, step in enumerate(steps)
+        if step.get("uses") == "./.github/actions/connect-arc"
+    )
+    assert "::add-mask::$RG" in masking["run"]
+    assert "::add-mask::$CLUSTER" in masking["run"]
+
+
+def test_published_arc_connection_keeps_provider_errors_private():
+    workflow = yaml.safe_load(_workflow())
+    action = yaml.safe_load(
+        (
+            ROOT / ".github" / "actions" / "connect-arc" / "action.yaml"
+        ).read_text(encoding="utf-8")
+    )
+    connect = next(
+        step for step in workflow["jobs"]["e2e"]["steps"]
+        if step.get("uses") == "./.github/actions/connect-arc"
+    )
+    assert connect["with"]["private-provider-errors"] == (
+        "${{ needs.prep.outputs.published-mode }}"
+    )
+    assert action["inputs"]["private-provider-errors"]["default"] == "false"
+    for name in (
+        "Connect cluster to Arc + enable features",
+        "Wait for Arc Connected status (initial)",
+        "Enable OIDC issuer + workload identity",
+        "Capture OIDC issuer URL",
+        "Wait for Arc Connected status (post-restart)",
+    ):
+        step = next(item for item in action["runs"]["steps"] if item.get("name") == name)
+        assert step["env"]["PRIVATE_PROVIDER_ERRORS"] == (
+            "${{ inputs.private-provider-errors }}"
+        )
+
+
+@pytest.mark.parametrize("mode", ["preflight-failure", "preflight-unused"])
+def test_persistent_arc_preflight_keeps_provider_errors_private(tmp_path, mode):
+    name = "Preflight Arc cluster name is unused (persistent mode)"
+    run = _step_run(name)
+    assert "umask 077" in run.split("if ! COUNT=")[0]
+    result, public, resource_id = _run_persistent_step(name, tmp_path, mode)
+    assert "rg-private-marker" not in public
+    assert resource_id not in public
+    assert result.returncode == (1 if mode == "preflight-failure" else 0)
+    assert "connectedk8s list" in (
+        tmp_path / "az-calls.log"
+    ).read_text(encoding="utf-8")
+    diagnostic = tmp_path / "published-arc-preflight.err"
+    if mode == "preflight-failure":
+        assert "could not be checked" in public
+        assert resource_id in diagnostic.read_text(encoding="utf-8")
+        if os.name != "nt":
+            assert stat.S_IMODE(diagnostic.stat().st_mode) == 0o600
+    else:
+        assert diagnostic.read_text(encoding="utf-8") == ""
+
+
+@pytest.mark.parametrize("mode", ["snapshot-success", "snapshot-failure"])
+def test_persistent_snapshot_keeps_identifiers_and_provider_errors_private(tmp_path, mode):
+    result, public, resource_id = _run_persistent_step(
+        "Snapshot RG resources (persistent mode)", tmp_path, mode,
+    )
+    assert "rg-private-marker" not in public
+    assert resource_id not in public
+    snapshot = tmp_path / "e2e-teardown" / "pre-ids.txt"
+    if mode == "snapshot-success":
+        assert result.returncode == 0
+        assert resource_id in snapshot.read_text(encoding="utf-8")
+        assert "1 pre-existing resource(s)" in public
+        if os.name != "nt":
+            assert stat.S_IMODE(snapshot.stat().st_mode) == 0o600
+    else:
+        assert result.returncode != 0
+        assert not snapshot.exists()
+        assert "could not be captured" in public
+        assert resource_id in (snapshot.parent / "snapshot.err").read_text(
+            encoding="utf-8",
+        )
+
+
+@pytest.mark.parametrize("mode", ["teardown-missing", "teardown-success", "teardown-failure"])
+def test_persistent_teardown_reports_without_public_resource_identity(tmp_path, mode):
+    snapshot = tmp_path / "e2e-teardown" / "pre-ids.txt"
+    if mode != "teardown-missing":
+        snapshot.parent.mkdir()
+        snapshot.write_text(
+            "/subscriptions/00000000-0000-0000-0000-000000000001/"
+            "resourceGroups/rg-private-marker/providers/Microsoft.Kubernetes/"
+            "connectedClusters/arc-private-marker\n", encoding="utf-8",
+        )
+    result, public, resource_id = _run_persistent_step(
+        "Teardown (persistent mode, delta cleanup, keep RG)", tmp_path, mode,
+    )
+    assert result.returncode == 0
+    assert "rg-private-marker" not in public
+    assert "arc-private-marker" not in public
+    assert "private-resource" not in public
+    assert resource_id not in public
+    calls = tmp_path / "az-calls.log"
+    if mode == "teardown-missing":
+        assert not calls.exists()
+        assert "Snapshot file missing" in public
+    else:
+        assert "resource delete" in calls.read_text(encoding="utf-8")
+        assert "rest --method DELETE" not in calls.read_text(encoding="utf-8")
+        assert ("incomplete" in public) is (mode == "teardown-failure")
+        suffix = "err" if mode == "teardown-failure" else "out"
+        private = list(snapshot.parent.glob(f"delete-*.{suffix}"))
+        assert private and any(
+            resource_id in path.read_text(encoding="utf-8") for path in private
+        )
 
 
 def test_guided_enabled_readiness_requires_live_secret_sync_resources():

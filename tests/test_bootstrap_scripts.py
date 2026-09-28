@@ -393,6 +393,8 @@ def test_windows_bootstrap_accepts_private_pipx_style_linked_launcher(tmp_path):
         launcher.symlink_to(target)
     except OSError as error:
         if error.winerror == 1314:
+            if os.environ.get("SITEOPS_REQUIRE_WINDOWS_LINK") == "1":
+                pytest.fail("Required Windows file symlink capability is unavailable.")
             pytest.skip("This local host cannot create a Windows file symlink.")
         raise
 
@@ -421,6 +423,8 @@ def test_windows_bootstrap_rejects_launcher_link_to_unrelated_executable(tmp_pat
         launcher.symlink_to(unrelated)
     except OSError as error:
         if error.winerror == 1314:
+            if os.environ.get("SITEOPS_REQUIRE_WINDOWS_LINK") == "1":
+                pytest.fail("Required Windows file symlink capability is unavailable.")
             pytest.skip("This local host cannot create a Windows file symlink.")
         raise
 

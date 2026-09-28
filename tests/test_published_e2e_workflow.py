@@ -19,6 +19,8 @@ from siteops.reporting import _KIND as DEPLOYMENT_KIND
 ROOT = Path(__file__).parent.parent
 WORKFLOW = ROOT / ".github" / "workflows" / "e2e-test.yaml"
 ACTION = ROOT / ".github" / "actions" / "setup-published-siteops" / "action.yaml"
+CI = ROOT / ".github" / "workflows" / "ci.yaml"
+PIPX_PROBE = ROOT / "tests" / "fixtures" / "windows-pipx-launcher.py"
 
 
 def _workflow() -> str:
@@ -146,7 +148,9 @@ def test_windows_capability_probe_is_opt_in_without_azure_authority():
     inputs = workflow.get("on", workflow.get(True))["workflow_dispatch"]["inputs"]
     assert inputs["scenario"]["type"] == "choice"
     assert inputs["scenario"]["default"] == "aio"
-    assert inputs["scenario"]["options"] == ["aio", "windows-installer-preflight"]
+    assert inputs["scenario"]["options"] == [
+        "aio", "windows-installer-preflight", "windows-pipx-launcher",
+    ]
 
     jobs = workflow["jobs"]
     assert jobs["prep"]["if"] == "inputs.scenario == 'aio'"
@@ -176,6 +180,95 @@ def test_windows_capability_probe_parses_in_native_powershell(tmp_path):
     probe = workflow["jobs"]["windows-installer-preflight"]["steps"][0]["run"]
     script = tmp_path / "windows-installer-preflight.ps1"
     script.write_text(probe, encoding="utf-8")
+    parsed = subprocess.run(
+        [
+            "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+            "$tokens=$null;$errors=$null;"
+            "[Management.Automation.Language.Parser]::ParseFile("
+            "$env:TEST_SCRIPT,[ref]$tokens,[ref]$errors) | Out-Null;"
+            "if ($errors) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }",
+        ],
+        env={**os.environ, "TEST_SCRIPT": str(script)},
+        capture_output=True, text=True, timeout=20,
+    )
+    assert parsed.returncode == 0, parsed.stdout + parsed.stderr
+
+
+def test_windows_bootstrap_ci_requires_native_real_launcher_checks():
+    workflow = yaml.safe_load(CI.read_text(encoding="utf-8"))
+    job = workflow["jobs"]["windows-bootstrap"]
+    assert job["runs-on"] == "windows-2025"
+    assert job["permissions"] == {"contents": "read"}
+    assert "id-token" not in str(job)
+    assert not job.get("environment")
+    assert job["timeout-minutes"] <= 30
+    assert job["env"]["PIP_INDEX_URL"] == "https://packagefeedproxy.microsoft.io/pypi/simple/"
+    assert job["env"]["SITEOPS_REQUIRE_WINDOWS_LINK"] == "1"
+    assert any("actions/checkout@" in step.get("uses", "") for step in job["steps"])
+    assert any("actions/setup-python@" in step.get("uses", "") for step in job["steps"])
+    preparation = next(step["run"] for step in job["steps"] if step.get("name") == "Prepare private test state")
+    assert "icacls.exe" in preparation
+    assert "GITHUB_ENV" in preparation
+    test = next(step["run"] for step in job["steps"] if step.get("name") == "Windows bootstrap tests")
+    assert "test_bootstrap_scripts.py" in test
+    assert PIPX_PROBE.name in test
+    assert "windows_bootstrap" in test
+    assert "--basetemp" in test
+    assert "azure/login" not in str(job)
+
+
+def test_real_pipx_launcher_e2e_is_separate_and_has_no_azure_authority():
+    workflow = yaml.safe_load(_workflow())
+    inputs = workflow.get("on", workflow.get(True))["workflow_dispatch"]["inputs"]
+    assert "windows-pipx-launcher" in inputs["scenario"]["options"]
+    jobs = workflow["jobs"]
+    job = jobs["windows-pipx-launcher"]
+    assert job["runs-on"] == "windows-2025"
+    assert job["if"] == "inputs.scenario == 'windows-pipx-launcher'"
+    assert job["permissions"] == {"contents": "read"}
+    assert not job.get("environment")
+    assert job["timeout-minutes"] <= 30
+    assert job["env"]["PIP_INDEX_URL"] == "https://packagefeedproxy.microsoft.io/pypi/simple/"
+    assert job["env"]["SITEOPS_REQUIRE_WINDOWS_LINK"] == "1"
+    assert any("actions/checkout@" in step.get("uses", "") for step in job["steps"])
+    assert any("actions/setup-python@" in step.get("uses", "") for step in job["steps"])
+    assert any(PIPX_PROBE.name in step.get("run", "") for step in job["steps"])
+    assert "azure/login" not in str(job)
+    assert "AZURE_CLIENT" not in str(job)
+    assert "id-token" not in str(job)
+    assert PIPX_PROBE.is_file()
+    source = PIPX_PROBE.read_text(encoding="utf-8")
+    for piece in ("pipx==1.17.2", "PIPX_BIN_DIR", "pipx.exe", "Require-PrivateExecutablePath"):
+        assert piece in source
+    compile(source, str(PIPX_PROBE), "exec")
+    assert "siteops-pipx-probe-" in source
+    assert "GITHUB_STEP_SUMMARY" in source
+    assert "PIP_INDEX_URL" in source
+    assert "PIP_CONFIG_FILE" in source
+    assert "shutil.rmtree(root)" in source
+    assert "github.com" not in source
+    assert "az login" not in source
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows PowerShell parser is needed.")
+@pytest.mark.parametrize(
+    ("workflow", "job", "step_name"),
+    [
+        (CI, "windows-bootstrap", "Install test dependencies"),
+        (CI, "windows-bootstrap", "Prepare private test state"),
+        (CI, "windows-bootstrap", "Windows bootstrap tests"),
+        (WORKFLOW, "windows-pipx-launcher", "Test the real pipx launcher without Azure"),
+    ],
+)
+def test_windows_automated_launcher_steps_parse_in_native_powershell(
+    tmp_path, workflow, job, step_name,
+):
+    steps = yaml.safe_load(workflow.read_text(encoding="utf-8"))["jobs"][job]["steps"]
+    script = tmp_path / "check-step.ps1"
+    script.write_text(
+        next(step["run"] for step in steps if step.get("name") == step_name),
+        encoding="utf-8",
+    )
     parsed = subprocess.run(
         [
             "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",

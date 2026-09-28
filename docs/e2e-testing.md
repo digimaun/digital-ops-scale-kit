@@ -46,6 +46,21 @@ installation coverage and approval. GitHub-hosted Windows Server runners
 run as administrators without UAC, so they do not establish the Windows
 desktop experience for a standard user.
 
+The separate opt-in `scenario=windows-pipx-launcher` uses a new
+`windows-2025` runner, installs pipx 1.17.2 through the configured
+Microsoft Python feed and asks it to install its own CLI into
+isolated state. The job requires a real pipx file symlink to that
+installed application and checks its launcher against the PowerShell
+bootstrap's current path guard. The regular PR CI job also runs
+native copied/link and unsafe-path controls plus this real launcher
+test. Both jobs fail when their required Windows link or installation
+checks cannot run.
+
+Neither Windows job builds a Site Ops release or claims a verified
+engine installation, a WinGet package installation, Azure deployment,
+or a normal Windows desktop session. Signed bundle and actual WinGet
+provisioning remain distinct qualification gates.
+
 ## How it fits together
 
 ```text

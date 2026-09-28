@@ -141,6 +141,55 @@ def test_published_mode_is_explicit_and_bounded():
         assert value in workflow
 
 
+def test_windows_capability_probe_is_opt_in_without_azure_authority():
+    workflow = yaml.safe_load(_workflow())
+    inputs = workflow.get("on", workflow.get(True))["workflow_dispatch"]["inputs"]
+    assert inputs["scenario"]["type"] == "choice"
+    assert inputs["scenario"]["default"] == "aio"
+    assert inputs["scenario"]["options"] == ["aio", "windows-installer-preflight"]
+
+    jobs = workflow["jobs"]
+    assert jobs["prep"]["if"] == "inputs.scenario == 'aio'"
+    assert jobs["e2e"]["needs"] == "prep"
+    probe = jobs["windows-installer-preflight"]
+    assert probe["if"] == "inputs.scenario == 'windows-installer-preflight'"
+    assert probe["runs-on"] == "windows-2025"
+    assert probe["permissions"] == {}
+    assert not probe.get("environment")
+    assert probe["timeout-minutes"] <= 10
+    steps = probe["steps"]
+    assert len(steps) == 1
+    assert steps[0]["shell"] == "powershell"
+    run = steps[0]["run"]
+    for capability in ("winget.exe", "python.exe", "gh.exe", "pipx.exe", "SymbolicLink"):
+        assert capability in run
+    assert "GITHUB_STEP_SUMMARY" in run
+    assert "throw" in run
+    assert "azure/login" not in str(probe)
+    assert "AZURE_" not in str(probe)
+    assert "actions/checkout" not in str(probe)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows PowerShell parser is needed.")
+def test_windows_capability_probe_parses_in_native_powershell(tmp_path):
+    workflow = yaml.safe_load(_workflow())
+    probe = workflow["jobs"]["windows-installer-preflight"]["steps"][0]["run"]
+    script = tmp_path / "windows-installer-preflight.ps1"
+    script.write_text(probe, encoding="utf-8")
+    parsed = subprocess.run(
+        [
+            "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+            "$tokens=$null;$errors=$null;"
+            "[Management.Automation.Language.Parser]::ParseFile("
+            "$env:TEST_SCRIPT,[ref]$tokens,[ref]$errors) | Out-Null;"
+            "if ($errors) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }",
+        ],
+        env={**os.environ, "TEST_SCRIPT": str(script)},
+        capture_output=True, text=True, timeout=20,
+    )
+    assert parsed.returncode == 0, parsed.stdout + parsed.stderr
+
+
 def test_operator_target_inputs_are_masked_before_step_headers():
     jobs = yaml.safe_load(_workflow())["jobs"]
     prep = next(

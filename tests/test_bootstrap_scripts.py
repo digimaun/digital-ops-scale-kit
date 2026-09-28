@@ -356,6 +356,81 @@ def test_windows_bootstrap_accepts_private_selected_executable_path(tmp_path, ki
     assert "TOOL_SELECTION_COMPLETED" in selected.stdout
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Native Windows launcher admission needs Windows.")
+def test_windows_bootstrap_accepts_private_copied_siteops_launcher(tmp_path):
+    local_appdata = tmp_path / "LocalAppData"
+    local_appdata.mkdir()
+    root = local_appdata / "siteops"
+    initial = _windows_tool_probe(_windows_private_root_wrapper(tmp_path), root, local_appdata)
+    assert initial.returncode == 0, initial.stdout + initial.stderr
+    bin_dir = root / "bin"
+    bin_dir.mkdir()
+    launcher = bin_dir / "siteops.exe"
+    shutil.copy2(shutil.which("where.exe"), launcher)
+
+    accepted = _windows_tool_probe(
+        _windows_tool_path_wrapper(tmp_path), root, local_appdata, launcher, bin_dir,
+    )
+    assert accepted.returncode == 0, accepted.stdout + accepted.stderr
+    assert "TOOL_ADMITTED" in accepted.stdout
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Native Windows launcher admission needs Windows.")
+def test_windows_bootstrap_accepts_private_pipx_style_linked_launcher(tmp_path):
+    local_appdata = tmp_path / "LocalAppData"
+    local_appdata.mkdir()
+    root = local_appdata / "siteops"
+    initial = _windows_tool_probe(_windows_private_root_wrapper(tmp_path), root, local_appdata)
+    assert initial.returncode == 0, initial.stdout + initial.stderr
+
+    target = root / "pipx" / "venvs" / "siteops" / "Scripts" / "siteops.exe"
+    target.parent.mkdir(parents=True)
+    shutil.copy2(shutil.which("where.exe"), target)
+    bin_dir = root / "bin"
+    bin_dir.mkdir()
+    launcher = bin_dir / "siteops.exe"
+    try:
+        launcher.symlink_to(target)
+    except OSError as error:
+        if error.winerror == 1314:
+            pytest.skip("This local host cannot create a Windows file symlink.")
+        raise
+
+    accepted = _windows_tool_probe(
+        _windows_tool_path_wrapper(tmp_path), root, local_appdata, launcher, bin_dir,
+    )
+    assert accepted.returncode == 0, accepted.stdout + accepted.stderr
+    assert "TOOL_ADMITTED" in accepted.stdout
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Native Windows launcher admission needs Windows.")
+def test_windows_bootstrap_rejects_launcher_link_to_unrelated_executable(tmp_path):
+    local_appdata = tmp_path / "LocalAppData"
+    local_appdata.mkdir()
+    root = local_appdata / "siteops"
+    initial = _windows_tool_probe(_windows_private_root_wrapper(tmp_path), root, local_appdata)
+    assert initial.returncode == 0, initial.stdout + initial.stderr
+
+    unrelated = tmp_path / "unrelated" / "siteops.exe"
+    unrelated.parent.mkdir()
+    shutil.copy2(shutil.which("where.exe"), unrelated)
+    bin_dir = root / "bin"
+    bin_dir.mkdir()
+    launcher = bin_dir / "siteops.exe"
+    try:
+        launcher.symlink_to(unrelated)
+    except OSError as error:
+        if error.winerror == 1314:
+            pytest.skip("This local host cannot create a Windows file symlink.")
+        raise
+
+    rejected = _windows_tool_probe(
+        _windows_tool_path_wrapper(tmp_path), root, local_appdata, launcher, bin_dir,
+    )
+    assert rejected.returncode != 0
+    assert "TOOL_ADMITTED" not in rejected.stdout
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Native Windows ACL admission needs Windows.")
 def test_windows_bootstrap_rejects_untrusted_executable_file_even_under_private_parent(tmp_path):
     local_appdata = tmp_path / "LocalAppData"

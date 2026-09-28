@@ -1,15 +1,15 @@
 # E2E Testing
 
-End-to-end (E2E) tests exercise selected Scale Kit scenarios in a live Azure
-subscription. A workflow matrix cell creates a fresh k3s cluster, registers it
-with Azure Arc, deploys Azure IoT Operations through Site Ops, and runs the
-selected integration tests. Ephemeral mode normally deletes its resource
-group. Persistent mode removes resources in the run's snapshot delta, and
-`skip-teardown` preserves them for inspection.
+The default end-to-end (E2E) scenario exercises selected Scale Kit deployments
+in a live Azure subscription. A workflow matrix cell creates a fresh k3s
+cluster, registers it with Azure Arc, deploys Azure IoT Operations through
+Site Ops, and runs the selected integration tests. Ephemeral mode normally
+deletes its resource group. Persistent mode removes resources in the run's
+snapshot delta, and `skip-teardown` preserves them for inspection.
 
 A passing cell establishes only the assertions selected for that release,
 mode, and test allowlist. It does not certify an arbitrary cluster, AIO
-installation, or workload as ready for production. These runs create Azure
+installation, or workload as ready for production. The AIO runs create Azure
 resources and can incur charges until teardown completes.
 
 Use E2E tests when:
@@ -28,6 +28,23 @@ after its module completes. It waits for their projected custom resources to
 disappear before the advanced resource-set sample starts. A focused run that
 selects only one phase preserves that phase's resources for an optional
 pre-teardown inspection hold.
+
+### Check a Windows runner before installer qualification
+
+Choose `scenario=windows-installer-preflight` in a separately approved
+**E2E Tests** dispatch to check a fresh `windows-2025` runner. This
+diagnostic runs without Azure credentials, a cluster, source checkout or
+package installation. It reports only whether WinGet is callable,
+whether Python, GitHub CLI and pipx are on PATH, and whether the runner
+can create a private copied file and file symlink. Missing WinGet or
+file-link capability fails the job rather than qualifying installation.
+
+The default `scenario=aio` keeps the existing Azure E2E behavior.
+The Windows diagnostic does not verify a signed script, install tools
+through WinGet, or qualify a Site Ops build. These need separate
+installation coverage and approval. GitHub-hosted Windows Server runners
+run as administrators without UAC, so they do not establish the Windows
+desktop experience for a standard user.
 
 ## How it fits together
 

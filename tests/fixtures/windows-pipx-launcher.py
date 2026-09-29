@@ -22,6 +22,15 @@ def run(command, *, cwd, env, log, timeout=180):
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"{log.stem} exceeded its time limit.") from None
     if result.returncode:
+        if log.name == "check-bootstrap-guard.log":
+            with log.open("r", encoding="utf-8", errors="replace") as private_log:
+                diagnostic = private_log.read(65536)
+            category = re.search(
+                r"Choose a private Windows tool location\. (TOOL_(?:PATH|TYPE|OWNER|ACL))\b",
+                diagnostic,
+            )
+            if category is not None:
+                raise RuntimeError(f"{log.stem} rejected {category.group(1)}.")
         raise RuntimeError(f"{log.stem} failed with exit code {result.returncode}.")
 
 
@@ -147,14 +156,20 @@ def main():
         if command.returncode or command.stdout.strip() != "1.17.2":
             raise RuntimeError("The launcher did not run the selected installed pipx application.")
         source = BOOTSTRAP.read_text(encoding="utf-8")
-        wrapper = root / "check-bootstrap-guard.ps1"
-        wrapper.write_text(
+        prefix = (
             'function Fail([string]$message) { throw "Site Ops installation: $message" }\n'
             + helper(source, "Require-PrivateDataRoot") + "\n"
             + helper(source, "Require-PrivateExecutablePath") + "\n"
             + "$ErrorActionPreference='Stop'\n"
-            + "Require-PrivateDataRoot $env:SITEOPS_PROBE_DATA\n"
-            + "Require-PrivateExecutablePath $env:SITEOPS_PROBE_APP $env:PIPX_BIN_DIR\n"
+        )
+        root_wrapper = root / "check-private-data-root.ps1"
+        root_wrapper.write_text(
+            prefix + "Require-PrivateDataRoot $env:SITEOPS_PROBE_DATA\n'ROOT_ADMITTED'\n",
+            encoding="utf-8",
+        )
+        wrapper = root / "check-bootstrap-guard.ps1"
+        wrapper.write_text(
+            prefix + "Require-PrivateExecutablePath $env:SITEOPS_PROBE_APP $env:PIPX_BIN_DIR\n"
             + "'LAUNCHER_ADMITTED'\n",
             encoding="utf-8",
         )
@@ -168,6 +183,11 @@ def main():
                 "symlink to that application. No Site Ops engine wheel, "
                 "release proof or Azure deployment was assessed.\n\n"
             )
+        run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy",
+             "Bypass", "-File", str(root_wrapper)],
+            cwd=root, env=env, log=logs / "check-private-data-root.log", timeout=45,
+        )
         run(
             ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy",
              "Bypass", "-File", str(wrapper)],

@@ -4,6 +4,7 @@
 import json
 import os
 import re
+import runpy
 import shutil
 import stat
 import subprocess
@@ -248,6 +249,40 @@ def test_real_pipx_launcher_e2e_is_separate_and_has_no_azure_authority():
     assert "shutil.rmtree(root)" in source
     assert "github.com" not in source
     assert "az login" not in source
+
+
+def test_real_pipx_launcher_separates_root_admission_from_link_guard():
+    source = PIPX_PROBE.read_text(encoding="utf-8")
+    assert source.index('log=logs / "check-private-data-root.log"') < (
+        source.index('log=logs / "check-bootstrap-guard.log"')
+    )
+    assert "TOOL_(?:PATH|TYPE|OWNER|ACL)" in source
+    assert "The bootstrap's selected executable guard admitted" in source
+
+
+@pytest.mark.parametrize(
+    ("code", "reason"),
+    [
+        ("TOOL_TYPE", "rejected TOOL_TYPE"),
+        ("TOOL_UNKNOWN", "failed with exit code 7"),
+    ],
+)
+def test_real_pipx_launcher_reports_only_bounded_guard_diagnostics(tmp_path, code, reason):
+    run = runpy.run_path(str(PIPX_PROBE))["run"]
+    marker = "PRIVATE_TARGET_MARKER"
+    log = tmp_path / "check-bootstrap-guard.log"
+    diagnostic = (
+        f"{marker}: Site Ops installation: "
+        f"Choose a private Windows tool location. {code} Use trusted directories."
+    )
+    with pytest.raises(RuntimeError, match=reason) as error:
+        run(
+            [sys.executable, "-c",
+             f"import sys;sys.stderr.write({diagnostic!r});sys.exit(7)"],
+            cwd=tmp_path, env=os.environ.copy(), log=log, timeout=10,
+        )
+    assert marker not in str(error.value)
+    assert marker in log.read_text(encoding="utf-8")
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows PowerShell parser is needed.")

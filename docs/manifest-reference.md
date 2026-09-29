@@ -158,6 +158,38 @@ contribute to the hash. With this declaration, `inputs --example` prefers
 the resource route and omits the fields it supplies. The AIO example
 therefore contains only `cluster: null`.
 
+A resource role can follow an earlier role through a declared relationship:
+
+```yaml
+- name: customLocation
+  type: azureResourceId
+  description: Custom location referenced by the selected resource.
+  fromResource: {input: instance, field: extendedLocation}
+  resource:
+    type: Microsoft.ExtendedLocation/customLocations
+    apiVersion: "2021-08-31-preview"
+```
+
+The closed fields are `extendedLocation` for the ARM extended-location
+reference and `customLocations.hostResourceId` for a custom location's host.
+The source must be an earlier resource role with the same activation
+condition. Related roles cannot require or accept separate operator answers.
+They must contribute a mapping, prerequisite or dependent read, and count
+toward the four-resource limit.
+
+`--read-resources` also authorizes these declared reads. Site Ops validates
+each source observation, related ID and declared target type before the
+next read. Related resources must stay in the source's subscription and
+resource group. This restriction is enforced by the engine, not selectable
+by content. No arbitrary property paths, URLs, code or subscription searches
+are supported. Explicit independent resources, such as a supplied vault,
+keep their declared scope rules.
+
+`nameFromResource` may select a related role. The example then asks for its
+explicit source input, while naming waits for the related resource's validated
+observation. This lets an instance input resolve its associated cluster and
+retain the same Site naming as a directly supplied cluster.
+
 An operator provides `cluster` through the same `--input NAME=VALUE`
 or answer file used for strings, and explicitly adds `--read-resources`
 to `inputs`, `plan` or `deploy`. If the role is omitted, ordinary manual

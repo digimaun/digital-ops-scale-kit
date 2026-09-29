@@ -11,6 +11,7 @@ separate planning, deployment, and health verification.
 | Task | Guide |
 |---|---|
 | Deploy AIO to one explicit target | [Guided inputs](guided-inputs.md) |
+| Enable Secret Sync on an existing AIO instance | [Existing-instance inputs](guided-inputs.md#enable-secret-sync-on-an-existing-instance) |
 | Deploy AIO with a configured example Site | [Local checkout guide](getting-started.md) |
 | Install an identified Site Ops release | [Install Site Ops](install-siteops.md) |
 | Configure and inspect a deployment target | [Site configuration](site-configuration.md) |

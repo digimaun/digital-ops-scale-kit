@@ -412,6 +412,61 @@ def test_aio_cluster_only_executable_plan(workspace, orchestrator, monkeypatch, 
         assert resolve_plan_value(tags, {}) == {"site": site.name, "managedBy": "siteops"}
 
 
+def test_existing_secret_sync_executable_plan_retains_instance_state(
+    workspace, orchestrator, monkeypatch, tmp_path,
+):
+    manifest = workspace / "manifests" / "secretsync" / "manifest.yaml"
+    contract = load_contract(manifest)
+    root = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/example-rg/providers/"
+    instance_id = root + "Microsoft.IoTOperations/instances/existing-aio"
+    location_id = root + "Microsoft.ExtendedLocation/customLocations/existing-location"
+    cluster_id = root + "Microsoft.Kubernetes/connectedClusters/existing-cluster"
+    bound = contract.bind(inline=[f"instance={instance_id}"])
+    site = contract.build_site(bound, {
+        "instance": ArmResourceObservation(
+            instance_id, "Microsoft.IoTOperations/instances", "eastus", "existing-aio", {},
+            {"extendedLocation": location_id},
+        ),
+        "customLocation": ArmResourceObservation(
+            location_id, "Microsoft.ExtendedLocation/customLocations", "eastus", "existing-location", {},
+            {"customLocations.hostResourceId": cluster_id},
+        ),
+        "cluster": ArmResourceObservation(
+            cluster_id, "Microsoft.Kubernetes/connectedClusters", "eastus", "existing-cluster",
+            {"connectedClusters.workloadIdentityEnabled": True, "connectedClusters.oidcIssuerAvailable": True},
+        ),
+    })
+    paths = {
+        workspace / "templates" / "aio" / "resolve-aio.bicep",
+        workspace / "templates" / "secretsync" / "enable-secretsync.bicep",
+    }
+    builds = _guard_local_compilation(monkeypatch, tmp_path, {path.resolve() for path in paths})
+    result = orchestrator.build_plan(manifest, sites=[site], intent=PlanIntent.EXECUTABLE)
+    assert result.status is PlanStatus.PLANNED, result.diagnostics
+    assert result.executable
+    assert len(result.plan.targets) == 1
+    operations = result.plan.targets[0].operations
+    assert [operation.identity.step for operation in operations] == ["resolve-aio", "secretsync"]
+    assert len(builds) == 2
+    for operation in operations:
+        values = {
+            entry.key.value: entry.value for entry in operation.details.parameters.entries
+            if isinstance(entry.key, LiteralValue)
+        }
+        assert resolve_plan_value(values["aioInstanceName"], {}) == "existing-aio"
+        assert resolve_plan_value(values["aioApiVersion"], {}) == "2026-07-01"
+        assert not {"aioVersion", "certManagerVersion", "secretStoreVersion"}.intersection(values)
+        if operation.identity.step == "secretsync":
+            for name in (
+                "instanceTags", "identityType", "userAssignedIdentities", "features",
+                "instanceDescription", "existingSpcResourceId",
+                "customLocationId", "customLocationName", "customLocationNamespace",
+                "connectedClusterName", "oidcIssuerUrl",
+            ):
+                assert isinstance(values[name], OutputValue)
+                assert values[name].reference.source.step == "resolve-aio"
+
+
 def test_aio_install_executable_plan_omits_nullable_instance_parameters(
     workspace,
     orchestrator,

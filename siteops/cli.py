@@ -707,17 +707,24 @@ def _resolve_typed_site(
             "provider-unavailable", f"The selected resource reader is unavailable ({error.code})."
         ) from None
     observations = {}
-    for index, resource in enumerate(bound.resources, start=1):
-        name = resource.field.name
+    resource_fields = contract.resource_fields(bound)
+    for index, field in enumerate(resource_fields, start=1):
+        resource = contract.resource_request(field, bound, observations)
+        name = field.name
         print(
             f"Reading declared resource {_content_text(name)} "
-            f"{index}/{len(bound.resources)} using {_content_text(reader.identity.name)}.",
+            f"{index}/{len(resource_fields)} using {_content_text(reader.identity.name)}.",
             file=sys.stderr,
         )
         try:
-            observations[name] = reader.read(resource.ref, facts=resource.required_facts)
+            references = contract.reference_fields(field, bound)
+            observations[name] = (
+                reader.read(resource.ref, facts=resource.required_facts, references=references)
+                if references else reader.read(resource.ref, facts=resource.required_facts)
+            )
         except ArmResourceError as error:
             raise ResourceReadError(error.code.lower().replace("_", "-"), f"Input '{name}' read failed.") from None
+        contract.validate_resource_observation(resource, bound, observations[name])
     site = contract.build_site(bound, observations)
     return site, {
         "provider": {"name": reader.identity.name, "version": reader.identity.version},
@@ -824,15 +831,12 @@ def cmd_inputs(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
                 ]
                 example_values = contract.example()["values"]
                 for resource in description["inputs"]:
-                    derived = set(resource.get("derive", {}).values())
-                    generated = {
-                        field["name"] for field in description["inputs"]
-                        if field.get("defaultFromResource") == resource["name"]
-                    }
-                    derived.update(generated)
+                    derived = contract.resource_route_fields(resource["name"])
                     if not derived.intersection(required) or resource["name"] not in example_values:
                         continue
-                    supplied = [name for name in required if name not in derived] + [resource["name"]]
+                    supplied = [
+                        name for name in required if name not in derived and name != resource["name"]
+                    ] + [resource["name"]]
                     for line in _wrap(
                         f"Resource route: fill {_content_text(', '.join(supplied))}. "
                         f"Leave {_content_text(', '.join(name for name in required if name in derived))} "
@@ -844,7 +848,7 @@ def cmd_inputs(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
                     if field.get("derivableFrom"):
                         status += " or derived from " + ", ".join(field["derivableFrom"])
                     if field.get("defaultFromResource"):
-                        status += " without " + field["defaultFromResource"] + ", otherwise generated"
+                        status = "generated from " + field["defaultFromResource"] + ", or supplied"
                     for line in _wrap(
                         f"{_content_text(field['name'])} "
                         f"({_content_text(field['type'])}, {_content_text(status)})"
@@ -863,6 +867,13 @@ def cmd_inputs(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
                         ):
                             print(line)
                     if "resource" in field:
+                        if field.get("fromResource"):
+                            link = field["fromResource"]
+                            for line in _wrap(
+                                f"Read from {link['input']} through {link['field']}. No separate answer needed.",
+                                indent="    ",
+                            ):
+                                print(line)
                         for line in _wrap(
                             "ARM type: "
                             + _content_text(field["resource"]["type"])
@@ -1827,7 +1838,7 @@ Examples:
     )
     p_inputs.add_argument(
         "--read-resources", action="store_true",
-        help="Read only supplied, declared ARM resource IDs with the selected Azure provider before previewing the Site",
+        help="Read supplied ARM IDs and declared related resources before previewing the Site. Related reads stay in the parent resource's subscription and resource group",
     )
     p_inputs.add_argument(
         "--offline", action="store_true",
@@ -2052,7 +2063,7 @@ Examples:
     for command in (p_plan, p_deploy):
         command.add_argument(
             "--read-resources", action="store_true",
-            help="Read only supplied, declared ARM resource IDs with the selected Azure provider before preparing the Site",
+            help="Read supplied ARM IDs and declared related resources before preparing the Site. Related reads stay in the parent resource's subscription and resource group",
         )
 
     p_project = subparsers.add_parser("project", help="Inspect or explicitly pin a project's workspace source")

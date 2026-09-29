@@ -5,10 +5,33 @@ This standalone operation performs enablement directly. The optional
 Secret Sync path inside [aio-install](../aio-install/README.md) is controlled
 by that entry's Site capability flag.
 
+## Use an existing instance ID
+
+With an approved workspace pinned in `factory`, AIO 2607 and 2608 can use
+one typed instance ID:
+
+```text
+siteops --approved-source official --project factory plan secretsync --input "instance=<AIO-instance-resource-ID>" --read-resources
+siteops --approved-source official --project factory deploy secretsync --input "instance=<AIO-instance-resource-ID>" --read-resources
+```
+
+The authorized reads resolve the instance's custom location and Arc cluster
+within the same subscription and resource group. They verify existing OIDC
+and workload identity before deployment. The operation uses the actual
+instance name and the API shared by those releases. It does not reinstall
+AIO, change extension versions or guess the installed monthly release.
+The `2608` content profile supplies the pinned API configuration only.
+
+`siteName`, `environment`, `country` and `existingVault` are optional answers.
+The default Site name is derived from the associated cluster. Keep an explicit
+name when reusing older Site configuration. See
+[guided inputs](../../../../docs/guided-inputs.md#enable-secret-sync-on-an-existing-instance)
+for answer files and the existing-vault route.
+
 ## Prerequisites and configuration
 
 The existing connected cluster must already have OIDC issuer and workload
-identity enabled. Confirm the Site's subscription, resource group,
+identity enabled. For the configured-Site route, confirm its subscription, resource group,
 `properties.aioRelease` and instance name. Use
 `parameters.aioInstanceName` for an instance that does not follow the
 Site-derived convention.
@@ -25,7 +48,7 @@ effective authorization or cluster readiness.
 
 ## Review and deploy
 
-From the repository root:
+For configured Sites, run from the repository root:
 
 ```bash
 siteops -w workspaces/iot-operations plan manifests/secretsync/manifest.yaml -l name=<site>

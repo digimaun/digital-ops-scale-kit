@@ -352,6 +352,214 @@ def test_resource_name_default_validates_observation_before_generating_name(tmp_
         })
 
 
+_LINKED_INSTANCE_ID = (
+    "/subscriptions/00000000-0000-0000-0000-000000000001/"
+    "resourceGroups/rg-first/providers/Microsoft.HybridCompute/machines/machine-one"
+)
+_LINKED_LOCATION_ID = _LINKED_INSTANCE_ID.replace(
+    "Microsoft.HybridCompute/machines/machine-one",
+    "Microsoft.ExtendedLocation/customLocations/location-one",
+)
+_LINKED_CLUSTER_ID = _LINKED_INSTANCE_ID.replace(
+    "Microsoft.HybridCompute/machines/machine-one",
+    "Microsoft.Kubernetes/connectedClusters/cluster-one",
+)
+
+
+def _linked_contract(tmp_path):
+    fields = [
+        _field("siteName", "name"), *_manual_resource_fields(),
+        _field("instanceName", "parameters.instanceName"),
+        _resource_role(
+            name="instance",
+            resource={"type": "Microsoft.HybridCompute/machines", "apiVersion": "2024-07-10"},
+            derive={"subscription": "subscription", "resourceGroup": "resourceGroup",
+                    "location": "location", "name": "instanceName"},
+        ),
+        _resource_role(
+            name="customLocation", derive={},
+            resource={"type": "Microsoft.ExtendedLocation/customLocations", "apiVersion": "2021-08-31-preview"},
+            fromResource={"input": "instance", "field": "extendedLocation"},
+        ),
+        _resource_role(
+            name="cluster", derive={"name": "clusterName"},
+            resource={"type": "Microsoft.Kubernetes/connectedClusters", "apiVersion": "2024-07-15-preview"},
+            fromResource={"input": "customLocation", "field": "customLocations.hostResourceId"},
+            requires=[{
+                "fact": "connectedClusters.workloadIdentityEnabled",
+                "description": "Workload identity is enabled.",
+            }],
+        ),
+    ]
+    manifest, path = _manifest_and_contract(
+        tmp_path, fields=fields, defaults={}, name_from_resource="instance",
+    )
+    return manifest, path
+
+
+def _linked_observations():
+    return {
+        "instance": ArmResourceObservation(
+            _LINKED_INSTANCE_ID, "Microsoft.HybridCompute/machines", "eastus", "machine-one", {},
+            {"extendedLocation": _LINKED_LOCATION_ID},
+        ),
+        "customLocation": ArmResourceObservation(
+            _LINKED_LOCATION_ID, "Microsoft.ExtendedLocation/customLocations", "eastus", "location-one", {},
+            {"customLocations.hostResourceId": _LINKED_CLUSTER_ID},
+        ),
+        "cluster": ArmResourceObservation(
+            _LINKED_CLUSTER_ID, "Microsoft.Kubernetes/connectedClusters", "eastus", "cluster-one",
+            {"connectedClusters.workloadIdentityEnabled": True},
+        ),
+    }
+
+
+def test_declared_links_build_one_site_without_asking_for_related_ids(tmp_path):
+    manifest, _ = _linked_contract(tmp_path)
+    contract = load_contract(manifest)
+    bound = contract.bind(inline=[f"instance={_LINKED_INSTANCE_ID}"])
+    assert [field.name for field in contract.resource_fields(bound)] == [
+        "instance", "customLocation", "cluster",
+    ]
+    site = contract.build_site(bound, _linked_observations())
+    assert site.parameters == {"instanceName": "machine-one", "clusterName": "cluster-one"}
+    assert site.name.startswith("machine-one-")
+    assert "customLocation" not in contract.example()["values"]
+    assert "cluster" not in contract.example()["values"]
+
+
+@pytest.mark.parametrize("name", ["customLocation", "cluster"])
+def test_related_resource_inputs_cannot_be_overridden(tmp_path, name):
+    manifest, _ = _linked_contract(tmp_path)
+    contract = load_contract(manifest)
+    with pytest.raises(ValueError, match="derived.*cannot be supplied"):
+        contract.bind(inline=[f"instance={_LINKED_INSTANCE_ID}", f"{name}={_LINKED_CLUSTER_ID}"])
+    answers = _values(tmp_path, {"instance": _LINKED_INSTANCE_ID, name: None})
+    with pytest.raises(ValueError, match="derived.*cannot be supplied"):
+        contract.bind(values_file=answers)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "message"),
+    [
+        ("input", "cluster", "earlier"),
+        ("input", "siteName", "resource"),
+        ("field", "properties.arbitrary", "relationship"),
+    ],
+)
+def test_related_resource_declarations_fail_before_any_read(tmp_path, field, replacement, message):
+    manifest, path = _linked_contract(tmp_path)
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    document["inputs"][-2]["fromResource"][field] = replacement
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ValueError, match=message):
+        load_contract(manifest)
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "category"),
+    [
+        ("rg-first", "another-rg", "resource-group-mismatch"),
+        ("00000000-0000-0000-0000-000000000001",
+         "00000000-0000-0000-0000-000000000002", "subscription-mismatch"),
+        ("Microsoft.ExtendedLocation/customLocations", "Microsoft.HybridCompute/machines", "type-mismatch"),
+    ],
+)
+def test_related_resource_scope_is_checked_before_request(tmp_path, old, new, category):
+    manifest, _ = _linked_contract(tmp_path)
+    contract = load_contract(manifest)
+    bound = contract.bind(inline=[f"instance={_LINKED_INSTANCE_ID}"])
+    observations = _linked_observations()
+    observations["instance"] = ArmResourceObservation(
+        _LINKED_INSTANCE_ID, "Microsoft.HybridCompute/machines", "eastus", "machine-one", {},
+        {"extendedLocation": _LINKED_LOCATION_ID.replace(old, new)},
+    )
+    field = next(field for field in contract.resource_fields(bound) if field.name == "customLocation")
+    with pytest.raises(ValueError, match=category) as error:
+        contract.resource_request(field, bound, observations)
+    assert "another-rg" not in str(error.value)
+
+
+def test_related_resource_name_uses_cluster_identity_and_example_uses_root_input(tmp_path):
+    manifest, path = _linked_contract(tmp_path)
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    document["nameFromResource"] = "cluster"
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    contract = load_contract(manifest)
+    assert contract.example()["values"] == {"instance": None}
+    bound = contract.bind(inline=[f"instance={_LINKED_INSTANCE_ID}"])
+    site = contract.build_site(bound, _linked_observations())
+    assert site.name == "cluster-one-" + hashlib.sha256(
+        _LINKED_CLUSTER_ID.casefold().encode("ascii"),
+    ).hexdigest()[:12]
+
+
+@pytest.mark.parametrize("bad_source", ["missing", "identity", "extra-reference"])
+def test_invalid_source_observation_cannot_supply_a_related_request(tmp_path, bad_source):
+    manifest, _ = _linked_contract(tmp_path)
+    contract = load_contract(manifest)
+    bound = contract.bind(inline=[f"instance={_LINKED_INSTANCE_ID}"])
+    observations = _linked_observations()
+    if bad_source == "missing":
+        observations["instance"] = ArmResourceObservation(
+            _LINKED_INSTANCE_ID, "Microsoft.HybridCompute/machines", "eastus", "machine-one", {},
+        )
+    elif bad_source == "identity":
+        observations["instance"] = ArmResourceObservation(
+            _LINKED_INSTANCE_ID.replace("machine-one", "private-other"),
+            "Microsoft.HybridCompute/machines", "eastus", "private-other", {},
+            {"extendedLocation": _LINKED_LOCATION_ID},
+        )
+    else:
+        observations["instance"] = ArmResourceObservation(
+            _LINKED_INSTANCE_ID, "Microsoft.HybridCompute/machines", "eastus", "machine-one", {},
+            {"extendedLocation": _LINKED_LOCATION_ID, "customLocations.hostResourceId": _LINKED_CLUSTER_ID},
+        )
+    field = next(field for field in contract.resource_fields(bound) if field.name == "customLocation")
+    with pytest.raises(ValueError, match="invalid-observation") as error:
+        contract.resource_request(field, bound, observations)
+    assert "private-other" not in str(error.value)
+
+
+def test_related_resource_prerequisites_are_checked_before_site_construction(tmp_path):
+    manifest, _ = _linked_contract(tmp_path)
+    contract = load_contract(manifest)
+    bound = contract.bind(inline=[f"instance={_LINKED_INSTANCE_ID}"])
+    observations = _linked_observations()
+    observations["cluster"] = ArmResourceObservation(
+        _LINKED_CLUSTER_ID, "Microsoft.Kubernetes/connectedClusters", "eastus", "cluster-one",
+        {"connectedClusters.workloadIdentityEnabled": False},
+    )
+    with pytest.raises(ValueError, match="requirement-unmet"):
+        contract.build_site(bound, observations)
+
+
+def test_manual_answers_cannot_bypass_active_related_resource_prerequisite(tmp_path):
+    manifest, _ = _linked_contract(tmp_path)
+    contract = load_contract(manifest)
+    with pytest.raises(ValueError, match="requirement-unverified.*'instance'"):
+        contract.resolve(inline=[
+            "siteName=manual", "subscription=00000000-0000-0000-0000-000000000001",
+            "resourceGroup=rg-first", "location=eastus", "clusterName=cluster-one",
+            "instanceName=machine-one",
+        ])
+
+
+def test_inactive_related_prerequisite_preserves_manual_route(tmp_path):
+    manifest, path = _linked_contract(tmp_path)
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    document["inputs"].insert(0, _field("verify", "properties.verify", type="boolean", default=False))
+    document["inputs"][-1]["requires"][0]["when"] = {"input": "verify", "equals": True}
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    site = load_contract(manifest).resolve(inline=[
+        "siteName=manual", "subscription=00000000-0000-0000-0000-000000000001",
+        "resourceGroup=rg-first", "location=eastus", "clusterName=cluster-one",
+        "instanceName=machine-one",
+    ])
+    assert site.name == "manual"
+    assert site.properties["verify"] is False
+
+
 def test_optional_cluster_reference_preserves_manual_answer_route(tmp_path):
     fields = [*_manual_resource_fields(), _resource_role()]
     manifest, _ = _manifest_and_contract(tmp_path, fields=fields)

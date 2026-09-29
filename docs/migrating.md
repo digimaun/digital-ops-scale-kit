@@ -68,6 +68,19 @@ Use an engine release supporting `nameFromResource`, string constraints and
 optional label mapping values with this workspace. Workspace producers must
 declare and qualify that compatible engine selection.
 
+### Guided Secret Sync resource reads
+
+The standalone `secretsync` typed route accepts an AIO instance ID for the
+API used by releases 2607 and 2608. It resolves the actual instance name and
+associated cluster instead of assuming a Site naming convention. Existing
+configured-Site commands and their release selections remain available.
+
+For contracts declaring `fromResource`, `--read-resources` covers the
+declared related reads as well as supplied IDs. Related targets stay in the
+source subscription and resource group. The operator cannot override a
+derived resource input. Use an engine release that supports these contracts
+with the corresponding workspace.
+
 ### Workspace content paths
 
 Core entries now have the same directory shape as samples: a named directory

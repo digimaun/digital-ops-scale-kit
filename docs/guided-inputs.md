@@ -139,6 +139,41 @@ the same validation rules, and the labels remain optional. The manual route
 does not establish Azure resource existence or enable guided Secret Sync,
 which requires observed cluster prerequisites.
 
+## Enable Secret Sync on an existing instance
+
+For an existing AIO 2607 or 2608 instance, supply its resource ID instead
+of running installation again:
+
+```text
+siteops --approved-source official --project ./factory plan secretsync --input "instance=<AIO-instance-resource-ID>" --read-resources
+siteops --approved-source official --project ./factory deploy secretsync --input "instance=<AIO-instance-resource-ID>" --read-resources
+```
+
+`instance` is the only required answer. Site Ops reads the instance, its
+custom location and that location's Arc cluster. The related resources
+must remain in the instance's subscription and resource group. OIDC issuer
+and workload identity must already be enabled. Unsupported relationships,
+conflicting target values or missing prerequisites fail before deployment.
+The reads do not enable cluster features or grant roles.
+
+The plan contains only instance resolution and Secret Sync enablement.
+It uses the actual instance name and does not reinstall or upgrade AIO.
+Configured Sites retain their release selection for other API generations.
+
+The default Site name comes from the associated cluster, matching the
+basic AIO resource route. Supply `siteName` to retain an earlier explicit
+name. Optional `environment` and `country` values label enablement resources.
+Add `existingVault` to use your existing Key Vault, including one in another
+resource group of the same subscription. Otherwise enablement uses its
+default vault. Review that choice before updating an existing Secret Sync
+configuration.
+
+The existing content forwards instance settings and preserves the bound
+Secret Provider Class object list when no secrets are declared. Enablement
+still updates the default Secret Provider Class binding. It does not prove
+that a secret materialized in Kubernetes. See the [Secret Sync reference](secret-sync.md)
+for preservation, vault permissions and functional checks.
+
 ## Deploy a selected AIO release to each cluster
 
 `aioRelease` is a typed answer mapped to the selected Site's

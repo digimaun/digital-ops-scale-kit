@@ -113,6 +113,10 @@ The first path leaves Secret Sync disabled. [Guided inputs](docs/guided-inputs.m
 explains optional names and labels, answer files, manual targets without an
 Azure read, and Secret Sync enablement. Planning does not submit
 deployments. Deployment success does not establish AIO workload health.
+For a combined installation, add `--input enableSecretSync=true` to both
+commands after confirming the cluster prerequisites. For an existing AIO
+instance, use the [standalone Secret Sync route](docs/guided-inputs.md#enable-secret-sync-on-an-existing-instance)
+with its instance ID instead of running installation again.
 
 **Scale out on the same model.** Save the first Site for repeat use, then
 configure a separate set of new clusters as project Sites. Review only

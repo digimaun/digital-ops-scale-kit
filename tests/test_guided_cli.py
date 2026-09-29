@@ -24,6 +24,7 @@ from siteops.package_builder import _source_files
 from siteops.planning import (
     DeploymentOperation,
     LiteralValue,
+    OutputValue,
     PlanDisposition,
     PlanIntent,
     PlanStatus,
@@ -1028,10 +1029,11 @@ def test_manifest_without_contract_accepts_complete_site_only(
     ]
 
 
-def test_aio_contract_is_included_in_workspace_package_source():
+@pytest.mark.parametrize("entry", ["aio-install", "secretsync"])
+def test_aio_contract_is_included_in_workspace_package_source(entry):
     root = Path(__file__).resolve().parents[1]
     authored = (
-        "workspaces/iot-operations/manifests/aio-install/inputs.yaml"
+        f"workspaces/iot-operations/manifests/{entry}/inputs.yaml"
     )
     assert authored in _source_files(root, "workspaces/iot-operations", ())
 
@@ -1388,6 +1390,20 @@ def _aio_template_session(
         )
         if include_aio_version and source.name == "instance.bicep":
             parameters = {"aioVersion": {"type": "string"}}
+        if source.name in {"resolve-aio.bicep", "enable-secretsync.bicep"}:
+            parameters.update({
+                "aioInstanceName": {"type": "string"},
+                "aioApiVersion": {"type": "string"},
+            })
+        if source.name == "enable-secretsync.bicep":
+            parameters.update({
+                "instanceTags": {"type": "object", "defaultValue": {}},
+                "userAssignedIdentities": {"type": "object", "defaultValue": {}},
+                "features": {"type": "object", "defaultValue": {}},
+                "identityType": {"type": "string", "defaultValue": "None"},
+                "instanceDescription": {"type": "string", "defaultValue": ""},
+                "existingSpcResourceId": {"type": "string", "defaultValue": ""},
+            })
         outputs = {
             name: {"type": "string"} for name in (
                 "customLocationId", "customLocationName", "customLocationNamespace",
@@ -1646,6 +1662,194 @@ def test_documented_cluster_only_commands_resolve_through_cli(tmp_path, capsys, 
         else:
             deploy.assert_not_called()
         capsys.readouterr()
+
+
+_EXISTING_INSTANCE_ID = _CLUSTER_ID.replace(
+    "Microsoft.Kubernetes/connectedClusters/arc-first",
+    "Microsoft.IoTOperations/instances/external-instance",
+)
+_EXISTING_LOCATION_ID = _CLUSTER_ID.replace(
+    "Microsoft.Kubernetes/connectedClusters/arc-first",
+    "Microsoft.ExtendedLocation/customLocations/external-location",
+)
+
+
+def _existing_instance_reader(*, identity_enabled=True, location_id=_EXISTING_LOCATION_ID, vault_id=None):
+    calls = []
+
+    def read(ref, *, facts=frozenset(), references=frozenset()):
+        calls.append((ref, facts, references))
+        if ref.resource_id == _EXISTING_INSTANCE_ID:
+            related = {"extendedLocation": location_id}
+        elif ref.resource_id == _EXISTING_LOCATION_ID:
+            related = {"customLocations.hostResourceId": _CLUSTER_ID}
+        elif ref.resource_id == _CLUSTER_ID:
+            related = {}
+        elif vault_id is not None and ref.resource_id == vault_id:
+            related = {}
+        else:
+            raise AssertionError("Unexpected resource read.")
+        assert set(related) == references
+        return ArmResourceObservation(
+            ref.resource_id, ref.resource_type, "eastus", ref.name,
+            {fact: identity_enabled for fact in facts}, related,
+        )
+
+    return SimpleNamespace(identity=SimpleNamespace(name="fixture", version="1"), read=read), calls
+
+
+@pytest.mark.parametrize("verb", ["plan", "deploy"])
+def test_existing_instance_secret_sync_uses_actual_identity_without_install(tmp_path, capsys, verb):
+    workspace = Path(__file__).resolve().parents[1] / "workspaces" / "iot-operations"
+    reader, calls = _existing_instance_reader()
+    session = _aio_template_session(tmp_path)
+    with (
+        patch("siteops.cli.new_arm_reader", return_value=reader),
+        patch("siteops.orchestrator.TemplateCompilationSession", return_value=session),
+        patch.object(Orchestrator, "execute_plan", return_value=RunResult.from_sites((), elapsed=0)) as execute,
+    ):
+        assert _invoke([
+            "-w", str(workspace), verb, "secretsync",
+            "--input", f"instance={_EXISTING_INSTANCE_ID}", "--read-resources", "--output", "json",
+        ]) == 0
+    output = capsys.readouterr().out
+    if verb == "plan":
+        document = json.loads(output)
+        operations = document["plan"]["targets"][0]["operations"]
+        assert [operation["identity"]["step"] for operation in operations] == ["resolve-aio", "secretsync"]
+        execute.assert_not_called()
+    else:
+        result = execute.call_args.args[0]
+        assert result.executable
+        assert [operation.identity.step for operation in result.plan.targets[0].operations] == [
+            "resolve-aio", "secretsync",
+        ]
+        for operation in result.plan.targets[0].operations:
+            parameters = {
+                entry.key.value: entry.value for entry in operation.details.parameters.entries
+                if isinstance(entry.key, LiteralValue)
+            }
+            assert resolve_plan_value(parameters["aioInstanceName"], {}) == "external-instance"
+            assert resolve_plan_value(parameters["aioApiVersion"], {}) == "2026-07-01"
+            if operation.identity.step == "secretsync":
+                for name in (
+                    "instanceTags", "userAssignedIdentities", "features", "identityType",
+                    "instanceDescription", "existingSpcResourceId",
+                ):
+                    assert isinstance(parameters[name], OutputValue)
+                    assert parameters[name].reference.source.step == "resolve-aio"
+    assert [ref.resource_id for ref, _, _ in calls] == [
+        _EXISTING_INSTANCE_ID, _EXISTING_LOCATION_ID, _CLUSTER_ID,
+    ]
+    assert [ref.api_version for ref, _, _ in calls] == [
+        "2026-07-01", "2021-08-31-preview", "2024-07-15-preview",
+    ]
+
+
+@pytest.mark.parametrize("fault", ["no-consent", "scope", "prerequisite"])
+def test_existing_secret_sync_fails_before_writes_on_read_boundaries(tmp_path, capsys, fault):
+    workspace = Path(__file__).resolve().parents[1] / "workspaces" / "iot-operations"
+    reader, calls = _existing_instance_reader(
+        identity_enabled=fault != "prerequisite",
+        location_id=_EXISTING_LOCATION_ID.replace("rg-first", "private-other-rg") if fault == "scope"
+        else _EXISTING_LOCATION_ID,
+    )
+    args = [
+        "-w", str(workspace), "deploy", "secretsync",
+        "--input", f"instance={_EXISTING_INSTANCE_ID}",
+    ]
+    if fault != "no-consent":
+        args.append("--read-resources")
+    with (
+        patch("siteops.cli.new_arm_reader", return_value=reader),
+        patch.object(Orchestrator, "deploy", side_effect=AssertionError("No deployment may start")),
+    ):
+        assert _invoke(args) == 1
+    error = capsys.readouterr().err
+    assert "private-other-rg" not in error
+    assert {
+        "no-consent": "read-required", "scope": "resource-group-mismatch",
+        "prerequisite": "requirement-unmet",
+    }[fault] in error
+    assert len(calls) == {"no-consent": 0, "scope": 1, "prerequisite": 3}[fault]
+
+
+def test_existing_secret_sync_example_needs_only_instance_and_reuses_cluster_site_name(capsys):
+    workspace = Path(__file__).resolve().parents[1] / "workspaces" / "iot-operations"
+    contract = load_contract(workspace / "manifests" / "secretsync" / "manifest.yaml")
+    assert contract is not None
+    assert contract.example()["values"] == {"instance": None}
+    assert _invoke(["-w", str(workspace), "inputs", "secretsync"]) == 0
+    text = capsys.readouterr().out
+    assert "Resource route: fill instance." in text
+    assert "fill siteName" not in text
+
+
+def test_existing_secret_sync_file_route_keeps_optional_vault_and_cluster_site_identity(tmp_path, capsys):
+    workspace = Path(__file__).resolve().parents[1] / "workspaces" / "iot-operations"
+    vault_id = _CLUSTER_ID.replace(
+        "resourceGroups/rg-first/providers/Microsoft.Kubernetes/connectedClusters/arc-first",
+        "resourceGroups/vault-rg/providers/Microsoft.KeyVault/vaults/vault-one",
+    )
+    answers = tmp_path / "secretsync.yaml"
+    answers.write_text(yaml.safe_dump({
+        "apiVersion": "siteops.inputs/v1", "kind": "SiteInputValues",
+        "values": {"instance": _EXISTING_INSTANCE_ID, "existingVault": vault_id},
+    }), encoding="utf-8")
+    reader, calls = _existing_instance_reader(vault_id=vault_id)
+    with patch("siteops.cli.new_arm_reader", return_value=reader):
+        assert _invoke([
+            "-w", str(workspace), "inputs", "secretsync",
+            "--input-file", str(answers), "--read-resources", "--output", "json",
+        ]) == 0
+    site = json.loads(capsys.readouterr().out)["resolution"]["site"]
+    assert site["parameters"]["aioInstanceName"] == "external-instance"
+    assert site["parameters"]["existingKeyVaultResourceId"] == vault_id
+    assert len(calls) == 4
+    aio = load_contract(workspace / "manifests" / "aio-install" / "manifest.yaml")
+    bound = aio.bind(inline=[f"cluster={_CLUSTER_ID}"])
+    fresh_site = aio.build_site(bound, {
+        "cluster": ArmResourceObservation(
+            _CLUSTER_ID, "Microsoft.Kubernetes/connectedClusters", "eastus", "arc-first", {},
+        ),
+    })
+    assert site["name"] == fresh_site.name
+
+
+@pytest.mark.parametrize("document", [
+    "docs/guided-inputs.md", "workspaces/iot-operations/manifests/secretsync/README.md",
+])
+def test_documented_existing_secret_sync_commands_use_one_instance_input(tmp_path, capsys, document):
+    root = Path(__file__).resolve().parents[1]
+    workspace = root / "workspaces" / "iot-operations"
+    lines = (root / document).read_text(encoding="utf-8").splitlines()
+    reader, calls = _existing_instance_reader()
+    session = _aio_template_session(tmp_path)
+    for verb in ("plan", "deploy"):
+        command = next(
+            line for line in lines
+            if line.startswith("siteops ") and f" {verb} secretsync " in line
+            and "instance=<AIO-instance-resource-ID>" in line
+        )
+        args = shlex.split(command.replace("<AIO-instance-resource-ID>", _EXISTING_INSTANCE_ID))[1:]
+        with (
+            patch("siteops.cli.open_command_context", side_effect=lambda **kwargs: nullcontext(
+                CommandContext(workspace, workspace),
+            )),
+            patch("siteops.cli.new_arm_reader", return_value=reader),
+            patch("siteops.orchestrator.TemplateCompilationSession", return_value=session),
+            patch.object(Orchestrator, "execute_plan", return_value=RunResult.from_sites((), elapsed=0)) as execute,
+        ):
+            assert _invoke(args) == 0
+        if verb == "deploy":
+            plan = execute.call_args.args[0].plan
+            assert [operation.identity.step for operation in plan.targets[0].operations] == [
+                "resolve-aio", "secretsync",
+            ]
+        else:
+            execute.assert_not_called()
+        capsys.readouterr()
+    assert len(calls) == 6
 
 
 def test_aio_executable_preparation_binds_existing_vault_from_second_resource(

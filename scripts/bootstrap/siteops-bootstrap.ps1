@@ -238,14 +238,25 @@ function Require-PrivateDataRoot([string]$Path) {
             Reject 'ROOT_DATA_CREATE'
         }
         $previousPreference = $ErrorActionPreference
+        $phase = 'ROOT_DATA_OWNER'
+        $owned = $false
+        $protected = $false
         try {
             $ErrorActionPreference = 'Continue'
-            & icacls.exe $Path /inheritance:r /grant:r "*${sid}:(OI)(CI)F" *> $null
-            $protected = $LASTEXITCODE -eq 0
+            & icacls.exe $Path /setowner "*$sid" *> $null
+            $owned = $LASTEXITCODE -eq 0
+            if ($owned) {
+                $phase = 'ROOT_DATA_ACL'
+                & icacls.exe $Path /inheritance:r /grant:r "*${sid}:(OI)(CI)F" *> $null
+                $protected = $LASTEXITCODE -eq 0
+            }
         } catch {
-            Reject 'ROOT_DATA_ACL'
+            Reject $phase
         } finally {
             $ErrorActionPreference = $previousPreference
+        }
+        if (-not $owned) {
+            Reject 'ROOT_DATA_OWNER'
         }
         if (-not $protected) {
             Reject 'ROOT_DATA_ACL'

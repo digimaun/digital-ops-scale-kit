@@ -186,6 +186,19 @@ def test_windows_bootstrap_admits_private_data_root_before_retained_tool_use():
     )
 
 
+def test_windows_bootstrap_owns_new_data_root_before_private_acl_and_admission():
+    powershell = (SCRIPTS / "siteops-bootstrap.ps1").read_text(encoding="utf-8")
+    create = powershell.split("function Require-PrivateDataRoot(", 1)[1].split(
+        "function Require-PrivateExecutablePath(", 1,
+    )[0].split("if (-not $exists)", 1)[1]
+    assert '& icacls.exe $Path /setowner "*$sid"' in create
+    assert create.index('& icacls.exe $Path /setowner "*$sid"') < create.index(
+        '& icacls.exe $Path /inheritance:r /grant:r "*${sid}:(OI)(CI)F"',
+    )
+    assert "if (-not $owned) {" in create
+    assert "Reject 'ROOT_DATA_OWNER'" in create
+
+
 def test_windows_bootstrap_checks_managed_executables_before_running_them():
     powershell = (SCRIPTS / "siteops-bootstrap.ps1").read_text(encoding="utf-8")
     assert powershell.index("Require-PrivateExecutablePath $candidate $env:LOCALAPPDATA") < (
@@ -724,6 +737,7 @@ def test_windows_bootstrap_rejects_symlinked_data_ancestor(tmp_path):
         ("ancestor-error", "ROOT_ANCESTOR_TYPE"),
         ("root-probe-error", "ROOT_DATA_TYPE"),
         ("creation-error", "ROOT_DATA_CREATE"),
+        ("owner-error", "ROOT_DATA_OWNER"),
         ("protection-error", "ROOT_DATA_ACL"),
     ],
 )
@@ -741,10 +755,16 @@ def test_windows_bootstrap_root_filesystem_errors_are_bounded(tmp_path, case, ca
         setup = f"function Test-Path {{ throw '{marker}' }}\n"
     elif case == "creation-error":
         setup = f"function New-Item {{ throw '{marker}' }}\n"
-    else:
+    elif case == "owner-error":
         setup = (
             f"function icacls.exe {{ Write-Error '{marker}'; "
             "$global:LASTEXITCODE = 5 }\n"
+        )
+    else:
+        setup = (
+            "function icacls.exe { if ($args -contains '/setowner') { "
+            "$global:LASTEXITCODE = 0; return }; "
+            f"Write-Error '{marker}'; $global:LASTEXITCODE = 5 }}\n"
         )
     wrapper = _windows_private_root_wrapper(tmp_path, setup)
     result = subprocess.run(

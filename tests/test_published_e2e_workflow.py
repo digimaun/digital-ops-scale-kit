@@ -256,24 +256,36 @@ def test_real_pipx_launcher_separates_root_admission_from_link_guard():
     assert source.index('log=logs / "check-private-data-root.log"') < (
         source.index('log=logs / "check-bootstrap-guard.log"')
     )
+    assert 'log=logs / "protect-data-root.log"' in source
+    assert 'env["SITEOPS_PROBE_DATA"] = str(data)' in source
+    assert "ROOT_(?:PATH|ANCESTOR_" in source
     assert "TOOL_(?:PATH|TYPE|OWNER|ACL)" in source
     assert "The bootstrap's selected executable guard admitted" in source
 
 
 @pytest.mark.parametrize(
-    ("code", "reason"),
+    ("log_name", "code", "reason"),
     [
-        ("TOOL_TYPE", "rejected TOOL_TYPE"),
-        ("TOOL_UNKNOWN", "failed with exit code 7"),
+        ("check-bootstrap-guard.log", "TOOL_TYPE", "rejected TOOL_TYPE"),
+        ("check-bootstrap-guard.log", "TOOL_UNKNOWN", "failed with exit code 7"),
+        ("check-private-data-root.log", "ROOT_DATA_OWNER", "rejected ROOT_DATA_OWNER"),
+        ("check-private-data-root.log", "ROOT_UNKNOWN", "failed with exit code 7"),
     ],
 )
-def test_real_pipx_launcher_reports_only_bounded_guard_diagnostics(tmp_path, code, reason):
+def test_real_pipx_launcher_reports_only_bounded_guard_diagnostics(
+    tmp_path, log_name, code, reason,
+):
     run = runpy.run_path(str(PIPX_PROBE))["run"]
     marker = "PRIVATE_TARGET_MARKER"
-    log = tmp_path / "check-bootstrap-guard.log"
+    log = tmp_path / log_name
+    context = (
+        "Choose a private Windows tool location."
+        if code.startswith("TOOL_")
+        else "Configure a private Site Ops data root."
+    )
     diagnostic = (
-        f"{marker}: Site Ops installation: "
-        f"Choose a private Windows tool location. {code} Use trusted directories."
+        f"{marker}: Site Ops installation: {context} "
+        f"{code} Use trusted directories."
     )
     with pytest.raises(RuntimeError, match=reason) as error:
         run(

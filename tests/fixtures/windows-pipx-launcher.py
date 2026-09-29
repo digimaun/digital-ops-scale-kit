@@ -22,13 +22,21 @@ def run(command, *, cwd, env, log, timeout=180):
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"{log.stem} exceeded its time limit.") from None
     if result.returncode:
-        if log.name == "check-bootstrap-guard.log":
+        messages = {
+            "check-private-data-root.log": (
+                r"Configure a private Site Ops data root\. "
+                r"(ROOT_(?:PATH|ANCESTOR_(?:TYPE|OWNER|ACL)|"
+                r"DATA_(?:CREATE|TYPE|OWNER|ACL)))\b"
+            ),
+            "check-bootstrap-guard.log": (
+                r"Choose a private Windows tool location\. "
+                r"(TOOL_(?:PATH|TYPE|OWNER|ACL))\b"
+            ),
+        }
+        if log.name in messages:
             with log.open("r", encoding="utf-8", errors="replace") as private_log:
                 diagnostic = private_log.read(65536)
-            category = re.search(
-                r"Choose a private Windows tool location\. (TOOL_(?:PATH|TYPE|OWNER|ACL))\b",
-                diagnostic,
-            )
+            category = re.search(messages[log.name], diagnostic)
             if category is not None:
                 raise RuntimeError(f"{log.stem} rejected {category.group(1)}.")
         raise RuntimeError(f"{log.stem} failed with exit code {result.returncode}.")
@@ -96,6 +104,17 @@ def main():
             ["icacls.exe", str(root), "/inheritance:r",
              "/grant:r", f"*{sid.stdout.strip()}:(OI)(CI)F"],
             cwd=root, env=env, log=logs / "protect-root.log", timeout=20,
+        )
+        data = root / "siteops"
+        data.mkdir()
+        run(
+            ["icacls.exe", str(data), "/setowner", f"*{sid.stdout.strip()}"],
+            cwd=root, env=env, log=logs / "set-data-owner.log", timeout=20,
+        )
+        run(
+            ["icacls.exe", str(data), "/inheritance:r",
+             "/grant:r", f"*{sid.stdout.strip()}:(OI)(CI)F"],
+            cwd=root, env=env, log=logs / "protect-data-root.log", timeout=20,
         )
         tooling = root / "tooling"
         run(
@@ -173,7 +192,7 @@ def main():
             + "'LAUNCHER_ADMITTED'\n",
             encoding="utf-8",
         )
-        env["SITEOPS_PROBE_DATA"] = str(root / "siteops")
+        env["SITEOPS_PROBE_DATA"] = str(data)
         env["SITEOPS_PROBE_APP"] = str(app)
         with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
             summary.write(

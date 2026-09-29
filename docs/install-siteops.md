@@ -281,11 +281,15 @@ WinGet Python fallback and managed executables before running them.
 An otherwise private data root does not make an existing writable
 child directory or executable safe. Its fixed
 `ROOT_PATH`, `ROOT_ANCESTOR_*` and `ROOT_DATA_*` error categories
-distinguish a path, ancestor or data directory rejection; `TOOL_*`
+distinguish a path, ancestor or data directory rejection. `TOOL_*`
 identifies a selected executable or its parent. Neither prints the
 directory or account identity. Inspect the affected directory and
 its ACL locally. Select private user storage beneath trusted
 ancestors rather than relaxing permissions on shared storage.
+The exposed `siteops.exe` may be a pipx file symlink to the selected
+environment's executable. The bootstrap checks that exact target and
+its private path, then runs the checked target directly. It continues
+to reject redirected directories and unrelated launchers.
 
 The `Azure-Samples/explore-iot-operations` Codespace may use Ubuntu 24.04,
 but its base image can change. Check `/etc/os-release` and tool versions in

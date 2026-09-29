@@ -135,6 +135,14 @@ def main():
         )
         if version.returncode or version.stdout.strip() != "1.17.2":
             raise RuntimeError("The launcher test did not select pipx 1.17.2.")
+        for key, selected in (("PIPX_HOME", root / "pipx"), ("PIPX_BIN_DIR", root / "bin")):
+            observed = subprocess.run(
+                [str(pipx), "environment", "--value", key],
+                cwd=root, env=env, stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, timeout=20, check=False,
+            )
+            if observed.returncode or Path(observed.stdout.strip()) != selected:
+                raise RuntimeError(f"pipx did not select the isolated {key} directory.")
         run(
             [str(pipx), "install", "pipx==1.17.2", "--backend", "pip",
              "--fetch-python", "never", "--skip-maintenance", "--app",
@@ -188,12 +196,21 @@ def main():
         )
         wrapper = root / "check-bootstrap-guard.ps1"
         wrapper.write_text(
-            prefix + "Require-PrivateExecutablePath $env:SITEOPS_PROBE_APP $env:PIPX_BIN_DIR\n"
+            prefix + "$selected=Require-PrivateExecutablePath $env:SITEOPS_PROBE_APP "
+            + "$env:PIPX_BIN_DIR $env:SITEOPS_PROBE_EXPECTED_TARGET "
+            + "$env:SITEOPS_PROBE_TARGET_ROOT\n"
+            + "if ($selected -cne $env:SITEOPS_PROBE_EXPECTED_TARGET) "
+            + "{ throw 'The linked launcher did not select the installed application.' }\n"
+            + "$observed=& $selected --version\n"
+            + "if ($LASTEXITCODE -ne 0 -or $observed -cne '1.17.2') "
+            + "{ throw 'The selected installed application did not run.' }\n"
             + "'LAUNCHER_ADMITTED'\n",
             encoding="utf-8",
         )
         env["SITEOPS_PROBE_DATA"] = str(data)
         env["SITEOPS_PROBE_APP"] = str(app)
+        env["SITEOPS_PROBE_EXPECTED_TARGET"] = str(expected)
+        env["SITEOPS_PROBE_TARGET_ROOT"] = str(venv.parent.parent)
         with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
             summary.write(
                 "## Windows pipx launcher check\n\n"

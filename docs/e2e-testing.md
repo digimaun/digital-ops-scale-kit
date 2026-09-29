@@ -51,10 +51,10 @@ The separate opt-in `scenario=windows-pipx-launcher` uses a new
 Microsoft Python feed and asks it to install its own CLI into
 isolated state. The job requires a real pipx file symlink to that
 installed application and checks its launcher against the PowerShell
-bootstrap's current path guard. The regular PR CI job also runs
-native copied/link and unsafe-path controls plus this real launcher
-test. Both jobs fail when their required Windows link or installation
-checks cannot run.
+bootstrap's path guard and the selected installed target. The regular
+PR CI job also runs native copied/link and unsafe-path controls plus
+this real launcher test. Both jobs fail when their required Windows
+link or installation checks cannot run.
 
 Neither Windows job builds a Site Ops release or claims a verified
 engine installation, a WinGet package installation, Azure deployment,

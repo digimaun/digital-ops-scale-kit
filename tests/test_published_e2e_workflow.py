@@ -260,6 +260,12 @@ def test_real_pipx_launcher_separates_root_admission_from_link_guard():
     assert 'env["SITEOPS_PROBE_DATA"] = str(data)' in source
     assert "ROOT_(?:PATH|ANCESTOR_" in source
     assert "TOOL_(?:PATH|TYPE|OWNER|ACL)" in source
+    assert 'env["SITEOPS_PROBE_EXPECTED_TARGET"] = str(expected)' in source
+    assert 'env["SITEOPS_PROBE_TARGET_ROOT"] = str(venv.parent.parent)' in source
+    assert "$selected=Require-PrivateExecutablePath $env:SITEOPS_PROBE_APP " in source
+    assert '"$env:PIPX_BIN_DIR $env:SITEOPS_PROBE_EXPECTED_TARGET "' in source
+    assert '"$env:SITEOPS_PROBE_TARGET_ROOT\\n"' in source
+    assert '"$observed=& $selected --version\\n"' in source
     assert "The bootstrap's selected executable guard admitted" in source
 
 

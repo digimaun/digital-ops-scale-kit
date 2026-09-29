@@ -110,6 +110,11 @@ values can be preserved across planning and reporting without disclosure.
 Author only mappings that ordinary Site parsing and actual deployment
 preparation accept. Do not map two inputs onto the same Site field.
 
+String inputs may declare `format: nonEmpty` or `format: dnsLabel`.
+The DNS label format accepts lowercase letters, digits and interior hyphens,
+with at most 63 characters. `maxLength` supplies a further string limit.
+These constraints apply to defaults, file values and inline overrides.
+
 A named `azureResourceId` input can instead derive values for existing
 semantic inputs. This is an optional read, not a source of Azure
 credentials or arbitrary provider commands. For example, after declaring
@@ -137,6 +142,21 @@ resource null for manual answers, or fill its ID and use
 `--read-resources` to derive the matching target facts. A null optional
 ID does not trigger an Azure read. The example remains incomplete until
 the operator supplies every requirement through one route.
+
+An optional top-level `nameFromResource: cluster` selects an unconditional
+declared resource to generate the Site name after its authorized read.
+The contract must also declare a required unconditional string input mapped
+to `name`, without another default, derivation or conditional readers.
+An explicit name overrides generation. Without the resource, that name
+remains required for the manual route.
+
+The generated name combines a lowercase sanitized resource-name prefix of
+at most 18 characters with a hyphen and 12 hexadecimal SHA-256 characters
+from the full case-normalized resource ID. Identical IDs retain their names
+across case variations, while different resource groups or subscriptions
+contribute to the hash. With this declaration, `inputs --example` prefers
+the resource route and omits the fields it supplies. The AIO example
+therefore contains only `cluster: null`.
 
 An operator provides `cluster` through the same `--input NAME=VALUE`
 or answer file used for strings, and explicitly adds `--read-resources`

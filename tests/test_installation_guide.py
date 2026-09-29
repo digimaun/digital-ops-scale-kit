@@ -33,7 +33,6 @@ def test_root_quickstart_connects_install_to_aio_without_hiding_fleet_use():
         "docs/install-siteops.md#bootstrap-from-https",
         "docs/install-siteops.md#verify-the-bootstrap-script",
         "siteops --approved-source official project pin",
-        "inputs aio-install --example",
         "plan aio-install",
         "deploy aio-install",
         "--read-resources",
@@ -41,19 +40,19 @@ def test_root_quickstart_connects_install_to_aio_without_hiding_fleet_use():
         "docs/getting-started.md",
     ):
         assert phrase in journey
-    assert journey.index("project pin") < journey.index("inputs aio-install --example")
-    assert journey.index("inputs aio-install --example") < journey.index("plan aio-install")
+    assert journey.index("project pin") < journey.index("plan aio-install")
     assert journey.index("plan aio-install") < journey.index("deploy aio-install")
     assert journey.index("deploy aio-install") < journey.index(
         "plan aio-install -l name=plant-two,name=plant-three"
     )
-    assert "generated example includes `cluster: null`" in " ".join(journey.split())
+    assert "only required target answer" in journey
+    assert "inputs aio-install --example" not in journey
     for verb in ("plan", "deploy"):
         command = next(
             line for line in journey.splitlines() if f" {verb} aio-install " in line
         )
         assert "--approved-source official" in command
-        assert "--input-file aio-inputs.yaml" in command
+        assert '--input "cluster=<Arc-cluster-resource-ID>"' in command
         assert "--read-resources" in command
     assert "&&\n    bash \"$script\"" in journey
 

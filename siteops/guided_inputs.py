@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -34,7 +35,7 @@ _ROOT_FIELDS = {"name", "subscription", "resourceGroup", "location"}
 _MAPPING_FIELDS = {"labels", "parameters", "properties"}
 _FIELD_KEYS = {
     "name", "type", "description", "sitePath", "required", "default", "sensitive",
-    "when", "resource", "derive", "requires",
+    "when", "resource", "derive", "requires", "format", "maxLength",
 }
 _MISSING = object()
 _RESOURCE_FACTS = {
@@ -192,10 +193,29 @@ class InputField:
     default: str | bool | object = _MISSING
     when: InputCondition | None = None
     resource: ResourceBinding | None = None
+    format: str | None = None
+    max_length: int | None = None
 
     @property
     def has_default(self) -> bool:
         return self.default is not _MISSING
+
+    def validate(self, value: Any, label: str) -> None:
+        """Check the declared scalar type and closed string constraints."""
+        _typed_value(value, self.type, label, required=self.required)
+        if self.type != "string":
+            return
+        if self.format == "nonEmpty" and not value.strip():
+            raise GuidedInputError(f"{label} must be a nonempty string.")
+        if self.format == "dnsLabel" and (
+            len(value) > 63 or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", value, re.ASCII)
+        ):
+            raise GuidedInputError(
+                f"{label} must be a lowercase DNS label, starting and ending "
+                "with a letter or digit, with at most 63 characters."
+            )
+        if self.max_length is not None and len(value) > self.max_length:
+            raise GuidedInputError(f"{label} exceeds its {self.max_length}-character limit.")
 
 
 def _condition(
@@ -341,11 +361,24 @@ def _parse_fields(value: Any) -> tuple[InputField, ...]:
             raise GuidedInputError(
                 f"{label} sensitive inputs are unsupported until protected Site output is available."
             )
-        if default is not _MISSING:
-            _typed_value(default, kind, f"{label} default", required=required)
+        value_format = row.get("format")
+        max_length = row.get("maxLength")
+        if "format" in row and (
+            kind != "string" or value_format not in ("nonEmpty", "dnsLabel")
+        ):
+            raise GuidedInputError(f"{label} format must be nonEmpty or dnsLabel on a string.")
+        if "maxLength" in row and (
+            kind != "string" or type(max_length) is not int or not 1 <= max_length <= 65536
+        ):
+            raise GuidedInputError(f"{label} maxLength must be a string limit from 1 to 65536.")
         when = _condition(row["when"], f"{label} when", by_name) if "when" in row else None
         resource = _resource_binding(row, label, by_name) if resource_role else None
-        field = InputField(name, kind, description, path, required, sensitive, default, when, resource)
+        field = InputField(
+            name, kind, description, path, required, sensitive, default, when, resource,
+            value_format, max_length,
+        )
+        if default is not _MISSING:
+            field.validate(default, f"{label} default")
         fields.append(field)
         by_name[name] = field
     roles = [field for field in fields if field.resource is not None]
@@ -434,9 +467,36 @@ class InputContract:
 
     fields: tuple[InputField, ...]
     _site_defaults: dict[str, Any]
+    name_from_resource: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "_site_defaults", copy.deepcopy(self._site_defaults))
+        if self.name_from_resource is not None:
+            resource = next(
+                (field for field in self.fields if field.name == self.name_from_resource), None,
+            )
+            name = next((field for field in self.fields if field.site_path == ("name",)), None)
+            controllers = {
+                field.when.input for field in self.fields if field.when is not None
+            } | {
+                check.when.input for field in self.fields if field.resource is not None
+                for check in field.resource.requires if check.when is not None
+            }
+            if (
+                not isinstance(self.name_from_resource, str)
+                or resource is None or resource.resource is None or resource.when is not None
+                or name is None or name.type != "string" or name.when is not None
+                or not name.required or name.has_default or name.name in controllers
+                or any(
+                    target == name.name for field in self.fields if field.resource is not None
+                    for _, target in field.resource.derive
+                )
+            ):
+                raise GuidedInputError(
+                    "nameFromResource needs an unconditional resource input and a "
+                    "required unconditional string name input without another default, "
+                    "derivation or conditional readers."
+                )
 
     @property
     def inputs(self) -> tuple[InputField, ...]:
@@ -467,6 +527,12 @@ class InputContract:
             }
             if field.site_path is not None:
                 row["sitePath"] = ".".join(field.site_path)
+            if self.name_from_resource is not None and field.site_path == ("name",):
+                row["defaultFromResource"] = self.name_from_resource
+            if field.format is not None:
+                row["format"] = field.format
+            if field.max_length is not None:
+                row["maxLength"] = field.max_length
             if field.name in derivations:
                 row["derivableFrom"] = derivations[field.name]
             if field.resource is not None:
@@ -505,6 +571,19 @@ class InputContract:
             field.name for field in self.fields
             if field.required and not field.has_default and field.when is None
         }
+        if self.name_from_resource is not None:
+            resource = next(field for field in self.fields if field.name == self.name_from_resource)
+            supplied_by_resource = {
+                target for _, target in resource.resource.derive
+            } | {
+                field.name for field in self.fields if field.site_path == ("name",)
+            }
+            names = (required - supplied_by_resource) | {resource.name}
+            return {
+                "apiVersion": _VERSION,
+                "kind": "SiteInputValues",
+                "values": {field.name: None for field in self.fields if field.name in names},
+            }
         return {
             "apiVersion": _VERSION,
             "kind": "SiteInputValues",
@@ -541,7 +620,10 @@ class InputContract:
                     raise GuidedInputError(f"Input '{name}' must be a boolean (true or false).")
                 inline_values[name] = value == "true"
             else:
-                _typed_value(value, "string", f"Input '{name}'", required=field.required)
+                if field.resource is None:
+                    field.validate(value, f"Input '{name}'")
+                else:
+                    _typed_value(value, "string", f"Input '{name}'", required=field.required)
                 inline_values[name] = value
 
         file_values: dict[str, Any] = {}
@@ -566,7 +648,7 @@ class InputContract:
                     field.required or (field.resource is not None and field.when is None)
                 ):
                     continue
-                _typed_value(value, field.type, f"Input '{name}'", required=field.required)
+                field.validate(value, f"Input '{name}'")
 
         effective = {
             field.name: field.default for field in self.fields if field.has_default
@@ -667,6 +749,10 @@ class InputContract:
             for _, target in bound_resource.field.resource.derive
         }
         selected_roles = {resource.field.name for resource in resource_refs}
+        if self.name_from_resource in selected_roles:
+            derivable.update(
+                field.name for field in self.fields if field.site_path == ("name",)
+            )
         for field in self.fields:
             if field.resource is None:
                 continue
@@ -752,6 +838,18 @@ class InputContract:
                     sources[target_name] = f"resource '{field.name}'"
             if field.site_path is not None:
                 _assign(data, field.site_path, observation.resource_id)
+            if field.name == self.name_from_resource:
+                name_field = next(
+                    item for item in self.fields if item.site_path == ("name",)
+                )
+                if name_field.name not in values:
+                    prefix = re.sub(r"[^a-z0-9]+", "-", resource.ref.name.casefold()).strip("-")
+                    prefix = prefix[:18].rstrip("-")
+                    suffix = hashlib.sha256(
+                        resource.ref.resource_id.casefold().encode("ascii"),
+                    ).hexdigest()[:12]
+                    values[name_field.name] = f"{prefix}-{suffix}"
+                    sources[name_field.name] = f"resource '{field.name}'"
         for field in self.fields:
             if field.resource is not None:
                 continue
@@ -764,6 +862,7 @@ class InputContract:
                 continue
             if field.site_path is None:
                 raise GuidedInputError("A mapped input needs a Site field.")
+            field.validate(values[field.name], f"Input '{field.name}'")
             _assign(data, field.site_path, values[field.name])
         return Site.from_data(data, source="guided inputs", default_name="guided-site")
 
@@ -806,7 +905,7 @@ def load_contract(
         binding.require_workspace_file(path)
     _shape(
         document,
-        allowed={"apiVersion", "kind", "siteDefaults", "inputs"},
+        allowed={"apiVersion", "kind", "siteDefaults", "inputs", "nameFromResource"},
         required={"apiVersion", "kind", "inputs"},
         label="Input contract",
     )
@@ -817,7 +916,9 @@ def load_contract(
     defaults = _site_defaults(document.get("siteDefaults", {}))
     fields = _parse_fields(document["inputs"])
     _validate_default_writers(defaults, fields)
-    return InputContract(fields, defaults)
+    if "nameFromResource" in document and document["nameFromResource"] is None:
+        raise GuidedInputError("nameFromResource must name a declared resource input.")
+    return InputContract(fields, defaults, document.get("nameFromResource"))
 
 
 def load_direct_site(path: Path) -> Site:

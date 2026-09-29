@@ -825,6 +825,11 @@ def cmd_inputs(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
                 example_values = contract.example()["values"]
                 for resource in description["inputs"]:
                     derived = set(resource.get("derive", {}).values())
+                    generated = {
+                        field["name"] for field in description["inputs"]
+                        if field.get("defaultFromResource") == resource["name"]
+                    }
+                    derived.update(generated)
                     if not derived.intersection(required) or resource["name"] not in example_values:
                         continue
                     supplied = [name for name in required if name not in derived] + [resource["name"]]
@@ -838,6 +843,8 @@ def cmd_inputs(args: argparse.Namespace, orchestrator: Orchestrator) -> int:
                     status = field["status"]
                     if field.get("derivableFrom"):
                         status += " or derived from " + ", ".join(field["derivableFrom"])
+                    if field.get("defaultFromResource"):
+                        status += " without " + field["defaultFromResource"] + ", otherwise generated"
                     for line in _wrap(
                         f"{_content_text(field['name'])} "
                         f"({_content_text(field['type'])}, {_content_text(status)})"
@@ -1680,10 +1687,10 @@ Global options such as --project and --approved-source precede the command.
 
 Examples:
   siteops -w workspaces/iot-operations browse aio-install
+  siteops -w workspaces/iot-operations plan aio-install --input "cluster=<Arc-cluster-resource-ID>" --read-resources
+  siteops -w workspaces/iot-operations deploy aio-install --input "cluster=<Arc-cluster-resource-ID>" --read-resources
+  # Optionally inspect inputs and generate an answer file.
   siteops -w workspaces/iot-operations inputs aio-install --example ./aio-inputs.yaml
-  # Fill siteName, environment, country and cluster in aio-inputs.yaml.
-  siteops -w workspaces/iot-operations plan aio-install --input-file ./aio-inputs.yaml --read-resources
-  siteops -w workspaces/iot-operations deploy aio-install --input-file ./aio-inputs.yaml --read-resources
   # After source enrollment, pin an identified release and select only new fleet Sites.
   siteops --approved-source NAME project pin ./factory --release RELEASE
   siteops --approved-source NAME --project ./factory plan aio-install -l name=plant-two,name=plant-three

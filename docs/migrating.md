@@ -33,6 +33,7 @@ Start with the changes that affect your workflow:
 
 | If you... | What to change |
 |---|---|
+| Use typed AIO installation answers | Review [optional naming and labels](#typed-aio-targets) before omitting an existing name. |
 | Reference shipped workspace paths | Update [entry and resource-set paths](#workspace-content-paths). |
 | Select a manifest by a bare filename | Review [name and path selection](#manifest-names-and-paths). |
 | Browse a published source | Use [reference refresh and offline controls](#remote-source-observations) when choosing source freshness. |
@@ -45,6 +46,27 @@ Start with the changes that affect your workflow:
 | Capture output in scripts or CI | Use [structured results and explicit projections](#results-and-ci-output). |
 | Manage temporary files | Review the [new location and cleanup behavior](#temporary-files). |
 | Call the engine from Python | Update the [internal result consumers](#internal-python-callers). |
+
+### Typed AIO targets
+
+The resource route accepts a cluster ID without a Site name, environment
+or country. An omitted Site name now generates an identity from the full
+cluster ID. Keep your previous explicit `siteName` when targeting resources
+created under that name. Existing configured or saved Sites keep their names.
+
+Typed AIO names must be lowercase DNS labels of at most 59 characters.
+Invalid values report `must be a lowercase DNS label` or
+`exceeds its 59-character limit`. The manual route still requires an
+explicit Site name and target fields.
+
+Omit optional labels rather than leaving them null or empty. Supplied labels
+still feed the corresponding resource tags. Without an environment label,
+a saved Site does not match `environment=dev`. Select its explicit name or
+assign intentional labels before including it in a fleet.
+
+Use an engine release supporting `nameFromResource`, string constraints and
+optional label mapping values with this workspace. Workspace producers must
+declare and qualify that compatible engine selection.
 
 ### Workspace content paths
 

@@ -1,8 +1,10 @@
 """Exercise guided target selection through the public command path."""
 
 import json
+import shlex
 import subprocess
 import sys
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +15,7 @@ import yaml
 
 from siteops.arm_resources import ArmResourceError, ArmResourceObservation
 from siteops.cli import main
+from siteops.command_context import CommandContext
 from siteops.compilation import TemplateCompilationSession
 from siteops.guided_inputs import contract_path, load_contract
 from siteops.models import Site
@@ -26,6 +29,7 @@ from siteops.planning import (
     PlanStatus,
     resolve_plan_value,
 )
+from siteops.results import RunResult
 
 
 @pytest.fixture
@@ -130,17 +134,19 @@ def test_top_level_help_leads_with_single_site_answers(capsys):
             main()
     assert stopped.value.code == 0
     help_text = capsys.readouterr().out
-    assert help_text.index("inputs aio-install --example") < help_text.index(
-        "plan aio-install --input-file"
+    assert help_text.index("plan aio-install --input") < help_text.index(
+        "inputs aio-install --example"
     )
-    assert help_text.index("plan aio-install --input-file") < help_text.index(
+    assert help_text.index("plan aio-install --input") < help_text.index(
         "plan aio-install -l name=plant-two,name=plant-three"
     )
     for verb in ("plan", "deploy"):
         example = next(
-            line for line in help_text.splitlines() if f" {verb} aio-install --input-file" in line
+            line for line in help_text.splitlines() if f" {verb} aio-install --input " in line
         )
         assert "--read-resources" in example
+        assert '--input "cluster=<Arc-cluster-resource-ID>"' in example
+        assert "--input-file" not in example
     assert "deploy aio-install -l name=plant-two,name=plant-three" in help_text
 
 
@@ -237,10 +243,7 @@ def test_aio_example_exposes_resource_first_route_without_a_read(tmp_path, capsy
     assert "Resource route:" in plain and "--read-resources" in plain
     assert plain.index("Resource route:") < plain.index("  siteName")
     values = yaml.safe_load(example.read_text(encoding="utf-8"))["values"]
-    assert set(values) == {
-        "siteName", "subscription", "resourceGroup", "location",
-        "clusterName", "environment", "country", "cluster",
-    }
+    assert values == {"cluster": None}
     assert all(value is None for value in values.values())
     with patch("siteops.cli.new_arm_reader", side_effect=AssertionError("No Azure read")):
         assert _invoke([
@@ -1042,8 +1045,9 @@ def test_aio_input_inspection_distinguishes_required_and_defaulted(capsys):
     document = json.loads(capsys.readouterr().out)
     fields = {field["name"]: field for field in document["inputs"]}
     assert fields["clusterName"]["status"] == "required"
-    assert fields["environment"]["status"] == "required"
-    assert fields["country"]["status"] == "required"
+    assert fields["environment"]["status"] == "optional"
+    assert fields["country"]["status"] == "optional"
+    assert fields["siteName"]["defaultFromResource"] == "cluster"
     assert fields["cluster"]["type"] == "azureResourceId"
     assert fields["subscription"]["derivableFrom"] == ["cluster"]
     assert fields["enableSecretSync"]["default"] is False
@@ -1483,11 +1487,7 @@ def test_aio_executable_preparation_resolves_country_and_environment_tags(
             manifest, sites=[replace(site, labels={})], intent=PlanIntent.EXECUTABLE,
         )
     assert result.status is PlanStatus.PLANNED, result.diagnostics
-    assert unlabelled.status is PlanStatus.INVALID
-    assert any(
-        diagnostic.code == "operation-preparation.invalid"
-        for diagnostic in unlabelled.diagnostics
-    )
+    assert unlabelled.status is PlanStatus.PLANNED, unlabelled.diagnostics
     assert result.plan is not None
     operations = {
         operation.identity.step: operation
@@ -1504,6 +1504,148 @@ def test_aio_executable_preparation_resolves_country_and_environment_tags(
         )
         assert resolve_plan_value(tags, {})["environment"] == "dev"
         assert resolve_plan_value(tags, {})["country"] == "US"
+        unlabelled_operation = next(
+            operation for operation in unlabelled.plan.targets[0].operations
+            if operation.identity.step == step
+        )
+        unlabelled_tags = next(
+            entry.value for entry in unlabelled_operation.details.parameters.entries
+            if isinstance(entry.key, LiteralValue) and entry.key.value == "tags"
+        )
+        assert resolve_plan_value(unlabelled_tags, {}) == {
+            "site": "plant-one", "managedBy": "siteops",
+        }
+
+
+@pytest.mark.parametrize("file_based", [False, True])
+def test_aio_cluster_only_answers_prepare_without_optional_labels(tmp_path, capsys, file_based):
+    root = Path(__file__).resolve().parents[1]
+    workspace = root / "workspaces" / "iot-operations"
+    calls = []
+
+    def read(ref, *, facts):
+        calls.append(ref.resource_id)
+        return ArmResourceObservation(ref.resource_id, ref.resource_type, "eastus", ref.name, {})
+
+    reader = SimpleNamespace(
+        identity=SimpleNamespace(name="fixture", version="1"), read=read,
+    )
+    if file_based:
+        path = tmp_path / "answers.yaml"
+        path.write_text(yaml.safe_dump({
+            "apiVersion": "siteops.inputs/v1", "kind": "SiteInputValues",
+            "values": {"cluster": _CLUSTER_ID},
+        }), encoding="utf-8")
+        answers = ["--input-file", str(path)]
+    else:
+        answers = ["--input", f"cluster={_CLUSTER_ID}"]
+    session = _aio_template_session(tmp_path)
+    with (
+        patch("siteops.cli.new_arm_reader", return_value=reader),
+        patch("siteops.orchestrator.TemplateCompilationSession", return_value=session),
+    ):
+        assert _invoke([
+            "-w", str(workspace), "plan", "aio-install",
+            *answers, "--read-resources", "--output", "json",
+        ]) == 0
+    document = json.loads(capsys.readouterr().out)
+    assert len(document["plan"]["targets"]) == 1
+    assert document["plan"]["targets"][0]["name"].startswith("arc-first-")
+    assert calls == [_CLUSTER_ID]
+
+
+def test_aio_generated_sites_save_reload_and_obey_fleet_selection(tmp_path, capsys):
+    root = Path(__file__).resolve().parents[1]
+    workspace = root / "workspaces" / "iot-operations"
+    project = tmp_path / "factory"
+    (project / "sites").mkdir(parents=True)
+    resources = [_CLUSTER_ID, _CLUSTER_ID.replace("rg-first", "rg-second")]
+    contract = load_contract(workspace / "manifests" / "aio-install" / "manifest.yaml")
+    names = []
+
+    def read(ref, *, facts):
+        return ArmResourceObservation(ref.resource_id, ref.resource_type, "eastus", ref.name, {})
+
+    reader = SimpleNamespace(identity=SimpleNamespace(name="fixture", version="1"), read=read)
+    with patch("siteops.cli.new_arm_reader", return_value=reader):
+        for resource in resources:
+            bound = contract.bind(inline=[f"cluster={resource}"])
+            site = contract.build_site(bound, {"cluster": read(bound.resources[0].ref, facts=frozenset())})
+            path = project / "sites" / f"{site.name}.yaml"
+            assert _invoke([
+                "--project", str(project), "-w", str(workspace), "inputs", "aio-install",
+                "--input", f"cluster={resource}", "--read-resources", "--save-site", str(path),
+            ]) == 0
+            assert Site.from_file(path).name == site.name
+            assert Site.from_file(path).labels == {}
+            names.append(site.name)
+            capsys.readouterr()
+        assert names[0] != names[1]
+        assert _invoke([
+            "--project", str(project), "-w", str(workspace), "inputs", "aio-install",
+            "--input", f"cluster={resources[0].upper()}", "--read-resources",
+            "--save-site", str(project / "sites" / f"{names[0]}.yaml"),
+        ]) == 1
+        capsys.readouterr()
+    with patch("siteops.cli.new_arm_reader", side_effect=AssertionError("Saved Sites do not read resources")):
+        assert _invoke([
+            "--project", str(project), "-w", str(workspace),
+            "plan", "aio-install", "-l", f"name={names[0]}", "--describe", "--output", "json",
+        ]) == 0
+    document = json.loads(capsys.readouterr().out)
+    assert [target["name"] for target in document["plan"]["targets"]] == [names[0]]
+    orchestrator = Orchestrator(workspace, site_config_root=project)
+    assert orchestrator.resolve_sites(orchestrator.load_manifest(
+        workspace / "manifests" / "aio-install" / "manifest.yaml",
+    )) == []
+
+
+@pytest.mark.parametrize("field", ["environment", "country"])
+def test_aio_optional_labels_reject_empty_supplied_values_before_resource_read(capsys, field):
+    workspace = Path(__file__).resolve().parents[1] / "workspaces" / "iot-operations"
+    with patch("siteops.cli.new_arm_reader", side_effect=AssertionError("Invalid input cannot read Azure")):
+        assert _invoke([
+            "-w", str(workspace), "inputs", "aio-install",
+            "--input", f"cluster={_CLUSTER_ID}", "--input", f"{field}=", "--read-resources",
+        ]) == 1
+    assert f"Input '{field}' must be a nonempty string." in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("document", ["README.md", "docs/guided-inputs.md"])
+def test_documented_cluster_only_commands_resolve_through_cli(tmp_path, capsys, document):
+    root = Path(__file__).resolve().parents[1]
+    workspace = root / "workspaces" / "iot-operations"
+    lines = (root / document).read_text(encoding="utf-8").splitlines()
+    reader = SimpleNamespace(
+        identity=SimpleNamespace(name="fixture", version="1"),
+        read=lambda ref, *, facts: ArmResourceObservation(
+            ref.resource_id, ref.resource_type, "eastus", ref.name, {},
+        ),
+    )
+    session = _aio_template_session(tmp_path)
+    for verb in ("plan", "deploy"):
+        line = next(
+            line for line in lines
+            if line.startswith("siteops ") and f" {verb} aio-install " in line
+            and "cluster=<Arc-cluster-resource-ID>" in line
+        )
+        args = shlex.split(line.replace("<Arc-cluster-resource-ID>", _CLUSTER_ID))[1:]
+        with (
+            patch("siteops.cli.open_command_context", side_effect=lambda **kwargs: nullcontext(
+                CommandContext(workspace, workspace),
+            )),
+            patch("siteops.cli.new_arm_reader", return_value=reader),
+            patch("siteops.orchestrator.TemplateCompilationSession", return_value=session),
+            patch.object(Orchestrator, "deploy", return_value=RunResult.from_sites((), elapsed=0)) as deploy,
+        ):
+            assert _invoke(args) == 0
+        if verb == "deploy":
+            assert len(deploy.call_args.kwargs["sites"]) == 1
+            assert deploy.call_args.kwargs["sites"][0].labels == {}
+            assert deploy.call_args.kwargs["sites"][0].parameters["clusterName"] == "arc-first"
+        else:
+            deploy.assert_not_called()
+        capsys.readouterr()
 
 
 def test_aio_executable_preparation_binds_existing_vault_from_second_resource(

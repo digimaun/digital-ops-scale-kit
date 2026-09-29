@@ -215,6 +215,9 @@ SITE_PROPERTIES_PATTERN = re.compile(r"\{\{\s*site\.properties\.([a-zA-Z0-9_.\[\
 # Supports nested paths like: site.parameters.brokerConfig.memoryProfile
 SITE_PARAMETERS_PATTERN = re.compile(r"\{\{\s*site\.parameters\.([a-zA-Z0-9_.\[\]]+)\s*\}\}")
 UNRESOLVED_SITE_TEMPLATE_PATTERN = re.compile(r"\{\{\s*site\.")
+OPTIONAL_LABEL_VALUE_PATTERN = re.compile(
+    r"\{\{\s*site\.labels\.([A-Za-z_][A-Za-z0-9_-]*)\?\s*\}\}"
+)
 FOR_EACH_SITE_PROPERTY_PATTERN = re.compile(
     r"^\{\{\s*site\.properties\.([a-zA-Z0-9_.\[\]-]+)\s*\}\}$"
 )
@@ -1992,6 +1995,8 @@ class Orchestrator:
             Value with all site templates resolved
         """
         if isinstance(value, str):
+            if OPTIONAL_LABEL_VALUE_PATTERN.search(value):
+                raise ValueError("Optional label references require a complete parameter mapping value.")
             # Simple replacements
             result = value
             result = result.replace("{{ site.name }}", site.name)
@@ -2014,8 +2019,19 @@ class Orchestrator:
             return result
 
         elif isinstance(value, dict):
+            selected: dict[Any, Any] = {}
+            for key, item in value.items():
+                if isinstance(key, str) and OPTIONAL_LABEL_VALUE_PATTERN.search(key):
+                    raise ValueError("Optional label references cannot be parameter mapping names.")
+                optional = OPTIONAL_LABEL_VALUE_PATTERN.fullmatch(item.strip()) if isinstance(item, str) else None
+                if optional is not None:
+                    label = optional.group(1)
+                    if label not in site.labels:
+                        continue
+                    item = str(site.labels[label])
+                selected[key] = item
             return _resolve_parameter_mapping(
-                value, lambda v: self._resolve_template_strings(v, site, step_outputs)
+                selected, lambda v: self._resolve_template_strings(v, site, step_outputs)
             )
         elif isinstance(value, list):
             return [self._resolve_template_strings(v, site, step_outputs) for v in value]

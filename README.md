@@ -95,28 +95,23 @@ a Codespace or another host without an Azure session, use `az login` and
 confirm the selected subscription privately. The cluster and
 resource group must already exist, and deployment can incur charges.
 
-Then select the approved workspace release, inspect its typed input
-contract, and prepare one target. Fill `siteName`, `environment`, `country`
-in the generated file, then replace `cluster: null` with the full Arc
-cluster resource ID. The generated example includes `cluster: null` as
-the optional resource route. The four manual target fields can stay
-`null` because the explicit resource read derives them. Review the Site and selected
-operations in the plan before deploying:
+Then select the approved workspace release and replace the cluster ID below.
+It is the only required target answer. Site Ops reads the existing cluster
+with your permission and generates a stable Site name. Environment and country
+labels are optional. Review the target and operations before deploying:
 
 ```text
 siteops --approved-source official project pin factory --release <approved-Scale-Kit-release>
-siteops --approved-source official --project factory inputs aio-install --example aio-inputs.yaml
-# Edit the generated answer file before proceeding.
-siteops --approved-source official --project factory plan aio-install --input-file aio-inputs.yaml --read-resources
-siteops --approved-source official --project factory deploy aio-install --input-file aio-inputs.yaml --read-resources
+siteops --approved-source official --project factory plan aio-install --input "cluster=<Arc-cluster-resource-ID>" --read-resources
+siteops --approved-source official --project factory deploy aio-install --input "cluster=<Arc-cluster-resource-ID>" --read-resources
 ```
 
 If the content release includes more than one workspace, add
 `--release-workspace` with the exact path in its descriptor to `project pin`.
 See [operator projects](docs/projects.md#run-project-pin).
 The first path leaves Secret Sync disabled. [Guided inputs](docs/guided-inputs.md)
-explains manual answers without an Azure read, Secret Sync prerequisites and
-the same invocation with enablement selected. Planning does not submit
+explains optional names and labels, answer files, manual targets without an
+Azure read, and Secret Sync enablement. Planning does not submit
 deployments. Deployment success does not establish AIO workload health.
 
 **Scale out on the same model.** Save the first Site for repeat use, then

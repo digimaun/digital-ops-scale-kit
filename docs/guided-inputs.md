@@ -26,7 +26,36 @@ explicit Site without first configuring it. Do not combine `--input-file`, `--in
 or `--site-file` targeting with a configured-Site `-l` selector. Saved Sites
 can later be selected with the same explicit fleet selectors as before.
 
-## Inspect and fill the inputs
+## Supply the cluster ID
+
+The existing Arc cluster resource ID is the only required target answer
+for the guided AIO installation. Replace the placeholder, review the plan,
+then deploy with the same inputs:
+
+```text
+siteops --approved-source official --project ./factory plan aio-install --input "cluster=<Arc-cluster-resource-ID>" --read-resources
+siteops --approved-source official --project ./factory deploy aio-install --input "cluster=<Arc-cluster-resource-ID>" --read-resources
+```
+
+The read uses your configured Azure CLI identity. The cluster and resource
+group must already exist. It supplies subscription, resource group, region
+and cluster name. An explicit manual value must agree with those facts.
+Deployment prepares again and can create or update resources and incur
+charges. Source approval, the resource read and deployment are separate
+decisions. A successful deployment is not a workload health check.
+
+Site Ops generates a stable name from a lowercase cluster prefix and a hash
+of its full resource ID. Review that name in the plan. Add
+`--input siteName=plant-one` to both commands to choose a different name.
+Typed Site names use lowercase letters, digits and interior hyphens, with a
+maximum of 59 characters. Existing saved Sites retain their names.
+
+Environment and country labels are optional. Add `--input environment=dev`
+or `--input country=US` when you want those labels and resource tags.
+Omitted values create neither labels nor tags. The default AIO release is
+2608, cert-manager is enabled, and Secret Sync is disabled.
+
+## Use an answer file instead
 
 Pin the approved content release for your project as described in
 [operator projects](projects.md#use-an-approved-source). The following
@@ -36,74 +65,39 @@ commands use that project and enrollment:
 siteops --approved-source official --project ./factory inputs aio-install --example ./aio-inputs.yaml
 ```
 
-This one command lists required, derivable, defaulted and conditional inputs
-and writes an incomplete example. Omit `--example` to inspect without
-writing anything. The example includes a null optional `cluster` ID so
-you can choose the resource route without adding a new YAML key:
+This optional command explains the inputs and writes an incomplete example.
+Omit `--example` to inspect without writing. The generated file needs one
+value:
 
 ```yaml
 apiVersion: siteops.inputs/v1
 kind: SiteInputValues
 values:
-  siteName: null       # Choose a Site name, such as plant-one.
-  subscription: null   # Use the subscription containing the Arc cluster.
-  resourceGroup: null  # Use the existing cluster's resource group.
-  location: null       # Use the cluster's Azure region.
-  clusterName: null    # Use the existing Arc cluster name.
-  environment: null    # Choose the environment label, such as dev or prod.
-  country: null        # Choose the country label for resource tags.
-  cluster: null        # Or supply the full existing Arc cluster resource ID.
+  cluster: null
 ```
 
-For the manual route, fill the seven required fields and leave `cluster`
-as `null`. For the resource route, fill `siteName`, `environment`, `country`
-and `cluster`. Leave `subscription`, `resourceGroup`, `location` and
-`clusterName` as `null` so an authorized read derives them.
-You can supply the same named answer with `--input`.
-Neither route is deployable until its required answers are complete.
-The default AIO path selects release 2608,
-enables cert-manager, and leaves Secret Sync disabled.
-Your existing cluster, resource group, appropriate Azure permissions, and
-Azure CLI are prerequisites. Input resolution checks types and the Site
-structure. It does not check that those Azure resources exist or that your
-identity can deploy. Do not use a plan as evidence of cluster readiness.
+Replace `cluster: null` with the full cluster ID. Optional overrides may
+also be included under `values`. Inline `--input` answers override the
+file. The generated example is incomplete and cannot deploy unchanged.
 
 Review the plan and target before deploying:
-
-```text
-siteops --approved-source official --project ./factory plan aio-install --input-file ./aio-inputs.yaml
-siteops --approved-source official --project ./factory deploy aio-install --input-file ./aio-inputs.yaml
-```
-
-The ordinary plan performs local preflight and does not read Azure
-resources or submit deployments.
-The deploy command prepares again before making changes and may update
-resources or incur charges. Authenticate explicitly with the identity
-authorized for the target. A successful deployment result is not evidence of
-AIO component health or a working application.
-
-For an optional preview before planning, run
-`siteops inputs aio-install --input-file ./aio-inputs.yaml` with the same
-project and trust options.
-It resolves and structurally validates one Site without writing it,
-compiling templates or reading Azure resources. Plain and local JSON output
-include a private display of the Site and its defaults. In CI and other
-redacted destinations, the command reports resolution status without
-publishing Site values.
-
-## Use an existing resource ID
-
-Give `cluster` the full ARM ID of your existing Arc-connected Kubernetes
-cluster in the generated answer file. Keep the four derived fields `null`.
-Explicitly allow the read with `--read-resources` on both `plan` and
-`deploy`:
 
 ```text
 siteops --approved-source official --project ./factory plan aio-install --input-file ./aio-inputs.yaml --read-resources
 siteops --approved-source official --project ./factory deploy aio-install --input-file ./aio-inputs.yaml --read-resources
 ```
 
-For this route, also fill `siteName`, `environment` and `country`.
+For an optional preview before planning, run
+`siteops inputs aio-install --input-file ./aio-inputs.yaml --read-resources`
+with the same project and trust options.
+It reads the selected cluster and structurally validates one Site without
+writing it, compiling templates or submitting deployments. Plain and local JSON output
+include a private display of the Site and its defaults. In CI and other
+redacted destinations, the command reports resolution status without
+publishing Site values.
+
+## Use an existing resource ID
+
 The ID must identify an existing
 `Microsoft.Kubernetes/connectedClusters` resource. Site Ops checks its
 type and identity, reads its region, and derives the four target values
@@ -117,7 +111,8 @@ previous plan's observation as current.
 prevent an Azure read explicitly requested with `--read-resources`.
 
 To enable Secret Sync during that same AIO deployment, set
-`enableSecretSync: true` in the answer file. This guided route requires
+`enableSecretSync: true` in the answer file, or add
+`--input enableSecretSync=true` to both inline commands. This guided route requires
 `cluster` and `--read-resources`. Before any deployment writes, Azure
 must report an OIDC issuer and enabled workload identity on the existing
 cluster. You may supply an optional `existingVault` resource ID when
@@ -134,6 +129,15 @@ strict `true` or `false` booleans are parsed
 according to the selected contract. Do not put secrets in process arguments
 or shell history. The initial typed route rejects contracts with protected
 inputs. Duplicate and unknown answer names fail.
+
+### Manual targets without resource reads
+
+Omit `cluster` and provide `siteName`, `subscription`, `resourceGroup`,
+`location` and `clusterName` instead. Use the same inline or file route
+without `--read-resources`. Name, environment and country overrides follow
+the same validation rules, and the labels remain optional. The manual route
+does not establish Azure resource existence or enable guided Secret Sync,
+which requires observed cluster prerequisites.
 
 ## Deploy a selected AIO release to each cluster
 
@@ -179,6 +183,10 @@ A Site saved outside that inventory remains available by explicit path.
 An inline target remains in memory unless you explicitly choose `--save-site`.
 Saving a Site built from resource observations does not store the
 observations or re-check their prerequisites on later `--site-file` use.
+If you retain the generated name, use the name shown by the input preview
+as the Site filename and selector. Without an environment label, the saved
+Site does not match the manifest's default `environment=dev` selector.
+Use an explicit name selection or supply intentional fleet labels.
 Keep Site and answer files outside the content cache and verified package.
 To reuse a complete standalone Site without saving it into a project, pass
 `--site-file ./plant-one.yaml` to `plan`, `validate`, or `deploy`. A standalone

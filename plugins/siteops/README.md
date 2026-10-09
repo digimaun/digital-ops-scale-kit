@@ -19,20 +19,22 @@ can load the same skill.
 
 ## Install
 
-From GitHub:
+Add the Scale Kit marketplace, then install the plugin from it:
 
 ```text
-copilot plugin install Azure/digital-ops-scale-kit:plugins/siteops
+copilot plugin marketplace add Azure/digital-ops-scale-kit
+copilot plugin install siteops@scale-kit
 ```
 
-From a local checkout:
+To try a branch, add the marketplace with that ref, for example
+`copilot plugin marketplace add OWNER/REPO#BRANCH`. From a local checkout,
+run `copilot plugin marketplace add .` at the repository root.
 
-```text
-copilot plugin install ./plugins/siteops
-```
-
-Start a new session and check that `/skills list` shows `deploy-aio`. After
-editing a local copy, install it again to refresh the cached plugin.
+Start a new session and check that `/skills list` shows `deploy-aio`. A
+local marketplace loads the plugin live, so edits apply in the next
+session. For a marketplace on GitHub, run
+`copilot plugin marketplace update scale-kit` and
+`copilot plugin update siteops` to pick up changes.
 
 ## Use
 

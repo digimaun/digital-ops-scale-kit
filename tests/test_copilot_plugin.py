@@ -12,6 +12,7 @@ import yaml
 from siteops import cli
 
 PLUGIN = Path(__file__).resolve().parents[1] / "plugins" / "siteops"
+MARKETPLACE = Path(__file__).resolve().parents[1] / ".github" / "plugin" / "marketplace.json"
 AGENT_PLUGINS_SCHEMA = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"
 MANIFEST_FIELDS = {
     "$schema", "name", "version", "description", "author", "homepage",
@@ -62,6 +63,14 @@ def test_manifest_uses_the_portable_plugin_format():
     assert manifest["$schema"] == AGENT_PLUGINS_SCHEMA
     assert set(manifest) <= MANIFEST_FIELDS
     assert re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", manifest["name"])
+
+
+def test_marketplace_lists_the_plugin_as_published():
+    manifest = json.loads((PLUGIN / "plugin.json").read_text(encoding="utf-8"))
+    marketplace = json.loads(MARKETPLACE.read_text(encoding="utf-8"))
+    (entry,) = [plugin for plugin in marketplace["plugins"] if plugin["name"] == manifest["name"]]
+    assert (MARKETPLACE.parents[2] / entry["source"]).resolve() == PLUGIN
+    assert (entry["version"], entry["description"]) == (manifest["version"], manifest["description"])
 
 
 def test_each_skill_names_its_directory_and_says_when_to_use_it():

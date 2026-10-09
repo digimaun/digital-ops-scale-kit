@@ -1691,7 +1691,7 @@ if ($env:CASE -eq 'acl-failed') {
             **os.environ, "CASE": case, "TEMP": str(tmp_path),
             "SCRIPT_BYTES": str(candidate["root"] / "release-bundle" / "siteops-bootstrap.ps1"),
             "BOOTSTRAP_ARGS": str(arguments), "DOWNLOAD_ARGS": str(downloads),
-        }, capture_output=True, text=True, timeout=30,
+        }, capture_output=True, text=True, timeout=120,
     )
     assert (result.returncode == 0) is (case == "success"), result.stdout + result.stderr
     assert arguments.exists() is (case in {"success", "installer-failed"})

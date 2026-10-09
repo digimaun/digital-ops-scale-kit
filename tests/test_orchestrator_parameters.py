@@ -2938,6 +2938,7 @@ class TestMultipleSubscriptionLevelSites:
         assert "global-0" in message
         assert "global-1" in message
 
+    @pytest.mark.usefixtures("deterministic_local_tools")
     def test_one_candidate_is_accepted(self, complete_workspace):
         """The guard rejects ambiguity, not subscription-scoped steps."""
         orchestrator = Orchestrator(complete_workspace)

@@ -542,6 +542,7 @@ steps:
         assert manifest.parallel.sites == 2
         assert manifest.parallel.max_workers == 2
 
+    @pytest.mark.usefixtures("deterministic_local_tools")
     def test_deploy_parallel_override_takes_precedence(self, complete_workspace):
         """Test that parallel_override parameter takes precedence over manifest."""
         orchestrator = Orchestrator(complete_workspace)
@@ -592,6 +593,7 @@ steps:
 
         assert run_targets.call_args.args[0].max_parallel_sites == 3
 
+    @pytest.mark.usefixtures("deterministic_local_tools")
     def test_deploy_single_site_always_sequential(self, complete_workspace):
         """Test that single site deployment is always sequential regardless of config."""
         orchestrator = Orchestrator(complete_workspace)

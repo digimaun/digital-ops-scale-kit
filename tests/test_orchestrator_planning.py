@@ -165,52 +165,9 @@ class _RecordingToolRunner:
         )
 
 
-class _VersionOnlyToolRunner:
-    """Provide deterministic local version probes without execution."""
-
-    def __call__(
-        self,
-        argv: tuple[str, ...],
-        timeout: int,
-    ) -> subprocess.CompletedProcess[str]:
-        if argv[1:] == ("version", "--output", "json"):
-            return subprocess.CompletedProcess(
-                argv,
-                0,
-                stdout=json.dumps({"azure-cli": "2.87.0"}),
-                stderr="",
-            )
-        if argv[1:] == ("bicep", "version"):
-            return subprocess.CompletedProcess(
-                argv,
-                0,
-                stdout="Bicep CLI version test",
-                stderr="",
-            )
-        raise AssertionError(
-            f"Unexpected local tool invocation: {argv}"
-        )
-
-
 @pytest.fixture(autouse=True)
-def _deterministic_local_tool_session(monkeypatch, tmp_path):
+def _deterministic_local_tool_session(deterministic_local_tools, monkeypatch):
     """Give ordinary plans fresh host-independent local tool sessions."""
-
-    def resolve_tool(name):
-        if name not in {"az", "kubectl"}:
-            raise AssertionError(f"Unexpected local tool resolution: {name}")
-        return str((tmp_path / "tools" / name).resolve())
-
-    def create_session():
-        return TemplateCompilationSession(
-            command_runner=_VersionOnlyToolRunner(),
-            tool_resolver=resolve_tool,
-        )
-
-    monkeypatch.setattr(
-        "siteops.orchestrator.TemplateCompilationSession",
-        create_session,
-    )
     monkeypatch.setattr(
         subprocess,
         "Popen",

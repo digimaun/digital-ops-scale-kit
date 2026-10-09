@@ -22,7 +22,6 @@ ARM = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/plant/
 PLACEHOLDERS = {
     "<source>": "official",
     "<release>": "v1.0.0b7",
-    "<name>": "partner",
     "<owner>": "contoso",
     "<repository>": "content",
     "<cluster-resource-ID>": f"{ARM}/Microsoft.Kubernetes/connectedClusters/plant-one",
@@ -46,7 +45,7 @@ def _siteops_commands():
     for path in _skills():
         _, body = _front_matter(path)
         for block in re.findall(r"```text\n(.*?)```", body, re.DOTALL):
-            commands += [line for line in block.splitlines() if line.startswith("siteops ")]
+            commands += [line.strip() for line in block.splitlines() if line.strip().startswith("siteops ")]
     return commands
 
 

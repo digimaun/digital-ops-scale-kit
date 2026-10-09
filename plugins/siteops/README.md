@@ -12,10 +12,12 @@ can load the same skill.
 ## Requirements
 
 - Site Ops installed. See [Install Site Ops](../../docs/install-siteops.md).
-- An approved content source, such as `siteops source enroll official`, and
-  a release that declares typed inputs for the manifest.
+- An approved content source, such as `siteops source enroll official`, with
+  a release that declares typed inputs for the manifest. The skill proposes
+  the newest such release of your source, preferring the official publisher
+  when it has one, and you can choose another.
 - Azure CLI signed in with an identity that can read the cluster and deploy
-  to its resource group.
+  to its resource group, and Git to list release tags.
 
 ## Install
 

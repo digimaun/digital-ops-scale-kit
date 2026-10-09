@@ -45,25 +45,52 @@ or newer, without a login, to verify published content.
 siteops source list
 ```
 
-Use the name of an approved source the user already has. If there is none,
-explain that enrolling approves a publisher's releases for 30 days. With the
-user's agreement, enroll the official publisher:
+Use an approved source the user already has. If there is none, explain that
+enrolling approves a publisher's releases for 30 days. With the user's
+agreement, enroll the official publisher:
 
 ```text
 siteops source enroll official
 ```
 
-For another publisher the user names, add its repository:
+For another publisher the user names, such as a fork, add its repository:
 
 ```text
-siteops source enroll <name> --source github:<owner>/<repository>
+siteops source enroll <source> --source github:<owner>/<repository>
 ```
 
-Ask the user which release to deploy. Site Ops does not choose one. If the
-user does not know, `siteops source show <name>` names the source's
-repository, and its published releases list the choices. The release must
-declare typed inputs for the manifest. Check with step 4's `inputs`
-command before planning.
+Unless the user names a release, propose the newest one that supports this
+route. Site Ops deploys only an explicit release, so resolve it first:
+
+1. Show the source's repository:
+
+   ```text
+   siteops source show <source>
+   ```
+
+2. List its release tags. This needs Git but no sign in:
+
+   ```text
+   git ls-remote --tags --refs https://github.com/<owner>/<repository>
+   ```
+
+3. Sort the tags that start with `v` by version, newest first, and check
+   the newest with the manifest you will deploy:
+
+   ```text
+   siteops inputs aio-install --source "<source>@<release>"
+   ```
+
+   If Site Ops reports that the release has no such manifest or no typed
+   inputs, check the next older tag. Stop after three and ask the user.
+
+If the user has enrolled the official publisher
+(`github:Azure/digital-ops-scale-kit`) and another source, prefer the
+official one when its newest release passes step 3. Otherwise use the
+other source. Tell the user which source and release you chose and why,
+and let them choose another. If Site Ops reports that the installed engine
+is not compatible with the release, point the user to that release's
+installation instructions.
 
 ## 3. Identify the target
 

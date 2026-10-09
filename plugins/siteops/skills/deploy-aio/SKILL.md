@@ -1,6 +1,6 @@
 ---
 name: deploy-aio
-description: Deploy Azure IoT Operations (AIO) to an existing cluster connected to Azure Arc, or enable Secret Sync on an existing AIO instance, using Site Ops. Use when the user asks to install, deploy or set up AIO or Secret Sync.
+description: Deploy Azure IoT Operations (AIO) to one or several existing clusters connected to Azure Arc, or enable Secret Sync on an existing AIO instance, using Site Ops. Use when the user asks to install, deploy or set up AIO or Secret Sync, on one cluster or a fleet.
 ---
 
 # Deploy Azure IoT Operations with Site Ops
@@ -92,9 +92,9 @@ and let them choose another. If Site Ops reports that the installed engine
 is not compatible with the release, point the user to that release's
 installation instructions.
 
-## 3. Identify the target
+## 3. Identify the targets
 
-AIO installation needs the full resource ID of an existing cluster
+AIO installation needs the full resource ID of each existing cluster
 connected to Azure Arc:
 
 ```text
@@ -108,15 +108,18 @@ ID instead:
 az resource list --resource-type Microsoft.IoTOperations/instances --query "[].id" --output tsv
 ```
 
-Confirm the exact ID with the user. Never choose between several yourself.
+Confirm each exact ID with the user. Never choose between several yourself.
+For several clusters, check that each is in its own resource group, because
+AIO supports one instance per resource group.
 
 ## 4. Choose the route and inputs
 
 | The user wants | Manifest | Required inputs |
 |---|---|---|
-| Install AIO | `aio-install` | `cluster` |
+| Install AIO on one cluster | `aio-install` | `cluster` |
 | Install AIO and enable Secret Sync | `aio-install` | `cluster`, `enableSecretSync=true` |
 | Enable Secret Sync on an existing AIO 2607 or 2608 instance | `secretsync` | `instance` |
+| Install AIO on several clusters | `aio-install` | `cluster` and `siteName` for each, saved as Sites (step 5) |
 
 The defaults are AIO release 2608, cert-manager enabled, Secret Sync
 disabled and a Site name generated from the cluster. List every optional
@@ -133,6 +136,8 @@ checks both before any write.
 
 ## 5. Prepare and show the plan
 
+For one cluster:
+
 ```text
 siteops plan aio-install --source "<source>@<release>" --input "cluster=<cluster-resource-ID>"
 ```
@@ -143,10 +148,40 @@ For Secret Sync on an existing instance:
 siteops plan secretsync --source "<source>@<release>" --input "instance=<instance-resource-ID>"
 ```
 
-Add the same `--input` options you chose in step 4. Planning reads the named
-resources with the user's Azure CLI identity but changes nothing. Show the
-user the Site, subscription, resource group, AIO release and operations from
-the output, then ask whether to deploy this plan.
+Add the same `--input` options you chose in step 4.
+
+For several clusters, save one Site per cluster in a project, then plan
+them together:
+
+1. Agree with the user on a project directory, such as `./factory`, and a
+   Site name per cluster, such as the cluster name. Site names use
+   lowercase letters, digits and hyphens. Ask before creating files, then
+   create the project's `sites` directory if it does not exist.
+2. Save each Site. The cluster read fills in its subscription, resource
+   group and region. Give every Site the same optional inputs:
+
+   ```text
+   siteops --project <project> inputs aio-install --source "<source>@<release>" --input "cluster=<cluster-resource-ID>" --input siteName=<site-name> --read-resources --save-site <project>/sites/<site-name>.yaml
+   ```
+
+   Site Ops never overwrites a file or reuses the name of a configured
+   Site. If it refuses, ask the user rather than choosing another name.
+3. Plan only the new Sites, selected by name:
+
+   ```text
+   siteops --project <project> plan aio-install --source "<source>@<release>" -l name=<site-name>,name=<other-site-name>
+   ```
+
+   The manifest deploys three Sites at once by default. For more, add
+   `--parallel` with the Site count to both plan and deploy. Do not select
+   by a shared label such as `environment=dev`. It can include clusters
+   that already run AIO, and deploying `aio-install` again can overwrite
+   their settings.
+
+Planning reads the named resources with the user's Azure CLI identity but
+changes nothing. Show the user each Site with its subscription, resource
+group and AIO release, the Site count and the operations, then ask whether
+to deploy this plan.
 
 If planning fails, show the error, explain it with the
 [troubleshooting guide](https://github.com/Azure/digital-ops-scale-kit/blob/main/docs/troubleshooting.md)
@@ -165,6 +200,10 @@ siteops deploy aio-install --source "<source>@<release>" --input "cluster=<clust
 siteops deploy secretsync --source "<source>@<release>" --input "instance=<instance-resource-ID>" --yes
 ```
 
+```text
+siteops --project <project> deploy aio-install --source "<source>@<release>" -l name=<site-name>,name=<other-site-name> --yes
+```
+
 `--yes` carries the user's approval, because an agent shell cannot answer
 the interactive confirmation. Deployment can take more than 20 minutes. Let
 it finish and keep the user informed. If it is interrupted, work that Azure
@@ -173,9 +212,10 @@ deployment without new approval.
 
 ## 7. Report the outcome
 
-Summarize the result line and any failed operation. A successful result
-means the deployment operations completed, not that AIO is healthy. Offer
-the AIO health check, which needs a kubeconfig context for that cluster:
+Summarize the result line and any failed operation, for each Site in a
+fleet. A successful result means the deployment operations completed, not
+that AIO is healthy. Offer the AIO health check, which needs a kubeconfig
+context for each cluster:
 
 ```text
 az iot ops check --context "<kubeconfig-context>"

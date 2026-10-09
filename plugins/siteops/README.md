@@ -1,10 +1,11 @@
 # Site Ops plugin for GitHub Copilot
 
 Preview. This plugin teaches GitHub Copilot to deploy Azure IoT Operations
-with Site Ops. It adds the `deploy-aio` skill, which installs AIO on an
-existing cluster connected to Azure Arc, or enables Secret Sync on an
-existing AIO instance. Copilot prepares the plan, shows it to you and
-deploys only after you approve that plan.
+with Site Ops. It adds the `deploy-aio` skill, which installs AIO on one
+existing cluster connected to Azure Arc or on several as a fleet, or enables
+Secret Sync on an existing AIO instance. For a fleet, it saves one Site per
+cluster in a project and deploys them in one run. Copilot prepares the plan,
+shows it to you and deploys only after you approve that plan.
 
 The plugin uses the Agent Plugins 1.0 format, so other compatible clients
 can load the same skill.
@@ -44,6 +45,7 @@ Ask Copilot, for example:
 
 - "Deploy AIO to my Arc cluster."
 - "Install AIO with Secret Sync on plant-one."
+- "Install AIO on plant-two and plant-three as a fleet."
 - "Enable Secret Sync on my existing AIO instance."
 
 Copilot asks for the source, release and target, shows the plan, and waits

@@ -26,6 +26,9 @@ PLACEHOLDERS = {
     "<repository>": "content",
     "<cluster-resource-ID>": f"{ARM}/Microsoft.Kubernetes/connectedClusters/plant-one",
     "<instance-resource-ID>": f"{ARM}/Microsoft.IoTOperations/instances/plant-one",
+    "<project>": "./factory",
+    "<site-name>": "plant-two",
+    "<other-site-name>": "plant-three",
 }
 
 
@@ -97,12 +100,18 @@ def test_skill_commands_parse_with_the_current_cli(monkeypatch, command):
         assert stopped.value.code == 0
 
 
+def _without(command, verb):
+    """Drop the command verb, keeping global options and arguments in order."""
+    position = command.index(verb)
+    return command[:position] + command[position + 1:]
+
+
 def test_each_deploy_repeats_a_shown_plan_and_only_deploy_confirms():
     commands = [_argv(command) for command in _siteops_commands()]
-    plans = [command[2:] for command in commands if command[1] == "plan"]
-    deploys = [command for command in commands if command[1] == "deploy"]
+    plans = [_without(command, "plan") for command in commands if "plan" in command]
+    deploys = [command for command in commands if "deploy" in command]
     assert deploys
     for command in commands:
-        assert ("--yes" in command) is (command[1] == "deploy")
+        assert ("--yes" in command) is ("deploy" in command)
     for deploy in deploys:
-        assert [argument for argument in deploy[2:] if argument != "--yes"] in plans
+        assert [argument for argument in _without(deploy, "deploy") if argument != "--yes"] in plans

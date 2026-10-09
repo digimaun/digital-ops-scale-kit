@@ -40,23 +40,27 @@ bootstrap and compatible workspace assets. Check the selected release's
 asset inventory before using these commands. Azure login and
 deployment are separate.
 
-| Route | First script trust | Requirements |
+| Route | Choose it when | Requirements |
 |---|---|---|
-| [Release wheel](#install-the-release-wheel) | Approved release channel and dependency feed. Native uv does not verify the detached proof. | uv from an approved channel and a configured package feed. |
-| [HTTPS bootstrap](#bootstrap-from-https) | Official HTTPS delivery. The script has not been independently authenticated before it starts. | Supported shell, `curl` and GitHub CLI 2.95 or newer. No administrator rights. |
-| [Verify the bootstrap script](#verify-the-bootstrap-script) | Detached proof, exact publisher, source commit, signing workflow, caller and runner checked before execution. | GitHub CLI 2.95 or newer in version 2 from an approved channel. No GitHub login. |
+| [You have uv](#install-the-release-wheel) | uv and a package feed that serves the runtime dependencies are already configured. | uv from an approved channel and a configured package feed. |
+| [One command](#bootstrap-from-https) | uv is not installed, or you want the verified installation archive. | Supported shell, `curl` and GitHub CLI 2.95 or newer. No administrator rights. |
+| [Checks the script's GitHub attestation before it runs](#verify-the-bootstrap-script) | Your policy requires publisher provenance before any installer code runs. | The same as one command, with GitHub CLI 2.95 or newer in version 2 from an approved channel. No GitHub login. |
 
 Managed environments can [provision approved tools first](#before-you-start),
 then use the same verified bootstrap. This keeps one bundle verification
 and installation path.
 
-The HTTPS path is suitable when your policy accepts the official release
-endpoint as authority for the initial script. Later verification of the
+The uv route trusts the approved release channel and dependency feed.
+Native uv does not verify the detached proof. The one command route trusts
+official HTTPS delivery for the initial script, which is not independently
+authenticated before it starts. It is suitable when your policy accepts the
+official release endpoint as that authority. Later verification of the
 archive does not retroactively authenticate that script. For publisher
-provenance before any installer code runs, select the verified path. A
-checksum obtained alongside a script from the same location does not add
-independent publisher authentication. The script enrolls a source only
-when you ask it to.
+provenance before any installer code runs, select the verified path. It
+checks the detached proof, exact publisher, source commit, signing workflow,
+caller and runner before execution. A checksum obtained alongside a script
+from the same location does not add independent publisher authentication.
+The script enrolls a source only when you ask it to.
 
 ### Bootstrap from HTTPS
 
@@ -69,64 +73,11 @@ The command removes its temporary script when it finishes.
 Run it from a trusted user shell with the normal protected temporary
 directory. The generated command installs the engine only. It asks before
 tool changes and leaves Azure authentication and source enrollment separate.
-
-<details>
-<summary>Assemble an approved selection manually</summary>
-
-For an approved selection assembled manually, the following templates also
-explicitly enroll the official content source. Replace
-the tag and commit with the pair from that release. These templates rely on
-HTTPS delivery without the additional digest check in the generated commands.
-
-Linux:
-
-```bash
-(
-  set -euo pipefail
-  tag="<approved-release-tag>"; sha="<full-source-commit>"
-  download="$(mktemp -d)"; chmod 700 "$download"
-  script="$download/siteops-bootstrap.sh"
-  url="https://github.com/Azure/digital-ops-scale-kit/releases/download/${tag//\//%2F}/siteops-bootstrap.sh"
-  curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-    --tlsv1.2 --max-redirs 3 --max-time 120 --output "$script" "$url" &&
-    bash "$script" --release "$tag" --source-commit "$sha" --enroll-source official
-)
-```
-
-The bootstrap downloads release assets with `curl`. If `curl` is missing,
-install it through your distribution's approved channel first.
-
-Windows PowerShell:
-
-```powershell
-& {
-  $ErrorActionPreference = "Stop"
-  $tag = "<approved-release-tag>"; $sha = "<full-source-commit>"
-  $download = Join-Path $env:TEMP ("siteops-bootstrap-" + [guid]::NewGuid())
-  New-Item -ItemType Directory -Path $download | Out-Null
-  $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-  icacls $download /inheritance:r /grant:r "*${sid}:(OI)(CI)F" | Out-Null
-  if ($LASTEXITCODE -ne 0) { throw "The download directory could not be protected." }
-  $script = Join-Path $download "siteops-bootstrap.ps1"
-  $url = "https://github.com/Azure/digital-ops-scale-kit/releases/download/$([uri]::EscapeDataString($tag))/siteops-bootstrap.ps1"
-  & curl.exe --fail --silent --show-error --location --proto '=https' --proto-redir '=https' `
-    --tlsv1.2 --max-redirs 3 --max-time 120 --output $script $url
-  if ($LASTEXITCODE -ne 0) { throw "The bootstrap script could not be downloaded." }
-  powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script `
-    -Release $tag -SourceCommit $sha -EnrollSource official
-  if ($LASTEXITCODE -ne 0) { throw "Site Ops installation did not complete." }
-}
-```
-
-The PowerShell execution policy setting is scoped to this process. An
-organization policy may still prohibit unsigned scripts. Use your approved
-managed installation path in that case. Keep the downloaded file to inspect
-it, or remove only the private directory you created when finished. The
-scripts do not run `gh auth login` or `az login`. They download public assets
-anonymously, verify the engine archive and offer source enrollment only
-because the command above selects `official`.
-
-</details>
+The scripts do not run `gh auth login` or `az login`, and they download
+public release assets anonymously. The PowerShell command sets its
+execution policy only for the child process. An organization policy may
+still prohibit unsigned scripts. Use your approved managed installation
+path in that case.
 
 Repeating the same selected installation checks the retained bundle before
 skipping native tool changes. The script retains the authenticated ZIP and proof
@@ -180,6 +131,11 @@ does not acquire workspace content, sign in or authorize Azure deployment.
 
 ### Verify the bootstrap script
 
+Your release's notes contain this command with every value filled in.
+Expand `Verify the script before it runs` in their `Install Site Ops`
+section and copy it from there. The placeholders below explain the checks
+and let you build the command without the notes.
+
 Install GitHub CLI 2.95 or newer in version 2 through an approved channel
 before any route. Some distribution packages, such as Ubuntu 24.04's, are
 older than the qualified verifier. Download the versioned script and its proof without
@@ -213,7 +169,7 @@ Linux:
     --predicate-type https://slsa.dev/provenance/v1 --hostname github.com \
     --digest-alg sha256 --format json --jq "$query")"
   [[ "$verified" == true ]] || { echo "Script verification failed." >&2; exit 1; }
-  bash "$script" --release "$tag" --source-commit "$sha" --enroll-source official
+  bash "$script" --release "$tag" --source-commit "$sha"
 )
 ```
 
@@ -286,13 +242,17 @@ Windows PowerShell:
     }
   }
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script `
-    -Release $tag -SourceCommit $sha -EnrollSource official
+    -Release $tag -SourceCommit $sha
   if ($LASTEXITCODE -ne 0) { throw "Site Ops installation did not complete." }
 }
 ```
 
 Do not change these publisher, workflow or runner values to accommodate a
-failed check. The release ZIP has its own detached proof and is verified
+failed check. Confirm that the repository is the publisher you intend. The
+checks prove that its workflows built the script, not that it is the right
+publisher. The command installs the engine only. Enroll a content source
+separately, as described in [Use the installed CLI](#use-the-installed-cli).
+The release ZIP has its own detached proof and is verified
 again by the authenticated script. In a managed environment,
 [provision approved tools first](#before-you-start). Preinstalled tools that
 already meet the supported versions are retained.

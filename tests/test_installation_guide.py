@@ -20,11 +20,16 @@ GUIDE = Path(__file__).resolve().parent.parent / "docs" / "install-siteops.md"
 def test_root_quickstart_connects_install_to_aio_without_hiding_fleet_use():
     readme = (GUIDE.parent.parent / "README.md").read_text(encoding="utf-8")
     journey = readme.split("## Quick start\n", 1)[1].split("\n## Browse deployment choices", 1)[0]
+    prose = " ".join(journey.split())
     for phrase in (
-        "docs/install-siteops.md",
-        "docs/install-siteops.md#install-the-release-wheel",
-        "docs/install-siteops.md#bootstrap-from-https",
-        "selected release's generated installation instructions",
+        "https://github.com/Azure/digital-ops-scale-kit/releases)",
+        "`Install Site Ops` section",
+        "`Already have uv`",
+        "`Verify the script before it runs`",
+        "selects that exact release",
+        "docs/install-siteops.md#choose-an-installation-route",
+        "https://github.com/cli/cli#installation",
+        "Ubuntu 24.04's, are older than 2.95",
         "independently",
         "private terminal",
         "--yes",
@@ -34,7 +39,8 @@ def test_root_quickstart_connects_install_to_aio_without_hiding_fleet_use():
         "docs/targeting.md",
         "docs/getting-started.md",
     ):
-        assert phrase in journey
+        assert phrase in prose
+    assert "releases/latest" not in journey
     first = next(
         line for line in journey.splitlines()
         if line.startswith("siteops deploy aio-install --source")
@@ -44,8 +50,13 @@ def test_root_quickstart_connects_install_to_aio_without_hiding_fleet_use():
         "--input", "cluster=<Arc-cluster-resource-ID>",
     ]
     assert journey.index(first) < journey.index("siteops --approved-source official project pin")
-    assert journey.index("#install-the-release-wheel") < journey.index(first)
-    assert journey.index("#bootstrap-from-https") < journey.index(first)
+    assert (
+        journey.index("### Install Site Ops")
+        < journey.index("### Enroll the official content source")
+        < journey.index("### Deploy AIO")
+        < journey.index(first)
+    )
+    assert journey.index("#choose-an-installation-route") < journey.index(first)
     assert "plan aio-install -l name=plant-two,name=plant-three" in journey
     assert "siteops inputs aio-install --example" not in journey
     assert "--read-resources" not in journey
@@ -161,31 +172,20 @@ def test_release_guide_distinguishes_bootstrap_assets_from_older_engine_referenc
     assert "a separate detached proof for each" in combined
 
 
-@pytest.mark.parametrize("download_succeeds", [False, True])
-def test_installer_guide_waits_for_full_https_download_before_execution(tmp_path, download_succeeds):
-    block = _block(_section("### Bootstrap from HTTPS"), "bash")
-    block = block.replace("<approved-Site-Ops-release>", "siteops/v1.0.0b1").replace(
-        "<full-source-commit>", "c" * 40,
-    ).replace("<approved-release-tag>", "siteops/v1.0.0b1")
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    write_executable(bin_dir / "curl", """#!/usr/bin/env bash
-[[ "$*" == *"--proto =https"* && "$*" == *"--tlsv1.2"* ]] || exit 99
-[[ "$*" == *"releases/download/siteops%2Fv1.0.0b1/siteops-bootstrap.sh"* ]] || exit 99
-while (($#)); do
-  if [[ "$1" == "--output" ]]; then target="$2"; shift 2; else shift; fi
-done
-[[ "$TEST_DOWNLOAD_SUCCEEDS" == 1 ]] || exit 7
-printf 'printf SCRIPT_RAN\\\\n\\n' > "$target"
-""")
-    result = run_script(
-        block, tmp_path, {
-            "TMPDIR": bash_path(tmp_path),
-            "TEST_DOWNLOAD_SUCCEEDS": "1" if download_succeeds else "0",
-        },
-    )
-    assert (result.returncode == 0) is download_succeeds, result.stdout + result.stderr
-    assert ("SCRIPT_RAN" in result.stdout) is download_succeeds
+def test_https_bootstrap_guide_defers_to_the_generated_release_command():
+    section = _section("### Bootstrap from HTTPS")
+    prose = " ".join(section.split())
+    assert "```" not in section and "<approved-release-tag>" not in section
+    assert "Assemble an approved selection manually" not in GUIDE.read_text(encoding="utf-8")
+    for phrase in (
+        "`Install Site Ops` section",
+        "checks the exact size and SHA-256",
+        "do not run `gh auth login` or `az login`",
+        "download public release assets anonymously",
+        "execution policy only for the child process",
+        "approved managed installation path",
+    ):
+        assert phrase in prose
 
 
 def test_preview_migration_describes_rejections_not_aliases():
@@ -212,11 +212,8 @@ def _block(section: str, language: str) -> str:
     return re.search(rf"```{language}\n(.*?)\n```", section, re.DOTALL).group(1)
 
 
-@pytest.mark.parametrize("heading", [
-    "### Bootstrap from HTTPS", "### Verify the bootstrap script",
-])
-def test_pasted_bootstrap_blocks_stop_before_execution_after_a_failure(heading):
-    section = _section(heading)
+def test_pasted_bootstrap_blocks_stop_before_execution_after_a_failure():
+    section = _section("### Verify the bootstrap script")
     windows = _block(section, "powershell")
     assert windows.lstrip().startswith('& {\n')
     assert '$ErrorActionPreference = "Stop"' in windows
@@ -229,11 +226,8 @@ def test_pasted_bootstrap_blocks_stop_before_execution_after_a_failure(heading):
     assert bash.rstrip().endswith(')')
 
 
-@pytest.mark.parametrize("heading", [
-    "### Bootstrap from HTTPS", "### Verify the bootstrap script",
-])
-def test_bootstrap_bash_examples_parse_without_executing_external_tools(tmp_path, heading):
-    section = _section(heading)
+def test_bootstrap_bash_examples_parse_without_executing_external_tools(tmp_path):
+    section = _section("### Verify the bootstrap script")
     body = _block(section, "bash")
     script = tmp_path / "example.sh"
     script.write_text(body, encoding="utf-8", newline="\n")
@@ -250,14 +244,11 @@ def test_bootstrap_bash_examples_parse_without_executing_external_tools(tmp_path
     assert "--tlsv1.2" in body
 
 
-@pytest.mark.parametrize("heading", [
-    "### Bootstrap from HTTPS", "### Verify the bootstrap script",
-])
-def test_bootstrap_windows_examples_parse(tmp_path, heading):
+def test_bootstrap_windows_examples_parse(tmp_path):
     powershell = shutil.which("pwsh") or shutil.which("powershell")
     if powershell is None:
         pytest.skip("PowerShell is unavailable.")
-    body = _block(_section(heading), "powershell")
+    body = _block(_section("### Verify the bootstrap script"), "powershell")
     example = tmp_path / "example.ps1"
     example.write_text(body, encoding="utf-8")
     parser = (
@@ -307,17 +298,11 @@ printf '%s\\n' "$TEST_VERIFIED"
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="PowerShell 5.1 is available on Windows.")
-@pytest.mark.parametrize(("heading", "verified", "install_exit"), [
-    ("### Bootstrap from HTTPS", True, 0),
-    ("### Bootstrap from HTTPS", True, 7),
-    ("### Verify the bootstrap script", False, 0),
-    ("### Verify the bootstrap script", True, 0),
-    ("### Verify the bootstrap script", True, 7),
-])
+@pytest.mark.parametrize(("verified", "install_exit"), [(False, 0), (True, 0), (True, 7)])
 def test_windows_bootstrap_guide_stops_on_proof_or_installation_failure(
-    tmp_path, heading, verified, install_exit,
+    tmp_path, verified, install_exit,
 ):
-    section = _section(heading)
+    section = _section("### Verify the bootstrap script")
     body = _block(section, "powershell").replace(
         "<approved-release-tag>", "siteops/v1.0.0b1",
     ).replace("<full-source-commit>", "c" * 40)

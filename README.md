@@ -50,19 +50,22 @@ clone, saved Site or project pin.
 
 ### Install Site Ops
 
-Use the selected release's generated installation instructions. They install
-the Site Ops engine only.
+Select a release deliberately rather than taking the newest. Open its notes
+from the [releases page](https://github.com/Azure/digital-ops-scale-kit/releases)
+and copy a command from their `Install Site Ops` section. Use the
+`Already have uv` command when uv is available, or the bootstrap command for
+your platform. Each command selects that exact release and installs the
+Site Ops engine only. To check the bootstrap script's GitHub
+attestation before it runs, expand `Verify the script before it runs` below
+the bootstrap commands.
+[Choose an installation route](docs/install-siteops.md#choose-an-installation-route)
+compares the routes.
 
-| Your environment | Installation route |
-|---|---|
-| uv is already available | Use the exact [release wheel command](docs/install-siteops.md#install-the-release-wheel). Dependencies come from your approved uv package feed. |
-| You need installation tooling | Use the generated [Windows or Linux bootstrap](docs/install-siteops.md#bootstrap-from-https). It proposes tool changes and verifies the installation archive. |
-
-For independent script provenance before any installer code runs, use the
-[verified bootstrap route](docs/install-siteops.md#verify-the-bootstrap-script).
-Site Ops uses GitHub CLI 2.95 or newer, without a login, to verify published
-content. The bootstrap also needs it, along with `curl`, and reports when
-Azure CLI is missing.
+The bootstrap needs `curl` and GitHub CLI 2.95 or newer, which Site Ops also
+uses without a login to verify published content. Install GitHub CLI from
+its [installation page](https://github.com/cli/cli#installation), because
+some distribution packages, such as Ubuntu 24.04's, are older than 2.95.
+The bootstrap reports when Azure CLI is missing.
 Installing the CLI alone does not acquire workspace content or enroll a
 source.
 

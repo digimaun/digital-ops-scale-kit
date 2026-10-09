@@ -1,0 +1,12 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "siteops",
+  "version": "0.1.0",
+  "description": "Deploy Azure IoT Operations to clusters connected to Azure Arc with Site Ops, reviewing each plan before it runs.",
+  "author": {
+    "name": "Microsoft"
+  },
+  "repository": "https://github.com/Azure/digital-ops-scale-kit",
+  "license": "MIT",
+  "keywords": ["azure-iot-operations", "azure-arc", "siteops", "deployment"]
+}

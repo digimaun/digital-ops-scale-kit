@@ -1,5 +1,6 @@
 """Exercise the declaration-driven publisher through its actual workflow steps."""
 
+import ast
 import copy
 import hashlib
 import importlib.util
@@ -65,16 +66,25 @@ def renderer():
     return module
 
 
+def qualification_matrix(state="passed", **cells):
+    """Return the summary rows the distribution workflow emits, with optional (python, column) overrides."""
+    rows = []
+    for version in ("3.10", "3.11", "3.12", "3.13", "3.14"):
+        limited = "n/a" if version != "3.11" else state
+        row = {"python": version, "linux": state, "ubuntu-26.04": limited, "windows": state,
+               "windows-standard-user": limited}
+        row.update(cells.get(version, {}))
+        rows.append(row)
+    return rows
+
+
 def summary_values(**overrides):
     return {
         "DRY_RUN": "false", "ENGINE_VERSION": "1.0.0b1+build.42",
         "CI_URL": f"https://github.com/{REPO}/actions/runs/42",
         "BUNDLE_SHA": "a" * 64, "WHEEL_NAME": WHEEL, "WHEEL_SHA": "b" * 64,
         "ASSET_LIST_SHA": "d" * 64, "ARCHIVE_NAME": ARCHIVE, "TAG_EXISTS": "false",
-        "MATRIX": json.dumps([
-            {"python": version, "linux": "passed", "windows": "passed"}
-            for version in ("3.10", "3.11", "3.12", "3.13", "3.14")
-        ]),
+        "MATRIX": json.dumps(qualification_matrix()),
         "ARTIFACT_URL": f"https://github.com/{REPO}/actions/runs/42/artifacts/99",
         **overrides,
     }
@@ -268,6 +278,8 @@ from pathlib import Path
 args = sys.argv[1:]
 with open(os.environ["FAKE_CALLS"], "a") as output:
     output.write(json.dumps(args) + "\\n")
+    if "--input" in args:
+        output.write(json.dumps(["<input>", sys.stdin.read()]) + "\\n")
 if args[:2] == ["attestation", "verify"]:
     expected = os.environ.get("EXPECTED_SIGNER_IDENTITY")
     if Path(args[2]).name == "siteops-engine.json":
@@ -290,6 +302,11 @@ responses = json.loads(Path(os.environ["FAKE_RESPONSES"]).read_text())
 if endpoint not in responses:
     raise SystemExit("Unexpected fake GitHub request: " + str(endpoint))
 response = responses[endpoint]
+method = args[args.index("--method") + 1] if "--method" in args else "GET"
+if response.get("method", method) != method:
+    raise SystemExit("Unexpected fake GitHub method: " + method)
+if any(flag not in args for flag in response.get("flags", [])):
+    raise SystemExit("A fake GitHub request lacks a required flag.")
 status = response["status"]
 if "--include" in args:
     print("HTTP/2.0 " + str(status) + (" Not Found" if status == 404 else " Result"))
@@ -460,8 +477,11 @@ def test_publication_uses_only_the_completed_candidate_and_required_approval():
     condition = " ".join(JOBS["review"]["if"].split())
     assert "needs.distribution.result == 'success'" in condition
     assert "needs.distribution.result == 'skipped'" in condition
-    assert JOBS["publish"]["needs"] == ["release-runner", "candidate"]
-    assert JOBS["publish"]["if"] == "needs.candidate.result == 'success' && needs.candidate.outputs.active == 'true'"
+    assert JOBS["publish"]["needs"] == ["release-runner", "candidate", "accept"]
+    assert JOBS["publish"]["if"] == (
+        "needs.candidate.result == 'success' && needs.candidate.outputs.active == 'true' && "
+        "needs.accept.result == 'success'"
+    )
     assert JOBS["candidate"]["uses"] == "./.github/workflows/_release-candidate.yaml"
     assert JOBS["candidate"]["with"]["dry-run"] is False
     assert JOBS["publish"]["environment"] == "siteops-release"
@@ -1352,7 +1372,11 @@ def test_dry_run_summary_stops_at_preview_without_approval_instructions(candidat
     assert summary.startswith("# Release preview (no publication)")
     assert "No tag, GitHub Release, or approval request was created." in summary
     assert "Approve and deploy" not in summary
-    assert summary.count("| Python | Linux | Windows |") == 1
+    assert summary.count(
+        "| Python | Ubuntu 24.04 | Ubuntu 26.04 | Windows | Windows standard user |"
+    ) == 1
+    assert "| 3.10 | passed | n/a | passed | n/a |" in summary
+    assert "| 3.11 | passed | passed | passed | passed |" in summary
     assert "Download the attested release assets" in summary
     assert WHEEL in summary
 
@@ -2161,7 +2185,11 @@ def test_summary_nests_markdown_headings_without_changing_published_notes(
     assert authored.encode() == before
 
 
-@pytest.mark.parametrize("matrix", ["[]", "{}", '[null]', '[{"python":"3.10"}]'])
+@pytest.mark.parametrize("matrix", [
+    "[]", "{}", '[null]', '[{"python":"3.10"}]',
+    json.dumps([{"python": version, "linux": "passed", "windows": "passed"}
+                for version in ("3.10", "3.11", "3.12", "3.13", "3.14")]),
+])
 def test_invalid_rendering_inputs_leave_existing_summary_unchanged(candidate, runner, matrix):
     _render_install_notes(candidate, runner)
     summary = candidate["root"].parent / "summary.md"
@@ -2173,6 +2201,25 @@ def test_invalid_rendering_inputs_leave_existing_summary_unchanged(candidate, ru
     assert result.returncode != 0
     assert "Incomplete installation qualification summary" in result.stdout + result.stderr
     assert summary.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize(("cells", "valid"), [
+    ({"3.11": {"windows-standard-user": "failed", "ubuntu-26.04": "not-run"}}, True),
+    ({"3.12": {"ubuntu-26.04": "passed"}}, False),
+    ({"3.10": {"windows-standard-user": "unknown"}}, False),
+    ({"3.11": {"windows-standard-user": "n/a"}}, False),
+    ({"3.11": {"ubuntu-26.04": "n/a"}}, False),
+    ({"3.13": {"linux": "n/a"}}, False),
+])
+def test_summary_renders_extra_installer_cells_only_for_their_python(candidate, renderer, cells, valid):
+    values = summary_values(MATRIX=json.dumps(qualification_matrix(**cells)))
+    if not valid:
+        with pytest.raises(renderer.RenderingError, match="Invalid qualification summary"):
+            renderer.render_summary(candidate["plan"], "## Changes\n", values)
+        return
+    summary = renderer.render_summary(candidate["plan"], "## Changes\n", values)
+    assert "| 3.11 | passed | not-run | passed | failed |" in summary
+    assert "| 3.14 | passed | n/a | passed | n/a |" in summary
 
 
 @pytest.mark.parametrize("bundle", [False, True])
@@ -2344,3 +2391,473 @@ def test_workspace_publisher_rechecks_routing_and_verified_metadata(candidate, r
     if fault in {"source", "kit"}:
         assert "verified workspace differs from the reviewed source contract" in result.stdout + result.stderr
     assert not any("--method" in call or call[:2] == ["release", "create"] for call in calls)
+
+
+# --- Candidate acceptance gate ------------------------------------------------
+
+ADMISSION = "a" * 64
+ACCEPTANCE_RUN = 7000
+RUNS = (
+    f"repos/{REPO}/actions/workflows/e2e-test.yaml/runs?event=workflow_dispatch&branch=main"
+    f"&head_sha={SHA}&per_page=100"
+)
+MAIN_REF = f"repos/{REPO}/git/ref/heads/main"
+DISPATCH = f"repos/{REPO}/actions/workflows/e2e-test.yaml/dispatches"
+LISTING = {"status": 200, "method": "GET", "flags": ["--paginate", "--slurp"]}
+
+
+def _contract_constant(name):
+    """Read a literal from the acceptance producer without importing its runtime dependencies."""
+    tree = ast.parse((ROOT / "scripts" / "release_acceptance.py").read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(getattr(target, "id", None) == name for target in node.targets):
+            return ast.literal_eval(node.value)
+    raise AssertionError(f"The acceptance producer defines no {name}.")
+
+
+def _fleet_candidate(candidate, **producer):
+    return {
+        "apiVersion": "siteops.release.acceptance/v1", "kind": "FleetCandidate",
+        "source": {"repository": REPO, "commit": SHA, "ref": "refs/heads/main"},
+        "producer": {"run": 42, "attempt": 1, "caller": ".github/workflows/release.yaml", "preview": False,
+                     **producer},
+        "artifacts": {
+            "admission": {"id": 501, "sha256": ADMISSION},
+            "plan": {"id": 502, "sha256": digest(json.dumps(candidate["plan"]).encode())},
+            "inventory": {"id": 503, "sha256": digest(
+                (candidate["root"] / "release-assets" / "release-assets.json").read_bytes())},
+            "engine": {"id": 504, "sha256": "e" * 64}, "workspaces": {"id": 505, "sha256": "f" * 64},
+        },
+    }
+
+
+def _acceptance_run(run_id=ACCEPTANCE_RUN, attempt=1, **fields):
+    return {
+        "id": run_id, "run_attempt": attempt, "path": ".github/workflows/e2e-test.yaml",
+        "event": "workflow_dispatch", "head_branch": "main", "head_sha": SHA,
+        "repository": {"full_name": REPO}, "display_title": "Release acceptance",
+        "status": "completed", "conclusion": "success", **fields,
+    }
+
+
+def _receipt_artifact(run_id=ACCEPTANCE_RUN, attempt=1, admission=ADMISSION, **fields):
+    return {
+        "id": run_id * 10 + attempt, "name": f"release-acceptance-{run_id}-{attempt}-{admission}",
+        "expired": False, "size_in_bytes": 900, "digest": "sha256:" + "d" * 64,
+        "workflow_run": {"id": run_id, "head_sha": SHA}, **fields,
+    }
+
+
+def _serve_acceptance(candidate, runs, artifacts):
+    candidate["responses"][RUNS] = {**LISTING, "body": [{"total_count": len(runs), "workflow_runs": runs}]}
+    for run in runs:
+        listed = artifacts.get(run["id"], [])
+        # Two pages prove that every page of the artifact list is read.
+        candidate["responses"][f"repos/{REPO}/actions/runs/{run['id']}/artifacts?per_page=100"] = {
+            **LISTING, "body": [{"total_count": len(listed), "artifacts": listed[:1]},
+                                {"total_count": len(listed), "artifacts": listed[1:]}],
+        }
+
+
+def _release_receipt(candidate, *, run=ACCEPTANCE_RUN, attempt=1, producer_attempt=1, bundle=True):
+    assertions = _contract_constant("ASSERTIONS")
+    rows = []
+    for name in _contract_constant("SCENARIOS"):
+        installer = name == "installer"
+        rows.append({
+            "scenario": name, "status": "not-applicable" if installer and not bundle else "passed",
+            "groups": "not-applicable" if installer else ("ephemeral" if name == "fleet" else "persistent"),
+            "assertions": [] if installer and not bundle else list(assertions[name]),
+            "cleanup": "not-applicable" if installer else "confirmed-absent",
+            # Vault purge never gates publication.
+            "vaultPurge": "failed" if name == "site-combined" else "not-applicable",
+        })
+    selection = _fleet_candidate(candidate, attempt=producer_attempt)
+    return {
+        "apiVersion": "siteops.release.acceptance/v1", "kind": "ReleaseAcceptance",
+        "candidate": {
+            "repository": REPO, "sourceCommit": SHA, "sourceRef": "refs/heads/main",
+            "caller": ".github/workflows/release.yaml", "producerRun": 42, "producerAttempt": producer_attempt,
+            "preview": False, "admissionSha256": ADMISSION,
+            "planSha256": selection["artifacts"]["plan"]["sha256"],
+            "inventorySha256": selection["artifacts"]["inventory"]["sha256"],
+        },
+        "acceptance": {"run": run, "attempt": attempt}, "environment": "dev", "transport": "prepublication",
+        "publicRelease": "not-observed", "status": "passed", "scenarios": rows,
+        "workloadFunctionality": "not-checked", "secretMaterialization": "not-checked",
+    }
+
+
+def _locate(runner, candidate, *, selection=None, run_attempt="1"):
+    return runner("publish", "Locate the governing acceptance run", extra={
+        "CANDIDATE": json.dumps(selection or _fleet_candidate(candidate)), "ADMISSION_ARTIFACT_ID": "501",
+        "GITHUB_RUN_ATTEMPT": run_attempt,
+    })
+
+
+def _verify(runner, candidate, receipt, *, run_attempt="1", producer_attempt=1, acceptance_attempt=1,
+            extra_file=False):
+    _serve_acceptance(candidate, [_acceptance_run(attempt=acceptance_attempt)], {
+        ACCEPTANCE_RUN: [_receipt_artifact(attempt=acceptance_attempt)],
+    })
+    located, outputs, before = _locate(
+        runner, candidate, selection=_fleet_candidate(candidate, attempt=producer_attempt), run_attempt=run_attempt,
+    )
+    assert located.returncode == 0, located.stdout + located.stderr
+    directory = candidate["root"] / "release-acceptance"
+    shutil.rmtree(directory, ignore_errors=True)
+    directory.mkdir()
+    (directory / "release-acceptance.json").write_text(json.dumps(receipt), encoding="utf-8")
+    if extra_file:
+        (directory / "notes.txt").write_text("unexpected", encoding="utf-8")
+    result, _, calls = runner("publish", "Verify the bound acceptance", extra={"GITHUB_RUN_ATTEMPT": run_attempt})
+    return result, calls[len(before):]
+
+
+def _inline_literal(job, name, variable):
+    program = re.search(r"\bpython3 -c '([^']*)'", step(job, name)["run"])[1]
+    for node in ast.parse(program).body:
+        if isinstance(node, ast.Assign) and any(getattr(target, "id", None) == variable for target in node.targets):
+            return ast.literal_eval(node.value)
+    raise AssertionError(f"{name} defines no {variable}.")
+
+
+def _accept(runner, candidate, *, selection=None, ref="refs/heads/main", run_attempt="1"):
+    raw = json.dumps(selection or _fleet_candidate(candidate), sort_keys=True, separators=(",", ":"))
+    result, _, calls = runner("accept", "Start acceptance for this exact candidate", extra={
+        "CANDIDATE": raw, "GITHUB_REF": ref, "GITHUB_RUN_ATTEMPT": run_attempt,
+    })
+    return result, calls, raw
+
+
+def _serve_dispatch(candidate, *, head=SHA, status=200, body=None):
+    candidate["responses"][MAIN_REF] = {
+        "status": 200, "method": "GET",
+        "body": {"ref": "refs/heads/main", "object": {"sha": head, "type": "commit"}},
+    }
+    candidate["responses"][DISPATCH] = {
+        "status": status, "method": "POST",
+        "flags": ["--include", "--input"],
+        "body": body if body is not None else {
+            "workflow_run_id": ACCEPTANCE_RUN, "run_url": f"https://api.github.com/repos/{REPO}/actions/runs/7000",
+            "html_url": f"https://github.com/{REPO}/actions/runs/{ACCEPTANCE_RUN}",
+        },
+    }
+
+
+def test_accept_holds_only_dispatch_authority_without_source_or_azure():
+    accept = JOBS["accept"]
+    assert accept["needs"] == "candidate"
+    assert accept["if"] == (
+        "needs.candidate.result == 'success' && needs.candidate.outputs.active == 'true' && "
+        "needs.candidate.outputs.fleet-candidate != ''"
+    )
+    assert accept["permissions"] == {"actions": "write", "contents": "read"}
+    assert accept["runs-on"] == "ubuntu-24.04"
+    assert "environment" not in accept and "uses" not in accept
+    assert [item.get("uses") for item in accept["steps"]] == [None]
+    started = step("accept", "Start acceptance for this exact candidate")
+    assert started["env"] == {
+        "GH_TOKEN": "${{ github.token }}", "CANDIDATE": "${{ needs.candidate.outputs.fleet-candidate }}",
+    }
+    assert "${{" not in started["run"]
+    # Only this job can start workflows, and the release workflow never reads secrets.
+    writers = [name for name, job in WORKFLOW["jobs"].items() if job.get("permissions", {}).get("actions") == "write"]
+    assert writers == ["accept"]
+    release_text = (ROOT / ".github" / "workflows" / "release.yaml").read_text(encoding="utf-8")
+    assert "secrets." not in release_text
+    # Normal CI never dispatches acceptance or acquires Azure authority.
+    ci_text = (ROOT / ".github" / "workflows" / "ci.yaml").read_text(encoding="utf-8")
+    for marker in ("e2e-test.yaml", "dispatches", "azure/login", "AZURE_CLIENT_ID", "secrets."):
+        assert marker not in ci_text, marker
+    assert not any(job.get("permissions", {}).get("actions") == "write" for job in CI_WORKFLOW["jobs"].values())
+
+
+@pytest.mark.parametrize("run_attempt", ["1", "2"])
+def test_accept_starts_acceptance_for_the_exact_candidate(candidate, runner, run_attempt):
+    _serve_dispatch(candidate)
+    result, calls, raw = _accept(runner, candidate, run_attempt=run_attempt)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert calls[:2] == [
+        ["api", MAIN_REF],
+        ["api", "--method", "POST", "--include", DISPATCH, "--input", "-"],
+    ]
+    assert calls[2][0] == "<input>" and len(calls) == 3
+    assert json.loads(calls[2][1]) == {"ref": "main", "return_run_details": True, "inputs": {
+        "scenario": "release-acceptance", "candidate": raw, "environment": "dev", "location": "eastus2",
+    }}
+    summary = (candidate["root"].parent / "summary.md").read_text(encoding="utf-8")
+    assert f"(https://github.com/{REPO}/actions/runs/{ACCEPTANCE_RUN})" in summary
+
+
+@pytest.mark.parametrize("response", [
+    {"status": 204, "body": {}},
+    {"body": {"html_url": f"https://github.com/{REPO}/actions/runs/{ACCEPTANCE_RUN}"}},
+    {"body": {"workflow_run_id": ACCEPTANCE_RUN, "html_url": "https://example.com/runs/7000"}},
+], ids=["no-content", "missing-run", "other-run-link"])
+def test_accepted_dispatch_without_run_details_never_prompts_a_second_run(candidate, runner, response):
+    _serve_dispatch(candidate, **response)
+    result, calls, _ = _accept(runner, candidate)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "::warning::GitHub started acceptance without identifying the run" in result.stdout
+    assert sum(DISPATCH in call for call in calls) == 1
+    summary = (candidate["root"].parent / "summary.md").read_text(encoding="utf-8")
+    assert "Find the newest Release acceptance run under E2E Tests" in summary
+    assert "https://example.com" not in summary
+
+
+@pytest.mark.parametrize("fault", [
+    "moved-main", "rejected",
+    "preview", "other-producer", "later-attempt", "other-commit", "other-ref", "unreadable",
+])
+def test_accept_fails_closed(candidate, runner, fault):
+    selection = _fleet_candidate(candidate)
+    response = {}
+    ref = "refs/heads/main"
+    if fault == "moved-main":
+        response["head"] = "d" * 40
+    elif fault == "rejected":
+        response["status"] = 422
+    elif fault == "preview":
+        selection["producer"].update(preview=True, caller=".github/workflows/ci.yaml")
+    elif fault == "other-producer":
+        selection["producer"]["run"] = 41
+    elif fault == "later-attempt":
+        selection["producer"]["attempt"] = 2
+    elif fault == "other-commit":
+        selection["source"]["commit"] = "d" * 40
+    elif fault == "other-ref":
+        ref = "refs/heads/feature"
+    _serve_dispatch(candidate, **response)
+    if fault == "unreadable":
+        result, _, calls = runner("accept", "Start acceptance for this exact candidate", extra={
+            "CANDIDATE": "[]", "GITHUB_REF": ref,
+        })
+    else:
+        result, calls, _ = _accept(runner, candidate, selection=selection, ref=ref)
+    assert result.returncode != 0
+    assert "::error::" in result.stdout + result.stderr
+    dispatched = any(DISPATCH in call for call in calls)
+    assert dispatched is (fault == "rejected")
+    if fault not in {"moved-main", "rejected"}:
+        assert calls == []
+
+
+def test_publish_binds_acceptance_before_any_other_input_or_write():
+    publish = JOBS["publish"]
+    names = [item["name"] for item in publish["steps"]]
+    for earlier, later in (
+        ("Download the pinned declaration", "Locate the governing acceptance run"),
+        ("Locate the governing acceptance run", "Download the acceptance receipt"),
+        ("Download the acceptance receipt", "Verify the bound acceptance"),
+        ("Verify the bound acceptance", "Download the reviewed release notes"),
+        ("Verify the bound acceptance", "Create only the approved missing tag"),
+    ):
+        assert names.index(earlier) < names.index(later)
+    located = step("publish", "Locate the governing acceptance run")
+    assert located["env"] == {
+        "CANDIDATE": "${{ needs.candidate.outputs.fleet-candidate }}",
+        "ADMISSION_ARTIFACT_ID": "${{ needs.candidate.outputs.admission-artifact-id }}",
+    }
+    assert step("publish", "Download the acceptance receipt")["with"] == {
+        "artifact-ids": "${{ steps.acceptance.outputs.artifact-id }}", "repository": "${{ github.repository }}",
+        "run-id": "${{ steps.acceptance.outputs.run-id }}", "github-token": "${{ github.token }}",
+        "path": "${{ runner.temp }}/release-acceptance", "merge-multiple": True, "digest-mismatch": "error",
+    }
+    assert "${{" not in located["run"] and "${{" not in step("publish", "Verify the bound acceptance")["run"]
+
+
+@pytest.mark.parametrize("case", ["single", "rerun-attempt", "newer-unbound", "publish-rerun"])
+def test_publish_locates_the_newest_bound_acceptance(candidate, runner, case):
+    runs = [_acceptance_run()]
+    artifacts = {ACCEPTANCE_RUN: [_receipt_artifact(), {"id": 1, "name": "site-outcome-7000-1-disabled"}]}
+    selection = _fleet_candidate(candidate)
+    run_attempt = "1"
+    expected = (ACCEPTANCE_RUN, ACCEPTANCE_RUN * 10 + 1)
+    if case == "rerun-attempt":
+        runs = [_acceptance_run(attempt=2)]
+        artifacts[ACCEPTANCE_RUN] = [_receipt_artifact(attempt=1), _receipt_artifact(attempt=2)]
+        expected = (ACCEPTANCE_RUN, ACCEPTANCE_RUN * 10 + 2)
+    elif case == "newer-unbound":
+        # A newer run for another candidate at this commit does not govern this one.
+        runs.insert(0, _acceptance_run(run_id=7100, conclusion="failure"))
+        artifacts[7100] = [_receipt_artifact(run_id=7100, admission="b" * 64)]
+    elif case == "publish-rerun":
+        run_attempt = "2"
+    _serve_acceptance(candidate, runs, artifacts)
+    result, outputs, calls = _locate(runner, candidate, selection=selection, run_attempt=run_attempt)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (int(outputs["run-id"]), int(outputs["artifact-id"])) == expected
+    binding = json.loads((candidate["root"] / "acceptance-binding.json").read_text(encoding="utf-8"))
+    assert binding["acceptance"] == {"run": ACCEPTANCE_RUN, "attempt": runs[-1]["run_attempt"]}
+    assert binding["candidate"]["producerAttempt"] == 1
+    assert all(call[:3] == ["api", "--paginate", "--slurp"] for call in calls)
+
+
+@pytest.mark.parametrize("fault", [
+    "no-runs", "running", "newer-running", "superseded-attempt", "latest-receipt-missing",
+    "newer-bound-failure", "duplicate", "expired", "missing-digest", "other-origin",
+    "other-path", "other-event", "other-branch", "other-commit", "other-repository", "other-title",
+    "other-candidate", "preview", "other-producer", "later-producer-attempt", "other-admission-id",
+    "other-plan", "listing-failure",
+])
+def test_publish_rejects_unbound_or_unsettled_acceptance(candidate, runner, fault):
+    runs = [_acceptance_run()]
+    artifacts = {ACCEPTANCE_RUN: [_receipt_artifact()]}
+    selection = _fleet_candidate(candidate)
+    if fault == "no-runs":
+        runs, artifacts = [], {}
+    elif fault == "running":
+        runs[0].update(status="in_progress", conclusion=None)
+    elif fault == "newer-running":
+        runs.insert(0, _acceptance_run(run_id=7100, status="queued", conclusion=None))
+    elif fault == "superseded-attempt":
+        # The older passing attempt cannot stand in for the failing latest attempt.
+        runs = [_acceptance_run(attempt=2, conclusion="failure")]
+        artifacts[ACCEPTANCE_RUN] = [_receipt_artifact(attempt=1), _receipt_artifact(attempt=2)]
+    elif fault == "latest-receipt-missing":
+        runs = [_acceptance_run(attempt=2)]
+    elif fault == "newer-bound-failure":
+        runs.insert(0, _acceptance_run(run_id=7100, conclusion="failure"))
+        artifacts[7100] = [_receipt_artifact(run_id=7100)]
+    elif fault == "duplicate":
+        artifacts[ACCEPTANCE_RUN].append(_receipt_artifact(id=99))
+    elif fault == "expired":
+        artifacts[ACCEPTANCE_RUN] = [_receipt_artifact(expired=True)]
+    elif fault == "missing-digest":
+        artifacts[ACCEPTANCE_RUN] = [_receipt_artifact(digest=None)]
+    elif fault == "other-origin":
+        artifacts[ACCEPTANCE_RUN] = [_receipt_artifact(workflow_run={"id": 1, "head_sha": SHA})]
+    elif fault.startswith("other-") and fault[6:] in {"path", "event", "branch", "commit", "repository", "title"}:
+        field, value = {
+            "path": ("path", ".github/workflows/e2e-copy.yaml"), "event": ("event", "push"),
+            "branch": ("head_branch", "feature"), "commit": ("head_sha", "d" * 40),
+            "repository": ("repository", {"full_name": "fork/publisher"}), "title": ("display_title", "E2E Tests"),
+        }[fault[6:]]
+        runs[0][field] = value
+    elif fault == "other-candidate":
+        artifacts[ACCEPTANCE_RUN] = [_receipt_artifact(admission="b" * 64)]
+    elif fault == "preview":
+        selection["producer"].update(preview=True, caller=".github/workflows/ci.yaml")
+    elif fault == "other-producer":
+        selection["producer"]["run"] = 41
+    elif fault == "later-producer-attempt":
+        selection["producer"]["attempt"] = 2
+    elif fault == "other-admission-id":
+        selection["artifacts"]["admission"]["id"] = 600
+    elif fault == "other-plan":
+        selection["artifacts"]["plan"]["sha256"] = "b" * 64
+    _serve_acceptance(candidate, runs, artifacts)
+    if fault == "listing-failure":
+        candidate["responses"][RUNS]["status"] = 500
+    result, outputs, calls = _locate(runner, candidate, selection=selection)
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "run-id" not in outputs and "artifact-id" not in outputs
+    assert not (candidate["root"] / "acceptance-binding.json").exists()
+    message = {
+        "running": "still running", "newer-running": "still running", "superseded-attempt": "did not pass",
+        "newer-bound-failure": "did not pass", "no-runs": "No acceptance evidence",
+        "other-candidate": "No acceptance evidence", "latest-receipt-missing": "no single valid receipt",
+        "listing-failure": "could not list",
+    }.get(fault)
+    if message:
+        assert message in output
+    if fault in {"preview", "other-producer", "later-producer-attempt", "other-admission-id", "other-plan"}:
+        assert "not this approved main candidate" in output and calls == []
+    assert not any("--method" in call for call in calls)
+
+
+@pytest.mark.parametrize(("run_attempt", "producer_attempt", "acceptance_attempt", "bundle"), [
+    ("1", 1, 1, True), ("2", 1, 1, True), ("2", 2, 1, True), ("1", 1, 3, True), ("1", 1, 1, False),
+])
+def test_publish_accepts_a_receipt_bound_to_this_candidate(
+    candidate, runner, run_attempt, producer_attempt, acceptance_attempt, bundle,
+):
+    candidate["plan"]["siteops"]["bundle"] = bundle
+    receipt = _release_receipt(candidate, attempt=acceptance_attempt, producer_attempt=producer_attempt, bundle=bundle)
+    result, calls = _verify(runner, candidate, receipt, run_attempt=run_attempt, producer_attempt=producer_attempt,
+                            acceptance_attempt=acceptance_attempt)
+    assert result.returncode == 0, result.stdout + result.stderr
+    summary = (candidate["root"].parent / "summary.md").read_text(encoding="utf-8")
+    assert f"/actions/runs/{ACCEPTANCE_RUN}/attempts/{acceptance_attempt})" in summary
+    assert "| fleet | passed | ephemeral | confirmed-absent |" in summary
+    assert "| site-aio | passed | persistent | confirmed-absent |" in summary
+    assert calls == []
+
+
+@pytest.mark.parametrize("fault", [
+    "other-repository", "other-commit", "other-producer-run", "producer-run-text", "other-producer-attempt",
+    "preview", "other-admission", "other-plan", "other-inventory", "other-acceptance-run",
+    "older-acceptance-attempt", "environment", "transport", "status", "failed-row", "residual-cleanup",
+    "missing-assertion", "reordered-rows", "extra-key", "row-extra-key", "unknown-groups", "extra-file",
+    "installer-not-applicable", "installer-cleanup",
+])
+def test_publish_rejects_a_receipt_that_does_not_bind(candidate, runner, fault):
+    receipt = _release_receipt(candidate)
+    rows = {row["scenario"]: row for row in receipt["scenarios"]}
+    changes = {
+        "other-repository": ("candidate", "repository", "fork/publisher"),
+        "other-commit": ("candidate", "sourceCommit", "d" * 40),
+        "other-producer-run": ("candidate", "producerRun", 41),
+        "producer-run-text": ("candidate", "producerRun", "42"),
+        "other-producer-attempt": ("candidate", "producerAttempt", 2),
+        "preview": ("candidate", "preview", True),
+        "other-admission": ("candidate", "admissionSha256", "b" * 64),
+        "other-plan": ("candidate", "planSha256", "b" * 64),
+        "other-inventory": ("candidate", "inventorySha256", "b" * 64),
+        "other-acceptance-run": ("acceptance", "run", 7100),
+        "older-acceptance-attempt": ("acceptance", "attempt", 0),
+    }
+    if fault in changes:
+        section, key, value = changes[fault]
+        receipt[section][key] = value
+    elif fault in {"environment", "transport", "status"}:
+        receipt[fault] = {"environment": "prod", "transport": "public", "status": "failed"}[fault]
+    elif fault == "failed-row":
+        rows["site-existing-secretsync"]["status"] = "failed"
+    elif fault == "residual-cleanup":
+        rows["fleet"]["cleanup"] = "residual"
+    elif fault == "missing-assertion":
+        rows["site-combined"]["assertions"].remove("vault-created-by-enablement")
+    elif fault == "reordered-rows":
+        receipt["scenarios"].reverse()
+    elif fault == "extra-key":
+        receipt["note"] = "PRIVATE_NOTE"
+    elif fault == "row-extra-key":
+        rows["site-aio"]["resourceGroup"] = "PRIVATE_GROUP"
+    elif fault == "unknown-groups":
+        rows["site-aio"]["groups"] = "shared"
+    elif fault == "installer-not-applicable":
+        rows["installer"].update(status="not-applicable", assertions=[])
+    elif fault == "installer-cleanup":
+        rows["installer"]["cleanup"] = "confirmed-absent"
+    result, calls = _verify(runner, candidate, receipt, extra_file=fault == "extra-file")
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "::error::" in output
+    assert "PRIVATE_" not in output
+    summary = candidate["root"].parent / "summary.md"
+    assert not summary.exists() or "Bound candidate acceptance" not in summary.read_text(encoding="utf-8")
+    assert calls == []
+
+
+def test_publish_accepts_the_receipt_the_acceptance_aggregator_writes(candidate, runner):
+    spec = importlib.util.spec_from_file_location("release_acceptance_contract", ROOT / "scripts" / "release_acceptance.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    from fleet_workflow import FleetCandidate
+
+    selection = FleetCandidate.parse(
+        json.dumps(_fleet_candidate(candidate)).encode(), repository=REPO, commit=SHA, ref="refs/heads/main",
+    )
+    rows = [module.row("installer", "passed", module.ASSERTIONS["installer"])] + [
+        module.row(name, "passed", module.ASSERTIONS[name], "confirmed-absent", groups="persistent")
+        for name in module.SCENARIOS[1:]
+    ]
+    receipt = module.receipt(selection, run=ACCEPTANCE_RUN, attempt=1, environment="dev", rows=rows, complete=True)
+    result, _ = _verify(runner, candidate, receipt)
+    assert result.returncode == 0, result.stdout + result.stderr
+    inline = _inline_literal("publish", "Verify the bound acceptance", "assertions")
+    assert list(inline) == list(module.SCENARIOS)
+    assert {name: tuple(values) for name, values in inline.items()} == module.ASSERTIONS

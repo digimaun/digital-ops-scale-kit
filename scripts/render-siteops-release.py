@@ -536,18 +536,25 @@ def render_summary(plan: dict[str, Any], notes: str, values: Mapping[str, str]) 
     if engine["bundle"]:
         matrix = json.loads(values["MATRIX"])
         expected = ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        columns = ("linux", "ubuntu-26.04", "windows", "windows-standard-user")
         if (
             not isinstance(matrix, list)
-            or any(not isinstance(row, dict) for row in matrix)
-            or [row.get("python") for row in matrix] != expected
+            or any(not isinstance(row, dict) or set(row) != {"python", *columns} for row in matrix)
+            or [row["python"] for row in matrix] != expected
         ):
             raise RenderingError("Incomplete installation qualification summary.")
-        lines.extend(["\n## Installation checks\n", "| Python | Linux | Windows |", "|---|---|---|"])
+        lines.extend([
+            "\n## Installation checks\n",
+            "| Python | Ubuntu 24.04 | Ubuntu 26.04 | Windows | Windows standard user |",
+            "|---|---|---|---|---|",
+        ])
         allowed = {"passed", "failed", "cancelled", "skipped", "not-run", "unknown"}
         for row in matrix:
-            if row.get("linux") not in allowed or row.get("windows") not in allowed:
+            # Ubuntu 26.04 and the Windows standard user run only with Python 3.11.
+            limited = set() if row["python"] == "3.11" else {"ubuntu-26.04", "windows-standard-user"}
+            if any(row[column] not in ({"n/a"} if column in limited else allowed) for column in columns):
                 raise RenderingError("Invalid qualification summary.")
-            lines.append(f"| {row['python']} | {row['linux']} | {row['windows']} |")
+            lines.append("| " + " | ".join([row["python"], *(row[column] for column in columns)]) + " |")
         lines.extend([
             f"\n[Download the attested release assets]({values['ARTIFACT_URL']})\n",
             "The Actions download contains the installation ZIP and standalone wheel. Each has "

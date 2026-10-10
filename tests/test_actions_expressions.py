@@ -17,7 +17,6 @@ from tests.actions_expressions import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-E2E = ROOT / ".github" / "workflows" / "e2e-test.yaml"
 _ALLOWED_UNSUPPORTED = set()
 
 
@@ -193,23 +192,6 @@ on:
     for overrides in ({"unknown": 1}, {"aio_release": "2609"}):
         with pytest.raises(ExpressionError, match="Unknown dispatch input"):
             dispatch_inputs(workflow, overrides)
-
-
-def test_real_fleet_job_decision_table():
-    workflow = yaml.safe_load(E2E.read_text(encoding="utf-8"))
-    assert set(workflow["jobs"]["fleet"]["needs"]) == {"fleet-request", "prep"}
-    cases = [
-        ("release-acceptance", "success", "success", True),
-        ("release-acceptance", "success", "failure", False),
-        ("release-acceptance", "failure", "success", False),
-        ("fleet", "success", "skipped", True),
-        ("aio", "success", "success", False),
-    ]
-    for scenario, request, prep, expected in cases:
-        assert job_runs(
-            workflow, "fleet", inputs=dispatch_inputs(workflow, scenario=scenario),
-            needs={"fleet-request": request, "prep": prep},
-        ) is expected, (scenario, request, prep)
 
 
 def _declared_inputs(document: dict) -> set[str]:

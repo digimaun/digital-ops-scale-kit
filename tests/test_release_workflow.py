@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tests.actions_expressions import job_runs
 from tests.release_helpers import CLI, _commit, _write_record, _write_source_version
 from tests.release_helpers import repository as repository
 from tests.shell_helpers import bash_path, write_executable
@@ -478,10 +479,6 @@ def test_publication_uses_only_the_completed_candidate_and_required_approval():
     assert "needs.distribution.result == 'success'" in condition
     assert "needs.distribution.result == 'skipped'" in condition
     assert JOBS["publish"]["needs"] == ["release-runner", "candidate", "accept"]
-    assert JOBS["publish"]["if"] == (
-        "needs.candidate.result == 'success' && needs.candidate.outputs.active == 'true' && "
-        "needs.accept.result == 'success'"
-    )
     assert JOBS["candidate"]["uses"] == "./.github/workflows/_release-candidate.yaml"
     assert JOBS["candidate"]["with"]["dry-run"] is False
     assert JOBS["publish"]["environment"] == "siteops-release"
@@ -2548,10 +2545,6 @@ def _serve_dispatch(candidate, *, head=SHA, status=200, body=None):
 def test_accept_holds_only_dispatch_authority_without_source_or_azure():
     accept = JOBS["accept"]
     assert accept["needs"] == "candidate"
-    assert accept["if"] == (
-        "needs.candidate.result == 'success' && needs.candidate.outputs.active == 'true' && "
-        "needs.candidate.outputs.fleet-candidate != ''"
-    )
     assert accept["permissions"] == {"actions": "write", "contents": "read"}
     assert accept["runs-on"] == "ubuntu-24.04"
     assert "environment" not in accept and "uses" not in accept
@@ -2571,6 +2564,64 @@ def test_accept_holds_only_dispatch_authority_without_source_or_azure():
     for marker in ("e2e-test.yaml", "dispatches", "azure/login", "AZURE_CLIENT_ID", "secrets."):
         assert marker not in ci_text, marker
     assert not any(job.get("permissions", {}).get("actions") == "write" for job in CI_WORKFLOW["jobs"].values())
+
+
+@pytest.mark.parametrize(("result", "active", "candidate", "cancelled", "expected"), [
+    pytest.param("success", "true", "exact-candidate", False, True, id="active-candidate"),
+    pytest.param("success", "false", "exact-candidate", False, False, id="inactive-candidate"),
+    pytest.param("success", "", "exact-candidate", False, False, id="missing-active-output"),
+    pytest.param("success", "true", "", False, False, id="no-fleet-candidate"),
+    pytest.param("success", "true", None, False, False, id="missing-candidate-output"),
+    pytest.param("failure", "true", "exact-candidate", False, False, id="candidate-failed"),
+    pytest.param("skipped", "true", "exact-candidate", False, False, id="candidate-skipped"),
+    pytest.param("cancelled", "true", "exact-candidate", False, False, id="candidate-cancelled"),
+    pytest.param("success", "true", "exact-candidate", True, False, id="run-cancelled"),
+])
+def test_accept_dispatches_only_an_active_successful_fleet_candidate(
+    result, active, candidate, cancelled, expected,
+):
+    outputs = {"active": active}
+    if candidate is not None:
+        outputs["fleet-candidate"] = candidate
+    assert job_runs(
+        WORKFLOW, "accept", inputs={}, needs={"candidate": result},
+        outputs={"candidate": outputs}, cancelled=cancelled,
+    ) is expected
+
+
+@pytest.mark.parametrize(("needs", "active", "cancelled", "expected"), [
+    pytest.param({"release-runner": "success", "candidate": "success", "accept": "success"},
+                 "true", False, True, id="approved-candidate"),
+    pytest.param({"release-runner": "success", "candidate": "success", "accept": "success"},
+                 "false", False, False, id="inactive-candidate"),
+    pytest.param({"release-runner": "success", "candidate": "success", "accept": "success"},
+                 "", False, False, id="missing-active-output"),
+    pytest.param({"release-runner": "failure", "candidate": "success", "accept": "success"},
+                 "true", False, False, id="runner-failed"),
+    pytest.param({"release-runner": "skipped", "candidate": "success", "accept": "success"},
+                 "true", False, False, id="runner-skipped"),
+    pytest.param({"release-runner": "cancelled", "candidate": "success", "accept": "success"},
+                 "true", False, False, id="runner-cancelled"),
+    pytest.param({"release-runner": "success", "candidate": "failure", "accept": "success"},
+                 "true", False, False, id="candidate-failed"),
+    pytest.param({"release-runner": "success", "candidate": "skipped", "accept": "success"},
+                 "true", False, False, id="candidate-skipped"),
+    pytest.param({"release-runner": "success", "candidate": "cancelled", "accept": "success"},
+                 "true", False, False, id="candidate-cancelled"),
+    pytest.param({"release-runner": "success", "candidate": "success", "accept": "failure"},
+                 "true", False, False, id="acceptance-failed"),
+    pytest.param({"release-runner": "success", "candidate": "success", "accept": "skipped"},
+                 "true", False, False, id="acceptance-skipped"),
+    pytest.param({"release-runner": "success", "candidate": "success", "accept": "cancelled"},
+                 "true", False, False, id="acceptance-cancelled"),
+    pytest.param({"release-runner": "success", "candidate": "success", "accept": "success"},
+                 "true", True, False, id="run-cancelled"),
+])
+def test_publish_requires_successful_candidate_acceptance_and_runner(needs, active, cancelled, expected):
+    assert job_runs(
+        WORKFLOW, "publish", inputs={}, needs=needs,
+        outputs={"candidate": {"active": active}}, cancelled=cancelled,
+    ) is expected
 
 
 @pytest.mark.parametrize("run_attempt", ["1", "2"])

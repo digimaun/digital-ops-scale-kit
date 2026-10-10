@@ -14,6 +14,8 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+from tests.actions_expressions import evaluate, truthy
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
@@ -516,16 +518,39 @@ def test_workflow_keeps_hosts_live_and_uploads_ownership_before_creation():
         assert "attestations" not in jobs[name]["permissions"]
     caller = yaml.safe_load((ROOT / ".github/workflows/e2e-test.yaml").read_text())
     assert caller["jobs"]["fleet"]["needs"] == ["fleet-request", "prep"]
-    assert caller["jobs"]["fleet"]["if"] == (
-        "${{ !cancelled() && needs.fleet-request.result == 'success' && (inputs.scenario == 'fleet' || "
-        "(inputs.scenario == 'release-acceptance' && needs.prep.result == 'success')) }}"
-    )
-    assert caller["jobs"]["fleet-cleanup"]["if"] == (
-        "inputs.scenario == 'fleet-cleanup' || inputs.scenario == 'site-cleanup'"
-    )
     assert caller["jobs"]["fleet-cleanup"]["with"]["kind"] == (
         "${{ inputs.scenario == 'site-cleanup' && 'site' || 'fleet' }}"
     )
+
+
+@pytest.mark.parametrize(("ownership_id", "cancelled", "prior_result", "expected"), [
+    pytest.param("123", False, "success", True, id="verified-ownership"),
+    pytest.param("", False, "success", False, id="no-owned-group"),
+    pytest.param(None, False, "success", False, id="missing-ownership-output"),
+    pytest.param("123", True, "failure", True, id="retain-after-cancellation"),
+    pytest.param("", True, "failure", False, id="cancelled-without-ownership"),
+    pytest.param("123", False, "failure", True, id="retain-after-reconciliation-failure"),
+    pytest.param("123", False, "skipped", True, id="retain-after-reconciliation-skip"),
+])
+def test_reconciliation_work_requires_ownership_and_retains_an_admitted_outcome(
+    ownership_id, cancelled, prior_result, expected,
+):
+    workflow = yaml.safe_load((ROOT / ".github/workflows/_fleet-reconcile.yaml").read_text())
+    steps = workflow["jobs"]["reconcile"]["steps"]
+    guarded = [
+        next(step for step in steps if step.get("with", {}).get("path") == "${{ runner.temp }}/fleet/ownership"),
+        next(step for step in steps if step.get("uses", "").startswith("azure/login@")),
+        next(step for step in steps if step.get("name") == "Reconcile original owned groups"),
+    ]
+    outputs = {} if ownership_id is None else {"ownership-id": ownership_id}
+    contexts = {
+        "steps": {"ownership": {"outputs": outputs}},
+        "needs": {"previous": {"result": prior_result}},
+    }
+    for step in guarded:
+        assert truthy(evaluate(step["if"], contexts)) is (ownership_id not in ("", None))
+    retained = next(step for step in steps if step.get("name") == "Retain reconciliation outcome")
+    assert truthy(evaluate(retained["if"], contexts, cancelled=cancelled)) is expected
 
 
 def test_allocation_markers_stay_private_and_cleanup_consumes_verified_original_receipts():

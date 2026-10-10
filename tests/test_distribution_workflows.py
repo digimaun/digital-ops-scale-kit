@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tests.actions_expressions import evaluate, truthy
 from tests.native_bundle import (
     NETWORK_BLOCK,
     native_only,
@@ -494,28 +495,11 @@ def test_qualification_matrix_adds_ubuntu_26_04_and_standard_user_cells():
     assert len(merged) == len(names) - 1
 
 
-_CONDITION = re.compile(r"(runner\.os|matrix\.[a-z]+) (==|!=) '([A-Za-z0-9.-]+)'")
-
-
-def _runs(condition: str | None, cell: dict) -> bool:
-    """Evaluate the closed condition grammar these steps use, with GitHub's null semantics."""
-    if condition is None:
-        return True
-    context = {
-        "runner.os": "Windows" if cell["os"].startswith("windows-") else "Linux",
-        **{f"matrix.{key}": value for key, value in cell.items()},
-    }
-    outcome = True
-    for clause in condition.split(" && "):
-        match = _CONDITION.fullmatch(clause)
-        assert match, f"Unsupported step condition: {condition}"
-        name, operator, literal = match.groups()
-        equal = context.get(name) == literal
-        outcome = outcome and (equal if operator == "==" else not equal)
-    return outcome
-
-
-def test_each_qualification_cell_runs_only_its_installation_path():
+@pytest.mark.parametrize("cell", [
+    pytest.param(cell, id=_cell_name(cell))
+    for cell in _matrix_cells(REUSABLE["jobs"]["qualify"]["strategy"]["matrix"])
+])
+def test_each_qualification_cell_runs_only_its_installation_path(cell):
     qualify = REUSABLE["jobs"]["qualify"]
     shared = [
         "Confirm the GitHub CLI verification capabilities", "Setup Python", "Download the attested assets",
@@ -529,17 +513,36 @@ def test_each_qualification_cell_runs_only_its_installation_path():
         "windows": shared + runner + ["Install with the signed PowerShell bootstrap"] + after,
         "standard": shared + [STANDARD_USER_STEP],
     }
-    seen = set()
-    for cell in _matrix_cells(qualify["strategy"]["matrix"]):
-        kind = "standard" if cell.get("account") == "standard" else cell["os"].split("-")[0]
-        steps = [step["name"] for step in qualify["steps"] if _runs(step.get("if"), cell)]
-        assert steps == expected[kind], _cell_name(cell)
-        seen.add(kind)
-    assert seen == set(expected)
-    assert _step(qualify, "Install with the signed Bash bootstrap")["if"] == "runner.os == 'Linux'"
-    assert _step(qualify, STANDARD_USER_STEP)["if"] == (
-        "runner.os == 'Windows' && matrix.account == 'standard'"
-    )
+    kind = "standard" if cell.get("account") == "standard" else cell["os"].split("-")[0]
+    contexts = {
+        "matrix": cell,
+        "runner": {"os": "Windows" if cell["os"].startswith("windows-") else "Linux"},
+    }
+    steps = [step["name"] for step in qualify["steps"] if truthy(evaluate(step.get("if", "true"), contexts))]
+    assert steps == expected[kind]
+
+
+@pytest.mark.parametrize(("runner", "account", "expected"), [
+    pytest.param("Linux", "runner", {"bash", "tooling", "lock", "wheel"}, id="linux-runner"),
+    pytest.param("Windows", "runner", {"powershell", "tooling", "lock", "wheel"}, id="windows-runner"),
+    pytest.param("Windows", "standard", {"standard"}, id="windows-standard-user"),
+    pytest.param("Linux", None, {"bash", "tooling", "lock", "wheel"}, id="linux-missing-account"),
+    pytest.param("Windows", None, {"powershell", "tooling", "lock", "wheel"}, id="windows-missing-account"),
+    pytest.param("macOS", "runner", {"tooling", "lock", "wheel"}, id="other-runner-has-no-bootstrap"),
+    pytest.param("macOS", "standard", set(), id="standard-user-requires-windows"),
+])
+def test_qualification_installation_guards_use_runner_os_and_account(runner, account, expected):
+    names = {
+        "bash": "Install with the signed Bash bootstrap",
+        "powershell": "Install with the signed PowerShell bootstrap",
+        "standard": STANDARD_USER_STEP,
+        "tooling": "Install the external qualification tooling",
+        "lock": "Install Site Ops from the verified lock",
+        "wheel": "Install Site Ops from the standalone wheel",
+    }
+    contexts = {"runner": {"os": runner}, "matrix": {} if account is None else {"account": account}}
+    for key, name in names.items():
+        assert truthy(evaluate(_step(REUSABLE["jobs"]["qualify"], name)["if"], contexts)) is (key in expected), name
 
 
 def test_qualification_uses_the_cell_runtime_and_packaged_uv_helper():
@@ -639,15 +642,13 @@ def test_qualification_verifies_before_it_extracts():
 
 def test_qualification_runs_both_signed_scripts_with_private_preseeded_assets():
     qualify = REUSABLE["jobs"]["qualify"]
-    for name, platform, argument, condition in (
-        ("Install with the signed Bash bootstrap", "ubuntu-24.04", "--yes", "runner.os == 'Linux'"),
+    for name, platform, argument in (
+        ("Install with the signed Bash bootstrap", "ubuntu-24.04", "--yes"),
         (
             "Install with the signed PowerShell bootstrap", "windows-2025", "-Yes",
-            "runner.os == 'Windows' && matrix.account != 'standard'",
         ),
     ):
         step = _step(qualify, name)
-        assert step["if"] == condition
         if platform == "windows-2025":
             assert step["shell"] == "powershell"
         script = step["run"]

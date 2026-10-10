@@ -452,7 +452,6 @@ def test_acceptance_run_is_bound_named_and_always_aggregated():
     )
     job = workflow["jobs"]["acceptance"]
     assert job["needs"] == ["fleet-request", "fleet", "prep", "site-groups", "e2e"]
-    assert job["if"] == "always() && inputs.scenario == 'release-acceptance'"
     assert job["permissions"] == {"contents": "read", "actions": "read"}
     assert "environment" not in job
     steps = job["steps"]
@@ -467,12 +466,6 @@ def test_acceptance_run_is_bound_named_and_always_aggregated():
     assert upload["with"]["name"] == (
         "release-acceptance-${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.bind.outputs.admission-sha }}"
     )
-    # A run whose candidate parses always records a result, even when selection or a download failed.
-    for selected, bound, expected in (("success", "success", True), ("failure", "success", True),
-                                      ("skipped", "success", True), ("success", "failure", False)):
-        steps_context = {"bind": {"outcome": bound}, "select": {"outcome": selected}}
-        for step in (aggregate_step, upload):
-            assert truthy(evaluate(step["if"], {"steps": steps_context}, cancelled=True)) is expected
     for key in ("disabled", "enabled", "existing", "fleet"):
         download = next(step for step in steps if step.get("id") == f"download-{key}")
         assert download["with"]["artifact-ids"] == f"${{{{ steps.evidence.outputs.{key}-id }}}}"
@@ -481,6 +474,66 @@ def test_acceptance_run_is_bound_named_and_always_aggregated():
         assert "pattern" not in download["with"] and "merge-multiple" not in download["with"]
         assert aggregate_step["env"][f"DOWNLOAD_{key.upper()}"] == f"${{{{ steps.download-{key}.outcome }}}}"
         assert names.index(f"download-{key}") < names.index("Require every scenario for this candidate")
+
+
+@pytest.mark.parametrize(("selected", "cancelled", "expected"), [
+    pytest.param("success", False, True, id="candidate-selected"),
+    pytest.param("failure", False, False, id="selection-failed"),
+    pytest.param("skipped", False, False, id="selection-skipped"),
+    pytest.param("cancelled", False, False, id="selection-cancelled"),
+    pytest.param("success", True, True, id="retain-evidence-on-cancelled-run"),
+    pytest.param("failure", True, False, id="cancelled-without-selection"),
+])
+def test_acceptance_selects_evidence_only_after_candidate_selection(selected, cancelled, expected):
+    job = yaml.safe_load((WORKFLOWS / "e2e-test.yaml").read_text())["jobs"]["acceptance"]
+    step = next(step for step in job["steps"] if step.get("id") == "evidence")
+    contexts = {"steps": {"select": {"outcome": selected}}, "needs": {"previous": {"result": "failure"}}}
+    assert truthy(evaluate(step["if"], contexts, cancelled=cancelled)) is expected
+
+
+@pytest.mark.parametrize("slot", [
+    pytest.param("disabled", id="disabled-evidence"),
+    pytest.param("enabled", id="enabled-evidence"),
+    pytest.param("existing", id="existing-evidence"),
+    pytest.param("fleet", id="fleet-evidence"),
+])
+@pytest.mark.parametrize(("artifact_id", "cancelled", "expected"), [
+    pytest.param("123", False, True, id="selected-artifact"),
+    pytest.param("", False, False, id="no-artifact"),
+    pytest.param(None, False, False, id="missing-output"),
+    pytest.param("123", True, True, id="selected-artifact-after-cancellation"),
+    pytest.param("", True, False, id="cancelled-without-artifact"),
+])
+def test_acceptance_downloads_only_the_selected_scenario_artifact(slot, artifact_id, cancelled, expected):
+    job = yaml.safe_load((WORKFLOWS / "e2e-test.yaml").read_text())["jobs"]["acceptance"]
+    step = next(step for step in job["steps"] if step.get("id") == f"download-{slot}")
+    outputs = {f"{key}-id": "other-artifact" for key in SLOT_SCENARIOS if key != slot}
+    if artifact_id is not None:
+        outputs[f"{slot}-id"] = artifact_id
+    contexts = {"steps": {"evidence": {"outputs": outputs}}, "needs": {"previous": {"result": "failure"}}}
+    assert truthy(evaluate(step["if"], contexts, cancelled=cancelled)) is expected
+
+
+@pytest.mark.parametrize(("bound", "selected", "cancelled", "expected"), [
+    pytest.param("success", "success", False, True, id="bound-and-selected"),
+    pytest.param("success", "failure", False, True, id="selection-failed-after-binding"),
+    pytest.param("success", "skipped", False, True, id="selection-skipped-after-binding"),
+    pytest.param("failure", "success", False, False, id="binding-failed"),
+    pytest.param("skipped", "success", False, False, id="binding-skipped"),
+    pytest.param("cancelled", "success", False, False, id="binding-cancelled"),
+    pytest.param("success", "failure", True, True, id="cancelled-after-binding"),
+    pytest.param("success", "skipped", True, True, id="cancelled-before-selection"),
+    pytest.param("failure", "success", True, False, id="cancelled-without-binding"),
+])
+def test_acceptance_aggregates_and_retains_every_bound_candidate(bound, selected, cancelled, expected):
+    job = yaml.safe_load((WORKFLOWS / "e2e-test.yaml").read_text())["jobs"]["acceptance"]
+    aggregate_step = next(step for step in job["steps"] if step.get("name") == "Require every scenario for this candidate")
+    contexts = {
+        "steps": {"bind": {"outcome": bound}, "select": {"outcome": selected}},
+        "needs": {"previous": {"result": "failure"}},
+    }
+    for step in (aggregate_step, job["steps"][-1]):
+        assert truthy(evaluate(step["if"], contexts, cancelled=cancelled)) is expected
 
 
 @pytest.mark.parametrize("slot", SLOT_SCENARIOS)
@@ -536,16 +589,54 @@ def test_site_cases_do_not_cancel_each_other_and_always_clean_up_before_the_rece
     ):
         assert names.index(earlier) < names.index(later)
     steps = {step.get("name"): step for step in job["steps"]}
-    assert steps[cleanup]["if"].startswith("always() && ")
-    assert "steps.site-preflight.outcome == 'success'" in steps[cleanup]["if"]
     assert "cleanup --execute --kind site" in steps[cleanup]["run"]
     assert "Teardown" not in json.dumps(steps[cleanup])
     assert steps["Retain Site ownership"]["with"]["name"] == (
         "site-ownership-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.secret-sync-mode }}")
     assert steps["Retain the Site case outcome"]["with"]["name"] == (
         "site-outcome-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.secret-sync-mode }}")
-    assert steps["Retain the Site case outcome"]["if"].startswith("always() && ")
-    assert "always()" not in steps["Prepare the Site resource group"].get("if", "")
+
+
+@pytest.mark.parametrize(("candidate", "preflight", "cancelled", "expected"), [
+    pytest.param("true", "success", False, True, id="admitted-candidate"),
+    pytest.param("true", "failure", False, False, id="preflight-failed"),
+    pytest.param("true", "skipped", False, False, id="preflight-skipped"),
+    pytest.param("true", "cancelled", False, False, id="preflight-cancelled"),
+    pytest.param("false", "success", False, False, id="ordinary-run"),
+    pytest.param("true", "success", True, True, id="cleanup-after-cancellation"),
+    pytest.param("true", "failure", True, False, id="cancelled-without-admission"),
+    pytest.param("false", "success", True, False, id="no-site-cleanup-for-ordinary-cancellation"),
+])
+def test_site_cleanup_requires_candidate_ownership_even_after_cancellation(candidate, preflight, cancelled, expected):
+    job = yaml.safe_load((WORKFLOWS / "e2e-test.yaml").read_text())["jobs"]["e2e"]
+    step = next(step for step in job["steps"] if step.get("id") == "site-cleanup")
+    contexts = {
+        "env": {"CANDIDATE_MODE": candidate},
+        "steps": {"site-preflight": {"outcome": preflight}},
+        "needs": {"previous": {"result": "failure"}},
+    }
+    assert truthy(evaluate(step["if"], contexts, cancelled=cancelled)) is expected
+
+
+@pytest.mark.parametrize(("candidate", "selected", "cancelled", "expected"), [
+    pytest.param("true", "success", False, True, id="selected-candidate"),
+    pytest.param("true", "failure", False, False, id="selection-failed"),
+    pytest.param("true", "skipped", False, False, id="selection-skipped"),
+    pytest.param("true", "cancelled", False, False, id="selection-cancelled"),
+    pytest.param("false", "success", False, False, id="ordinary-run"),
+    pytest.param("true", "success", True, True, id="receipt-after-cancellation"),
+    pytest.param("false", "success", True, False, id="no-site-receipt-for-ordinary-cancellation"),
+])
+def test_site_outcomes_are_recorded_and_retained_only_for_selected_candidates(candidate, selected, cancelled, expected):
+    job = yaml.safe_load((WORKFLOWS / "e2e-test.yaml").read_text())["jobs"]["e2e"]
+    contexts = {
+        "env": {"CANDIDATE_MODE": candidate},
+        "steps": {"select": {"outcome": selected}},
+        "needs": {"previous": {"result": "failure"}},
+    }
+    for name in ("Record the Site case outcome", "Retain the Site case outcome"):
+        step = next(step for step in job["steps"] if step.get("name") == name)
+        assert truthy(evaluate(step["if"], contexts, cancelled=cancelled)) is expected
 
 
 @pytest.mark.parametrize(("selected", "expected"), [("2", 0), ("1", 1), ("", 1)])

@@ -18,6 +18,7 @@ import yaml
 
 from siteops.reporting import _KIND as DEPLOYMENT_KIND
 from tests.acceptance_helpers import calls, double_environment, install_doubles
+from tests.actions_expressions import dispatch_inputs, evaluate, job_runs, truthy
 from tests.native_bundle import NETWORK_BLOCK, publish_assets
 from tests.native_bundle import bundle_factory as bundle_factory
 from tests.native_uv_consumers import linux_archives
@@ -162,14 +163,259 @@ def test_published_mode_is_explicit_and_bounded():
         assert value in workflow
 
 
-def test_release_acceptance_starts_azure_work_only_after_both_request_guards_pass():
-    # Each guard rejects inputs the other does not check, so neither path may start alone.
-    jobs = yaml.safe_load(_workflow())["jobs"]
-    assert "needs.fleet-request.result == 'success'" in jobs["prep"]["if"]
-    assert jobs["fleet"]["needs"] == ["fleet-request", "prep"]
-    assert "(inputs.scenario == 'release-acceptance' && needs.prep.result == 'success')" in jobs["fleet"]["if"]
-    assert "needs.fleet-request.result == 'success'" in jobs["fleet"]["if"]
-    assert "prep" in jobs["e2e"]["needs"]
+def _e2e_results(request="success", prep="success", fleet="success", groups="success", e2e="success"):
+    return {"fleet-request": request, "prep": prep, "fleet": fleet, "site-groups": groups, "e2e": e2e}
+
+
+@pytest.mark.parametrize(("inputs", "needs", "cancelled", "expected"), [
+    pytest.param({"scenario": "release-acceptance", "candidate": "selected"}, _e2e_results(), False,
+                 {"fleet-request", "prep", "fleet", "site-groups", "e2e", "acceptance"}, id="release-acceptance"),
+    pytest.param({"scenario": "aio", "candidate": ""}, _e2e_results(request="skipped", groups="skipped"), False,
+                 {"prep", "e2e"}, id="ordinary-aio-after-skipped-optional-jobs"),
+    pytest.param({"scenario": "aio", "candidate": "selected"}, _e2e_results(request="skipped"), False,
+                 {"prep", "site-groups", "e2e"}, id="standalone-candidate-aio"),
+    pytest.param({"scenario": "fleet", "candidate": "selected"}, _e2e_results(prep="skipped", groups="skipped"), False,
+                 {"fleet-request", "fleet"}, id="fleet-after-skipped-prep"),
+    pytest.param({"scenario": "fleet-cleanup", "candidate": ""}, _e2e_results(prep="skipped", groups="skipped"), False,
+                 {"fleet-request", "fleet-cleanup"}, id="fleet-cleanup"),
+    pytest.param({"scenario": "site-cleanup", "candidate": ""}, _e2e_results(prep="skipped", groups="skipped"), False,
+                 {"fleet-request", "fleet-cleanup"}, id="site-cleanup"),
+    pytest.param({"scenario": "windows-installer-preflight", "candidate": ""},
+                 _e2e_results(request="skipped", prep="skipped", groups="skipped"), False,
+                 set(), id="windows-probe-does-not-start-acceptance-work"),
+    pytest.param({"scenario": "release-acceptance", "candidate": ""}, _e2e_results(prep="failure", fleet="skipped"), False,
+                 {"fleet-request", "prep", "acceptance"}, id="missing-candidate-rejected-by-prep"),
+    pytest.param({"scenario": "release-acceptance", "candidate": "selected"},
+                 _e2e_results(request="failure", prep="skipped", fleet="skipped"), False,
+                 {"fleet-request", "site-groups", "acceptance"}, id="request-rejected"),
+    pytest.param({"scenario": "release-acceptance", "candidate": "selected"},
+                 _e2e_results(request="skipped", prep="skipped", fleet="skipped"), False,
+                 {"fleet-request", "site-groups", "acceptance"}, id="request-skipped"),
+    pytest.param({"scenario": "release-acceptance", "candidate": "selected"},
+                 _e2e_results(request="cancelled", prep="skipped", fleet="skipped"), False,
+                 {"fleet-request", "site-groups", "acceptance"}, id="request-cancelled"),
+    # Direct results are independent here so that a passed prep cannot mask a rejected request.
+    pytest.param({"scenario": "release-acceptance", "candidate": "selected"},
+                 _e2e_results(request="failure"), False,
+                 {"fleet-request", "site-groups", "e2e", "acceptance"}, id="request-rejected-despite-passed-prep"),
+    pytest.param({"scenario": "release-acceptance", "candidate": "selected"},
+                 _e2e_results(request="skipped"), False,
+                 {"fleet-request", "site-groups", "e2e", "acceptance"}, id="request-skipped-despite-passed-prep"),
+    pytest.param({"scenario": "release-acceptance", "candidate": "selected"},
+                 _e2e_results(prep="failure"), False,
+                 {"fleet-request", "prep", "site-groups", "acceptance"}, id="prep-rejected-despite-passed-request"),
+    pytest.param({"scenario": "release-acceptance", "candidate": "selected"},
+                 _e2e_results(prep="skipped"), False,
+                 {"fleet-request", "prep", "site-groups", "acceptance"}, id="prep-skipped-despite-passed-request"),
+    pytest.param({"scenario": "release-acceptance", "candidate": "selected"},
+                 _e2e_results(prep="cancelled"), False,
+                 {"fleet-request", "prep", "site-groups", "acceptance"}, id="prep-cancelled"),
+    pytest.param({"scenario": "release-acceptance", "candidate": "selected"}, _e2e_results(groups="failure"), False,
+                 {"fleet-request", "prep", "fleet", "site-groups", "acceptance"}, id="site-groups-rejected"),
+    pytest.param({"scenario": "release-acceptance", "candidate": "selected"}, _e2e_results(groups="skipped"), False,
+                 {"fleet-request", "prep", "fleet", "site-groups", "acceptance"}, id="site-groups-skipped"),
+    pytest.param({"scenario": "release-acceptance", "candidate": "selected"}, _e2e_results(groups="cancelled"), False,
+                 {"fleet-request", "prep", "fleet", "site-groups", "acceptance"}, id="site-groups-cancelled"),
+    pytest.param({"scenario": "release-acceptance", "candidate": "selected"}, _e2e_results(fleet="failure"), False,
+                 {"fleet-request", "prep", "fleet", "site-groups", "e2e", "acceptance"}, id="aggregate-fleet-failure"),
+    pytest.param({"scenario": "release-acceptance", "candidate": "selected"}, _e2e_results(e2e="failure"), False,
+                 {"fleet-request", "prep", "fleet", "site-groups", "e2e", "acceptance"}, id="aggregate-site-failure"),
+    pytest.param({"scenario": "release-acceptance", "candidate": "selected"},
+                 _e2e_results("failure", "skipped", "skipped", "skipped", "skipped"), True,
+                 {"acceptance"}, id="cancelled-release-still-aggregates"),
+    pytest.param({"scenario": "aio", "candidate": "selected"}, _e2e_results(), True, set(), id="cancelled-aio"),
+    pytest.param({"scenario": "fleet", "candidate": "selected"}, _e2e_results(), True, set(), id="cancelled-fleet"),
+    pytest.param({"scenario": "fleet-cleanup", "candidate": ""}, _e2e_results(), True, set(), id="cancelled-fleet-cleanup"),
+    pytest.param({"scenario": "site-cleanup", "candidate": ""}, _e2e_results(), True, set(), id="cancelled-site-cleanup"),
+    pytest.param({"scenario": "fleet-cleanup", "candidate": ""}, _e2e_results(request="failure", prep="skipped"), False,
+                 {"fleet-request"}, id="fleet-cleanup-request-rejected"),
+    pytest.param({"scenario": "site-cleanup", "candidate": ""}, _e2e_results(request="skipped", prep="skipped"), False,
+                 {"fleet-request"}, id="site-cleanup-request-skipped"),
+    pytest.param({"scenario": "fleet", "candidate": ""}, _e2e_results(request="failure", prep="skipped"), False,
+                 {"fleet-request"}, id="fleet-request-rejected"),
+    pytest.param({"scenario": "fleet", "candidate": ""}, _e2e_results(prep="failure"), False,
+                 {"fleet-request", "fleet"}, id="ordinary-fleet-does-not-require-prep"),
+    pytest.param({"scenario": "aio", "candidate": ""}, _e2e_results(request="failure", groups="failure"), False,
+                 {"prep", "e2e"}, id="ordinary-aio-does-not-require-optional-admissions"),
+    pytest.param({"scenario": "aio", "candidate": ""}, _e2e_results(prep="failure"), False,
+                 {"prep"}, id="ordinary-aio-prep-rejected"),
+    pytest.param({"scenario": "aio", "candidate": "selected"}, _e2e_results(groups="failure"), False,
+                 {"prep", "site-groups"}, id="standalone-candidate-needs-site-groups"),
+])
+def test_e2e_jobs_gate_work_on_scenarios_and_required_admissions(inputs, needs, cancelled, expected):
+    workflow = yaml.safe_load(_workflow())
+    declared = {
+        "fleet-request": [],
+        "prep": "fleet-request",
+        "fleet": ["fleet-request", "prep"],
+        "fleet-cleanup": "fleet-request",
+        "site-groups": [],
+        "e2e": ["prep", "site-groups"],
+        "acceptance": ["fleet-request", "fleet", "prep", "site-groups", "e2e"],
+    }
+    outputs = {"prep": {"candidate-mode": "true" if inputs["candidate"] else "false"}}
+    for job_id, dependencies in declared.items():
+        assert workflow["jobs"][job_id].get("needs", []) == dependencies
+        keys = [dependencies] if isinstance(dependencies, str) else dependencies
+        assert job_runs(
+            workflow, job_id, inputs=dispatch_inputs(workflow, inputs),
+            needs={key: needs[key] for key in keys},
+            outputs={key: value for key, value in outputs.items() if key in keys},
+            cancelled=cancelled,
+        ) is (job_id in expected), job_id
+
+
+def _e2e_step(selector):
+    steps = yaml.safe_load(_workflow())["jobs"]["e2e"]["steps"]
+    if selector.startswith("download:"):
+        path = "${{ runner.temp }}/fleet/" + selector.removeprefix("download:")
+        return next(step for step in steps if step.get("with", {}).get("path") == path)
+    return next(step for step in steps if selector in (step.get("name"), step.get("id"), step.get("uses")))
+
+
+@pytest.mark.parametrize(("selected", "expected"), [
+    pytest.param({}, True, id="ordinary-source-templates"),
+    pytest.param({"published-release": "v1.0.0"}, False, id="published-release"),
+    pytest.param({"candidate": "selected"}, False, id="candidate"),
+    pytest.param({"candidate": "selected", "published-release": "v1.0.0"}, False, id="both-transports"),
+])
+def test_prep_validates_templates_only_without_a_candidate_or_published_release(selected, expected):
+    workflow = yaml.safe_load(_workflow())
+    step = next(step for step in workflow["jobs"]["prep"]["steps"] if step.get("name") == "Validate Bicep templates")
+    assert truthy(evaluate(step["if"], {"inputs": dispatch_inputs(workflow, selected)})) is expected
+
+
+@pytest.mark.parametrize("selector", [
+    pytest.param("tools", id="candidate-tools"),
+    pytest.param("select", id="candidate-selection"),
+    pytest.param("download:admission", id="candidate-admission"),
+    pytest.param("download:plan", id="candidate-plan"),
+    pytest.param("download:inventory", id="candidate-inventory"),
+    pytest.param("download:engine", id="candidate-engine-assets"),
+    pytest.param("download:workspaces", id="candidate-workspace-assets"),
+    pytest.param("Bind candidate inputs and owned Site names", id="candidate-binding"),
+    pytest.param("candidate-engine", id="candidate-installation"),
+    pytest.param("site-preflight", id="site-preflight"),
+    pytest.param("Retain Site ownership", id="site-ownership"),
+    pytest.param("Prepare the Site resource group", id="site-preparation"),
+])
+@pytest.mark.parametrize(("candidate_mode", "expected"), [
+    pytest.param("true", True, id="candidate"),
+    pytest.param("false", False, id="ordinary"),
+    pytest.param("", False, id="missing-mode"),
+])
+def test_candidate_setup_and_site_preparation_run_only_for_candidate_mode(selector, candidate_mode, expected):
+    assert truthy(evaluate(_e2e_step(selector)["if"], {"env": {"CANDIDATE_MODE": candidate_mode}})) is expected
+
+
+@pytest.mark.parametrize(("candidate", "published", "expected"), [
+    pytest.param("true", "true", False, id="candidate-uses-no-public-release"),
+    pytest.param("true", "false", False, id="candidate-without-published-mode"),
+    pytest.param("false", "true", True, id="published-release"),
+    pytest.param("false", "false", False, id="source-mode"),
+    pytest.param("", "true", True, id="ordinary-without-candidate-output"),
+    pytest.param("false", "", False, id="missing-published-output"),
+])
+def test_public_release_setup_and_enrollment_exclude_candidate_cases(candidate, published, expected):
+    steps = yaml.safe_load(_workflow())["jobs"]["e2e"]["steps"]
+    guarded = [
+        step for step in steps
+        if any(token in json.dumps(step) for token in ("setup-published-siteops", "source enroll", "project pin"))
+    ]
+    assert {step.get("name") or step.get("uses") for step in guarded} == {
+        "./.github/actions/setup-published-siteops", "Prepare the published workspace project",
+    }
+    contexts = {"env": {"CANDIDATE_MODE": candidate}, "needs": {"prep": {"outputs": {"published-mode": published}}}}
+    for step in guarded:
+        assert truthy(evaluate(step["if"], contexts)) is expected
+
+
+@pytest.mark.parametrize(("persistent", "candidate", "snapshot", "create"), [
+    pytest.param("false", "false", False, True, id="ordinary-ephemeral"),
+    pytest.param("true", "false", True, False, id="ordinary-persistent"),
+    pytest.param("false", "true", True, False, id="candidate-ephemeral"),
+    pytest.param("true", "true", True, False, id="candidate-persistent"),
+])
+def test_group_snapshot_covers_candidates_and_creation_excludes_them(persistent, candidate, snapshot, create):
+    contexts = {"env": {"PERSISTENT_RG": persistent, "CANDIDATE_MODE": candidate}}
+    assert truthy(evaluate(_e2e_step("Snapshot RG resources (persistent mode)")["if"], contexts)) is snapshot
+    assert truthy(evaluate(_e2e_step("Create resource group (ephemeral mode)")["if"], contexts)) is create
+
+
+@pytest.mark.parametrize(("candidate", "debug_user", "expected"), [
+    pytest.param("false", "operator", True, id="ordinary-with-debug-user"),
+    pytest.param("false", "", False, id="ordinary-without-debug-user"),
+    pytest.param("true", "operator", False, id="candidate-with-debug-user"),
+    pytest.param("true", "", False, id="candidate-without-debug-user"),
+])
+def test_debug_cluster_access_requires_an_operator_outside_candidate_mode(candidate, debug_user, expected):
+    step = _e2e_step("Grant debug user cluster-admin on k3s (Arc proxy access)")
+    assert truthy(evaluate(
+        step["if"], {"env": {"CANDIDATE_MODE": candidate, "DEBUG_USER_OID": debug_user}},
+    )) is expected
+
+
+@pytest.mark.parametrize("selector", [
+    pytest.param("existing-vault", id="create-existing-vault"),
+    pytest.param("existing-enable", id="enable-existing-secret-sync"),
+])
+@pytest.mark.parametrize(("candidate", "slot", "expected"), [
+    pytest.param("true", "existing", True, id="candidate-existing"),
+    pytest.param("true", "enabled", False, id="candidate-enabled"),
+    pytest.param("true", "disabled", False, id="candidate-disabled"),
+    pytest.param("false", "existing", False, id="ordinary-existing"),
+    pytest.param("false", "enabled", False, id="ordinary-enabled"),
+    pytest.param("false", "disabled", False, id="ordinary-disabled"),
+])
+def test_existing_vault_setup_is_reserved_for_the_candidate_existing_case(selector, candidate, slot, expected):
+    assert truthy(evaluate(
+        _e2e_step(selector)["if"],
+        {"env": {"CANDIDATE_MODE": candidate}, "matrix": {"secret-sync-mode": slot}},
+    )) is expected
+
+
+@pytest.mark.parametrize(("published", "candidate", "cancelled", "prior_result", "expected"), [
+    pytest.param("true", "false", False, "success", True, id="ordinary-published"),
+    pytest.param("true", "true", False, "success", False, id="candidate-has-its-own-receipt"),
+    pytest.param("false", "false", False, "success", False, id="source-mode"),
+    pytest.param("", "false", False, "success", False, id="missing-published-output"),
+    pytest.param("true", "false", True, "failure", True, id="retain-cancelled-published-result"),
+    pytest.param("true", "false", False, "skipped", True, id="retain-skipped-published-result"),
+    pytest.param("true", "true", True, "failure", False, id="no-public-receipt-for-cancelled-candidate"),
+])
+def test_published_receipts_survive_failure_but_never_replace_candidate_receipts(
+    published, candidate, cancelled, prior_result, expected,
+):
+    steps = yaml.safe_load(_workflow())["jobs"]["e2e"]["steps"]
+    step = next(step for step in steps if step.get("with", {}).get("name", "").startswith("published-e2e-"))
+    contexts = {
+        "env": {"CANDIDATE_MODE": candidate},
+        "needs": {"prep": {"outputs": {"published-mode": published}}, "previous": {"result": prior_result}},
+    }
+    assert truthy(evaluate(step["if"], contexts, cancelled=cancelled)) is expected
+
+
+@pytest.mark.parametrize(("persistent", "candidate", "skip", "cancelled", "expected"), [
+    pytest.param("false", "false", False, False, True, id="ordinary-ephemeral"),
+    pytest.param("true", "false", False, False, False, id="ordinary-persistent"),
+    pytest.param("false", "true", False, False, False, id="candidate-ephemeral"),
+    pytest.param("true", "true", False, False, False, id="candidate-persistent"),
+    pytest.param("false", "false", True, False, False, id="operator-keeps-group"),
+    pytest.param("false", "false", False, True, True, id="cleanup-after-cancellation"),
+    pytest.param("false", "true", False, True, False, id="cancelled-candidate-uses-owned-cleanup"),
+])
+def test_ephemeral_teardown_cleans_ordinary_runs_without_deleting_candidate_groups(
+    persistent, candidate, skip, cancelled, expected,
+):
+    workflow = yaml.safe_load(_workflow())
+    contexts = {
+        "env": {"PERSISTENT_RG": persistent, "CANDIDATE_MODE": candidate},
+        "inputs": dispatch_inputs(workflow, skip_teardown=skip),
+        "needs": {"previous": {"result": "failure"}},
+    }
+    assert truthy(evaluate(
+        _e2e_step("Teardown (ephemeral mode, delete RG)")["if"], contexts, cancelled=cancelled,
+    )) is expected
 
 
 def test_windows_capability_probe_is_opt_in_without_azure_authority():
@@ -184,10 +430,6 @@ def test_windows_capability_probe_is_opt_in_without_azure_authority():
 
     jobs = workflow["jobs"]
     assert jobs["prep"]["needs"] == "fleet-request"
-    assert jobs["prep"]["if"] == (
-        "${{ !cancelled() && (inputs.scenario == 'aio' || (inputs.scenario == 'release-acceptance' "
-        "&& needs.fleet-request.result == 'success')) }}"
-    )
     assert jobs["e2e"]["needs"] == ["prep", "site-groups"]
     probe = jobs["windows-installer-preflight"]
     assert probe["if"] == "inputs.scenario == 'windows-installer-preflight'"
@@ -493,7 +735,6 @@ def test_guided_published_run_requires_persistent_snapshot_before_observation():
         step for step in steps
         if step.get("name") == "Snapshot RG resources (persistent mode)"
     )
-    assert snapshot["if"] == "env.PERSISTENT_RG == 'true' || env.CANDIDATE_MODE == 'true'"
     assert steps.index(snapshot) < next(
         index for index, step in enumerate(steps)
         if step.get("uses") == "./.github/actions/connect-arc"
@@ -1984,12 +2225,7 @@ def test_candidate_cases_use_masked_owned_names_and_a_distinct_existing_suffix(t
 def test_candidate_steps_never_read_enroll_or_pin_a_public_release():
     job = yaml.safe_load(_workflow())["jobs"]["e2e"]
     steps = job["steps"]
-    for step in steps:
-        body = json.dumps(step)
-        if any(token in body for token in ("setup-published-siteops", "source enroll", "project pin")):
-            assert "env.CANDIDATE_MODE != 'true'" in step["if"], step.get("name") or step.get("uses")
     engine = next(step for step in steps if step.get("id") == "candidate-engine")
-    assert engine["if"] == "env.CANDIDATE_MODE == 'true'"
     for value in ("scripts/qualify-workspace-engine.py", "--project-workspace workspaces/iot-operations",
                   "--expected-runner-environment self-hosted", "Candidate E2E imported Site Ops from checkout.",
                   "SITEOPS_E2E_TRUST=policy", 'rmdir "$project/sites"', 'echo "$state/command" >> "$GITHUB_PATH"'):
@@ -2007,9 +2243,6 @@ def test_candidate_steps_never_read_enroll_or_pin_a_public_release():
         ("Enable Secret Sync on the existing instance", "Observe bounded AIO readiness"),
     ):
         assert names.index(earlier) < names.index(later), (earlier, later)
-    for name in ("Teardown (ephemeral mode, delete RG)", "Create resource group (ephemeral mode)",
-                 "Grant debug user cluster-admin on k3s (Arc proxy access)"):
-        assert "env.CANDIDATE_MODE != 'true'" in steps[names.index(name)]["if"]
     assert job["permissions"] == {"contents": "read", "actions": "read", "id-token": "write"}
 
 
@@ -2197,7 +2430,6 @@ def test_site_group_selection_reads_only_environment_secrets_and_publishes_no_na
     job = yaml.safe_load(_workflow())["jobs"]["site-groups"]
     assert job["environment"] == "${{ inputs.environment }}"
     assert job["permissions"] == {}
-    assert job["if"] == "inputs.candidate != '' && (inputs.scenario == 'aio' || inputs.scenario == 'release-acceptance')"
     assert set(job["outputs"]) == {"groups", "rg-key", "max-parallel"}
     assert len(job["steps"]) == 1 and "uses" not in job["steps"][0]
     assert job["steps"][0]["env"]["SITE_GROUP"] == "${{ secrets.E2E_SITE_RESOURCE_GROUP }}"
@@ -2231,10 +2463,6 @@ def test_site_groups_select_parallel_ephemeral_or_serialized_persistent_cases(si
 
 def test_site_cases_schedule_from_site_groups_and_keep_ordinary_dispatches_unchanged():
     job = yaml.safe_load(_workflow())["jobs"]["e2e"]
-    assert job["if"] == (
-        "${{ !cancelled() && needs.prep.result == 'success' && (needs.prep.outputs.candidate-mode != 'true' "
-        "|| needs.site-groups.result == 'success') }}"
-    )
     assert job["strategy"]["max-parallel"] == (
         "${{ fromJSON(needs.site-groups.outputs.max-parallel || needs.prep.outputs.max-parallel) }}")
     group = job["concurrency"]["group"]

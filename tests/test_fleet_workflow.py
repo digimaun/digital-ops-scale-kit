@@ -26,6 +26,7 @@ from fleet_workflow import (  # noqa: E402
     hosts_ready,
     jobs,
     participants_started,
+    run_jobs,
     wait_for_job_state,
 )
 from siteops_release_assets import FrozenReleaseAssets, ReleaseAsset  # noqa: E402
@@ -57,7 +58,7 @@ def test_fleet_onboarding_retains_the_existing_environment_secret_name(
     assert host["environment"] == "${{ inputs.environment }}"
 
     def secret_name(expression):
-        match = re.fullmatch(r"\$\{\{ secrets\.([A-Z_]+) \}\}", expression)
+        match = re.fullmatch(r"\$\{\{ secrets\.([A-Z0-9_]+) \}\}", expression)
         assert match, "This boundary must use one named secret, not a conditional fallback."
         return match[1]
 
@@ -433,6 +434,7 @@ def test_host_requires_the_committed_immutable_owner(inputs, monkeypatch, capsys
     subscription = "00000000-0000-0000-0000-000000000001"
     for key, content in {
         "FLEET_RUN_ID": "50", "FLEET_RUN_ATTEMPT": "1", "AZURE_SUBSCRIPTION_ID": subscription,
+        "GITHUB_ENV": str(root / "host-environment"), "E2E_FLEET_RESOURCE_GROUPS": "",
     }.items():
         monkeypatch.setenv(key, content)
     selected = parse(value)
@@ -451,7 +453,7 @@ def test_host_requires_the_committed_immutable_owner(inputs, monkeypatch, capsys
     }))
     observed = {
         "id": f"/subscriptions/{subscription}/resourceGroups/{scope.group('one')}",
-        "name": scope.group("one"), "tags": scope.tags("one"),
+        "name": scope.group("one"), "tags": scope.tags("one"), "location": "eastus2",
         "managedBy": owners["one" if matching_owner else "two"],
     }
     monkeypatch.setattr(script, "AzureGroups", lambda *args: SimpleNamespace(show=lambda slot: observed))
@@ -463,6 +465,8 @@ def test_host_requires_the_committed_immutable_owner(inputs, monkeypatch, capsys
     assert script.main() == (0 if matching_owner else 1)
     captured = capsys.readouterr()
     assert all(owner not in captured.out + captured.err for owner in owners.values())
+    assert ((root / "host-environment").read_text() if matching_owner else None) == (
+        "FLEET_LOCATION=eastus2\n" if matching_owner else None)
 
 
 def test_workflow_keeps_hosts_live_and_uploads_ownership_before_creation():
@@ -476,7 +480,7 @@ def test_workflow_keeps_hosts_live_and_uploads_ownership_before_creation():
     assert "always()" in jobs["cleanup"]["if"]
     assert jobs["hosts"]["timeout-minutes"] > jobs["controller"]["timeout-minutes"] + jobs["cleanup"]["timeout-minutes"]
     names = [step.get("name") for step in jobs["prepare"]["steps"]]
-    assert names.index("Preflight resource ownership") < names.index("Retain resource ownership") < names.index("Create owned resource groups")
+    assert names.index("Preflight resource ownership") < names.index("Retain resource ownership") < names.index("Prepare fleet resource groups")
     host_steps = jobs["hosts"]["steps"]
     held = next(step for step in host_steps if step.get("name") == "Hold host through cleanup")
     assert "always()" in held["if"] and "wait-cleanup" in held["run"]
@@ -494,15 +498,20 @@ def test_workflow_keeps_hosts_live_and_uploads_ownership_before_creation():
         assert jobs[name]["runs-on"] == "ubuntu-24.04"
         assert "attestations" not in jobs[name]["permissions"]
     caller = yaml.safe_load((ROOT / ".github/workflows/e2e-test.yaml").read_text())
-    assert caller["jobs"]["fleet"]["if"] == "inputs.scenario == 'fleet'"
-    assert caller["jobs"]["fleet-cleanup"]["if"] == "inputs.scenario == 'fleet-cleanup'"
+    assert caller["jobs"]["fleet"]["if"] == "inputs.scenario == 'fleet' || inputs.scenario == 'release-acceptance'"
+    assert caller["jobs"]["fleet-cleanup"]["if"] == (
+        "inputs.scenario == 'fleet-cleanup' || inputs.scenario == 'site-cleanup'"
+    )
+    assert caller["jobs"]["fleet-cleanup"]["with"]["kind"] == (
+        "${{ inputs.scenario == 'site-cleanup' && 'site' || 'fleet' }}"
+    )
 
 
 def test_allocation_markers_stay_private_and_cleanup_consumes_verified_original_receipts():
     flow = yaml.safe_load((ROOT / ".github/workflows/_fleet-acceptance.yaml").read_text())
     steps = flow["jobs"]["prepare"]["steps"]
     preflight = next(step for step in steps if step.get("id") == "preflight")
-    creation = next(step for step in steps if step.get("name") == "Create owned resource groups")
+    creation = next(step for step in steps if step.get("name") == "Prepare fleet resource groups")
     upload = next(step for step in steps if step.get("id") == "ownership")
     for step in (preflight, creation):
         assert '--allocation-state "$root/allocation.json"' in step["run"]
@@ -723,3 +732,261 @@ def test_metadata_shutdown_failure_stops_coordination_without_publishing_outputs
     captured = capsys.readouterr()
     assert "cleanup deadline" in captured.err
     assert "synthetic-token" not in captured.out + captured.err
+
+
+@pytest.mark.parametrize("fault", [None, "future-attempt", "other-run", "duplicate", "unnamed"])
+def test_run_jobs_accept_every_earlier_attempt_of_this_run_only(fault):
+    values = [{"id": index, "run_id": 50, "run_attempt": attempt, "head_sha": SOURCE["commit"], "name": "Site case"}
+              for index, attempt in enumerate((1, 2, 3), 1)]
+    if fault == "future-attempt":
+        values[0]["run_attempt"] = 4
+    elif fault == "other-run":
+        values[0]["run_id"] = 51
+    elif fault == "duplicate":
+        values[1]["id"] = 1
+    elif fault == "unnamed":
+        values[0]["name"] = None
+    pages = [{"total_count": 3, "jobs": values}]
+    if fault is None:
+        assert run_jobs(pages, run=50, attempt=3, commit=SOURCE["commit"]) == values
+    else:
+        with pytest.raises(CoordinationError):
+            run_jobs(pages, run=50, attempt=3, commit=SOURCE["commit"])
+
+
+def site_environment(monkeypatch, root, value, **extra):
+    for name, content in {
+        "FLEET_CANDIDATE": json.dumps(value), "GITHUB_REPOSITORY": SOURCE["repository"],
+        "GITHUB_SHA": SOURCE["commit"], "GITHUB_REF": SOURCE["ref"], "FLEET_RUN_ID": "50",
+        "FLEET_RUN_ATTEMPT": "2", "GITHUB_RUN_ID": "60", "GITHUB_RUN_ATTEMPT": "1",
+        "AZURE_SUBSCRIPTION_ID": "00000000-0000-0000-0000-000000000001",
+        "GITHUB_ENV": str(root / "environment"), "GITHUB_OUTPUT": str(root / "outputs"), **extra,
+    }.items():
+        monkeypatch.setenv(name, content)
+
+
+@pytest.mark.parametrize("marker", ["rg%0Aprivate-marker", "rg-private\r\n::warning::forged"])
+def test_site_scope_masks_every_private_name_before_publishing_it(inputs, monkeypatch, capsys, marker):
+    root, value, _ = inputs
+    script = load_script("coordinate-release-fleet")
+    site_environment(monkeypatch, root, value)
+    real = script.scope_for
+
+    def scope_for(*args, **kwargs):
+        assert kwargs["slot"] == "existing"
+        selected = real(*args, **kwargs)
+        return SimpleNamespace(subscription=selected.subscription, group=lambda slot: marker,
+                               cluster=lambda slot: "arc%25private", vault=lambda slot: "kv%private")
+
+    monkeypatch.setattr(script, "scope_for", scope_for)
+    monkeypatch.setattr(sys, "argv", ["coordinate-release-fleet.py", "scope", "--root", str(root),
+                                      "--kind", "site", "--slot", "existing"])
+    code = script.main()
+    captured = capsys.readouterr()
+    if "\n" in marker:
+        assert code == 1
+        assert not (root / "environment").exists()
+        assert "::add-mask::" not in captured.out
+        assert "rg-private" not in captured.out + captured.err and "forged" not in captured.out + captured.err
+        return
+    assert code == 0
+    masks = [line for line in captured.out.splitlines() if line.startswith("::add-mask::")]
+    assert masks[:2] == ["::add-mask::rg%250Aprivate-marker", "::add-mask::arc%2525private"]
+    assert masks[-1] == "::add-mask::kv%25private"
+    assert all(line.startswith("::add-mask::") for line in captured.out.splitlines())
+    environment = (root / "environment").read_text()
+    assert f"FLEET_RESOURCE_GROUP={marker}\n" in environment and "FLEET_VAULT_NAME=kv%private\n" in environment
+
+
+@pytest.mark.parametrize("arguments", [["--slot", "existing"], ["--kind", "site", "--slot", "one"],
+                                       ["--kind", "site"]])
+def test_site_slots_and_site_kind_are_selected_together(inputs, monkeypatch, arguments):
+    root, value, _ = inputs
+    script = load_script("coordinate-release-fleet")
+    site_environment(monkeypatch, root, value)
+    monkeypatch.setattr(sys, "argv", ["coordinate-release-fleet.py", "scope", "--root", str(root), *arguments])
+    assert script.main() == 1
+    assert not (root / "environment").exists()
+
+
+def test_each_phase_gets_a_fresh_policy_from_the_admitted_roots(inputs, monkeypatch, capsys):
+    root, value, _ = inputs
+    script = load_script("coordinate-release-fleet")
+    site_environment(monkeypatch, root, value)
+    state = root / "controller"
+    (state / "workspace-policy").mkdir(parents=True)
+    (state / "workspace-policy" / "root.json").write_bytes(b'{"admitted":"roots"}')
+    monkeypatch.setattr(sys, "argv", ["coordinate-release-fleet.py", "policy", "--root", str(root),
+                                      "--state", str(state)])
+    printed = []
+    for _ in range(2):
+        assert script.main() == 0
+        printed.append(capsys.readouterr().out.strip())
+    assert printed == [str(root / "policy-1"), str(root / "policy-2")]
+    policy = json.loads((root / "policy-2" / "policy.json").read_text())
+    assert policy["provider"] == {
+        "kind": "github-attestation/v1", "repository": SOURCE["repository"], "sourceRef": "refs/heads/main",
+        "signerWorkflow": ".github/workflows/_workspace-distribution.yaml",
+        "builderWorkflow": ".github/workflows/release.yaml", "runnerEnvironment": "self-hosted",
+    }
+    assert (root / "policy-2" / "root.json").read_bytes() == b'{"admitted":"roots"}'
+
+
+def _reads(responses, calls):
+    class Reads:
+        def __init__(self, path):
+            pass
+
+        def read(self, endpoint, *, pages=False, timeout=60):
+            calls.append(endpoint)
+            for fragment, value in responses.items():
+                if fragment in endpoint:
+                    return value
+            pytest.fail(f"Unexpected metadata request: {endpoint}")
+
+    return Reads
+
+
+@pytest.mark.parametrize(("job", "retained", "artifact", "expected"), [
+    (False, None, False, ("", 0)),
+    (True, "failure", False, ("", 0)),
+    (True, "skipped", False, ("", 0)),
+    (True, "success", True, ("700", 0)),
+    (True, "success", False, (None, 1)),
+    (True, None, False, (None, 1)),
+])
+def test_site_reconciliation_reports_nothing_only_when_creation_could_not_start(
+    inputs, monkeypatch, job, retained, artifact, expected,
+):
+    root, value, _ = inputs
+    script = load_script("coordinate-release-fleet")
+    site_environment(monkeypatch, root, value)
+    steps = [] if retained is None else [{"name": "Retain Site ownership", "status": "completed",
+                                         "conclusion": retained}]
+    jobs_page = [{"total_count": 1 if job else 1, "jobs": [{
+        "id": 1, "run_id": 50, "run_attempt": 2, "head_sha": SOURCE["commit"],
+        "name": "Site case (existing)" if job else "Site case (enabled)", "steps": steps,
+    }]}]
+    artifacts = [{"artifacts": [{
+        "id": 700, "name": "site-ownership-50-2-existing", "expired": False, "size_in_bytes": 10,
+        "digest": "sha256:" + "e" * 64, "workflow_run": {"id": 50, "head_sha": SOURCE["commit"]},
+    }] if artifact else []}]
+    calls = []
+    monkeypatch.setattr(script, "GitHubReads", _reads({
+        "/attempts/2/jobs": jobs_page, "/runs/50/artifacts": artifacts,
+        "/runs/50/attempts/2": {"id": 50, "run_attempt": 2, "head_sha": SOURCE["commit"],
+                                "repository": {"full_name": SOURCE["repository"]}, "status": "completed"},
+    }, calls))
+    monkeypatch.setattr(sys, "argv", ["coordinate-release-fleet.py", "ownership", "--root", str(root),
+                                      "--kind", "site", "--slot", "existing"])
+    assert script.main() == expected[1]
+    if expected[0] is None:
+        assert not (root / "outputs").exists()
+    else:
+        assert (root / "outputs").read_text() == f"ownership-id={expected[0]}\n"
+
+
+def test_evidence_selection_publishes_only_ids_of_the_latest_attempts(inputs, monkeypatch):
+    root, value, _ = inputs
+    script = load_script("coordinate-release-fleet")
+    site_environment(monkeypatch, root, value, GITHUB_RUN_ID="60", GITHUB_RUN_ATTEMPT="2")
+    names = ["Site case (disabled)", "Site case (enabled)", "Site case (existing)", "Site case (existing)",
+             *(f"Fleet / {name}" for name in ("Select fleet candidate", "Fleet prepare", "Fleet host (one)",
+                                              "Fleet host (two)", "Fleet controller", "Fleet cleanup",
+                                              "Require complete fleet acceptance"))]
+    executions = [{"id": index, "run_id": 60, "run_attempt": 2 if index == 4 else 1, "head_sha": SOURCE["commit"],
+                   "name": name, "status": "completed", "conclusion": "success"}
+                  for index, name in enumerate(names, 1)]
+    artifacts = [{"id": 800 + index, "name": name, "expired": False, "size_in_bytes": 10,
+                  "digest": "sha256:" + "e" * 64, "workflow_run": {"id": 60, "head_sha": SOURCE["commit"]}}
+                 for index, name in enumerate(("site-outcome-60-1-disabled", "site-outcome-60-1-enabled",
+                                               "site-outcome-60-1-existing", "site-outcome-60-2-existing",
+                                               "fleet-acceptance-60-1"))]
+    calls = []
+    monkeypatch.setattr(script, "GitHubReads", _reads({
+        "/runs/60/jobs?filter=all": [{"total_count": len(executions), "jobs": executions}],
+        "/runs/60/artifacts": [{"artifacts": artifacts}],
+    }, calls))
+    monkeypatch.setattr(sys, "argv", ["coordinate-release-fleet.py", "evidence", "--root", str(root)])
+    assert script.main() == 0
+    assert (root / "outputs").read_text().splitlines() == [
+        "disabled-id=800", "enabled-id=801", "existing-id=803", "fleet-id=804"]
+    assert json.loads((root / "run-jobs.json").read_text())[0]["jobs"] == executions
+    assert all(endpoint.startswith("repos/example/content/actions/runs/60/") for endpoint in calls)
+
+
+@pytest.mark.parametrize(("kind", "value", "expected"), [
+    ("site", "", None), ("site", "rg-Site_1.(a)", ("rg-Site_1.(a)",)),
+    ("fleet", "", None), ("fleet", "rg-one,RG-two", ("rg-one", "RG-two")),
+    ("site", " rg-private-marker", ValueError), ("site", "rg-private-marker.", ValueError),
+    ("site", "rg-private-marker\n", ValueError), ("site", "rg-private,marker", ValueError),
+    ("fleet", "rg-private-marker", ValueError), ("fleet", "rg-private-marker, rg-two", ValueError),
+    ("fleet", "rg-private-marker,RG-PRIVATE-MARKER", ValueError), ("fleet", "a,b,c", ValueError),
+    ("site", "rg-" + "x" * 88, ValueError),
+])
+def test_persistent_group_secrets_have_a_strict_shape_and_are_never_echoed(kind, value, expected):
+    from fleet_workflow import supplied_groups
+
+    environment = {"E2E_SITE_RESOURCE_GROUP" if kind == "site" else "E2E_FLEET_RESOURCE_GROUPS": value}
+    if expected is ValueError:
+        with pytest.raises(CoordinationError) as caught:
+            supplied_groups(kind, environment)
+        assert "private" not in str(caught.value) and "rg-" not in str(caught.value)
+    else:
+        assert supplied_groups(kind, environment) == expected
+
+
+def test_persistent_hosts_take_their_region_from_the_supplied_group(inputs, monkeypatch, capsys):
+    root, value, _ = inputs
+    script = load_script("coordinate-release-fleet")
+    subscription = "00000000-0000-0000-0000-000000000001"
+    for key, content in {"FLEET_RUN_ID": "50", "FLEET_RUN_ATTEMPT": "1", "AZURE_SUBSCRIPTION_ID": subscription,
+                         "GITHUB_ENV": str(root / "host-environment"),
+                         "E2E_FLEET_RESOURCE_GROUPS": "rg-private-one,rg-private-two"}.items():
+        monkeypatch.setenv(key, content)
+    selected = parse(value)
+    monkeypatch.setattr(script, "candidate", lambda: selected)
+    monkeypatch.setattr(script, "FleetBudget", SimpleNamespace(
+        from_environment=lambda: SimpleNamespace(remaining=lambda *args: 60)))
+    scope = script.scope_for(selected, root, run=50, attempt=1, subscription=subscription)
+    assert scope.mode == "persistent" and scope.group("two") == "rg-private-two"
+    snapshot = sorted({scope.snapshot_digest(f"{scope.group_id('two')}/providers/X/y/old")})
+    rows = {slot: {"admittedAbsent": False, "snapshot": snapshot,
+                   "ownerSha256": scope.snapshot_commitment(slot, snapshot)} for slot in ("one", "two")}
+    ownership = root / "persistent-ownership.json"
+    ownership.write_text(json.dumps({"apiVersion": "siteops.release.fleet/v1", "kind": "FleetOwnership",
+                                     "context": scope.context(), "scopeKey": scope.key, "slots": rows}))
+    observed = {"id": scope.group_id("two"), "name": "RG-PRIVATE-TWO", "location": "westus3"}
+    monkeypatch.setattr(script, "AzureGroups", lambda *args: SimpleNamespace(show=lambda slot: observed))
+    monkeypatch.setattr(sys, "argv", [
+        "coordinate-release-fleet.py", "check-ownership", "--root", str(root), "--slot", "two",
+        "--ownership", str(ownership), "--expected-ownership-sha", hashlib.sha256(ownership.read_bytes()).hexdigest(),
+    ])
+    assert script.main() == 0
+    assert (root / "host-environment").read_text() == "FLEET_LOCATION=westus3\n"
+    assert "rg-private" not in capsys.readouterr().out
+    observed["name"] = "rg-private-one"
+    (root / "host-environment").unlink()
+    assert script.main() == 1
+    assert not (root / "host-environment").exists()
+
+
+@pytest.mark.parametrize(("secret", "expected", "code"), [
+    ("", "ephemeral", 0), ("rg-private-marker", "persistent", 0), ("", "persistent", 1),
+    ("rg-private-marker", "ephemeral", 1),
+])
+def test_site_scope_refuses_a_mode_other_than_the_scheduled_one(inputs, monkeypatch, capsys, secret, expected, code):
+    root, value, _ = inputs
+    script = load_script("coordinate-release-fleet")
+    site_environment(monkeypatch, root, value, E2E_SITE_RESOURCE_GROUP=secret)
+    monkeypatch.setattr(sys, "argv", ["coordinate-release-fleet.py", "scope", "--root", str(root), "--kind", "site",
+                                      "--slot", "enabled", "--expect-groups", expected])
+    assert script.main() == code
+    output = capsys.readouterr()
+    if code:
+        assert not (root / "environment").exists()
+    else:
+        environment = (root / "environment").read_text()
+        assert (f"FLEET_RESOURCE_GROUP={secret}\n" in environment) is bool(secret)
+        assert "FLEET_VAULT_NAME" not in environment
+        assert "::add-mask::" + (secret or "rg-siteops-site-") in output.out

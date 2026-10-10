@@ -22,6 +22,75 @@ Unit tests (`pytest tests/ -m "not integration"`) cover local engine,
 workspace, and workflow behavior and should remain the default gate before
 each commit. E2E runs only when you dispatch it (`workflow_dispatch`).
 
+### Accept one release candidate
+
+Choose `scenario=release-acceptance` with the exact **Fleet qualification
+selection** JSON as `candidate`. The release workflow starts this run on
+`main` after it admits a candidate, with `environment=dev` and
+`location=eastus2`. The run is named **Release acceptance** and runs at the
+candidate's source commit. Leave the options for one Site at their defaults,
+because the run selects its own cases.
+
+The run starts these scenarios together:
+
+- Three single Site cases through the installed candidate engine and package.
+  `disabled` installs AIO only. `enabled` installs AIO with Secret Sync.
+  `existing` installs AIO, then enables Secret Sync on that instance with a
+  Key Vault created beforehand and passed as `existingVault`.
+- The [two Site fleet](#qualify-one-exact-candidate-across-two-sites).
+
+The candidate is labeled prepublication. Each case installs the exact engine
+outside the checkout, checks its module origin and seeds its project from the
+admitted workspace package. It never reads, enrolls or pins a public release.
+
+#### Choose ephemeral or persistent resource groups
+
+Each scenario selects its groups from its own secret in the selected environment:
+
+| Secret | Value | Effect |
+|---|---|---|
+| `E2E_SITE_RESOURCE_GROUP` | One resource group name | The single Site cases run one after another in this persistent group. |
+| `E2E_FLEET_RESOURCE_GROUPS` | Two names separated by one comma, without spaces | Fleet slots `one` and `two` use these persistent groups. |
+
+Without its secret, a scenario uses ephemeral groups. Each Site case or fleet
+slot creates a new group named for its run attempt and deletes it afterward,
+which needs Owner on the subscription. Persistent groups need Owner on each
+group. The run never creates or deletes a persistent group. Before any write
+it commits a private snapshot of the group and refuses a group that already
+hosts an AIO instance. Cleanup deletes only resources missing from that
+snapshot. Use groups dedicated to acceptance and distinct from each other,
+and do not deploy into them while a run is active. Group names stay in the
+secrets and never appear in logs, outputs or receipts.
+
+Cleanup runs after any failure and must confirm that everything the attempt
+created is gone. Residual or unknown state fails the case. Only then does the
+case purge the soft deleted Key Vaults it created: the vault named for the
+attempt, or one found among its own created resources, and only when the
+deleted record names that case's group. A purge failure is recorded in the
+result without failing acceptance.
+
+#### Read the result and retry
+
+The final job uploads `release-acceptance-<run>-<attempt>-<admission digest>`
+with one row each for the installer, the three Site cases and the fleet. A row
+records its status, group mode, cleanup and vault purge. Missing, skipped,
+duplicated, ambiguous or failed evidence fails the run, and the result is
+uploaded either way. Publication requires the newest acceptance run for the
+candidate to pass.
+
+- Retry a failed Site case with **Re-run failed jobs**. Each attempt uses new
+  names and its own snapshot, and the newest attempt of each case governs.
+- The fleet must pass within one attempt. Rerunning only its failed jobs stops
+  before any Azure work and asks for **Re-run all jobs**.
+- Reconcile an attempt whose cleanup did not complete with
+  `scenario=site-cleanup` or `scenario=fleet-cleanup`, the original run and
+  attempt, the same `candidate` and the same environment secrets.
+
+With ephemeral groups the Site cases run in parallel, the fleet is usually the
+longest path, and a run takes about 1 to 1.5 hours. With a persistent Site
+group the three cases run one after another, each about 35 to 40 minutes, so a
+run takes about 2 hours. Job timeouts set longer failure ceilings.
+
 ### Qualify one exact candidate across two Sites
 
 Choose `scenario=fleet` for acceptance of a fleet with mixed AIO releases.
@@ -32,7 +101,7 @@ both Sites and makes one deployment with `--parallel 2`. It also checks that
 an unselected sentinel Site is excluded.
 
 Use the exact **Fleet qualification selection** JSON from the selected
-release producer's admission summary as `fleet-candidate`. Run the workflow
+release producer's admission summary as `candidate`. Run the workflow
 at that same source commit, using a branch or retained tag pointing there.
 The selection binds the producer run/attempt, artifact IDs and frozen
 digests. Preview candidates remain previews and cannot authorize publication.
@@ -46,11 +115,13 @@ The approved environment supplies `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`,
 the new groups, Arc onboarding, AIO deployment and its role assignments.
 The test does not create or widen those permissions.
 
-Fleet groups use private ownership markers in Azure's immutable `managedBy`
-property. Their hashes are retained before creation and checked before
-deployment or cleanup. This also applies in a shared subscription, without
-a separate allocation service. The `aio` scenario's persistent mode remains
-available for supplied groups and an identity scoped to those groups.
+Ephemeral fleet groups use private ownership markers in Azure's immutable
+`managedBy` property. Their hashes are retained before creation and checked
+before deployment or cleanup. This also applies in a shared subscription,
+without a separate allocation service. With `E2E_FLEET_RESOURCE_GROUPS`, the
+slots use those persistent groups instead, as described in
+[Choose ephemeral or persistent resource groups](#choose-ephemeral-or-persistent-resource-groups).
+Each host then connects its cluster in its group's region.
 
 The two configured Sites select AIO `2607` and `2608`, Secret Sync disabled
 and the existing E2E Low broker memory profile. Acceptance checks exact Site
@@ -117,7 +188,7 @@ cannot substitute for that evidence.
 
 Hard workflow cancellation can prevent automatic cleanup. For a separately
 approved recovery, choose `scenario=fleet-cleanup` with the same
-`fleet-candidate`, original `fleet-original-run` and `fleet-original-attempt`,
+`candidate`, original `fleet-original-run` and `fleet-original-attempt`,
 and the original subscription/environment. Use the original controller
 commit, preserving a branch or tag if necessary. Reconciliation recovers
 and verifies the original ownership artifact by ID and digest, then checks
@@ -127,9 +198,9 @@ that is still running. It does not provision clusters or perform deployments.
 Raw Site identities, Site files, kubeconfigs and provider logs are not
 uploaded by either mode.
 
-Start a fresh full fleet run for another attempt. Rerunning only failed
-jobs can combine retained outputs with a new run attempt identity, which
-the ownership guards deliberately reject. Reconcile the old scope first.
+For another attempt, use **Re-run all jobs** or start a new run. Rerunning
+only failed jobs stops before any Azure work, because the fleet must pass
+within one attempt. Reconcile an earlier attempt whose cleanup did not complete.
 
 ### Keep workload phases isolated on one Site
 
@@ -266,7 +337,7 @@ From the **Actions** tab, dispatch **E2E Tests** with the defaults to run one AI
 
 | Input | Typical value | Notes |
 |-------|--------------|-------|
-| `scenario` | `aio` | `aio` runs the AIO matrix described on this page. `fleet` and `fleet-cleanup` run [fleet qualification](#qualify-one-exact-candidate-across-two-sites). `windows-installer-preflight` runs the [Windows runner check](#check-a-windows-runner-before-installer-qualification). |
+| `scenario` | `aio` | `aio` runs the AIO matrix described on this page. `release-acceptance` and `site-cleanup` run [release acceptance](#accept-one-release-candidate). `fleet` and `fleet-cleanup` run [fleet qualification](#qualify-one-exact-candidate-across-two-sites). `windows-installer-preflight` runs the [Windows runner check](#check-a-windows-runner-before-installer-qualification). |
 | `aio-releases` | `2608` or `2607,2608` | Separated by commas. Ephemeral mode runs them in parallel. Persistent mode serializes cells in the same RG. See [aio-releases.md](aio-releases.md) for how AIO releases are defined and pinned. |
 | `environment` | `dev` | GitHub Environment whose secrets/approvers apply. |
 | `location` | `eastus2` | ephemeral mode only. Persistent derives from the RG. |
@@ -281,8 +352,8 @@ From the **Actions** tab, dispatch **E2E Tests** with the defaults to run one AI
 | `published-release` | empty or an exact tag | Empty keeps the integration suite that runs from the checkout source. A tag selects the bounded, verified published package mode below. |
 | `published-source-sha` | empty or a full commit | Required with `published-release`. Must be the exact commit targeted by the published tag. |
 | `published-journey` | `configured` | Applies only with `published-release`. `configured` deploys a configured Site, and `guided` deploys one guided Site. See below. |
-| `fleet-candidate` | empty | Fleet scenarios only. The exact **Fleet qualification selection** JSON from the release producer's admission summary. |
-| `fleet-original-run`, `fleet-original-attempt` | empty | `fleet-cleanup` only. The original acceptance workflow run ID and attempt. |
+| `candidate` | empty | Candidate scenarios only. The exact **Fleet qualification selection** JSON from the release producer's admission summary. With `aio`, it runs only the three Site cases. |
+| `fleet-original-run`, `fleet-original-attempt` | empty | `fleet-cleanup` and `site-cleanup` only. The original acceptance workflow run ID and attempt. |
 
 Qualify both AIO upgrade optionality paths in one dispatch:
 

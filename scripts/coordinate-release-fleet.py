@@ -1,9 +1,10 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Coordinate exact fleet job state without publishing target identities."""
+"""Coordinate exact fleet and Site case job state without publishing target identities."""
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -20,10 +21,19 @@ from fleet_workflow import (  # noqa: E402
     check_inputs,
     jobs,
     named_job,
+    run_jobs,
     scope_for,
     wait_for_job_state,
 )
-from release_fleet import AzureGroups, expected_document, validate_ownership  # noqa: E402
+from release_acceptance import SITE_JOB, select_evidence  # noqa: E402
+from release_fleet import (  # noqa: E402
+    LOCATION,
+    SITE_SLOTS,
+    AzureGroups,
+    expected_document,
+    validate_ownership,
+)
+from release_verification import ReleaseVerifier  # noqa: E402
 
 from siteops.artifacts import load_artifact_json  # noqa: E402
 
@@ -70,21 +80,39 @@ def output(values: dict) -> None:
             stream.write(f"{key}={text}\n")
 
 
+def write_private(path: Path, value) -> None:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        stream.write(json.dumps(value, sort_keys=True) + "\n")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("operation", choices=(
         "select", "check-inputs", "scope", "check-ownership", "wait-participants", "wait-ready", "wait-deployed",
-        "wait-observed", "wait-cleanup", "ownership",
+        "wait-observed", "wait-cleanup", "ownership", "policy", "evidence",
     ))
     parser.add_argument("--root", required=True, type=Path)
-    parser.add_argument("--slot", choices=("one", "two"))
+    parser.add_argument("--kind", choices=("fleet", "site"), default="fleet")
+    parser.add_argument("--slot", choices=("one", "two", *SITE_SLOTS))
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--ownership", type=Path)
     parser.add_argument("--expected-ownership-sha")
+    parser.add_argument("--state", type=Path, help="Installed candidate state that holds the admitted roots.")
+    parser.add_argument("--jobs-output", type=Path, help="New private file for the validated producer jobs.")
+    parser.add_argument("--expect-groups", choices=("ephemeral", "persistent"),
+                        help="Group mode the scheduling job selected for this scenario.")
     args = parser.parse_args()
     try:
         selected = candidate()
         prefix = f"repos/{selected.source['repository']}/actions"
+        site_slot = None
+        if args.kind == "site":
+            if args.slot not in SITE_SLOTS:
+                raise CoordinationError("Select one single Site case.")
+            site_slot = args.slot
+        elif args.slot in SITE_SLOTS:
+            raise CoordinationError("A Site case slot requires the site kind.")
         if args.operation == "select":
             reader = GitHubReads(args.root / "selection-metadata")
             producer = selected.producer
@@ -99,16 +127,19 @@ def main() -> int:
                 or run.get("event") not in {"push", "workflow_dispatch"}
             ):
                 raise CoordinationError("The fleet producer run differs from the selected source.")
-            values = jobs(
-                reader.read(f"{prefix}/runs/{producer['run']}/attempts/{producer['attempt']}/jobs?per_page=100", pages=True),
-                run=producer["run"], attempt=producer["attempt"], commit=selected.source["commit"],
+            producer_pages = reader.read(
+                f"{prefix}/runs/{producer['run']}/attempts/{producer['attempt']}/jobs?per_page=100", pages=True,
             )
+            values = jobs(producer_pages, run=producer["run"], attempt=producer["attempt"],
+                          commit=selected.source["commit"])
             for name in ("Assemble release", "Admit frozen inputs"):
                 job = named_job(values, name)
                 if not job or job.get("status") != "completed" or job.get("conclusion") != "success":
                     raise CoordinationError("The selected candidate producer has not completed admission.")
             for role, record in selected.artifacts.items():
                 selected.verify_artifact(role, reader.read(f"{prefix}/artifacts/{record['id']}"))
+            if args.jobs_output is not None:
+                write_private(args.jobs_output, producer_pages)
             output({**{f"{role}-id": row["id"] for role, row in selected.artifacts.items()},
                     **{f"{role}-sha": row["sha256"] for role, row in selected.artifacts.items()},
                     "producer-run": producer["run"]})
@@ -121,10 +152,17 @@ def main() -> int:
             scope = scope_for(
                 selected, args.root, run=int(os.environ["FLEET_RUN_ID"]),
                 attempt=int(os.environ["FLEET_RUN_ATTEMPT"]), subscription=os.environ["AZURE_SUBSCRIPTION_ID"],
+                slot=site_slot,
             )
+            if args.expect_groups and scope.mode != args.expect_groups:
+                raise CoordinationError("The resource group mode differs from the scheduled mode.")
             group, cluster = scope.group(args.slot), scope.cluster(args.slot)
             cluster_id = f"/subscriptions/{scope.subscription}/resourceGroups/{group}/providers/Microsoft.Kubernetes/connectedClusters/{cluster}"
             values = {"FLEET_RESOURCE_GROUP": group, "FLEET_CLUSTER_NAME": cluster, "FLEET_CLUSTER_ID": cluster_id}
+            if site_slot == "existing":
+                values["FLEET_VAULT_NAME"] = scope.vault(site_slot)
+            if any("\r" in value or "\n" in value for value in values.values()):
+                raise CoordinationError("A private target name has an invalid shape.")
             for value in values.values():
                 print("::add-mask::" + value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"), flush=True)
             with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as stream:
@@ -141,11 +179,49 @@ def main() -> int:
             ownership = expected_document(args.ownership, args.expected_ownership_sha)
             slots = validate_ownership(scope, ownership)
             groups = AzureGroups(scope, args.root / "owned-group-observation")
-            if not slots[args.slot]["admittedAbsent"] or not scope.owns(
-                args.slot, groups.show(args.slot), slots[args.slot]["ownerSha256"],
+            observed = groups.show(args.slot)
+            location = observed.get("location") if isinstance(observed, dict) else None
+            if (
+                (not scope.groups and not slots[args.slot]["admittedAbsent"])
+                or not scope.owns(args.slot, observed, slots[args.slot]["ownerSha256"])
+                or not isinstance(location, str) or LOCATION.fullmatch(location) is None
             ):
-                raise CoordinationError("The host resource group is not owned by this acceptance run.")
-            print("The selected fleet slot is owned by this run.")
+                raise CoordinationError("The host resource group is not the one selected for this acceptance run.")
+            # Persistent groups set the region for the resources this run creates.
+            with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as stream:
+                stream.write(f"FLEET_LOCATION={location}\n")
+            print(f"The selected fleet slot uses its {scope.mode} resource group.")
+        elif args.operation == "policy":
+            # Each preparation or deployment phase starts a fresh policy, valid for one hour, from admitted roots.
+            if args.state is None:
+                raise CoordinationError("Select the installed candidate state.")
+            for number in range(1, 21):
+                directory = args.root / f"policy-{number}"
+                if not os.path.lexists(directory):
+                    break
+            else:
+                raise CoordinationError("The candidate policy refresh limit was reached.")
+            verifier = ReleaseVerifier(
+                directory, args.state / "workspace-policy" / "root.json", selected.source,
+                signer=".github/workflows/_workspace-distribution.yaml",
+                builder=selected.producer["caller"], runner_environment="self-hosted",
+            )
+            print(verifier.policy_file.parent)
+        elif args.operation == "evidence":
+            run, attempt = int(os.environ["GITHUB_RUN_ID"]), int(os.environ["GITHUB_RUN_ATTEMPT"])
+            reader = GitHubReads(args.root / "evidence-metadata")
+            execution_pages = reader.read(f"{prefix}/runs/{run}/jobs?filter=all&per_page=100", pages=True)
+            executions = run_jobs(execution_pages, run=run, attempt=attempt, commit=selected.source["commit"])
+            artifact_pages = reader.read(f"{prefix}/runs/{run}/artifacts?per_page=100", pages=True)
+            if (not isinstance(artifact_pages, list) or not 1 <= len(artifact_pages) <= 32
+                    or any(not isinstance(page, dict) or not isinstance(page.get("artifacts"), list)
+                           for page in artifact_pages)):
+                raise CoordinationError("The acceptance artifact metadata is invalid.")
+            chosen = select_evidence(executions, [item for page in artifact_pages for item in page["artifacts"]],
+                                     run=run, commit=selected.source["commit"])
+            write_private(args.root / "run-jobs.json", execution_pages)
+            write_private(args.root / "run-artifacts.json", artifact_pages)
+            output({f"{key}-id": value["artifact"]["id"] if value["artifact"] else "" for key, value in chosen.items()})
         elif args.operation.startswith("wait-"):
             run, attempt = int(os.environ["GITHUB_RUN_ID"]), int(os.environ["GITHUB_RUN_ATTEMPT"])
             reader = GitHubReads(args.root / args.operation)
@@ -167,6 +243,7 @@ def main() -> int:
             scope = scope_for(
                 selected, args.root, run=int(os.environ["FLEET_RUN_ID"]),
                 attempt=int(os.environ["FLEET_RUN_ATTEMPT"]), subscription=os.environ["AZURE_SUBSCRIPTION_ID"],
+                slot=site_slot,
             )
             reader = GitHubReads(args.root / "ownership-metadata")
             if scope.run != int(os.environ["GITHUB_RUN_ID"]):
@@ -182,11 +259,26 @@ def main() -> int:
                 reader.read(f"{prefix}/runs/{scope.run}/attempts/{scope.attempt}/jobs?per_page=100", pages=True),
                 run=scope.run, attempt=scope.attempt, commit=selected.source["commit"],
             )
-            prepare = named_job(values, "Fleet prepare")
+            if site_slot is None:
+                prepare = named_job(values, "Fleet prepare")
+                names, artifact = ("Preflight resource ownership", "Retain resource ownership"), "fleet-ownership"
+            else:
+                prepare = named_job(values, SITE_JOB.format(site_slot))
+                names, artifact = ("Retain Site ownership",), "site-ownership"
+                retained = [step for step in (prepare or {}).get("steps") or ()
+                            if isinstance(step, dict) and step.get("name") == names[0]]
+                if prepare is None or (
+                    len(retained) == 1 and retained[0].get("status") == "completed"
+                    and retained[0].get("conclusion") != "success"
+                ):
+                    # Creation runs only after a successful ownership upload in the same job.
+                    print("No Site resource group was created for this case in the selected attempt.")
+                    output({"ownership-id": ""})
+                    return 0
             steps = prepare.get("steps") if prepare else None
             if not isinstance(steps, list):
                 raise CoordinationError("Fleet preparation metadata is unavailable.")
-            for name in ("Preflight resource ownership", "Retain resource ownership"):
+            for name in names:
                 matches = [step for step in steps if isinstance(step, dict) and step.get("name") == name]
                 if (len(matches) != 1 or matches[0].get("status") != "completed"
                         or matches[0].get("conclusion") != "success"):
@@ -195,8 +287,9 @@ def main() -> int:
             if not isinstance(pages, list) or not 1 <= len(pages) <= 16:
                 raise CoordinationError("Fleet ownership metadata is invalid.")
             items = [item for page in pages for item in page.get("artifacts", [])]
+            suffix = f"-{site_slot}" if site_slot else ""
             matches = [item for item in items if isinstance(item, dict)
-                       and item.get("name") == f"fleet-ownership-{scope.run}-{scope.attempt}"]
+                       and item.get("name") == f"{artifact}-{scope.run}-{scope.attempt}{suffix}"]
             if (len(matches) != 1 or matches[0].get("expired") is not False
                     or type(matches[0].get("id")) is not int
                     or type(matches[0].get("size_in_bytes")) is not int or matches[0]["size_in_bytes"] <= 0

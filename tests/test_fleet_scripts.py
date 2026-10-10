@@ -67,7 +67,7 @@ def test_fleet_scope_refuses_single_site_or_cleanup_bypasses_without_printing_va
 ):
     script = WORKFLOW["jobs"]["fleet-request"]["steps"][0]["run"]
     path = tmp_path / "event.json"
-    path.write_text(json.dumps({"inputs": {"scenario": "fleet", "fleet-candidate": "fixture", field: value}}))
+    path.write_text(json.dumps({"inputs": {"scenario": "fleet", "candidate": "fixture", field: value}}))
     monkeypatch.setenv("GITHUB_EVENT_PATH", str(path))
     with pytest.raises(SystemExit):
         exec(compile(script, "<fleet-request>", "exec"), {})
@@ -85,7 +85,7 @@ def test_fleet_request_distinguishes_new_acceptance_and_original_run_cleanup(
     script = WORKFLOW["jobs"]["fleet-request"]["steps"][0]["run"]
     path = tmp_path / "event.json"
     path.write_text(json.dumps({"inputs": {
-        "scenario": mode, "fleet-candidate": "fixture", "fleet-original-run": prior[0],
+        "scenario": mode, "candidate": "fixture", "fleet-original-run": prior[0],
         "fleet-original-attempt": prior[1],
     }}))
     monkeypatch.setenv("GITHUB_EVENT_PATH", str(path))

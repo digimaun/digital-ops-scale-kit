@@ -97,10 +97,12 @@ Reconciliation jobs use `Reconcile original Site case (<scenario>)`.
   and the same environment secrets.
   Reconciliation starts only after every attempt of the original run has
   completed. In a persistent group it removes only resources outside the
-  original snapshot that Azure reports as created before that attempt
-  completed, allowing two minutes of clock difference. Later resources stay.
-  A resource without a reported creation time stays in place and leaves the
-  case incomplete, so remove it yourself after checking it.
+  original snapshot, bounded by the completion of the original Site case or
+  latest fleet job. Deployments that started before that bound extend it to
+  their end, allowing two minutes of clock difference. Later resources stay.
+  A deployment still running leaves the case incomplete. Rerun reconciliation
+  after it finishes. Resources without a creation time stay and leave the case
+  incomplete, so remove them yourself after checking them.
 
 With ephemeral groups the Site cases run in parallel, the fleet is usually the
 longest path, and a run takes about 1 to 1.5 hours. With a persistent Site

@@ -32,6 +32,7 @@ from fleet_workflow import (  # noqa: E402
     run_jobs,
     wait_for_job_state,
 )
+from release_acceptance import FLEET_JOBS, SITE_JOB  # noqa: E402
 from siteops_release_assets import FrozenReleaseAssets, ReleaseAsset  # noqa: E402
 from workspace_engine import EngineSelection  # noqa: E402
 
@@ -384,15 +385,15 @@ def test_selection_entrypoint_reads_only_the_bound_producer_before_publishing_ou
     assert all(endpoint.startswith("repos/example/content/actions/") for endpoint in calls)
 
 
-@pytest.mark.parametrize(("run_status", "updated_at", "metadata_error"), [
+@pytest.mark.parametrize(("run_status", "completed_at", "metadata_error"), [
     ("completed", "2026-10-09T12:34:56Z", None),
     ("in_progress", "2026-10-09T12:34:56Z", "original fleet run to be stopped"),
-    ("completed", "2026-10-09T12:34:56.123Z", "original fleet attempt completion time is invalid"),
+    ("completed", "2026-10-09T12:34:56.123Z", "original job completion time is invalid"),
 ])
 @pytest.mark.parametrize("uploaded", [False, True])
 @pytest.mark.parametrize("digest", ["sha256:" + "e" * 64, None])
 def test_reconciliation_uses_original_execution_and_requires_the_prewrite_upload(
-    inputs, monkeypatch, capsys, uploaded, digest, run_status, updated_at, metadata_error,
+    inputs, monkeypatch, capsys, uploaded, digest, run_status, completed_at, metadata_error,
 ):
     root, value, _ = inputs
     script = load_script("coordinate-release-fleet")
@@ -417,7 +418,7 @@ def test_reconciliation_uses_original_execution_and_requires_the_prewrite_upload
                 return {
                     "id": 50, "run_attempt": 2, "head_sha": SOURCE["commit"],
                     "repository": {"full_name": SOURCE["repository"]}, "status": "completed",
-                    "updated_at": updated_at,
+                    "updated_at": "2026-10-09T14:00:00Z",
                 }
             if endpoint.endswith("/runs/50"):
                 return {"id": 50, "head_sha": SOURCE["commit"],
@@ -426,6 +427,7 @@ def test_reconciliation_uses_original_execution_and_requires_the_prewrite_upload
                 return [{"total_count": 1, "jobs": [{
                     "id": 100, "run_id": 50, "run_attempt": 2, "head_sha": SOURCE["commit"],
                     "name": "Fleet / Fleet prepare", "status": "completed", "conclusion": "failure",
+                    "completed_at": completed_at,
                     "steps": [
                         {"name": "Preflight resource ownership", "status": "completed", "conclusion": "success"},
                         {"name": "Retain resource ownership", "status": "completed", "conclusion": "success" if uploaded else "failure"},
@@ -442,10 +444,11 @@ def test_reconciliation_uses_original_execution_and_requires_the_prewrite_upload
     assert script.main() == (0 if uploaded and digest and metadata_error is None else 1)
     if metadata_error is not None:
         assert metadata_error in capsys.readouterr().err
-        assert calls[-1].endswith("/runs/50")
+        assert calls[-1].endswith("/runs/50" if run_status != "completed"
+                                  else "/attempts/2/jobs?per_page=100")
     assert all("/runs/50" in endpoint for endpoint in calls)
     if uploaded and digest and metadata_error is None:
-        assert output.read_text().splitlines() == ["ownership-id=500", f"original-completed={updated_at}"]
+        assert output.read_text().splitlines() == ["ownership-id=500", f"original-completed={completed_at}"]
         assert "ownership-sha" not in output.read_text()
     else:
         assert not output.exists()
@@ -590,7 +593,7 @@ def test_allocation_markers_stay_private_and_cleanup_consumes_verified_original_
         assert "ownership-sha" not in cleanup_step.get("env", {}).get("OWNERSHIP_SHA", "")
 
 
-def test_reconciliation_passes_attempt_completion_bound_through_environment():
+def test_reconciliation_passes_original_job_completion_bound_through_environment():
     flow = yaml.safe_load((ROOT / ".github/workflows/_fleet-reconcile.yaml").read_text())
     steps = flow["jobs"]["reconcile"]["steps"]
     ownership = next(step for step in steps if step.get("id") == "ownership")
@@ -937,6 +940,7 @@ def test_site_reconciliation_reports_nothing_only_when_creation_could_not_start(
     jobs_page = [{"total_count": 1 if job else 1, "jobs": [{
         "id": 1, "run_id": 50, "run_attempt": 2, "head_sha": SOURCE["commit"],
         "name": "Site case (site-existing-secretsync)" if job else "Site case (site-combined)", "steps": steps,
+        "status": "completed", "completed_at": "2026-10-09T12:34:56Z",
     }]}]
     artifacts = [{"artifacts": [{
         "id": 700, "name": "site-ownership-50-2-existing", "expired": False, "size_in_bytes": 10,
@@ -947,7 +951,7 @@ def test_site_reconciliation_reports_nothing_only_when_creation_could_not_start(
         "/attempts/2/jobs": jobs_page, "/runs/50/artifacts": artifacts,
         "/runs/50/attempts/2": {"id": 50, "run_attempt": 2, "head_sha": SOURCE["commit"],
                                 "repository": {"full_name": SOURCE["repository"]}, "status": "completed",
-                                "updated_at": "2026-10-09T12:34:56Z"},
+                                "updated_at": "2026-10-09T14:00:00Z"},
         "/runs/50": {"id": 50, "head_sha": SOURCE["commit"],
                      "repository": {"full_name": SOURCE["repository"]}, "status": "completed"},
     }, calls))
@@ -962,6 +966,101 @@ def test_site_reconciliation_reports_nothing_only_when_creation_could_not_start(
             f"ownership-id={expected[0]}", f"original-completed={timestamp}",
         ]
     assert any(call.endswith("/runs/50") for call in calls) == standalone
+
+
+def _original_ownership(inputs, monkeypatch, kind):
+    root, value, _ = inputs
+    script = load_script("coordinate-release-fleet")
+    site_environment(monkeypatch, root, value, E2E_SITE_RESOURCE_GROUP="", E2E_FLEET_RESOURCE_GROUPS="")
+    values = [{
+        "id": index, "run_id": 50, "run_attempt": 2, "head_sha": SOURCE["commit"],
+        "name": f"Fleet / {name}", "status": "completed", "completed_at": f"2026-10-09T12:{34 + index}:00Z",
+        "steps": [{"name": step, "status": "completed", "conclusion": "success"}
+                  for step in ("Preflight resource ownership", "Retain resource ownership")],
+    } for index, name in enumerate(FLEET_JOBS, 1)]
+    values += [{
+        "id": 100, "run_id": 50, "run_attempt": 2, "head_sha": SOURCE["commit"],
+        "name": SITE_JOB["existing"], "status": "completed", "completed_at": "2026-10-09T12:34:56Z",
+        "steps": [{"name": "Retain Site ownership", "status": "completed", "conclusion": "success"}],
+    }, {
+        "id": 101, "run_id": 50, "run_attempt": 2, "head_sha": SOURCE["commit"],
+        "name": SITE_JOB["enabled"], "status": "completed", "completed_at": "2026-10-09T16:00:00Z",
+    }]
+    original = {"id": 50, "run_attempt": 2, "head_sha": SOURCE["commit"],
+                "repository": {"full_name": SOURCE["repository"]}, "status": "completed",
+                "updated_at": "2026-10-09T17:00:00Z"}
+    artifact = "site-ownership-50-2-existing" if kind == "site" else "fleet-ownership-50-2"
+    calls = []
+    monkeypatch.setattr(script, "GitHubReads", _reads({
+        "/attempts/2/jobs": [{"total_count": len(values), "jobs": values}],
+        "/runs/50/artifacts": [{"artifacts": [{
+            "id": 700, "name": artifact, "expired": False, "size_in_bytes": 10,
+            "digest": "sha256:" + "e" * 64, "workflow_run": {"id": 50, "head_sha": SOURCE["commit"]},
+        }]}],
+        "/runs/50/attempts/2": original,
+        "/runs/50": {"id": 50, "head_sha": SOURCE["commit"],
+                     "repository": {"full_name": SOURCE["repository"]}, "status": "completed"},
+    }, calls))
+    arguments = ["--kind", "site", "--slot", "existing"] if kind == "site" else []
+    monkeypatch.setattr(sys, "argv", ["coordinate-release-fleet.py", "ownership", "--root", str(root), *arguments])
+    return script, root, original, values, calls
+
+
+@pytest.mark.parametrize("kind", ["site", "fleet"])
+@pytest.mark.parametrize("updated_at", ["2026-10-09T17:00:00Z", None, "invalid"])
+def test_reconciliation_ownership_uses_original_job_completion(inputs, monkeypatch, kind, updated_at):
+    script, root, original, _, calls = _original_ownership(inputs, monkeypatch, kind)
+    original["updated_at"] = updated_at
+    assert script.main() == 0
+    completed = "2026-10-09T12:34:56Z" if kind == "site" else "2026-10-09T12:41:00Z"
+    assert (root / "outputs").read_text().splitlines() == ["ownership-id=700", f"original-completed={completed}"]
+    assert all("/runs/50" in endpoint for endpoint in calls)
+
+
+@pytest.mark.parametrize(("kind", "name"), [
+    ("site", SITE_JOB["existing"]), *(("fleet", name) for name in FLEET_JOBS),
+])
+@pytest.mark.parametrize("status", ["in_progress", "queued", None])
+def test_reconciliation_ownership_requires_every_present_owning_job_completed(
+    inputs, monkeypatch, capsys, kind, name, status,
+):
+    script, root, _, values, _ = _original_ownership(inputs, monkeypatch, kind)
+    script.named_job(values, name)["status"] = status
+    assert script.main() == 1
+    assert capsys.readouterr().err == "The original owning job has not completed.\n"
+    assert not (root / "outputs").exists()
+
+
+@pytest.mark.parametrize("kind", ["site", "fleet"])
+@pytest.mark.parametrize("completed_at", [
+    None, 42, "2026-10-09T12:34:56.123Z", "2026-10-09T12:34:56+00:00",
+    "2026-10-09T12:34:56", "2026-02-30T12:34:56Z", "2026-10-09T12:34:56Z\n",
+])
+def test_reconciliation_ownership_requires_exact_original_job_timestamp(
+    inputs, monkeypatch, capsys, kind, completed_at,
+):
+    script, root, _, values, _ = _original_ownership(inputs, monkeypatch, kind)
+    name = SITE_JOB["existing"] if kind == "site" else FLEET_JOBS[0]
+    script.named_job(values, name)["completed_at"] = completed_at
+    assert script.main() == 1
+    assert capsys.readouterr().err == "The original job completion time is invalid.\n"
+    assert not (root / "outputs").exists()
+
+
+@pytest.mark.parametrize(("status", "completed_at", "error"), [
+    ("in_progress", "2026-10-09T12:34:56Z", "The original owning job has not completed.\n"),
+    ("completed", None, "The original job completion time is invalid.\n"),
+])
+def test_site_reconciliation_validates_present_job_before_reporting_no_ownership(
+    inputs, monkeypatch, capsys, status, completed_at, error,
+):
+    script, root, _, values, _ = _original_ownership(inputs, monkeypatch, "site")
+    job = script.named_job(values, SITE_JOB["existing"])
+    job.update(status=status, completed_at=completed_at)
+    job["steps"][0]["conclusion"] = "failure"
+    assert script.main() == 1
+    assert capsys.readouterr().err == error
+    assert not (root / "outputs").exists()
 
 
 def test_evidence_selection_publishes_only_ids_of_the_latest_attempts(inputs, monkeypatch):

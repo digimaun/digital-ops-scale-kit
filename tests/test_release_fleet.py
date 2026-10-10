@@ -811,6 +811,7 @@ class PersistentGroups:
         self.items = {slot: [] for slot in scope.slots}
         self.sticky, self.failures, self.list_errors, self.purge_errors = set(), {}, {}, set()
         self.deleted_vaults, self.calls, self.owners = {}, [], None
+        self.deployment_rows = {slot: [] for slot in scope.slots}
         for slot in scope.slots:
             for kind, name in existing:
                 self.add(slot, kind, name)
@@ -844,6 +845,10 @@ class PersistentGroups:
         if slot in self.list_errors:
             raise self.list_errors[slot]
         return [dict(item) for item in self.items[slot]]
+
+    def deployments(self, slot):
+        self.calls.append(("deployments", slot))
+        return copy.deepcopy(self.deployment_rows[slot])
 
     def delete_resource(self, slot, item):
         self.calls.append(("delete-resource", item["name"]))
@@ -978,6 +983,7 @@ def test_persistent_cleanup_removes_only_the_created_delta_and_confirms_absence(
     assert code == 0
     assert report["groups"] == "persistent" and report["status"] == "complete"
     assert report["slots"] == {slot: {"state": "absent", "reason": "confirmed-absent"} for slot in scope.slots}
+    assert not any(action == "deployments" for action, _ in groups.calls)
     deleted = [name for operation, name in groups.calls if operation == "delete-resource"]
     assert "operatorstorage" not in deleted and "kvoperator" not in deleted
     assert deleted[0] == scope.cluster(scope.slots[0])
@@ -1034,18 +1040,230 @@ def test_bounded_reconciliation_keeps_missing_creation_time_incomplete():
     assert any(item["name"] == "kvunknown" for item in groups.items["enabled"])
 
 
-def test_bounded_reconciliation_skips_unobserved_bound_vault():
+@pytest.mark.parametrize("matching_group", [True, False])
+def test_bounded_reconciliation_purges_unobserved_bound_vault_only_for_its_group(matching_group):
     scope = persistent_scope("site")
     groups = PersistentGroups(scope, EXISTING)
     lease = preflight(scope, groups)
-    groups.soft_delete("existing", scope.vault("existing"))
+    name = scope.vault("existing")
+    groups.soft_delete("existing", name, group=None if matching_group else "rg-other")
     groups.calls.clear()
-    code, report, _ = invoke(
+    code, report, clock = invoke(
+        scope, lease, groups, created_before=datetime(2026, 10, 9, 12, 35, tzinfo=timezone.utc),
+    )
+    assert code == 0 and report["status"] == "complete"
+    assert report["vaultPurge"] == ("purged" if matching_group else "failed")
+    assert (("purge", name) in groups.calls) is matching_group
+    assert groups.calls.count(("deleted", name)) == (2 if matching_group else 1)
+    assert clock.sleeps == []
+
+
+def test_bounded_reconciliation_checks_missing_bound_vault_once_without_waiting():
+    scope = persistent_scope("site")
+    groups = PersistentGroups(scope, EXISTING)
+    lease = preflight(scope, groups)
+    groups.calls.clear()
+    code, report, clock = invoke(
         scope, lease, groups, created_before=datetime(2026, 10, 9, 12, 35, tzinfo=timezone.utc),
     )
     assert code == 0 and report["status"] == "complete"
     assert report["vaultPurge"] == "not-applicable"
-    assert not any(action in {"deleted", "purge"} for action, _ in groups.calls)
+    assert groups.calls.count(("deleted", scope.vault("existing"))) == 1
+    assert not any(action == "purge" for action, _ in groups.calls)
+    assert clock.sleeps == []
+
+
+@pytest.mark.parametrize("kind", ["site", "fleet"])
+@pytest.mark.parametrize("state", ["sUcCeEdEd", "FAILED", "Canceled"])
+def test_bounded_reconciliation_waits_for_deployment_and_confirms_extended_delta_gone(kind, state):
+    scope = persistent_scope(kind, "enabled")
+    groups = PersistentGroups(scope, EXISTING)
+    lease = preflight(scope, groups)
+    slot = scope.slots[0]
+    groups.deployment_rows[slot] = [{
+        "name": "deployment-private", "timestamp": "2026-10-09T12:45:00.0000000Z",
+        "duration": "PT11M", "state": "Running",
+    }]
+    clock = Clock()
+    requested = []
+
+    def delete_resource(selected, item):
+        assert selected == slot
+        requested.append((clock.now(), item["name"]))
+
+    def sleep(duration):
+        clock.sleep(duration)
+        if clock.now() == 1:
+            assert requested == []
+            assert ("resources", slot) not in groups.calls
+            groups.deployment_rows[slot][0]["state"] = state
+            groups.add(slot, "Microsoft.IoTOperations/instances", "aioafterjob",
+                       created_time="2026-10-09T12:43:00Z")
+        else:
+            groups.items[slot] = [item for item in groups.items[slot] if item["name"] != "aioafterjob"]
+
+    groups.delete_resource = delete_resource
+    groups.calls.clear()
+    code, report = cleanup(
+        scope, lease, groups, timeout=3, interval=1, clock=clock.now, sleep=sleep,
+        created_before=datetime(2026, 10, 9, 12, 35, tzinfo=timezone.utc),
+    )
+    assert code == 0 and report["status"] == "complete"
+    assert report["slots"][slot] == {"state": "absent", "reason": "confirmed-absent"}
+    assert requested == [(1, "aioafterjob")]
+    assert clock.sleeps == [1, 1]
+    assert groups.calls.count(("deployments", slot)) == 3
+    assert all(item["name"] != "aioafterjob" for item in groups.items[slot])
+
+
+@pytest.mark.parametrize("kind", ["site", "fleet"])
+def test_bounded_reconciliation_leaves_running_deployment_residual_without_deleting(kind):
+    scope = persistent_scope(kind, "enabled")
+    groups = PersistentGroups(scope, EXISTING)
+    lease = preflight(scope, groups)
+    slot = scope.slots[0]
+    groups.deployment_rows[slot] = [{
+        "name": "deployment-private", "timestamp": "2026-10-09T12:40:00Z",
+        "duration": "PT6M", "state": "rUnNiNg",
+    }]
+    groups.add(slot, "Microsoft.IoTOperations/instances", "aioinflight", created_time="2026-10-09T12:34:00Z")
+    if kind == "fleet":
+        groups.add("two", "Microsoft.Storage/storageAccounts", "completedstorage",
+                   created_time="2026-10-09T12:34:00Z")
+    groups.calls.clear()
+    code, report, clock = invoke(
+        scope, lease, groups, created_before=datetime(2026, 10, 9, 12, 35, tzinfo=timezone.utc),
+    )
+    assert code == 1 and report["status"] == "incomplete"
+    assert report["slots"][slot] == {"state": "residual", "reason": "deployment-running"}
+    assert ("delete-resource", "aioinflight") not in groups.calls
+    assert ("resources", slot) not in groups.calls
+    assert groups.calls.count(("deployments", slot)) == 4
+    assert clock.sleeps == [1, 1, 1]
+    if kind == "fleet":
+        assert report["slots"]["two"]["state"] == "absent"
+        assert ("delete-resource", "completedstorage") in groups.calls
+    else:
+        assert report["vaultPurge"] == "not-attempted"
+
+
+@pytest.mark.parametrize("state", ["Succeeded", "Running"])
+def test_bounded_reconciliation_ignores_deployment_started_after_original_window(state):
+    scope = persistent_scope("site", "enabled")
+    groups = PersistentGroups(scope, EXISTING)
+    lease = preflight(scope, groups)
+    groups.deployment_rows["enabled"] = [{
+        "name": "deployment-private", "timestamp": "2026-10-09T12:55:00Z",
+        "duration": "PT17M", "state": state,
+    }]
+    groups.add("enabled", "Microsoft.IoTOperations/instances", "aiolater", created_time="2026-10-09T12:43:00Z")
+    groups.calls.clear()
+    code, report, clock = invoke(
+        scope, lease, groups, created_before=datetime(2026, 10, 9, 12, 35, tzinfo=timezone.utc),
+    )
+    assert code == 0 and report["status"] == "complete"
+    assert report["slots"]["enabled"] == {"state": "absent", "reason": "confirmed-absent"}
+    assert not any(action == "delete-resource" for action, _ in groups.calls)
+    assert groups.calls.count(("deployments", "enabled")) == 1
+    assert any(item["name"] == "aiolater" for item in groups.items["enabled"])
+    assert clock.sleeps == []
+
+
+@pytest.mark.parametrize(("timestamp", "duration"), [
+    ("2026-10-09T12:45:00Z", "PT8M"),
+    ("2026-10-09T12:45:00.1234567+00:00", "PT8M0.1234567S"),
+    ("2026-10-09T14:45:00+02:00", "PT8M"),
+])
+def test_bounded_reconciliation_includes_deployment_at_clock_tolerance(timestamp, duration):
+    scope = persistent_scope("site", "enabled")
+    groups = PersistentGroups(scope, EXISTING)
+    lease = preflight(scope, groups)
+    groups.deployment_rows["enabled"] = [{
+        "name": "deployment-private", "timestamp": timestamp, "duration": duration, "state": "Succeeded",
+    }]
+    groups.add("enabled", "Microsoft.IoTOperations/instances", "aiodelayed", created_time="2026-10-09T12:47:00Z")
+    code, report, _ = invoke(
+        scope, lease, groups, created_before=datetime(2026, 10, 9, 12, 35, tzinfo=timezone.utc),
+    )
+    assert code == 0 and report["status"] == "complete"
+    assert ("delete-resource", "aiodelayed") in groups.calls
+
+
+DEPLOYMENT = {
+    "name": "deployment-private", "timestamp": "2026-10-09T12:35:00Z", "duration": "PT1M", "state": "Succeeded",
+}
+
+
+@pytest.mark.parametrize("invalid", [
+    None, False, {}, "[]", [None], [DEPLOYMENT] * 1001,
+    [{**DEPLOYMENT, "extra": "private"}],
+    [{key: value for key, value in DEPLOYMENT.items() if key != "duration"}],
+    *([{**DEPLOYMENT, key: value}] for key in DEPLOYMENT for value in (None, 42, "")),
+    *([{**DEPLOYMENT, "timestamp": value}] for value in (
+        "2026-10-09T12:35:00", "2026-02-30T12:35:00Z", "2026-10-09T12:35:00+24:00", "private",
+    )),
+    *([{**DEPLOYMENT, "duration": value}] for value in (
+        "PT", "P1D", "PT-1M", "PT1.5H", "PT1S2M", "PT1M ", "PT1.S", "PT999999999999999999999999H",
+    )),
+    [{**DEPLOYMENT, "timestamp": "0001-01-01T00:00:00Z", "duration": "PT1S"}],
+])
+def test_bounded_reconciliation_rejects_invalid_deployment_response(tmp_path, invalid):
+    scope = persistent_scope("site", "enabled")
+    lease = preflight(scope, PersistentGroups(scope, EXISTING))
+    calls = []
+
+    def runner(args):
+        calls.append(args[1:4])
+        if args[1:3] == ["group", "exists"]:
+            return 0, b"true", b""
+        if args[1:4] == ["deployment", "group", "list"]:
+            return 0, json.dumps(invalid).encode(), b"private"
+        return 0, b"[]", b""
+
+    groups = AzureGroups(scope, tmp_path / "logs", runner=runner)
+    code, report, _ = invoke(
+        scope, lease, groups, created_before=datetime(2026, 10, 9, 12, 35, tzinfo=timezone.utc),
+    )
+    assert code == 1 and report["status"] == "incomplete"
+    assert report["slots"]["enabled"] == {"state": "unknown", "reason": "invalid-deployment-response"}
+    assert report["vaultPurge"] == "not-attempted"
+    assert calls == [["group", "exists", "--subscription"], ["deployment", "group", "list"]]
+    assert all(value not in json.dumps(report) for value in (*scope.groups, DEPLOYMENT["name"]))
+
+
+def test_bounded_reconciliation_rejects_malformed_deployment_json(tmp_path):
+    scope = persistent_scope("site", "enabled")
+    lease = preflight(scope, PersistentGroups(scope, EXISTING))
+
+    def runner(args):
+        return 0, b"true" if args[1:3] == ["group", "exists"] else b"{invalid", b"private"
+
+    groups = AzureGroups(scope, tmp_path / "logs", runner=runner)
+    code, report, _ = invoke(
+        scope, lease, groups, created_before=datetime(2026, 10, 9, 12, 35, tzinfo=timezone.utc),
+    )
+    assert code == 1 and report["status"] == "incomplete"
+    assert report["slots"]["enabled"] == {"state": "unknown", "reason": "invalid-deployment-response"}
+
+
+@pytest.mark.parametrize("duration", ["PT1M23.4567S", "PT45S", "PT2H3M", "PT0S"])
+def test_deployment_adapter_validates_timing_and_uses_private_group_query(tmp_path, duration):
+    scope = persistent_scope("site", "enabled")
+    listing = [{**DEPLOYMENT, "timestamp": "2026-10-09T14:35:00.1234567+02:00", "duration": duration}]
+    calls = []
+
+    def runner(args):
+        calls.append(args)
+        return 0, json.dumps(listing).encode(), b"private"
+
+    groups = AzureGroups(scope, tmp_path / "logs", runner=runner)
+    assert groups.deployments("enabled") == listing
+    assert calls == [[
+        "az", "deployment", "group", "list", "--resource-group", scope.group("enabled"),
+        "--query", "[].{name:name,timestamp:properties.timestamp,duration:properties.duration,"
+        "state:properties.provisioningState}",
+        "--subscription", SUBSCRIPTION, "--only-show-errors", "-o", "json",
+    ]]
 
 
 @pytest.mark.parametrize(("created_time", "expected"), [
@@ -1081,6 +1299,7 @@ def test_unbounded_persistent_cleanup_still_deletes_later_vault():
     assert report["vaultPurge"] == "purged"
     assert ("delete-resource", "kvlater") in groups.calls
     assert ("purge", "kvlater") in groups.calls
+    assert not any(action == "deployments" for action, _ in groups.calls)
 
 
 def test_ephemeral_site_group_cleanup_ignores_creation_bound():

@@ -43,6 +43,7 @@ CREATION_CLOCK_TOLERANCE = timedelta(minutes=2)
 CREATION_TIMESTAMP = re.compile(
     r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})"
 )
+DEPLOYMENT_DURATION = re.compile(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?")
 
 
 class FleetError(ValueError):
@@ -57,6 +58,7 @@ class FleetError(ValueError):
             "invalid-receipt", "select-new-output-and-log-paths", "candidate-not-admitted",
             "private-diagnostics-failed", "invalid-allocation", "allocation-context-mismatch",
             "persistent-group-missing", "persistent-group-occupied", "invalid-resource-response",
+            "invalid-deployment-response",
         }:
             raise ValueError("Unsupported fleet failure category.")
         self.retryable = retryable
@@ -374,6 +376,31 @@ class AzureGroups:
                 "resource", "delete", "--ids", identity, "--no-wait", "--only-show-errors", "-o", "none",
             ])
 
+    def deployments(self, slot: str) -> list[dict]:
+        """Read and validate deployment timing and state for the selected group."""
+        values = self._json("deployment-list", slot, [
+            "deployment", "group", "list", "--resource-group", self.scope.group(slot),
+            "--query", "[].{name:name,timestamp:properties.timestamp,duration:properties.duration,"
+            "state:properties.provisioningState}",
+        ], "invalid-deployment-response")
+        if not isinstance(values, list) or len(values) > MAX_SNAPSHOT:
+            raise FleetError("invalid-deployment-response")
+        for item in values:
+            if (
+                not isinstance(item, dict) or set(item) != {"name", "timestamp", "duration", "state"}
+                or any(not isinstance(value, str) or not value for value in item.values())
+            ):
+                raise FleetError("invalid-deployment-response")
+            timestamp = _creation_time(item["timestamp"])
+            duration = _deployment_duration(item["duration"])
+            if timestamp is None or duration is None:
+                raise FleetError("invalid-deployment-response")
+            try:
+                timestamp - duration
+            except OverflowError:
+                raise FleetError("invalid-deployment-response") from None
+        return values
+
     def vaults(self, slot: str) -> list[str]:
         names = self._json("vault-list", slot, [
             "keyvault", "list", "--resource-group", self.scope.group(slot), "--query", "[].name",
@@ -422,6 +449,19 @@ def _creation_time(value: object) -> datetime | None:
     try:
         return datetime.fromisoformat(normalized)
     except ValueError:
+        return None
+
+
+def _deployment_duration(value: object) -> timedelta | None:
+    if not isinstance(value, str):
+        return None
+    match = DEPLOYMENT_DURATION.fullmatch(value)
+    if match is None or not any(match.groups()):
+        return None
+    hours, minutes, seconds = match.groups()
+    try:
+        return timedelta(hours=int(hours or 0), minutes=int(minutes or 0), seconds=float(seconds or 0))
+    except (ValueError, OverflowError):
         return None
 
 
@@ -542,9 +582,8 @@ def purge_vaults(
 
     Candidates are the vaults read in an ephemeral group before its deletion,
     or found in a persistent group's created delta, plus the vault name bound
-    to this attempt during its own cleanup. A bounded reconciliation selects
-    only vaults created by its original attempt and never adds a bound name
-    without an observation. Each deleted record must name the selected group.
+    to this attempt for the existing Site slot. An unobserved bound name is
+    checked once without waiting. Each deleted record must name the selected group.
     A purge outcome never changes the cleanup exit, and provider details stay private.
     """
     if not complete:
@@ -552,7 +591,7 @@ def purge_vaults(
     if any(names is None for names in observed.values()):
         return "failed"
     bound = {slot: scope.vault(slot) for slot in scope.slots
-             if created_before is None and scope.kind == "site" and slot == "existing"}
+             if scope.kind == "site" and slot == "existing"}
     selected = {(slot, name): True for slot, names in observed.items() for name in names}
     for slot, name in bound.items():
         selected.setdefault((slot, name), False)
@@ -641,9 +680,9 @@ def _delete_created(scope, slots, groups, results, vaults, *, timeout, interval,
                     created_before=None, retry_after=180):
     """Delete the created delta and confirm it is empty.
 
-    A bounded reconciliation deletes only resources created by the original
-    attempt within the clock tolerance. Missing creation times keep the slot
-    incomplete without deleting those resources.
+    A bounded reconciliation waits for deployments started within the original
+    job window and extends the bound to their completion. Missing creation
+    times keep the slot incomplete without deleting those resources.
     """
     pending = {slot: "inspect" for slot in scope.slots}
     requested = {}
@@ -655,6 +694,20 @@ def _delete_created(scope, slots, groups, results, vaults, *, timeout, interval,
                     results[slot] = {"state": "unknown", "reason": "persistent-group-missing"}
                     del pending[slot]
                     continue
+                effective_bound = created_before
+                if created_before is not None:
+                    deployments = [
+                        item for item in groups.deployments(slot)
+                        if _creation_time(item["timestamp"]) - _deployment_duration(item["duration"])
+                        <= created_before + CREATION_CLOCK_TOLERANCE
+                    ]
+                    if any(item["state"].casefold() not in {"succeeded", "failed", "canceled"}
+                           for item in deployments):
+                        results[slot] = {"state": "residual", "reason": "deployment-running"}
+                        continue
+                    effective_bound = max([
+                        created_before, *(_creation_time(item["timestamp"]) for item in deployments),
+                    ])
                 snapshot = set(slots[slot]["snapshot"])
                 created = []
                 unavailable = False
@@ -666,7 +719,7 @@ def _delete_created(scope, slots, groups, results, vaults, *, timeout, interval,
                         if created_at is None:
                             unavailable = True
                             continue
-                        if created_at > created_before + CREATION_CLOCK_TOLERANCE:
+                        if created_at > effective_bound + CREATION_CLOCK_TOLERANCE:
                             continue
                     created.append(item)
                 if pending[slot] == "inspect":
@@ -711,10 +764,11 @@ def cleanup(
 
     Ephemeral groups are deleted once and polled until absent. Persistent groups
     are never deleted. Without a bound, their created delta is removed and
-    polled until empty. A bounded reconciliation removes only resources created
-    by the original attempt within the clock tolerance. Resources without a
-    usable creation time leave cleanup incomplete. Site scopes then purge only
-    the vaults eligible for deletion.
+    polled until empty. A bounded reconciliation waits for deployments started
+    within the original job window and extends its resource bound to their
+    completion, allowing the clock tolerance. Running deployments and resources
+    without a usable creation time leave cleanup incomplete. Site scopes then
+    purge only the vaults eligible for deletion.
     """
     slots = validate_ownership(scope, lease)
     if (

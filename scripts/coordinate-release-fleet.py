@@ -28,7 +28,7 @@ from fleet_workflow import (  # noqa: E402
     scope_for,
     wait_for_job_state,
 )
-from release_acceptance import SITE_JOB, select_evidence  # noqa: E402
+from release_acceptance import FLEET_JOBS, SITE_JOB, select_evidence  # noqa: E402
 from release_fleet import (  # noqa: E402
     LOCATION,
     SITE_SLOTS,
@@ -271,15 +271,6 @@ def main() -> int:
                     or run.get("status") != "completed"
                 ):
                     raise CoordinationError("Standalone reconciliation requires the original fleet run to be stopped.")
-                original_completed = original.get("updated_at")
-                if not isinstance(original_completed, str) or re.fullmatch(
-                    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", original_completed
-                ) is None:
-                    raise CoordinationError("The original fleet attempt completion time is invalid.")
-                try:
-                    datetime.strptime(original_completed, "%Y-%m-%dT%H:%M:%SZ")
-                except ValueError:
-                    raise CoordinationError("The original fleet attempt completion time is invalid.") from None
             values = jobs(
                 reader.read(f"{prefix}/runs/{scope.run}/attempts/{scope.attempt}/jobs?per_page=100", pages=True),
                 run=scope.run, attempt=scope.attempt, commit=selected.source["commit"],
@@ -292,14 +283,33 @@ def main() -> int:
                 names, artifact = ("Retain Site ownership",), "site-ownership"
                 retained = [step for step in (prepare or {}).get("steps") or ()
                             if isinstance(step, dict) and step.get("name") == names[0]]
-                if prepare is None or (
-                    len(retained) == 1 and retained[0].get("status") == "completed"
-                    and retained[0].get("conclusion") != "success"
-                ):
-                    # Creation runs only after a successful ownership upload in the same job.
-                    print("No Site resource group was created for this case in the selected attempt.")
-                    output({"ownership-id": "", "original-completed": ""})
-                    return 0
+            if scope.run != int(os.environ["GITHUB_RUN_ID"]) and (site_slot is None or prepare is not None):
+                owning_jobs = ([prepare] if site_slot is not None else [
+                    job for name in FLEET_JOBS if (job := named_job(values, name)) is not None
+                ])
+                if not owning_jobs or any(job is None or job.get("status") != "completed" for job in owning_jobs):
+                    raise CoordinationError("The original owning job has not completed.")
+                completed_times = []
+                for job in owning_jobs:
+                    completed = job.get("completed_at")
+                    if not isinstance(completed, str) or re.fullmatch(
+                        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", completed
+                    ) is None:
+                        raise CoordinationError("The original job completion time is invalid.")
+                    try:
+                        datetime.strptime(completed, "%Y-%m-%dT%H:%M:%SZ")
+                    except ValueError:
+                        raise CoordinationError("The original job completion time is invalid.") from None
+                    completed_times.append(completed)
+                original_completed = max(completed_times)
+            if site_slot is not None and (prepare is None or (
+                len(retained) == 1 and retained[0].get("status") == "completed"
+                and retained[0].get("conclusion") != "success"
+            )):
+                # Creation runs only after a successful ownership upload in the same job.
+                print("No Site resource group was created for this case in the selected attempt.")
+                output({"ownership-id": "", "original-completed": ""})
+                return 0
             steps = prepare.get("steps") if prepare else None
             if not isinstance(steps, list):
                 raise CoordinationError("Fleet preparation metadata is unavailable.")

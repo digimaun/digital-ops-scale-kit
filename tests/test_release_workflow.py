@@ -1214,7 +1214,7 @@ def test_published_identity_comes_from_approval_not_changed_local_bytes(candidat
     candidate["responses"][f"repos/{REPO}/releases/tags/v1.0.0b8"] = {
         "status": 200,
         "body": {
-            "tag_name": "v1.0.0b8", "draft": False, "prerelease": True, "immutable": False,
+            "tag_name": "v1.0.0b8", "draft": False, "prerelease": True, "immutable": True,
             "assets": [
                 {**asset, "digest": "sha256:" + asset["sha256"], "state": "uploaded"}
                 for asset in inventory["assets"]
@@ -2264,9 +2264,14 @@ def test_published_asset_digests_and_immutable_release_are_checked(candidate, ru
         "publish", "Confirm published assets and immutability",
         extra={"PRERELEASE": "true", "BUNDLE": "true"},
     )
-    assert result.returncode == 0, result.stdout + result.stderr
+    # A published release must be immutable, so its assets cannot change after approval.
+    assert (result.returncode == 0) is immutable, result.stdout + result.stderr
+    assert ("::error::The published release is not immutable." in result.stdout + result.stderr) is not immutable
+    summary = (candidate["root"].parent / "summary.md").read_text(encoding="utf-8")
+    assert f"- Immutable: `{str(immutable).lower()}`" in summary
     assert any(call[:2] == ["release", "verify"] for call in calls) is immutable
     assert len([call for call in calls if call[:2] == ["release", "verify-asset"]]) == (8 if immutable else 0)
+    candidate["responses"][endpoint]["body"]["immutable"] = True
     assets[0]["digest"] = "sha256:" + "a" * 64
     result, _, _ = runner(
         "publish", "Confirm published assets and immutability",

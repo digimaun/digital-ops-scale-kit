@@ -776,6 +776,8 @@ publish rerun keeps the candidate from the original attempt.
    deployment, readiness and cleanup in private notes. These runs use staged
    candidate assets, not a public download.
 4. For content releases, the applicable content and AIO evidence is confirmed.
+5. Immutable releases are enabled in the repository settings. The publish job
+   fails when the published release is not immutable.
 
 ## Approve publication
 
@@ -816,8 +818,8 @@ After approval, the workflow:
    and reauthenticates each declared workspace package. It compares workspace
    routing, source, package identity and compatibility metadata with the approved
    declaration before creating the release with its unchanged payload.
-6. Confirms every uploaded asset digest and verifies GitHub's release
-   attestation when immutable releases are enabled.
+6. Confirms every uploaded asset digest, requires the published release to be
+   immutable, and verifies GitHub's release attestation.
 
 The destination is the repository running the workflow. Official publication
 occurs in `Azure/digital-ops-scale-kit`. A fork's workflow writes only to that
@@ -825,9 +827,12 @@ fork. Existing releases are never overwritten.
 
 With native installation assets, GitHub CLI creates a draft, uploads the files,
 and then publishes. This temporary draft is not a separate stage for human review.
-If immutability is enabled, GitHub locks the uploaded assets and tag when
-publication completes. Titles and release notes remain editable through
-GitHub's normal controls. The workflow does not enable immutability itself.
+Enable immutable releases in the repository settings before publishing.
+GitHub then locks the uploaded assets and tag when publication completes, so
+the short install command can rely on a release tag's download location.
+Titles and release notes remain editable through GitHub's normal controls.
+The workflow cannot enable immutability itself, and the publish job fails when
+the published release is not immutable.
 
 ## Retry or prepare a new candidate
 

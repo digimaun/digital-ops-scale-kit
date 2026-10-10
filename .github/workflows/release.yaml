@@ -1011,3 +1011,8 @@ jobs:
             echo "- Source: \`$SOURCE_SHA\`"
             echo "- Immutable: \`$immutable\`"
           } >> "$GITHUB_STEP_SUMMARY"
+          # The short install command binds a release tag through its locked assets.
+          if [[ "$immutable" != "true" ]]; then
+            echo "::error::The published release is not immutable. Enable immutable releases for this repository, then replace this release."
+            exit 1
+          fi

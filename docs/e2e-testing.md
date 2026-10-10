@@ -62,8 +62,10 @@ snapshot. Use groups dedicated to acceptance and distinct from each other,
 and do not deploy into them while a run is active. Group names stay in the
 secrets and never appear in logs, outputs or receipts.
 
-Cleanup runs after any failure and must confirm that everything the attempt
-created is gone. Residual or unknown state fails the case. Only then does the
+Cleanup runs after a failed step and must confirm that everything the attempt
+created is gone. Residual or unknown state fails the case. A cancelled run or
+a job timeout can stop cleanup, so reconcile that attempt as described below.
+Only after confirmed cleanup does the
 case purge the soft deleted Key Vaults it created: the vault named for the
 attempt, or one found among its own created resources, and only when the
 deleted record names that case's group. A purge failure is recorded in the
@@ -85,6 +87,12 @@ candidate to pass.
 - Reconcile an attempt whose cleanup did not complete with
   `scenario=site-cleanup` or `scenario=fleet-cleanup`, the original run and
   attempt, the same `candidate` and the same environment secrets.
+  Reconciliation starts only after every attempt of the original run has
+  completed. In a persistent group it removes only resources outside the
+  original snapshot that Azure reports as created before that attempt
+  completed, allowing two minutes of clock difference. Later resources stay.
+  A resource without a reported creation time stays in place and leaves the
+  case incomplete, so remove it yourself after checking it.
 
 With ephemeral groups the Site cases run in parallel, the fleet is usually the
 longest path, and a run takes about 1 to 1.5 hours. With a persistent Site
@@ -193,8 +201,9 @@ and the original subscription/environment. Use the original controller
 commit, preserving a branch or tag if necessary. Reconciliation recovers
 and verifies the original ownership artifact by ID and digest, then checks
 resource ownership again. It needs no copy of the private allocation file
-and does not regenerate ownership commitments. It refuses an original workflow
-that is still running. It does not provision clusters or perform deployments.
+and does not regenerate ownership commitments. It refuses an original run
+that is still running, including a later attempt of that run. It does not
+provision clusters or perform deployments.
 Raw Site identities, Site files, kubeconfigs and provider logs are not
 uploaded by either mode.
 

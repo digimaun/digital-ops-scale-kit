@@ -123,6 +123,7 @@ jobs:
         env:
           PYTHON: ${{ steps.tools.outputs.python }}
           ADMISSION_SHA: ${{ steps.select.outputs.admission-sha }}
+          ORIGINAL_COMPLETED: ${{ steps.ownership.outputs.original-completed }}
         run: |
           set -euo pipefail
           umask 077
@@ -130,9 +131,13 @@ jobs:
           if [[ "$KIND" == "site" ]]; then
             scope=(--kind site --slot "$SLOT")
           fi
+          bound=()
+          if [[ -n "$ORIGINAL_COMPLETED" ]]; then
+            bound=(--created-before "$ORIGINAL_COMPLETED")
+          fi
           # The preceding download verifies the selected original artifact's digest.
           OWNERSHIP_SHA="$(sha256sum "$RUNNER_TEMP/fleet/ownership/ownership.json" | cut -d ' ' -f 1)"
-          "$PYTHON" -B scripts/manage-release-fleet.py cleanup --execute "${scope[@]}" \
+          "$PYTHON" -B scripts/manage-release-fleet.py cleanup --execute "${scope[@]}" "${bound[@]}" \
             --admission "$RUNNER_TEMP/fleet/admission/receipt.json" --expected-admission-sha "$ADMISSION_SHA" \
             --ownership "$RUNNER_TEMP/fleet/ownership/ownership.json" --expected-ownership-sha "$OWNERSHIP_SHA" \
             --private-logs "$RUNNER_TEMP/fleet/reconcile-private" --output "$RUNNER_TEMP/fleet/reconciled.json"

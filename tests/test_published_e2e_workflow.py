@@ -162,6 +162,16 @@ def test_published_mode_is_explicit_and_bounded():
         assert value in workflow
 
 
+def test_release_acceptance_starts_azure_work_only_after_both_request_guards_pass():
+    # Each guard rejects inputs the other does not check, so neither path may start alone.
+    jobs = yaml.safe_load(_workflow())["jobs"]
+    assert "needs.fleet-request.result == 'success'" in jobs["prep"]["if"]
+    assert jobs["fleet"]["needs"] == ["fleet-request", "prep"]
+    assert "(inputs.scenario == 'release-acceptance' && needs.prep.result == 'success')" in jobs["fleet"]["if"]
+    assert "needs.fleet-request.result == 'success'" in jobs["fleet"]["if"]
+    assert "prep" in jobs["e2e"]["needs"]
+
+
 def test_windows_capability_probe_is_opt_in_without_azure_authority():
     workflow = yaml.safe_load(_workflow())
     inputs = workflow.get("on", workflow.get(True))["workflow_dispatch"]["inputs"]
@@ -173,7 +183,11 @@ def test_windows_capability_probe_is_opt_in_without_azure_authority():
     ]
 
     jobs = workflow["jobs"]
-    assert jobs["prep"]["if"] == "inputs.scenario == 'aio' || inputs.scenario == 'release-acceptance'"
+    assert jobs["prep"]["needs"] == "fleet-request"
+    assert jobs["prep"]["if"] == (
+        "${{ !cancelled() && (inputs.scenario == 'aio' || (inputs.scenario == 'release-acceptance' "
+        "&& needs.fleet-request.result == 'success')) }}"
+    )
     assert jobs["e2e"]["needs"] == ["prep", "site-groups"]
     probe = jobs["windows-installer-preflight"]
     assert probe["if"] == "inputs.scenario == 'windows-installer-preflight'"
@@ -2164,14 +2178,14 @@ def test_candidate_deployment_receipt_names_prepublication_transport(tmp_path):
     assert receipt["transport"] == "prepublication" and "release" not in receipt
 
 
-def _select_site_groups(site="", fleet="", scenario="release-acceptance"):
+def _select_site_groups(site="", fleet=""):
     workflow = yaml.safe_load(_workflow())
     job = workflow["jobs"]["site-groups"]
     with tempfile.TemporaryDirectory() as directory:
         output = Path(directory) / "output"
         result = subprocess.run(
             [sys.executable, "-c", job["steps"][0]["run"]],
-            env={**os.environ, "SITE_GROUP": site, "FLEET_GROUPS": fleet, "SCENARIO": scenario,
+            env={**os.environ, "SITE_GROUP": site, "FLEET_GROUPS": fleet,
                  "RUN_ID": "42", "GITHUB_OUTPUT": str(output)},
             capture_output=True, text=True, check=False,
         )
@@ -2190,19 +2204,19 @@ def test_site_group_selection_reads_only_environment_secrets_and_publishes_no_na
     assert job["steps"][0]["env"]["FLEET_GROUPS"] == "${{ secrets.E2E_FLEET_RESOURCE_GROUPS }}"
 
 
-@pytest.mark.parametrize(("site", "fleet", "scenario", "expected"), [
-    ("", "", "release-acceptance", {"groups": "ephemeral", "rg_key": "ephemeral-42", "max_parallel": "3"}),
-    ("", "rg-fleet-one,rg-fleet-two", "release-acceptance",
-     {"groups": "ephemeral", "rg_key": "ephemeral-42", "max_parallel": "3"}),
-    ("RG-Private-Marker", "rg-fleet-one,rg-fleet-two", "release-acceptance",
-     {"groups": "persistent", "max_parallel": "1"}),
-    ("rg-private-marker", "rg-private-marker,rg-fleet-two", "aio", {"groups": "persistent", "max_parallel": "1"}),
-    ("rg-private-marker", "RG-PRIVATE-MARKER,rg-fleet-two", "release-acceptance", None),
-    ("rg private-marker", "", "release-acceptance", None),
-    ("rg-private-marker.", "", "release-acceptance", None),
+@pytest.mark.parametrize(("site", "fleet", "expected"), [
+    ("", "", {"groups": "ephemeral", "rg_key": "ephemeral-42", "max_parallel": "3"}),
+    ("", "rg-fleet-one,rg-fleet-two", {"groups": "ephemeral", "rg_key": "ephemeral-42", "max_parallel": "3"}),
+    ("RG-Private-Marker", "rg-fleet-one,rg-fleet-two", {"groups": "persistent", "max_parallel": "1"}),
+    ("rg-private-marker", "", {"groups": "persistent", "max_parallel": "1"}),
+    # Overlap is refused for every candidate Site run, standalone or release acceptance.
+    ("rg-private-marker", "rg-private-marker,rg-fleet-two", None),
+    ("rg-private-marker", "rg-fleet-one,RG-PRIVATE-MARKER", None),
+    ("rg private-marker", "", None),
+    ("rg-private-marker.", "", None),
 ])
-def test_site_groups_select_parallel_ephemeral_or_serialized_persistent_cases(site, fleet, scenario, expected):
-    result, values = _select_site_groups(site, fleet, scenario)
+def test_site_groups_select_parallel_ephemeral_or_serialized_persistent_cases(site, fleet, expected):
+    result, values = _select_site_groups(site, fleet)
     assert "private-marker" not in result.stdout + result.stderr + json.dumps(values)
     if expected is None:
         assert result.returncode != 0 and not values

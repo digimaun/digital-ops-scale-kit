@@ -18,6 +18,7 @@ import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from siteops.arm_resources import ArmResourceError
@@ -38,6 +39,10 @@ LOCATION = re.compile(r"[a-z][a-z0-9]{1,63}")
 CLUSTER_TYPE = "microsoft.kubernetes/connectedclusters"
 INSTANCE_TYPE = "microsoft.iotoperations/instances"
 VAULT_TYPE = "microsoft.keyvault/vaults"
+CREATION_CLOCK_TOLERANCE = timedelta(minutes=2)
+CREATION_TIMESTAMP = re.compile(
+    r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})"
+)
 
 
 class FleetError(ValueError):
@@ -339,12 +344,13 @@ class AzureGroups:
         """Every resource in the selected group, limited to identities inside that group."""
         values = self._json("resource-list", slot, [
             "resource", "list", "--resource-group", self.scope.group(slot),
-            "--query", "[].{id:id,type:type,name:name}",
+            "--query", "[].{id:id,type:type,name:name,createdTime:createdTime}",
         ], "invalid-resource-response")
         prefix = (self.scope.group_id(slot) + "/providers/").casefold()
         if not isinstance(values, list) or len(values) > MAX_SNAPSHOT or any(
-            not isinstance(item, dict) or set(item) != {"id", "type", "name"}
-            or any(not isinstance(item[key], str) or not item[key] for key in item)
+            not isinstance(item, dict) or set(item) != {"id", "type", "name", "createdTime"}
+            or any(not isinstance(item[key], str) or not item[key] for key in ("id", "type", "name"))
+            or item["createdTime"] is not None and not isinstance(item["createdTime"], str)
             or not item["id"].casefold().startswith(prefix)
             or re.search(r"[\s?#]|/\.\.?(?:/|$)", item["id"]) is not None
             for item in values
@@ -403,6 +409,20 @@ def is_cluster(resource: dict) -> bool:
     return (resource["type"].casefold() == CLUSTER_TYPE
             and re.search(r"/providers/microsoft\.kubernetes/connectedclusters/[^/]+$", resource["id"].casefold())
             is not None)
+
+
+def _creation_time(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    match = CREATION_TIMESTAMP.fullmatch(value)
+    if match is None:
+        return None
+    base, fraction, offset = match.groups()
+    normalized = base + (f".{fraction[:6]}" if fraction else "") + ("+00:00" if offset == "Z" else offset)
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
 
 
 def preflight(scope: FleetScope, groups: AzureGroups) -> dict:
@@ -515,20 +535,24 @@ def _poll(read, done, *, timeout: float, interval: float, clock, sleep):
 
 def purge_vaults(
     scope: FleetScope, groups: AzureGroups, observed: dict, *, complete: bool,
-    interval: float, clock, sleep, record_timeout: float = 120, purge_timeout: float = 300,
+    interval: float, clock, sleep, created_before: datetime | None = None,
+    record_timeout: float = 120, purge_timeout: float = 300,
 ) -> str:
     """Purge only soft deleted vaults this attempt created in a group it used.
 
     Candidates are the vaults read in an ephemeral group before its deletion,
     or found in a persistent group's created delta, plus the vault name bound
-    to this attempt. Each deleted record must name the selected group. A purge
-    outcome never changes the cleanup exit, and provider details stay private.
+    to this attempt during its own cleanup. A bounded reconciliation selects
+    only vaults created by its original attempt and never adds a bound name
+    without an observation. Each deleted record must name the selected group.
+    A purge outcome never changes the cleanup exit, and provider details stay private.
     """
     if not complete:
         return "not-attempted"
     if any(names is None for names in observed.values()):
         return "failed"
-    bound = {slot: scope.vault(slot) for slot in scope.slots if scope.kind == "site" and slot == "existing"}
+    bound = {slot: scope.vault(slot) for slot in scope.slots
+             if created_before is None and scope.kind == "site" and slot == "existing"}
     selected = {(slot, name): True for slot, names in observed.items() for name in names}
     for slot, name in bound.items():
         selected.setdefault((slot, name), False)
@@ -613,8 +637,14 @@ def _delete_groups(scope, slots, groups, results, vaults, *, timeout, interval, 
             sleep(min(interval, remaining))
 
 
-def _delete_created(scope, slots, groups, results, vaults, *, timeout, interval, clock, sleep, retry_after=180):
-    """Delete only resources outside the committed snapshot, then confirm the delta is empty."""
+def _delete_created(scope, slots, groups, results, vaults, *, timeout, interval, clock, sleep,
+                    created_before=None, retry_after=180):
+    """Delete the created delta and confirm it is empty.
+
+    A bounded reconciliation deletes only resources created by the original
+    attempt within the clock tolerance. Missing creation times keep the slot
+    incomplete without deleting those resources.
+    """
     pending = {slot: "inspect" for slot in scope.slots}
     requested = {}
     deadline = clock() + timeout
@@ -626,14 +656,26 @@ def _delete_created(scope, slots, groups, results, vaults, *, timeout, interval,
                     del pending[slot]
                     continue
                 snapshot = set(slots[slot]["snapshot"])
-                created = [item for item in groups.resources(slot)
-                           if scope.snapshot_digest(item["id"]) not in snapshot]
+                created = []
+                unavailable = False
+                for item in groups.resources(slot):
+                    if scope.snapshot_digest(item["id"]) in snapshot:
+                        continue
+                    if created_before is not None:
+                        created_at = _creation_time(item.get("createdTime"))
+                        if created_at is None:
+                            unavailable = True
+                            continue
+                        if created_at > created_before + CREATION_CLOCK_TOLERANCE:
+                            continue
+                    created.append(item)
                 if pending[slot] == "inspect":
                     vaults[slot] = [item["name"] for item in created if item["type"].casefold() == VAULT_TYPE
                                     and VAULT_NAME.fullmatch(item["name"])]
                     pending[slot] = "deleting"
                 if not created:
-                    results[slot] = {"state": "absent", "reason": "confirmed-absent"}
+                    results[slot] = ({"state": "residual", "reason": "creation-time-unavailable"} if unavailable
+                                     else {"state": "absent", "reason": "confirmed-absent"})
                     del pending[slot]
                     continue
                 # The cluster goes first so its extensions are removed with it.
@@ -663,23 +705,32 @@ def _delete_created(scope, slots, groups, results, vaults, *, timeout, interval,
 def cleanup(
     scope: FleetScope, lease: dict, groups: AzureGroups, *, operation_exit: int = 0,
     timeout: float = 1200, interval: float = 15, clock=time.monotonic, sleep=time.sleep,
+    created_before: datetime | None = None,
 ) -> tuple[int, dict]:
     """Remove what this attempt created, confirm it is absent, and preserve the operation exit.
 
     Ephemeral groups are deleted once and polled until absent. Persistent groups
-    are never deleted. Their created delta is removed and polled until empty.
-    Site scopes then purge the vaults this attempt created.
+    are never deleted. Without a bound, their created delta is removed and
+    polled until empty. A bounded reconciliation removes only resources created
+    by the original attempt within the clock tolerance. Resources without a
+    usable creation time leave cleanup incomplete. Site scopes then purge only
+    the vaults eligible for deletion.
     """
     slots = validate_ownership(scope, lease)
     if (
         type(operation_exit) is not int or not 0 <= operation_exit <= 255
         or type(timeout) not in {int, float} or type(interval) not in {int, float}
         or not 0 < timeout <= 3600 or not 0 < interval <= timeout
+        or created_before is not None and (
+            not isinstance(created_before, datetime) or created_before.utcoffset() is None
+        )
     ):
         raise FleetError("invalid-cleanup-bound")
     results, vaults = {}, {}
     remove = _delete_created if scope.groups else _delete_groups
-    remove(scope, slots, groups, results, vaults, timeout=timeout, interval=interval, clock=clock, sleep=sleep)
+    options = {"created_before": created_before} if scope.groups else {}
+    remove(scope, slots, groups, results, vaults, timeout=timeout, interval=interval, clock=clock, sleep=sleep,
+           **options)
     complete = all(result["state"] == "absent" for result in results.values())
     receipt = {
         "apiVersion": VERSION, "kind": "FleetCleanup", "groups": scope.mode,
@@ -690,5 +741,6 @@ def cleanup(
         receipt["kind"] = "SiteCleanup"
         receipt["vaultPurge"] = purge_vaults(
             scope, groups, vaults, complete=complete, interval=interval, clock=clock, sleep=sleep,
+            created_before=created_before if scope.groups else None,
         )
     return operation_exit or (0 if complete else 1), receipt

@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -246,15 +247,37 @@ def main() -> int:
                 slot=site_slot,
             )
             reader = GitHubReads(args.root / "ownership-metadata")
+            original_completed = ""
             if scope.run != int(os.environ["GITHUB_RUN_ID"]):
                 original = reader.read(f"{prefix}/runs/{scope.run}/attempts/{scope.attempt}")
                 if (
-                    original.get("id") != scope.run or original.get("run_attempt") != scope.attempt
+                    not isinstance(original, dict)
+                    or type(original.get("id")) is not int or original["id"] != scope.run
+                    or original.get("run_attempt") != scope.attempt
                     or original.get("head_sha") != selected.source["commit"]
-                    or original.get("repository", {}).get("full_name") != selected.source["repository"]
+                    or not isinstance(original.get("repository"), dict)
+                    or original["repository"].get("full_name") != selected.source["repository"]
                     or original.get("status") != "completed"
                 ):
                     raise CoordinationError("Standalone reconciliation requires the original fleet run to be stopped.")
+                run = reader.read(f"{prefix}/runs/{scope.run}")
+                if (
+                    not isinstance(run, dict) or type(run.get("id")) is not int or run["id"] != scope.run
+                    or run.get("head_sha") != selected.source["commit"]
+                    or not isinstance(run.get("repository"), dict)
+                    or run["repository"].get("full_name") != selected.source["repository"]
+                    or run.get("status") != "completed"
+                ):
+                    raise CoordinationError("Standalone reconciliation requires the original fleet run to be stopped.")
+                original_completed = original.get("updated_at")
+                if not isinstance(original_completed, str) or re.fullmatch(
+                    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", original_completed
+                ) is None:
+                    raise CoordinationError("The original fleet attempt completion time is invalid.")
+                try:
+                    datetime.strptime(original_completed, "%Y-%m-%dT%H:%M:%SZ")
+                except ValueError:
+                    raise CoordinationError("The original fleet attempt completion time is invalid.") from None
             values = jobs(
                 reader.read(f"{prefix}/runs/{scope.run}/attempts/{scope.attempt}/jobs?per_page=100", pages=True),
                 run=scope.run, attempt=scope.attempt, commit=selected.source["commit"],
@@ -273,7 +296,7 @@ def main() -> int:
                 ):
                     # Creation runs only after a successful ownership upload in the same job.
                     print("No Site resource group was created for this case in the selected attempt.")
-                    output({"ownership-id": ""})
+                    output({"ownership-id": "", "original-completed": ""})
                     return 0
             steps = prepare.get("steps") if prepare else None
             if not isinstance(steps, list):
@@ -299,7 +322,7 @@ def main() -> int:
                     or matches[0].get("workflow_run", {}).get("id") != scope.run
                     or matches[0].get("workflow_run", {}).get("head_sha") != selected.source["commit"]):
                 raise CoordinationError("The original fleet ownership artifact is missing or ambiguous.")
-            output({"ownership-id": matches[0]["id"]})
+            output({"ownership-id": matches[0]["id"], "original-completed": original_completed})
     except FleetProcessError as error:
         print(str(error), file=sys.stderr)
         return error.code

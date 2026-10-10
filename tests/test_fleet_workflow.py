@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -372,10 +373,15 @@ def test_selection_entrypoint_reads_only_the_bound_producer_before_publishing_ou
     assert all(endpoint.startswith("repos/example/content/actions/") for endpoint in calls)
 
 
+@pytest.mark.parametrize(("run_status", "updated_at", "metadata_error"), [
+    ("completed", "2026-10-09T12:34:56Z", None),
+    ("in_progress", "2026-10-09T12:34:56Z", "original fleet run to be stopped"),
+    ("completed", "2026-10-09T12:34:56.123Z", "original fleet attempt completion time is invalid"),
+])
 @pytest.mark.parametrize("uploaded", [False, True])
 @pytest.mark.parametrize("digest", ["sha256:" + "e" * 64, None])
 def test_reconciliation_uses_original_execution_and_requires_the_prewrite_upload(
-    inputs, monkeypatch, uploaded, digest,
+    inputs, monkeypatch, capsys, uploaded, digest, run_status, updated_at, metadata_error,
 ):
     root, value, _ = inputs
     script = load_script("coordinate-release-fleet")
@@ -400,7 +406,11 @@ def test_reconciliation_uses_original_execution_and_requires_the_prewrite_upload
                 return {
                     "id": 50, "run_attempt": 2, "head_sha": SOURCE["commit"],
                     "repository": {"full_name": SOURCE["repository"]}, "status": "completed",
+                    "updated_at": updated_at,
                 }
+            if endpoint.endswith("/runs/50"):
+                return {"id": 50, "head_sha": SOURCE["commit"],
+                        "repository": {"full_name": SOURCE["repository"]}, "status": run_status}
             if "/jobs?" in endpoint:
                 return [{"total_count": 1, "jobs": [{
                     "id": 100, "run_id": 50, "run_attempt": 2, "head_sha": SOURCE["commit"],
@@ -418,13 +428,18 @@ def test_reconciliation_uses_original_execution_and_requires_the_prewrite_upload
 
     monkeypatch.setattr(script, "GitHubReads", Reads)
     monkeypatch.setattr(sys, "argv", ["coordinate-release-fleet.py", "ownership", "--root", str(root)])
-    assert script.main() == (0 if uploaded and digest else 1)
-    assert all("/runs/50/" in endpoint for endpoint in calls)
-    if uploaded and digest:
-        assert "ownership-id=500" in output.read_text()
+    assert script.main() == (0 if uploaded and digest and metadata_error is None else 1)
+    if metadata_error is not None:
+        assert metadata_error in capsys.readouterr().err
+        assert calls[-1].endswith("/runs/50")
+    assert all("/runs/50" in endpoint for endpoint in calls)
+    if uploaded and digest and metadata_error is None:
+        assert output.read_text().splitlines() == ["ownership-id=500", f"original-completed={updated_at}"]
         assert "ownership-sha" not in output.read_text()
     else:
-        assert not output.exists() and len(calls) == (3 if uploaded else 2)
+        assert not output.exists()
+        if metadata_error is None:
+            assert len(calls) == (4 if uploaded else 3)
 
 
 @pytest.mark.parametrize("matching_owner", [False, True])
@@ -498,7 +513,11 @@ def test_workflow_keeps_hosts_live_and_uploads_ownership_before_creation():
         assert jobs[name]["runs-on"] == "ubuntu-24.04"
         assert "attestations" not in jobs[name]["permissions"]
     caller = yaml.safe_load((ROOT / ".github/workflows/e2e-test.yaml").read_text())
-    assert caller["jobs"]["fleet"]["if"] == "inputs.scenario == 'fleet' || inputs.scenario == 'release-acceptance'"
+    assert caller["jobs"]["fleet"]["needs"] == ["fleet-request", "prep"]
+    assert caller["jobs"]["fleet"]["if"] == (
+        "${{ !cancelled() && needs.fleet-request.result == 'success' && (inputs.scenario == 'fleet' || "
+        "(inputs.scenario == 'release-acceptance' && needs.prep.result == 'success')) }}"
+    )
     assert caller["jobs"]["fleet-cleanup"]["if"] == (
         "inputs.scenario == 'fleet-cleanup' || inputs.scenario == 'site-cleanup'"
     )
@@ -535,6 +554,21 @@ def test_allocation_markers_stay_private_and_cleanup_consumes_verified_original_
         assert '--expected-ownership-sha "$OWNERSHIP_SHA"' in cleanup_step["run"]
         assert "--allocation-state" not in cleanup_step["run"]
         assert "ownership-sha" not in cleanup_step.get("env", {}).get("OWNERSHIP_SHA", "")
+
+
+def test_reconciliation_passes_attempt_completion_bound_through_environment():
+    flow = yaml.safe_load((ROOT / ".github/workflows/_fleet-reconcile.yaml").read_text())
+    steps = flow["jobs"]["reconcile"]["steps"]
+    ownership = next(step for step in steps if step.get("id") == "ownership")
+    reconcile = next(step for step in steps if step.get("name") == "Reconcile original owned groups")
+    assert steps.index(ownership) < steps.index(reconcile)
+    assert reconcile["env"]["ORIGINAL_COMPLETED"] == "${{ steps.ownership.outputs.original-completed }}"
+    script = reconcile["run"]
+    assert 'if [[ -n "$ORIGINAL_COMPLETED" ]]; then' in script
+    assert 'bound=(--created-before "$ORIGINAL_COMPLETED")' in script
+    command = next(line for line in script.splitlines() if "manage-release-fleet.py cleanup" in line)
+    assert "${bound[@]}" in shlex.split(command.removesuffix("\\"))
+    assert "${{ " not in script
 
 
 @pytest.mark.skipif(os.name != "posix", reason="The fleet command supervisor runs on Linux hosts.")
@@ -847,6 +881,7 @@ def _reads(responses, calls):
     return Reads
 
 
+@pytest.mark.parametrize("standalone", [False, True])
 @pytest.mark.parametrize(("job", "retained", "artifact", "expected"), [
     (False, None, False, ("", 0)),
     (True, "failure", False, ("", 0)),
@@ -856,11 +891,13 @@ def _reads(responses, calls):
     (True, None, False, (None, 1)),
 ])
 def test_site_reconciliation_reports_nothing_only_when_creation_could_not_start(
-    inputs, monkeypatch, job, retained, artifact, expected,
+    inputs, monkeypatch, job, retained, artifact, expected, standalone,
 ):
     root, value, _ = inputs
     script = load_script("coordinate-release-fleet")
     site_environment(monkeypatch, root, value)
+    if not standalone:
+        monkeypatch.setenv("GITHUB_RUN_ID", "50")
     steps = [] if retained is None else [{"name": "Retain Site ownership", "status": "completed",
                                          "conclusion": retained}]
     jobs_page = [{"total_count": 1 if job else 1, "jobs": [{
@@ -875,7 +912,10 @@ def test_site_reconciliation_reports_nothing_only_when_creation_could_not_start(
     monkeypatch.setattr(script, "GitHubReads", _reads({
         "/attempts/2/jobs": jobs_page, "/runs/50/artifacts": artifacts,
         "/runs/50/attempts/2": {"id": 50, "run_attempt": 2, "head_sha": SOURCE["commit"],
-                                "repository": {"full_name": SOURCE["repository"]}, "status": "completed"},
+                                "repository": {"full_name": SOURCE["repository"]}, "status": "completed",
+                                "updated_at": "2026-10-09T12:34:56Z"},
+        "/runs/50": {"id": 50, "head_sha": SOURCE["commit"],
+                     "repository": {"full_name": SOURCE["repository"]}, "status": "completed"},
     }, calls))
     monkeypatch.setattr(sys, "argv", ["coordinate-release-fleet.py", "ownership", "--root", str(root),
                                       "--kind", "site", "--slot", "existing"])
@@ -883,7 +923,11 @@ def test_site_reconciliation_reports_nothing_only_when_creation_could_not_start(
     if expected[0] is None:
         assert not (root / "outputs").exists()
     else:
-        assert (root / "outputs").read_text() == f"ownership-id={expected[0]}\n"
+        timestamp = "2026-10-09T12:34:56Z" if standalone and expected[0] else ""
+        assert (root / "outputs").read_text().splitlines() == [
+            f"ownership-id={expected[0]}", f"original-completed={timestamp}",
+        ]
+    assert any(call.endswith("/runs/50") for call in calls) == standalone
 
 
 def test_evidence_selection_publishes_only_ids_of_the_latest_attempts(inputs, monkeypatch):
@@ -934,6 +978,30 @@ def test_persistent_group_secrets_have_a_strict_shape_and_are_never_echoed(kind,
         assert "private" not in str(caught.value) and "rg-" not in str(caught.value)
     else:
         assert supplied_groups(kind, environment) == expected
+
+
+@pytest.mark.parametrize(("kind", "site", "fleet", "expected"), [
+    ("site", "rg-One", "RG-ONE,rg-two", True),
+    ("fleet", "Rg-Two", "rg-one,rg-two", True),
+    ("site", "rg-site", "rg-one,rg-two", False),
+    ("fleet", "rg-site", "rg-one,rg-two", False),
+    ("site", "rg-site", "", False),
+    ("fleet", "", "rg-one,rg-two", False),
+])
+def test_site_and_fleet_group_secrets_must_differ(kind, site, fleet, expected):
+    from fleet_workflow import supplied_groups
+
+    environment = {"E2E_SITE_RESOURCE_GROUP": site, "E2E_FLEET_RESOURCE_GROUPS": fleet}
+    own = site if kind == "site" else fleet
+    if expected:
+        with pytest.raises(CoordinationError) as caught:
+            supplied_groups(kind, environment)
+        assert str(caught.value) == "The single Site group must differ from both fleet groups."
+    else:
+        assert supplied_groups(kind, environment) == (tuple(own.split(",")) if own else None)
+    environment.pop("E2E_FLEET_RESOURCE_GROUPS" if kind == "site" else "E2E_SITE_RESOURCE_GROUP")
+    if own:
+        assert supplied_groups(kind, environment) == tuple(own.split(","))
 
 
 def test_persistent_hosts_take_their_region_from_the_supplied_group(inputs, monkeypatch, capsys):

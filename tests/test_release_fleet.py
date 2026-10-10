@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -99,11 +100,11 @@ class Clock:
         self.value += duration
 
 
-def invoke(scope, lease, groups, *, operation_exit=0):
+def invoke(scope, lease, groups, *, operation_exit=0, created_before=None):
     clock = Clock()
     code, report = cleanup(
         scope, lease, groups, operation_exit=operation_exit, timeout=3, interval=1,
-        clock=clock.now, sleep=clock.sleep,
+        clock=clock.now, sleep=clock.sleep, created_before=created_before,
     )
     return code, report, clock
 
@@ -386,6 +387,13 @@ def test_actual_management_entrypoint_uses_selected_receipts_and_preserves_exit(
         "FLEET_RUN_ATTEMPT": "3", "AZURE_SUBSCRIPTION_ID": SUBSCRIPTION,
     }.items():
         monkeypatch.setenv(key, value)
+    real_cleanup = module.cleanup
+
+    def bounded_cleanup(*args, **kwargs):
+        assert kwargs["created_before"] == datetime(2026, 10, 9, 12, 34, 56, tzinfo=timezone.utc)
+        return real_cleanup(*args, **kwargs)
+
+    monkeypatch.setattr(module, "cleanup", bounded_cleanup)
     selected = []
 
     def groups(scope, _logs, *, owners=None):
@@ -416,7 +424,8 @@ def test_actual_management_entrypoint_uses_selected_receipts_and_preserves_exit(
         if operation in {"preflight", "create"}:
             args.extend(["--allocation-state", str(allocation)])
         if operation == "cleanup":
-            args.extend(["--operation-exit", str(operation_exit)])
+            args.extend(["--operation-exit", str(operation_exit),
+                         "--created-before", "2026-10-09T12:34:56Z"])
         monkeypatch.setattr(sys, "argv", args)
         assert module.main() == (operation_exit if operation == "cleanup" else 0)
         assert output.is_file()
@@ -432,6 +441,29 @@ def test_actual_management_entrypoint_uses_selected_receipts_and_preserves_exit(
     assert all(value not in captured.out + captured.err + ownership.read_text()
                for value in private["owners"].values())
     assert not any(selected[0].present.values())
+
+
+@pytest.mark.parametrize("value", [
+    "2026-10-09T12:34:56+00:00", "2026-10-09T12:34:56.1Z",
+    "2026-10-09T12:34:56", "2026-13-09T12:34:56Z", "rg-private-time",
+])
+def test_management_rejects_non_utc_second_cleanup_bounds_without_echo(tmp_path, monkeypatch, capsys, value):
+    spec = importlib.util.spec_from_file_location(
+        "manage_bound_refusal", ROOT / "scripts" / "manage-release-fleet.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(sys, "argv", [
+        "manage-release-fleet.py", "cleanup", "--created-before", value,
+        "--admission", str(tmp_path / "missing"), "--expected-admission-sha", "0" * 64,
+        "--output", str(tmp_path / "result"), "--private-logs", str(tmp_path / "logs"),
+    ])
+    with pytest.raises(SystemExit) as caught:
+        module.main()
+    assert caught.value.code == 2
+    message = capsys.readouterr().err
+    assert "Expected a UTC completion time in YYYY-MM-DDTHH:MM:SSZ format." in message
+    assert value not in message
 
 
 @pytest.mark.parametrize("operation", ["create", "cleanup"])
@@ -783,9 +815,9 @@ class PersistentGroups:
             for kind, name in existing:
                 self.add(slot, kind, name)
 
-    def add(self, slot, kind, name):
+    def add(self, slot, kind, name, created_time=None):
         self.items[slot].append({"id": f"{self.scope.group_id(slot)}/providers/{kind}/{name}", "type": kind,
-                                 "name": name})
+                                 "name": name, "createdTime": created_time})
 
     def soft_delete(self, slot, name, group=None):
         self.deleted_vaults[name] = {"name": name, "properties": {
@@ -961,6 +993,118 @@ def test_persistent_cleanup_removes_only_the_created_delta_and_confirms_absence(
     assert all(value not in public for value in (*scope.groups, scope.cluster(scope.slots[0]), "operatorstorage"))
 
 
+def test_bounded_reconciliation_preserves_later_vault():
+    scope = persistent_scope("site", "enabled")
+    groups = PersistentGroups(scope, EXISTING)
+    lease = preflight(scope, groups)
+    groups.add("enabled", "Microsoft.Storage/storageAccounts", "createdbyattempt",
+               created_time="2026-10-09T12:34:56.1234567+00:00")
+    groups.add("enabled", "Microsoft.KeyVault/vaults", "kvlater",
+               created_time="2026-10-09T12:40:00Z")
+    groups.soft_delete("enabled", "kvlater")
+    groups.calls.clear()
+    code, report, _ = invoke(
+        scope, lease, groups, created_before=datetime(2026, 10, 9, 12, 35, tzinfo=timezone.utc),
+    )
+    assert code == 0 and report["status"] == "complete"
+    assert report["slots"]["enabled"] == {"state": "absent", "reason": "confirmed-absent"}
+    assert ("delete-resource", "createdbyattempt") in groups.calls
+    assert not any(action == "delete-resource" and name == "kvlater" for action, name in groups.calls)
+    assert not any(action in {"deleted", "purge"} and name == "kvlater" for action, name in groups.calls)
+    assert {item["name"] for item in groups.items["enabled"]} == {"operatorstorage", "kvoperator", "kvlater"}
+    assert report["vaultPurge"] == "not-applicable"
+
+
+def test_bounded_reconciliation_keeps_missing_creation_time_incomplete():
+    scope = persistent_scope("site", "enabled")
+    groups = PersistentGroups(scope, EXISTING)
+    lease = preflight(scope, groups)
+    groups.add("enabled", "Microsoft.Storage/storageAccounts", "createdbyattempt",
+               created_time="2026-10-09T12:34:56Z")
+    groups.add("enabled", "Microsoft.KeyVault/vaults", "kvunknown")
+    groups.calls.clear()
+    code, report, _ = invoke(
+        scope, lease, groups, created_before=datetime(2026, 10, 9, 12, 35, tzinfo=timezone.utc),
+    )
+    assert code == 1 and report["status"] == "incomplete"
+    assert report["slots"]["enabled"] == {"state": "residual", "reason": "creation-time-unavailable"}
+    assert report["vaultPurge"] == "not-attempted"
+    assert [name for action, name in groups.calls if action == "delete-resource"] == ["createdbyattempt"]
+    assert not any(action in {"deleted", "purge"} for action, _ in groups.calls)
+    assert any(item["name"] == "kvunknown" for item in groups.items["enabled"])
+
+
+def test_bounded_reconciliation_skips_unobserved_bound_vault():
+    scope = persistent_scope("site")
+    groups = PersistentGroups(scope, EXISTING)
+    lease = preflight(scope, groups)
+    groups.soft_delete("existing", scope.vault("existing"))
+    groups.calls.clear()
+    code, report, _ = invoke(
+        scope, lease, groups, created_before=datetime(2026, 10, 9, 12, 35, tzinfo=timezone.utc),
+    )
+    assert code == 0 and report["status"] == "complete"
+    assert report["vaultPurge"] == "not-applicable"
+    assert not any(action in {"deleted", "purge"} for action, _ in groups.calls)
+
+
+@pytest.mark.parametrize(("created_time", "expected"), [
+    ("2026-10-09T12:36:56.1234567+00:00", "absent"),
+    ("2026-10-09T12:34:56Z", "absent"),
+    ("2026-10-09T12:34:56.12Z", "absent"),
+    ("2026-10-09T12:34:56", "residual"),
+    ("garbage", "residual"),
+])
+def test_reconciliation_requires_aware_arm_creation_time(created_time, expected):
+    scope = persistent_scope("site", "enabled")
+    groups = PersistentGroups(scope, EXISTING)
+    lease = preflight(scope, groups)
+    groups.add("enabled", "Microsoft.Storage/storageAccounts", "runstorage", created_time=created_time)
+    groups.calls.clear()
+    code, report, _ = invoke(
+        scope, lease, groups, created_before=datetime(2026, 10, 9, 12, 35, tzinfo=timezone.utc),
+    )
+    assert report["slots"]["enabled"]["state"] == expected
+    assert code == (0 if expected == "absent" else 1)
+    assert (("delete-resource", "runstorage") in groups.calls) == (expected == "absent")
+
+
+def test_unbounded_persistent_cleanup_still_deletes_later_vault():
+    scope = persistent_scope("site", "enabled")
+    groups = PersistentGroups(scope, EXISTING)
+    lease = preflight(scope, groups)
+    groups.add("enabled", "Microsoft.KeyVault/vaults", "kvlater",
+               created_time="2026-10-09T12:40:00Z")
+    groups.calls.clear()
+    code, report, _ = invoke(scope, lease, groups)
+    assert code == 0 and report["status"] == "complete"
+    assert report["vaultPurge"] == "purged"
+    assert ("delete-resource", "kvlater") in groups.calls
+    assert ("purge", "kvlater") in groups.calls
+
+
+def test_ephemeral_site_group_cleanup_ignores_creation_bound():
+    scope = site_scope("enabled")
+    groups = SiteGroups(scope)
+    lease = preflight(scope, groups)
+    create(scope, lease, groups, "eastus2")
+    code, report, _ = invoke(
+        scope, lease, groups, created_before=datetime(2026, 10, 9, 12, 35, tzinfo=timezone.utc),
+    )
+    assert code == 0 and report["status"] == "complete"
+    assert ("delete", "enabled") in groups.calls
+    assert report["vaultPurge"] == "purged"
+
+
+@pytest.mark.parametrize("invalid", ["2026-10-09T12:35:00Z", 1, datetime(2026, 10, 9, 12, 35)])
+def test_cleanup_requires_an_aware_datetime_bound(invalid):
+    scope = persistent_scope("site")
+    groups = PersistentGroups(scope)
+    lease = preflight(scope, groups)
+    with pytest.raises(FleetError, match="invalid-cleanup-bound"):
+        invoke(scope, lease, groups, created_before=invalid)
+
+
 @pytest.mark.parametrize(("fault", "state", "code"), [
     ("sticky", "residual", 1), ("listing", "unknown", 1), ("group-removed", "unknown", 1),
     ("dependency", "absent", 0),
@@ -1024,7 +1168,7 @@ def test_resource_adapter_stays_inside_the_selected_group(tmp_path):
     group = scope.group_id("existing")
     calls = []
     listing = [{"id": f"{group}/providers/Microsoft.Kubernetes/connectedClusters/arc", "type":
-                "Microsoft.Kubernetes/connectedClusters", "name": "arc"}]
+                "Microsoft.Kubernetes/connectedClusters", "name": "arc", "createdTime": None}]
 
     def runner(args):
         calls.append(args)
@@ -1039,7 +1183,8 @@ def test_resource_adapter_stays_inside_the_selected_group(tmp_path):
                                         "type": "Microsoft.Storage/storageAccounts", "name": "s"})
     assert calls == [
         ["az", "resource", "list", "--resource-group", scope.group("existing"), "--query",
-         "[].{id:id,type:type,name:name}", "--subscription", SUBSCRIPTION, "--only-show-errors", "-o", "json"],
+         "[].{id:id,type:type,name:name,createdTime:createdTime}", "--subscription", SUBSCRIPTION,
+         "--only-show-errors", "-o", "json"],
         ["az", "rest", "--method", "DELETE", "--uri", listing[0]["id"] + "?api-version=2024-01-01",
          "--only-show-errors"],
         ["az", "resource", "delete", "--ids", f"{group}/providers/Microsoft.Storage/storageAccounts/s",
@@ -1051,10 +1196,20 @@ def test_resource_adapter_stays_inside_the_selected_group(tmp_path):
             groups.delete_resource("existing", {"id": identity, "type": "X/y", "name": "z"})
     assert len(calls) == 3
     outside = [{"id": f"/subscriptions/{SUBSCRIPTION}/resourceGroups/rg-other/providers/X/y/z", "type": "X/y",
-                "name": "z"}]
+                "name": "z", "createdTime": None}]
     with pytest.raises(FleetError, match="invalid-resource-response"):
         AzureGroups(scope, tmp_path / "other", runner=lambda args: (0, json.dumps(outside).encode(), b"")).resources(
             "existing")
+
+
+@pytest.mark.parametrize("invalid", [False, 42, [], {}])
+def test_resource_adapter_rejects_non_string_creation_time(tmp_path, invalid):
+    scope = persistent_scope("site")
+    listing = [{"id": f"{scope.group_id('existing')}/providers/Microsoft.Storage/storageAccounts/s",
+                "type": "Microsoft.Storage/storageAccounts", "name": "s", "createdTime": invalid}]
+    adapter = AzureGroups(scope, tmp_path / "logs", runner=lambda _: (0, json.dumps(listing).encode(), b""))
+    with pytest.raises(FleetError, match="invalid-resource-response"):
+        adapter.resources("existing")
 
 
 @pytest.mark.parametrize(("kind", "secret"), [("site", "rg-PersistentSite.one"), ("fleet", "rg-fleet-one,rg-fleet-two")])

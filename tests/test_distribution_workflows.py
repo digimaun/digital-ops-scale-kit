@@ -1125,6 +1125,14 @@ function Remove-LocalUser {
     $record.calls.Add("Remove-LocalUser $SID"); Save-Record
 }
 function taskkill.exe { $record.calls.Add('taskkill ' + ($args -join ' ')); Save-Record }
+# Runs the real icacls, except that a staging scenario refuses the grant or grants the user write access.
+function icacls.exe {
+    if ($env:TEST_SCENARIO -eq 'staging-grant') { $global:LASTEXITCODE = 5; return }
+    $arguments = @(foreach ($argument in $args) {
+        if ($env:TEST_SCENARIO -eq 'staging-access') { $argument -replace ':\(OI\)\(CI\)RX$', ':(OI)(CI)M' } else { $argument }
+    })
+    & (Get-Command icacls.exe -CommandType Application | Select-Object -First 1).Source @arguments
+}
 """
 
 
@@ -1138,6 +1146,8 @@ def _run_standard_user_step(tmp_path: Path, scenario: str, **extra: str):
     download = runner_temp / "siteops-download"
     download.mkdir(parents=True)
     for name in (BOOTSTRAP_PS1, ARCHIVE_NAME, ARCHIVE_NAME + ATTESTATION_SUFFIX):
+        if scenario == "staging-copy" and name.endswith(ATTESTATION_SUFFIX):
+            continue
         (download / name).write_text("synthetic " + name, encoding="utf-8")
     if scenario == "existing-staging":
         (runner_temp / "siteops-standard-user").mkdir()
@@ -1229,6 +1239,9 @@ def test_windows_qualification_standard_user_installs_from_read_only_staging(tmp
     ("cache-not-used", "CACHE_NOT_USED", ""),
     ("runtime", "RUNTIME", ""),
     ("leftover", "STAGING_LEFT", ""),
+    ("staging-grant", "STAGING_GRANT", ""),
+    ("staging-copy", "STAGING_COPY", ""),
+    ("staging-access", "STAGING_ACCESS", ""),
     ("version", "VERSION", ""),
     ("missing-result", "RESULT", ""),
 ])
@@ -1247,9 +1260,25 @@ def test_windows_qualification_standard_user_reports_fixed_failure_categories(
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="The standard user step runs in Windows PowerShell 5.1.")
+def test_windows_qualification_standard_user_reports_staging_access_by_class(tmp_path):
+    result, _, staging = _run_standard_user_step(tmp_path, "staging-access")
+    output = result.stdout + result.stderr
+    assert "The standard user installation did not pass (STAGING_ACCESS)." in output
+    lines = [line for line in result.stdout.splitlines() if line.startswith("Staging access: ")]
+    assert "Staging access: folder owner job-account." in lines
+    # The user's modify grant is the reason the check failed, reported as a class and a rights mask.
+    assert any(re.fullmatch(r"Staging access: folder rule standard-user Allow 0x[0-9A-F]+ explicit\.", line)
+               for line in lines)
+    assert any(line.startswith(f"Staging access: {BOOTSTRAP_PS1} rule standard-user Allow ") for line in lines)
+    diagnostics = "\n".join(lines)
+    assert "S-1-" not in diagnostics and str(tmp_path) not in diagnostics
+    assert not staging.exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="The standard user step runs in Windows PowerShell 5.1.")
 @pytest.mark.parametrize(("scenario", "category", "extra"), [
     ("existing-user", "ACCOUNT", {}),
-    ("existing-staging", "STAGING", {}),
+    ("existing-staging", "STAGING_EXISTS", {}),
     ("input", "INPUT", {"SOURCE_REF": "refs/heads/main extra"}),
 ])
 def test_windows_qualification_standard_user_keeps_what_it_did_not_create(tmp_path, scenario, category, extra):
@@ -1309,7 +1338,8 @@ def test_windows_qualification_standard_user_step_structure():
     calls = [item["text"] for item in outer["commands"] if item["name"] == "Stop-StandardUser"]
     categories = {re.fullmatch(r"Stop-StandardUser '([A-Z_]+)'", text).group(1)
                   for text in calls if "Get-BootstrapFailure" not in text}
-    assert categories == {"INPUT", "ACCOUNT", "NOT_STANDARD", "STAGING", "LAUNCH", "TIMEOUT", "RESULT",
+    assert categories == {"INPUT", "ACCOUNT", "NOT_STANDARD", "STAGING_EXISTS", "STAGING_CREATE", "STAGING_GRANT",
+                          "STAGING_COPY", "STAGING_ACCESS", "LAUNCH", "TIMEOUT", "RESULT",
                           "CACHE_NOT_USED", "RUNTIME", "STAGING_LEFT", "VERSION"}
     bootstrap = [item for item in wrapper["commands"] if "-Release" in item["text"]]
     assert len(bootstrap) == 1

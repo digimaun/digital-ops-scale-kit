@@ -150,8 +150,9 @@ jobs:
 
   fleet:
     name: Fleet
-    needs: fleet-request
-    if: inputs.scenario == 'fleet' || inputs.scenario == 'release-acceptance'
+    # Release acceptance starts the fleet only after the Site case inputs are also admitted.
+    needs: [fleet-request, prep]
+    if: ${{ !cancelled() && needs.fleet-request.result == 'success' && (inputs.scenario == 'fleet' || (inputs.scenario == 'release-acceptance' && needs.prep.result == 'success')) }}
     uses: ./.github/workflows/_fleet-acceptance.yaml
     permissions:
       contents: read
@@ -167,6 +168,7 @@ jobs:
       AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       CUSTOM_LOCATIONS_OID: ${{ secrets.CUSTOM_LOCATIONS_OID }}
       E2E_FLEET_RESOURCE_GROUPS: ${{ secrets.E2E_FLEET_RESOURCE_GROUPS }}
+      E2E_SITE_RESOURCE_GROUP: ${{ secrets.E2E_SITE_RESOURCE_GROUP }}
 
   fleet-cleanup:
     name: Owned resource reconciliation
@@ -277,7 +279,9 @@ jobs:
           }
 
   prep:
-    if: inputs.scenario == 'aio' || inputs.scenario == 'release-acceptance'
+    # Release acceptance starts no Site case unless the candidate request was admitted.
+    needs: fleet-request
+    if: ${{ !cancelled() && (inputs.scenario == 'aio' || (inputs.scenario == 'release-acceptance' && needs.fleet-request.result == 'success')) }}
     runs-on: ubuntu-latest
     outputs:
       versions: ${{ steps.v.outputs.versions }}
@@ -600,7 +604,6 @@ jobs:
         env:
           SITE_GROUP: ${{ secrets.E2E_SITE_RESOURCE_GROUP }}
           FLEET_GROUPS: ${{ secrets.E2E_FLEET_RESOURCE_GROUPS }}
-          SCENARIO: ${{ inputs.scenario }}
           RUN_ID: ${{ github.run_id }}
         run: |
           import hashlib, os, re
@@ -608,9 +611,7 @@ jobs:
           site, fleet = os.environ["SITE_GROUP"], os.environ["FLEET_GROUPS"]
           if site and name.fullmatch(site) is None:
               raise SystemExit("E2E_SITE_RESOURCE_GROUP must name one resource group.")
-          if os.environ["SCENARIO"] == "release-acceptance" and site and site.casefold() in {
-              value.casefold() for value in fleet.split(",")
-          }:
+          if site and site.casefold() in {value.casefold() for value in fleet.split(",")}:
               raise SystemExit("The single Site group must differ from both fleet groups.")
           # The persistent key matches persistent E2E for the same group, so both serialize.
           key = ("persistent-" + hashlib.sha256(site.casefold().encode("utf-8")).hexdigest()

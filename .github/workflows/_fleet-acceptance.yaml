@@ -28,6 +28,9 @@ on:
       # Empty selects two new ephemeral groups.
       E2E_FLEET_RESOURCE_GROUPS:
         required: false
+      # The single Site group, read only to refuse a fleet group that matches it.
+      E2E_SITE_RESOURCE_GROUP:
+        required: false
 
 permissions:
   contents: read
@@ -152,6 +155,7 @@ jobs:
     env:
       AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       E2E_FLEET_RESOURCE_GROUPS: ${{ secrets.E2E_FLEET_RESOURCE_GROUPS }}
+      E2E_SITE_RESOURCE_GROUP: ${{ secrets.E2E_SITE_RESOURCE_GROUP }}
     steps:
       # Rerunning only failed jobs would mix this attempt with earlier outputs.
       - name: Require one complete fleet attempt
@@ -244,6 +248,7 @@ jobs:
     env:
       AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       E2E_FLEET_RESOURCE_GROUPS: ${{ secrets.E2E_FLEET_RESOURCE_GROUPS }}
+      E2E_SITE_RESOURCE_GROUP: ${{ secrets.E2E_SITE_RESOURCE_GROUP }}
       SLOT: ${{ matrix.slot }}
       FLEET_STARTED_AT: ${{ needs.prepare.outputs.started-at }}
     steps:
@@ -389,6 +394,7 @@ jobs:
     env:
       AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       E2E_FLEET_RESOURCE_GROUPS: ${{ secrets.E2E_FLEET_RESOURCE_GROUPS }}
+      E2E_SITE_RESOURCE_GROUP: ${{ secrets.E2E_SITE_RESOURCE_GROUP }}
       FLEET_STARTED_AT: ${{ needs.prepare.outputs.started-at }}
     steps:
       # Rerunning only failed jobs would mix this attempt with earlier outputs.
@@ -580,6 +586,7 @@ jobs:
     env:
       AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       E2E_FLEET_RESOURCE_GROUPS: ${{ secrets.E2E_FLEET_RESOURCE_GROUPS }}
+      E2E_SITE_RESOURCE_GROUP: ${{ secrets.E2E_SITE_RESOURCE_GROUP }}
     steps:
       # Rerunning only failed jobs would mix this attempt with earlier outputs.
       - name: Require one complete fleet attempt

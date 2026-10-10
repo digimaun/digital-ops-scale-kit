@@ -151,7 +151,8 @@ def supplied_groups(kind: str, environ=os.environ) -> tuple[str, ...] | None:
     """Read persistent group names from the environment secret for this kind.
 
     The site secret holds one name. The fleet secret holds two names for slots
-    one and two, separated by one comma without spaces. Errors never echo values.
+    one and two, separated by one comma without spaces. If both secrets are
+    present, their group names must differ. Errors never echo values.
     """
     raw = environ.get(GROUP_SECRETS[kind], "")
     if raw == "":
@@ -160,6 +161,11 @@ def supplied_groups(kind: str, environ=os.environ) -> tuple[str, ...] | None:
     if (len(values) != (2 if kind == "fleet" else 1) or any(GROUP_NAME.fullmatch(value) is None for value in values)
             or len({value.casefold() for value in values}) != len(values)):
         raise CoordinationError(f"{GROUP_SECRETS[kind]} must name {'two distinct resource groups' if kind == 'fleet' else 'one resource group'}.")
+    other = environ.get(GROUP_SECRETS["fleet" if kind == "site" else "site"], "")
+    if other and {value.casefold() for value in values} & {
+        value.casefold() for value in other.split(",")
+    }:
+        raise CoordinationError("The single Site group must differ from both fleet groups.")
     return values
 
 

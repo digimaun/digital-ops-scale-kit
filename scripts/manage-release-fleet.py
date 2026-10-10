@@ -10,8 +10,10 @@ from an environment secret and only their created delta is removed.
 import argparse
 import json
 import os
+import re
 import secrets
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -34,6 +36,15 @@ from siteops.artifacts import load_artifact_json, open_regular_file  # noqa: E40
 from siteops.cache_filesystem import check_cache_ancestors  # noqa: E402
 
 
+def created_before_arg(value: str) -> datetime:
+    if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", value) is None:
+        raise argparse.ArgumentTypeError("Expected a UTC completion time in YYYY-MM-DDTHH:MM:SSZ format.")
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise argparse.ArgumentTypeError("Expected a UTC completion time in YYYY-MM-DDTHH:MM:SSZ format.") from None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("operation", choices=("preflight", "create", "cleanup"))
@@ -50,7 +61,10 @@ def main() -> int:
     parser.add_argument("--location")
     parser.add_argument("--operation-exit", type=int, default=0)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--created-before", type=created_before_arg)
     args = parser.parse_args()
+    if args.created_before is not None and args.operation != "cleanup":
+        parser.error("Only cleanup accepts --created-before.")
     if args.operation != "preflight" and (
         not args.execute or args.ownership is None or args.expected_ownership_sha is None
     ):
@@ -107,7 +121,8 @@ def main() -> int:
                 "status": "created" if not scope.groups else "confirmed", "slots": list(scope.slots),
             }
         else:
-            code, report = cleanup(scope, ownership, groups, operation_exit=args.operation_exit)
+            code, report = cleanup(scope, ownership, groups, operation_exit=args.operation_exit,
+                                   created_before=args.created_before)
         with args.output.open("x", encoding="utf-8") as stream:
             stream.write(json.dumps(report, sort_keys=True) + "\n")
     except (ValueError, OSError, KeyError, TypeError) as error:

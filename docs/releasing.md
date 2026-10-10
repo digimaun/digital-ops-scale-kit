@@ -251,7 +251,10 @@ writer classes of `gh.exe` and each parent folder. The bootstrap admits GitHub
 CLI only when Administrators, SYSTEM, TrustedInstaller or the current user own
 and control it, so a `job-account` or `other` class explains a `GH_ADMISSION`
 failure. A failure names one fixed category, such as `ROOT_DATA_ACL`,
-`TOOL_OWNER`, `GH_ADMISSION`, `GH_VERSION`, `CACHE_NOT_USED` or `TIMEOUT`. The
+`TOOL_OWNER`, `GH_ADMISSION`, `GH_VERSION`, `STAGING_ACCESS`,
+`CACHE_NOT_USED` or `TIMEOUT`. Before `STAGING_ACCESS`, `Staging access` lines
+report the owner and access rules of each staged item by class, such as
+`job-account` or `standard-user`. The
 bootstrap log stays in the temporary profile and is never published.
 
 ## Fleet resource ownership
@@ -737,6 +740,8 @@ Reruns keep the candidate and write a new receipt for each attempt. The
 latest attempt decides. Resources left by an earlier attempt are removed by
 its own cleanup, or by a separately approved `scenario=site-cleanup` or
 `scenario=fleet-cleanup` run with the original candidate, run and attempt.
+In persistent groups, that run removes only what the original attempt
+created, as described in [Read the result and retry](e2e-testing.md#read-the-result-and-retry).
 
 ### How publication binds acceptance
 

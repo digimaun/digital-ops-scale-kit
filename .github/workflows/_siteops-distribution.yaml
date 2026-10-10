@@ -1258,6 +1258,33 @@ jobs:
               }
               return $true
           }
+          # Reports the owner and access classes of each staged item after the read only check fails.
+          function Write-StagingAccess([string]$Path, [string]$Owner, [string]$User) {
+              $expected = @($env:BOOTSTRAP_PS1, $env:ARCHIVE_NAME, ($env:ARCHIVE_NAME + $env:ATTESTATION_SUFFIX),
+                            'standard-user.ps1')
+              try {
+                  foreach ($item in @(Get-Item -LiteralPath $Path -Force) + @(Get-ChildItem -LiteralPath $Path -Force -Recurse)) {
+                      $label = if ($item.FullName -eq $Path) { 'folder' } elseif ($item.Name -cin $expected) {
+                          $item.Name
+                      } else { 'other item' }
+                      $acl = $item.GetAccessControl()
+                      $sids = @($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value)
+                      $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+                      $classes = @(foreach ($sid in $sids + @($rules | ForEach-Object { $_.IdentityReference.Value })) {
+                          if ($sid -eq $User) { 'standard-user' } else { Get-PrincipalClass $sid $Owner }
+                      })
+                      Write-Host "Staging access: $label owner $($classes[0])."
+                      for ($index = 0; $index -lt $rules.Count; $index++) {
+                          $rule = $rules[$index]
+                          $origin = if ($rule.IsInherited) { 'inherited' } else { 'explicit' }
+                          Write-Host ("Staging access: {0} rule {1} {2} 0x{3:X} {4}." -f $label, $classes[$index + 1],
+                              $rule.AccessControlType, [int]$rule.FileSystemRights, $origin)
+                      }
+                  }
+              } catch {
+                  Write-Host 'Staging access: the staged items could not be read.'
+              }
+          }
 
           $download = Join-Path $env:RUNNER_TEMP 'siteops-download'
           $staging = Join-Path $env:RUNNER_TEMP 'siteops-standard-user'
@@ -1339,7 +1366,7 @@ jobs:
           $stagingCreated = $false
           try {
               if (Get-LocalUser -Name $userName -ErrorAction SilentlyContinue) { Stop-StandardUser 'ACCOUNT' }
-              if (Test-Path -LiteralPath $staging) { Stop-StandardUser 'STAGING' }
+              if (Test-Path -LiteralPath $staging) { Stop-StandardUser 'STAGING_EXISTS' }
               $bytes = [byte[]]::new(24)
               $generator = [Security.Cryptography.RandomNumberGenerator]::Create()
               try { $generator.GetBytes($bytes) } finally { $generator.Dispose() }
@@ -1366,20 +1393,29 @@ jobs:
               try {
                   New-Item -ItemType Directory -Path $staging | Out-Null
                   $stagingCreated = $true
-                  $staged = Grant-StagingAccess $staging $jobSid $userSid
+              } catch {
+                  Stop-StandardUser 'STAGING_CREATE'
+              }
+              if (-not (Grant-StagingAccess $staging $jobSid $userSid)) { Stop-StandardUser 'STAGING_GRANT' }
+              $copied = $true
+              try {
                   foreach ($name in @($env:BOOTSTRAP_PS1, $env:ARCHIVE_NAME, ($env:ARCHIVE_NAME + $env:ATTESTATION_SUFFIX))) {
                       Copy-Item -LiteralPath (Join-Path $download $name) -Destination (Join-Path $staging $name)
                       if ((Get-FileHash -LiteralPath (Join-Path $download $name)).Hash -cne
                           (Get-FileHash -LiteralPath (Join-Path $staging $name)).Hash) {
-                          $staged = $false
+                          $copied = $false
                       }
                   }
                   Set-Content -LiteralPath (Join-Path $staging 'standard-user.ps1') -Value $wrapper -Encoding UTF8
-                  $staged = $staged -and (Test-StagingAccess $staging $jobSid $userSid)
               } catch {
-                  Stop-StandardUser 'STAGING'
+                  $copied = $false
               }
-              if (-not $staged) { Stop-StandardUser 'STAGING' }
+              if (-not $copied) { Stop-StandardUser 'STAGING_COPY' }
+              try { $readOnly = Test-StagingAccess $staging $jobSid $userSid } catch { $readOnly = $false }
+              if (-not $readOnly) {
+                  Write-StagingAccess $staging $jobSid $userSid
+                  Stop-StandardUser 'STAGING_ACCESS'
+              }
 
               $credential = [Management.Automation.PSCredential]::new($userName, $secure)
               $arguments = @(

@@ -1341,7 +1341,8 @@ def test_windows_qualification_standard_user_reports_staging_access_by_class(tmp
     output = result.stdout + result.stderr
     assert "The standard user installation did not pass (STAGING_ACCESS)." in output
     lines = [line for line in result.stdout.splitlines() if line.startswith("Staging access: ")]
-    assert "Staging access: folder owner job-account." in lines
+    # A local folder is owned by the job account. An elevated runner makes Administrators the owner.
+    assert any(re.fullmatch(r"Staging access: folder owner (job-account|administrators)\.", line) for line in lines)
     # The user's modify grant is the reason the check failed, reported as a class and a rights mask.
     assert any(re.fullmatch(r"Staging access: folder rule standard-user Allow 0x[0-9A-F]+ explicit\.", line)
                for line in lines)

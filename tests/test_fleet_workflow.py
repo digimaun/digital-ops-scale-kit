@@ -136,7 +136,9 @@ def test_reconciliation_can_use_an_immutable_tag_of_the_same_controller_commit()
 
 
 @pytest.mark.parametrize("invalid", [False, True])
-def test_producer_emits_the_exact_selection_without_inventing_missing_artifact_ids(tmp_path, monkeypatch, invalid):
+def test_producer_emits_the_exact_selection_without_inventing_missing_artifact_ids(
+    tmp_path, monkeypatch, capsys, invalid,
+):
     script = load_script("emit-fleet-candidate")
     selected = selection()
     output, summary = tmp_path / "outputs", tmp_path / "summary"
@@ -154,13 +156,18 @@ def test_producer_emits_the_exact_selection_without_inventing_missing_artifact_i
     for key, value in environment.items():
         monkeypatch.setenv(key, value)
     assert script.main() == int(invalid)
+    printed = capsys.readouterr().out
     if invalid:
         assert not output.exists() and not summary.exists()
+        assert "Exact candidate selection:" not in printed
     else:
-        assert json.loads(output.read_text().split("=", 1)[1]) == selected
+        raw = output.read_text().split("=", 1)[1].strip()
+        assert json.loads(raw) == selected
         rendered = summary.read_text()
         assert rendered.splitlines()[1] == "### Exact candidate selection"
         assert "does not authorize Azure use or publication" in rendered
+        # The log carries the same single line selection as the job output.
+        assert printed.splitlines() == ["Exact candidate selection: " + raw]
 
 
 @pytest.mark.parametrize("fault", ["id", "attempt", "source", "expired"])

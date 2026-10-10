@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# Workflows may set PYTHONSAFEPATH, so sibling helpers are found through an explicit path entry.
+sys.path.insert(1, str(Path(__file__).resolve().parent))
 
 from fleet_workflow import supplied_groups  # noqa: E402
 from release_fleet import (  # noqa: E402

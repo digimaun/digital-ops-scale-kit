@@ -25,7 +25,9 @@ each commit. E2E runs only when you dispatch it (`workflow_dispatch`).
 ### Accept one release candidate
 
 Choose `scenario=release-acceptance` with the JSON from the producer's
-**Exact candidate selection** summary as `candidate`. The release workflow starts this run on
+**Exact candidate selection** summary as `candidate`. The log of the step
+that renders that summary repeats the same JSON on one line that starts with
+`Exact candidate selection:`. The release workflow starts this run on
 `main` after it admits a candidate, with `environment=dev` and
 `location=eastus2`. The run is named **Release acceptance** and runs at the
 candidate's source commit. Leave the options for one Site at their defaults,

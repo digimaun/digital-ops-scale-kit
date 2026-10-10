@@ -12,6 +12,8 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# Workflows may set PYTHONSAFEPATH, so sibling helpers are found through an explicit path entry.
+sys.path.insert(1, str(Path(__file__).resolve().parent))
 
 from fleet_process import FleetProcessError  # noqa: E402
 from fleet_process import run as run_private  # noqa: E402

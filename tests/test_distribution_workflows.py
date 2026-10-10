@@ -1039,7 +1039,7 @@ function New-LocalUser {
     [CmdletBinding()] param(
         [Parameter(Mandatory = $true)][string]$Name, [Parameter(Mandatory = $true)][Security.SecureString]$Password,
         [switch]$PasswordNeverExpires, [switch]$UserMayNotChangePassword, [switch]$AccountNeverExpires,
-        [string]$Description
+        [ValidateLength(0, 48)][string]$Description
     )
     if (-not ($PasswordNeverExpires -and $UserMayNotChangePassword -and $AccountNeverExpires)) { throw 'Unexpected account policy.' }
     $record.calls.Add("New-LocalUser $Name"); Save-Record

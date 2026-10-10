@@ -1354,7 +1354,7 @@ jobs:
               try {
                   $account = New-LocalUser -Name $userName -Password $secure -PasswordNeverExpires `
                       -UserMayNotChangePassword -AccountNeverExpires `
-                      -Description 'Temporary Site Ops installer qualification account'
+                      -Description 'Temporary Site Ops installer test account'
                   $userSid = $account.SID.Value
                   Add-LocalGroupMember -Group 'Users' -Member $userName
                   $administrators = @(Get-LocalGroupMember -SID 'S-1-5-32-544' | ForEach-Object { $_.SID.Value })

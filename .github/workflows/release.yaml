@@ -389,11 +389,13 @@ jobs:
               else:
                   expected = {"status": "passed", "assertions": assertions[name],
                               "cleanup": "not-applicable" if name == "installer" else "confirmed-absent"}
+              # Only the values the aggregator writes for each scenario are accepted.
+              groups = {"not-applicable"} if name == "installer" else {"ephemeral", "persistent"}
+              purge = {"purged", "not-applicable", "failed"} if name.startswith("site-") else {"not-applicable"}
               if (
                   set(row) != {"scenario", "status", "groups", "assertions", "cleanup", "vaultPurge"}
                   or canonical({key: row[key] for key in expected}) != canonical(expected)
-                  or row["groups"] not in {"ephemeral", "persistent", "unknown", "not-applicable"}
-                  or row["vaultPurge"] not in {"purged", "not-applicable", "not-attempted", "failed"}
+                  or row["groups"] not in groups or row["vaultPurge"] not in purge
               ):
                   raise SystemExit("::error::Acceptance scenario " + name + " did not pass for this candidate.")
           run = binding["acceptance"]

@@ -1242,6 +1242,8 @@ jobs:
               }
           }
           # The standard user may only read and execute the staged files, never change or replace them.
+          # An elevated job gives a new folder an explicit Administrators rule. Administrators are trusted
+          # like SYSTEM, and the step separately confirms that the account is not a member.
           function Test-StagingAccess([string]$Path, [string]$Owner, [string]$User) {
               foreach ($item in @(Get-Item -LiteralPath $Path -Force) + @(Get-ChildItem -LiteralPath $Path -Force -Recurse)) {
                   $acl = $item.GetAccessControl()
@@ -1249,7 +1251,8 @@ jobs:
                   $rights = 0
                   foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
                       $principal = $rule.IdentityReference.Value
-                      if ($principal -notin @($Owner, 'S-1-5-18', $User) -or $rule.AccessControlType -ne 'Allow') {
+                      if ($principal -notin @($Owner, 'S-1-5-18', 'S-1-5-32-544', $User) -or
+                          $rule.AccessControlType -ne 'Allow') {
                           return $false
                       }
                       if ($principal -eq $User) { $rights = $rights -bor [int]$rule.FileSystemRights }
@@ -1257,6 +1260,13 @@ jobs:
                   if (($rights -band 0x500D0156) -or ($rights -band 0x200A9) -ne 0x200A9) { return $false }
               }
               return $true
+          }
+          # Lists processes owned by the account. A failed query throws so cleanup never assumes none remain.
+          function Get-StandardUserProcessIds([string]$Sid) {
+              foreach ($item in @(Get-CimInstance -ClassName Win32_Process -Filter 'ProcessId > 4' -ErrorAction Stop)) {
+                  $owner = Invoke-CimMethod -InputObject $item -MethodName GetOwnerSid -ErrorAction SilentlyContinue
+                  if ($owner -and $owner.Sid -eq $Sid) { [int]$item.ProcessId }
+              }
           }
           # Reports the owner and access classes of each staged item after the read only check fails.
           function Write-StagingAccess([string]$Path, [string]$Owner, [string]$User) {
@@ -1364,6 +1374,7 @@ jobs:
           $secure = $null
           $process = $null
           $stagingCreated = $false
+          $installed = $false
           try {
               if (Get-LocalUser -Name $userName -ErrorAction SilentlyContinue) { Stop-StandardUser 'ACCOUNT' }
               if (Test-Path -LiteralPath $staging) { Stop-StandardUser 'STAGING_EXISTS' }
@@ -1465,30 +1476,51 @@ jobs:
                   Stop-StandardUser 'STAGING_LEFT'
               }
               if ($result.version -cne "siteops $env:PACKAGE_VERSION") { Stop-StandardUser 'VERSION' }
-              Write-Host 'A standard user installed the verified bundle with the signed PowerShell bootstrap and its own uv and Python.'
+              $installed = $true
           } finally {
               $previousPreference = $ErrorActionPreference
               $ErrorActionPreference = 'Continue'
+              $cleanupFailed = $false
               try {
                   if ($process -and -not $process.HasExited) { & taskkill.exe /PID $process.Id /T /F *> $null }
               } catch { }
               if ($secure) { $secure.Dispose() }
               if ($userSid) {
+                  # Processes that outlive the wrapper keep the profile loaded, so stop each one the account owns.
+                  try {
+                      for ($round = 0; $round -lt 5; $round++) {
+                          $remaining = @(Get-StandardUserProcessIds $userSid)
+                          if (-not $remaining) { break }
+                          foreach ($id in $remaining) { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }
+                          Start-Sleep -Seconds 2
+                      }
+                      if (@(Get-StandardUserProcessIds $userSid)) { $cleanupFailed = $true }
+                  } catch {
+                      $cleanupFailed = $true
+                  }
                   try {
                       Get-CimInstance -ClassName Win32_UserProfile -Filter "SID = '$userSid'" |
                           Remove-CimInstance -ErrorAction Stop
                   } catch {
-                      Write-Host '::warning::The temporary standard user profile remains on this runner.'
+                      $cleanupFailed = $true
                   }
                   try {
                       Remove-LocalUser -SID $userSid -ErrorAction Stop
                   } catch {
-                      Write-Host '::warning::The temporary standard user account remains on this runner.'
+                      $cleanupFailed = $true
                   }
               }
-              if ($stagingCreated) { Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue }
+              if ($stagingCreated) {
+                  try { Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction Stop } catch { $cleanupFailed = $true }
+              }
               $ErrorActionPreference = $previousPreference
+              # An earlier failure keeps its own category. A completed installation fails on incomplete cleanup.
+              if ($cleanupFailed) {
+                  Write-Host '::warning::The temporary standard user, its processes, profile or staging remain on this runner.'
+                  if ($installed) { Stop-StandardUser 'CLEANUP' }
+              }
           }
+          Write-Host 'A standard user installed the verified bundle with the signed PowerShell bootstrap and its own uv and Python.'
 
       - name: Install Site Ops from the verified lock
         if: matrix.account != 'standard'

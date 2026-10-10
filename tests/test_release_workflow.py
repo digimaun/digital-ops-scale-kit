@@ -2791,7 +2791,8 @@ def test_publish_accepts_a_receipt_bound_to_this_candidate(
     "preview", "other-admission", "other-plan", "other-inventory", "other-acceptance-run",
     "older-acceptance-attempt", "environment", "transport", "status", "failed-row", "residual-cleanup",
     "missing-assertion", "reordered-rows", "extra-key", "row-extra-key", "unknown-groups", "extra-file",
-    "installer-not-applicable", "installer-cleanup",
+    "installer-not-applicable", "installer-cleanup", "installer-groups", "site-groups-unknown",
+    "fleet-groups-not-applicable", "fleet-purged", "installer-purged", "site-purge-not-attempted",
 ])
 def test_publish_rejects_a_receipt_that_does_not_bind(candidate, runner, fault):
     receipt = _release_receipt(candidate)
@@ -2832,6 +2833,15 @@ def test_publish_rejects_a_receipt_that_does_not_bind(candidate, runner, fault):
         rows["installer"].update(status="not-applicable", assertions=[])
     elif fault == "installer-cleanup":
         rows["installer"]["cleanup"] = "confirmed-absent"
+    elif fault in {"installer-groups", "site-groups-unknown", "fleet-groups-not-applicable"}:
+        scenario, value = {"installer-groups": ("installer", "persistent"),
+                           "site-groups-unknown": ("site-aio", "unknown"),
+                           "fleet-groups-not-applicable": ("fleet", "not-applicable")}[fault]
+        rows[scenario]["groups"] = value
+    elif fault in {"fleet-purged", "installer-purged", "site-purge-not-attempted"}:
+        scenario, value = {"fleet-purged": ("fleet", "purged"), "installer-purged": ("installer", "failed"),
+                           "site-purge-not-attempted": ("site-aio", "not-attempted")}[fault]
+        rows[scenario]["vaultPurge"] = value
     result, calls = _verify(runner, candidate, receipt, extra_file=fault == "extra-file")
     output = result.stdout + result.stderr
     assert result.returncode != 0
@@ -2840,6 +2850,18 @@ def test_publish_rejects_a_receipt_that_does_not_bind(candidate, runner, fault):
     summary = candidate["root"].parent / "summary.md"
     assert not summary.exists() or "Bound candidate acceptance" not in summary.read_text(encoding="utf-8")
     assert calls == []
+
+
+@pytest.mark.parametrize(("scenario", "key", "value"), [
+    ("site-aio", "vaultPurge", "purged"), ("site-existing-secretsync", "vaultPurge", "failed"),
+    ("site-combined", "vaultPurge", "not-applicable"), ("site-aio", "groups", "ephemeral"),
+    ("fleet", "groups", "persistent"),
+])
+def test_publish_accepts_every_row_value_the_aggregator_writes(candidate, runner, scenario, key, value):
+    receipt = _release_receipt(candidate)
+    next(row for row in receipt["scenarios"] if row["scenario"] == scenario)[key] = value
+    result, _ = _verify(runner, candidate, receipt)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_publish_accepts_the_receipt_the_acceptance_aggregator_writes(candidate, runner):

@@ -103,13 +103,20 @@ def aggregate_run(args) -> int:
     run, attempt = int(os.environ["GITHUB_RUN_ID"]), int(os.environ["GITHUB_RUN_ATTEMPT"])
     commit = selected.source["commit"]
     plan, bound = None, False
-    try:
-        admission_for(selected, args.root)
-        plan = load_artifact_json(read_selected(args.root / "plan" / "plan.json", selected.artifacts["plan"]["sha256"]),
-                                  limit=2 * 1024 * 1024, label="Release plan")
-        bound = True
-    except (ValueError, OSError):
-        print("The admission or plan does not bind to the selected candidate.", file=sys.stderr)
+    if not (args.root / "admission" / "receipt.json").exists() or not (args.root / "plan" / "plan.json").exists():
+        # The selection or its downloads did not complete, so the evidence is missing rather than mismatched.
+        bound = None
+        print("The admission or plan for the selected candidate is unavailable.", file=sys.stderr)
+    else:
+        try:
+            admission_for(selected, args.root)
+            plan = load_artifact_json(
+                read_selected(args.root / "plan" / "plan.json", selected.artifacts["plan"]["sha256"]),
+                limit=2 * 1024 * 1024, label="Release plan",
+            )
+            bound = True
+        except (ValueError, OSError):
+            print("The admission or plan does not bind to the selected candidate.", file=sys.stderr)
     try:
         producer = jobs(pages(args.root / "producer-jobs.json", "jobs"), run=selected.producer["run"],
                         attempt=selected.producer["attempt"], commit=commit)

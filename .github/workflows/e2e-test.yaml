@@ -2643,6 +2643,15 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-fleet-tools
         id: tools
+      # Binding makes no GitHub reads, so every run of a candidate that parses records a bound result.
+      - name: Bind the exact candidate
+        id: bind
+        shell: bash
+        env:
+          PYTHON: ${{ steps.tools.outputs.python }}
+        run: |
+          set -euo pipefail
+          "$PYTHON" -B scripts/coordinate-release-fleet.py bind --root "$RUNNER_TEMP"
       - name: Select exact candidate inputs
         id: select
         shell: bash
@@ -2724,10 +2733,10 @@ jobs:
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/acceptance/evidence/fleet
           digest-mismatch: error
-      # Runs after a failed download too, so this run always records a bound
-      # result. Evidence counts only when its own download step succeeded.
+      # Runs after a failed selection or download too, so this run always records a
+      # bound result. Evidence counts only when its own download step succeeded.
       - name: Require every scenario for this candidate
-        if: always() && steps.select.outcome == 'success'
+        if: always() && steps.bind.outcome == 'success'
         shell: bash
         env:
           PYTHON: ${{ steps.tools.outputs.python }}
@@ -2739,14 +2748,15 @@ jobs:
           DOWNLOAD_FLEET: ${{ steps.download-fleet.outcome }}
         run: |
           set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/acceptance"
           "$PYTHON" -B scripts/aggregate-release-acceptance.py aggregate --root "$RUNNER_TEMP/acceptance" \
             --workflow .github/workflows/_siteops-distribution.yaml \
             --output "$RUNNER_TEMP/acceptance/release-acceptance.json"
       # A failing receipt is retained too, so a newer failed run governs publication.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always() && steps.select.outcome == 'success'
+        if: always() && steps.bind.outcome == 'success'
         with:
-          name: release-acceptance-${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.select.outputs.admission-sha }}
+          name: release-acceptance-${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.bind.outputs.admission-sha }}
           path: ${{ runner.temp }}/acceptance/release-acceptance.json
           if-no-files-found: error
           overwrite: false

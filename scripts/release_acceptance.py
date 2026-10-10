@@ -343,16 +343,26 @@ def receipt(candidate: FleetCandidate, *, run: int, attempt: int, environment: s
     }
 
 
-def aggregate(candidate: FleetCandidate, *, plan: object, bound: bool, producer_jobs: list[dict] | None,
+def aggregate(candidate: FleetCandidate, *, plan: object, bound: bool | None, producer_jobs: list[dict] | None,
               run_jobs: list[dict] | None, artifacts: list[dict] | None, documents: dict, workflow: object,
               run: int, attempt: int, environment: str, needs: object) -> dict:
-    """Bind every required scenario to this candidate. Missing evidence is never success."""
+    """Bind every required scenario to this candidate. Missing evidence is never success.
+
+    `bound` is None when the admission or plan is unavailable, which records every
+    scenario as missing. False records the candidate as mismatched.
+    """
     if TOKEN.fullmatch(environment or "") is None:
         raise AcceptanceError("The acceptance environment is not a bounded name.")
     complete = (
         isinstance(needs, dict) and set(needs) == {"fleet-request", "fleet", "prep", "site-groups", "e2e"}
         and all(isinstance(value, dict) and value.get("result") == "success" for value in needs.values())
     )
+    if bound is None:
+        rows = [row("installer", "missing")] + [
+            row(name, "missing", cleanup="unknown", vault_purge="not-applicable" if name == "fleet" else "not-attempted")
+            for name in SCENARIOS[1:]
+        ]
+        return receipt(candidate, run=run, attempt=attempt, environment=environment, rows=rows, complete=False)
     try:
         required = required_scenarios(plan, candidate) if bound else None
     except AcceptanceError:

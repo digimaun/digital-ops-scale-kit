@@ -3,6 +3,7 @@
 import copy
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -39,6 +40,7 @@ from tests.acceptance_helpers import (  # noqa: E402
     site_receipt,
     write_candidate,
 )
+from tests.actions_expressions import evaluate, truthy  # noqa: E402
 from tests.shell_helpers import run_script  # noqa: E402
 
 WORKFLOWS = ROOT / ".github" / "workflows"
@@ -402,6 +404,29 @@ def test_aggregate_entrypoint_ignores_evidence_from_a_failed_download(tmp_path, 
     assert {row["status"] for row in document["scenarios"][1:]} == {"missing"}
 
 
+@pytest.mark.parametrize("unavailable", ["admission", "plan"])
+def test_aggregate_entrypoint_binds_a_missing_result_when_selection_did_not_complete(
+    tmp_path, selection, unavailable,
+):
+    # A failed selection skips both downloads. The run still records a failing receipt for this candidate.
+    shutil.rmtree(tmp_path / unavailable)
+    result, document = _cli(tmp_path, selection)
+    assert result.returncode == 1
+    assert document["status"] == "failed"
+    assert document["candidate"]["admissionSha256"] == selection["artifacts"]["admission"]["sha256"]
+    assert {row["status"] for row in document["scenarios"]} == {"missing"}
+    assert [(row["groups"], row["vaultPurge"]) for row in document["scenarios"]] == [
+        ("not-applicable", "not-applicable"), *[("unknown", "not-attempted")] * 3, ("unknown", "not-applicable"),
+    ]
+
+
+def test_aggregate_records_a_mismatched_admission_as_another_candidate(tmp_path, selection):
+    (tmp_path / "admission" / "receipt.json").write_text("{}")
+    result, document = _cli(tmp_path, selection)
+    assert result.returncode == 1
+    assert {row["status"] for row in document["scenarios"]} == {"wrong-candidate"}
+
+
 def test_aggregate_entrypoint_names_a_partial_fleet_rerun(tmp_path, selection):
     jobs = Jobs().acceptance().add("Fleet controller", 2, prefix="Fleet / ")
     result, document = _cli(tmp_path, selection, jobs=jobs)
@@ -429,14 +454,22 @@ def test_acceptance_run_is_bound_named_and_always_aggregated():
     assert "environment" not in job
     steps = job["steps"]
     names = [step.get("name") or step.get("id") or step.get("uses") for step in steps]
+    bind = next(step for step in steps if step.get("id") == "bind")
+    assert names.index("Bind the exact candidate") < names.index("Select exact candidate inputs")
+    assert "if" not in bind and "GH_TOKEN" not in bind["env"]
+    assert " bind --root " in bind["run"]
     aggregate_step = next(step for step in steps if step.get("name") == "Require every scenario for this candidate")
-    assert aggregate_step["if"] == "always() && steps.select.outcome == 'success'"
     assert aggregate_step["env"]["ACCEPTANCE_NEEDS"] == "${{ toJSON(needs) }}"
     upload = steps[-1]
     assert upload["with"]["name"] == (
-        "release-acceptance-${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.select.outputs.admission-sha }}"
+        "release-acceptance-${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.bind.outputs.admission-sha }}"
     )
-    assert upload["if"] == "always() && steps.select.outcome == 'success'"
+    # A run whose candidate parses always records a result, even when selection or a download failed.
+    for selected, bound, expected in (("success", "success", True), ("failure", "success", True),
+                                      ("skipped", "success", True), ("success", "failure", False)):
+        steps_context = {"bind": {"outcome": bound}, "select": {"outcome": selected}}
+        for step in (aggregate_step, upload):
+            assert truthy(evaluate(step["if"], {"steps": steps_context}, cancelled=True)) is expected
     for key in ("disabled", "enabled", "existing", "fleet"):
         download = next(step for step in steps if step.get("id") == f"download-{key}")
         assert download["with"]["artifact-ids"] == f"${{{{ steps.evidence.outputs.{key}-id }}}}"

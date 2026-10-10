@@ -1113,25 +1113,57 @@ function Get-ItemProperty {
 }
 function Get-CimInstance {
     [CmdletBinding()] param([Parameter(Mandatory = $true)][string]$ClassName, [Parameter(Mandatory = $true)][string]$Filter)
+    if ($ClassName -eq 'Win32_Process') {
+        # A system process is always present. Only the account's own process may be stopped.
+        if ($env:TEST_CLEANUP -eq 'process-query-fails') { throw 'Synthetic process query failure.' }
+        $items = @([pscustomobject]@{ ProcessId = 900; Owner = 'S-1-5-18' })
+        if ($env:TEST_CLEANUP -eq 'lingering-process' -or
+            ($env:TEST_CLEANUP -eq 'stopped-process' -and -not $stopped.Contains(777))) {
+            $items += [pscustomobject]@{ ProcessId = 777; Owner = 'S-1-5-32-545' }
+        }
+        return $items
+    }
     $record.calls.Add("Get-CimInstance $ClassName $Filter"); Save-Record
     [pscustomobject]@{ SID = 'S-1-5-32-545' }
 }
+$stopped = [Collections.Generic.List[int]]::new()
+function Invoke-CimMethod {
+    [CmdletBinding()] param([Parameter(Mandatory = $true)]$InputObject, [Parameter(Mandatory = $true)][string]$MethodName)
+    if ($MethodName -cne 'GetOwnerSid') { throw 'Unexpected CIM method.' }
+    [pscustomobject]@{ Sid = $InputObject.Owner }
+}
+function Stop-Process {
+    [CmdletBinding()] param([Parameter(Mandatory = $true)][int]$Id, [switch]$Force)
+    $record.calls.Add("Stop-Process $Id"); Save-Record
+    $stopped.Add($Id)
+}
+function Start-Sleep { [CmdletBinding()] param([Parameter(Mandatory = $true)][int]$Seconds) }
 function Remove-CimInstance {
     [CmdletBinding()] param([Parameter(Mandatory = $true, ValueFromPipeline = $true)]$InputObject)
-    process { $record.calls.Add('Remove-CimInstance ' + $InputObject.SID); Save-Record }
+    process {
+        $record.calls.Add('Remove-CimInstance ' + $InputObject.SID); Save-Record
+        if ($env:TEST_CLEANUP -eq 'profile-remains') { throw 'Synthetic profile removal failure.' }
+    }
 }
 function Remove-LocalUser {
     [CmdletBinding()] param([Parameter(Mandatory = $true)][string]$SID)
     $record.calls.Add("Remove-LocalUser $SID"); Save-Record
+    if ($env:TEST_CLEANUP -eq 'account-remains') { throw 'Synthetic account removal failure.' }
 }
 function taskkill.exe { $record.calls.Add('taskkill ' + ($args -join ' ')); Save-Record }
-# Runs the real icacls, except that a staging scenario refuses the grant or grants the user write access.
+# Runs the real icacls, except that a staging scenario refuses the grant, grants the user write access,
+# adds the explicit Administrators rule an elevated runner gives a new folder, or adds an untrusted reader.
 function icacls.exe {
     if ($env:TEST_SCENARIO -eq 'staging-grant') { $global:LASTEXITCODE = 5; return }
     $arguments = @(foreach ($argument in $args) {
         if ($env:TEST_SCENARIO -eq 'staging-access') { $argument -replace ':\(OI\)\(CI\)RX$', ':(OI)(CI)M' } else { $argument }
     })
-    & (Get-Command icacls.exe -CommandType Application | Select-Object -First 1).Source @arguments
+    $native = (Get-Command icacls.exe -CommandType Application | Select-Object -First 1).Source
+    & $native @arguments
+    $status = $LASTEXITCODE
+    $extra = @{ 'elevated-folder' = '*S-1-5-32-544:F'; 'other-principal' = '*S-1-5-11:R' }[$env:TEST_SCENARIO]
+    if ($extra -and $status -eq 0) { & $native $args[0] /grant $extra *> $null; $status = $LASTEXITCODE }
+    $global:LASTEXITCODE = $status
 }
 """
 
@@ -1242,6 +1274,7 @@ def test_windows_qualification_standard_user_installs_from_read_only_staging(tmp
     ("staging-grant", "STAGING_GRANT", ""),
     ("staging-copy", "STAGING_COPY", ""),
     ("staging-access", "STAGING_ACCESS", ""),
+    ("other-principal", "STAGING_ACCESS", ""),
     ("version", "VERSION", ""),
     ("missing-result", "RESULT", ""),
 ])
@@ -1257,6 +1290,48 @@ def test_windows_qualification_standard_user_reports_fixed_failure_categories(
     assert ("taskkill /PID 4242 /T /F" in recorded["calls"]) is (scenario == "timeout")
     assert recorded["calls"][-1] == "Remove-LocalUser S-1-5-32-545"
     assert not staging.exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="The standard user step runs in Windows PowerShell 5.1.")
+@pytest.mark.parametrize("fault", ["lingering-process", "process-query-fails", "profile-remains", "account-remains"])
+def test_windows_qualification_standard_user_fails_when_cleanup_is_incomplete(tmp_path, fault):
+    result, recorded, staging = _run_standard_user_step(tmp_path, "success", TEST_CLEANUP=fault)
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "The standard user installation did not pass (CLEANUP)." in output
+    assert "A standard user installed the verified bundle" not in output
+    # One failed removal never skips the others.
+    assert recorded["calls"][-2:] == ["Remove-CimInstance S-1-5-32-545", "Remove-LocalUser S-1-5-32-545"]
+    assert "Stop-Process 900" not in recorded["calls"]
+    assert not staging.exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="The standard user step runs in Windows PowerShell 5.1.")
+def test_windows_qualification_standard_user_stops_only_the_accounts_remaining_processes(tmp_path):
+    result, recorded, _ = _run_standard_user_step(tmp_path, "success", TEST_CLEANUP="stopped-process")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "A standard user installed the verified bundle" in result.stdout
+    assert recorded["calls"].count("Stop-Process 777") == 1
+    assert "Stop-Process 900" not in recorded["calls"]
+    assert recorded["calls"].index("Stop-Process 777") < recorded["calls"].index("Remove-CimInstance S-1-5-32-545")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="The standard user step runs in Windows PowerShell 5.1.")
+def test_windows_qualification_standard_user_keeps_the_earlier_failure_category(tmp_path):
+    result, _, _ = _run_standard_user_step(tmp_path, "version", TEST_CLEANUP="profile-remains")
+    output = result.stdout + result.stderr
+    assert "The standard user installation did not pass (VERSION)." in output
+    assert "(CLEANUP)" not in output
+    assert "::warning::The temporary standard user, its processes, profile or staging remain" in result.stdout
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="The standard user step runs in Windows PowerShell 5.1.")
+def test_windows_qualification_standard_user_trusts_the_administrators_rule_of_an_elevated_folder(tmp_path):
+    # An elevated job creates the staging folder with an explicit Administrators rule.
+    result, recorded, _ = _run_standard_user_step(tmp_path, "elevated-folder")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "A standard user installed the verified bundle" in result.stdout
+    assert recorded["start"]["userRights"] & 0x500D0156 == 0
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="The standard user step runs in Windows PowerShell 5.1.")
@@ -1332,7 +1407,8 @@ def test_windows_qualification_standard_user_step_structure():
     ]
     cleanup = [text for text in outer["finallyBlocks"] if "Remove-LocalUser" in text]
     assert len(cleanup) == 1
-    for fragment in ("taskkill.exe", "Remove-CimInstance", "Remove-LocalUser -SID $userSid",
+    for fragment in ("taskkill.exe", "Get-StandardUserProcessIds $userSid", "Stop-Process -Id $id",
+                     "Remove-CimInstance", "Remove-LocalUser -SID $userSid",
                      "Remove-Item -LiteralPath $staging", "$secure.Dispose()"):
         assert fragment in cleanup[0]
     calls = [item["text"] for item in outer["commands"] if item["name"] == "Stop-StandardUser"]
@@ -1340,7 +1416,7 @@ def test_windows_qualification_standard_user_step_structure():
                   for text in calls if "Get-BootstrapFailure" not in text}
     assert categories == {"INPUT", "ACCOUNT", "NOT_STANDARD", "STAGING_EXISTS", "STAGING_CREATE", "STAGING_GRANT",
                           "STAGING_COPY", "STAGING_ACCESS", "LAUNCH", "TIMEOUT", "RESULT",
-                          "CACHE_NOT_USED", "RUNTIME", "STAGING_LEFT", "VERSION"}
+                          "CACHE_NOT_USED", "RUNTIME", "STAGING_LEFT", "VERSION", "CLEANUP"}
     bootstrap = [item for item in wrapper["commands"] if "-Release" in item["text"]]
     assert len(bootstrap) == 1
     assert "(Join-Path $PSScriptRoot 'siteops-bootstrap.ps1') -Release 'siteops/v0.0.0-ci'" in bootstrap[0]["text"]

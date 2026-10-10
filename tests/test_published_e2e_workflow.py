@@ -1469,6 +1469,53 @@ def test_guided_published_deploy_uses_answers_and_read_gate():
     assert 'trust_args=(--approved-source guided)' in step
 
 
+@pytest.mark.parametrize(("mode", "journey", "expected"), [
+    pytest.param("candidate", "guided", ["--trust-policy", "{policy}/policy.json", "--trusted-root", "{policy}/root.json"],
+                 id="candidate-policy-without-published-trust"),
+    pytest.param("published", "guided", ["--approved-source", "guided"], id="published-guided"),
+    pytest.param("published", "configured", ["--trust-policy", "{state}/policy.json", "--trusted-root",
+                                             "{state}/trusted-root.json"], id="published-configured"),
+])
+def test_published_deploy_reads_only_the_trust_inputs_its_mode_provides(tmp_path, mode, journey, expected):
+    # Each setup route exports its own trust inputs, and the step runs with `set -u`.
+    policy, state = (tmp_path / "policy-1").as_posix(), (tmp_path / "published").as_posix()
+    version = "1.0.0b7+build.42.1.g" + "a" * 12
+    document = {
+        "apiVersion": "siteops/v1alpha1", "kind": DEPLOYMENT_KIND, "projection": "publishable",
+        "status": "succeeded", "exitCode": 0, "engine": {"name": "siteops", "version": version},
+        "summary": {"sites": {"total": 1, "counts": {"succeeded": 1}},
+                    "operations": {"total": 5, "counts": {"succeeded": 5}}},
+    }
+    install_doubles(tmp_path, {
+        "siteops": [{"match": ["deploy", "aio-install", "--yes", "--offline-content"], "stdout": json.dumps(document)}],
+        "fleet-python": [{"match": ["scripts/coordinate-release-fleet.py", "policy"], "stdout": policy + "\n"}],
+    })
+    (tmp_path / "bin" / "python").write_text(
+        f"#!/usr/bin/env bash\nexec {shlex.quote(Path(sys.executable).as_posix())} \"$@\"\n", encoding="utf-8",
+        newline="\n",
+    )
+    environment = {
+        **double_environment(tmp_path), "RUNNER_TEMP": tmp_path.as_posix(), "PUBLISHED_JOURNEY": journey,
+        "SITEOPS_E2E_PROJECT": (tmp_path / "project").as_posix(), "SITEOPS_E2E_ENGINE_VERSION": version,
+        "RELEASE": "" if mode == "candidate" else "v1.0.0b7", "SOURCE_SHA": "a" * 40, "SITE_NAME": "site-one",
+    }
+    if mode == "candidate":
+        environment.update({"SITEOPS_E2E_TRUST": "policy", "SITEOPS_E2E_STATE": (tmp_path / "state").as_posix(),
+                            "FLEET_PYTHON": "fleet-python"})
+    else:
+        environment.update({"SITEOPS_E2E_POLICY": f"{state}/policy.json",
+                            "SITEOPS_E2E_TRUSTED_ROOT": f"{state}/trusted-root.json"})
+    result = run_script(_step_run("Deploy AIO through the published engine and package"), tmp_path, environment)
+    assert result.returncode == 0, result.stdout + result.stderr
+    deploys = [arguments for name, arguments in calls(tmp_path) if name == "siteops"]
+    assert len(deploys) == 1
+    trust = [value.format(policy=policy, state=state) for value in expected]
+    assert deploys[0][deploys[0].index("--project") + 2:deploys[0].index("deploy")] == trust
+    target = (["--input-file", (tmp_path / "published-answers.json").as_posix()] if journey == "guided"
+              else ["-l", "name=site-one"])
+    assert all(token in deploys[0] for token in target)
+
+
 def test_published_deploy_uses_only_the_pin_offline():
     workflow = _workflow()
 

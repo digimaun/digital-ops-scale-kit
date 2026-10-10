@@ -1758,15 +1758,18 @@ jobs:
         run: |
           set -euo pipefail
           target_args=(-l "name=$SITE_NAME")
-          trust_args=(--trust-policy "$SITEOPS_E2E_POLICY" --trusted-root "$SITEOPS_E2E_TRUSTED_ROOT")
           if [[ "$PUBLISHED_JOURNEY" == "guided" ]]; then
             target_args=(--input-file "$RUNNER_TEMP/published-answers.json")
-            trust_args=(--approved-source guided)
           fi
+          # Each mode reads only the trust inputs its own setup step provides.
           if [[ "${SITEOPS_E2E_TRUST:-}" == "policy" ]]; then
             policy="$("$FLEET_PYTHON" -B scripts/coordinate-release-fleet.py policy \
               --root "$RUNNER_TEMP/fleet" --state "$SITEOPS_E2E_STATE")"
             trust_args=(--trust-policy "$policy/policy.json" --trusted-root "$policy/root.json")
+          elif [[ "$PUBLISHED_JOURNEY" == "guided" ]]; then
+            trust_args=(--approved-source guided)
+          else
+            trust_args=(--trust-policy "$SITEOPS_E2E_POLICY" --trusted-root "$SITEOPS_E2E_TRUSTED_ROOT")
           fi
           run_root="$RUNNER_TEMP/published-run"
           mkdir "$run_root"

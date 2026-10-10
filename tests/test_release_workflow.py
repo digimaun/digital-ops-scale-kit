@@ -2146,13 +2146,15 @@ def test_verified_powershell_bootstrap_runs_the_script_only_after_a_matching_pro
 def test_installation_guides_name_the_rendered_release_note_labels(verified_notes):
     readme = " ".join((ROOT / "README.md").read_text(encoding="utf-8").split())
     guide = " ".join((ROOT / "docs" / "install-siteops.md").read_text(encoding="utf-8").split())
+    # The README names the release note sections a reader copies from.
     for label, rendered in (
         ("Install Site Ops", "\n## Install Site Ops\n"),
         ("Already have uv", "\n### Already have uv\n"),
-        ("Verify the script before it runs", VERIFIED),
+        ("Bootstrap without uv", "\n### Bootstrap without uv\n"),
     ):
         assert rendered in verified_notes
-        assert f"`{label}`" in readme
+        assert f"**{label}**" in readme
+    assert VERIFIED in verified_notes
     for label in ("Install Site Ops", "Verify the script before it runs"):
         assert f"`{label}`" in guide
 
@@ -2295,6 +2297,8 @@ def test_complete_workspace_candidate_reaches_only_the_approved_publication_set(
     assert result.returncode == 0, result.stdout + result.stderr
     notes = (root / "publish-notes.md").read_text()
     assert "## Workspace content" in notes and "siteops-workspaces.json" in notes
+    # The README quick start sends readers to this section for the exact deploy command.
+    assert "**Workspace content**" in (ROOT / "README.md").read_text(encoding="utf-8")
     assert f"https://github.com/{REPO}/blob/{SHA}/docs/projects.md#run-project-pin" in notes
     assert "`siteops project pin` with `--release`" in notes
     workspace_section = notes.split("## Workspace content", 1)[1]

@@ -23,17 +23,22 @@ def test_root_quickstart_connects_install_to_aio_without_hiding_fleet_use():
     prose = " ".join(journey.split())
     for phrase in (
         "https://github.com/Azure/digital-ops-scale-kit/releases)",
-        "`Install Site Ops` section",
-        "`Already have uv`",
-        "`Verify the script before it runs`",
-        "selects that exact engine release",
-        "A content only release links to its referenced engine's installation instructions.",
+        "**Install Site Ops** section",
+        "**Bootstrap without uv**, Linux",
+        "**Bootstrap without uv**, PowerShell",
+        "**Already have uv**",
+        "**Workspace content**",
+        "generated for that exact release",
+        "A release that contains only content links to the engine release it uses.",
         "docs/install-siteops.md#choose-an-installation-route",
+        "verifying the script before it runs",
         "https://github.com/cli/cli#installation",
-        "Ubuntu 24.04's, are older than 2.95",
-        "independently",
-        "private terminal",
+        "Ubuntu 24.04's, are older",
+        "only from a source you approve",
+        "does not sign you in",
+        "asks before it changes anything",
         "--yes",
+        "docs/guided-inputs.md#check-the-result",
         "docs/guided-inputs.md#enable-secret-sync-on-an-existing-instance",
         "enableSecretSync=true",
         "siteops --approved-source official project pin",
@@ -42,6 +47,8 @@ def test_root_quickstart_connects_install_to_aio_without_hiding_fleet_use():
     ):
         assert phrase in prose
     assert "releases/latest" not in journey
+    # Provenance detail stays in the installation guide, outside the first reading path.
+    assert "attestation" not in journey
     first = next(
         line for line in journey.splitlines()
         if line.startswith("siteops deploy aio-install --source")
@@ -52,10 +59,12 @@ def test_root_quickstart_connects_install_to_aio_without_hiding_fleet_use():
     ]
     assert journey.index(first) < journey.index("siteops --approved-source official project pin")
     assert (
-        journey.index("### Install Site Ops")
-        < journey.index("### Enroll the official content source")
-        < journey.index("### Deploy AIO")
+        journey.index("Before you start, have:")
+        < journey.index("### 1. Install Site Ops")
+        < journey.index("### 2. Approve the official content source")
+        < journey.index("### 3. Deploy AIO")
         < journey.index(first)
+        < journey.index("### 4. Scale out on the same model")
     )
     assert journey.index("#choose-an-installation-route") < journey.index(first)
     assert "plan aio-install -l name=plant-two,name=plant-three" in journey

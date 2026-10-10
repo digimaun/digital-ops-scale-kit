@@ -45,95 +45,86 @@ logic separate from the configuration of each environment.
 
 ## Quick start
 
-Start with one existing cluster connected to Azure Arc. You do not need a repository
-clone, saved Site or project pin.
+Install Azure IoT Operations on one cluster connected to Azure Arc. You need
+no repository clone, saved Site or project pin.
 
-### Install Site Ops
+Before you start, have:
 
-Select a release deliberately rather than taking the newest. Open its notes
-from the [releases page](https://github.com/Azure/digital-ops-scale-kit/releases).
-A release that includes an engine provides an `Install Site Ops` section.
-A content only release links to its referenced engine's installation instructions.
+- A cluster connected to Azure Arc, and its full resource ID.
+- Azure CLI 2.70 or newer, signed in with permission to deploy to that
+  cluster's resource group.
+- GitHub CLI 2.95 or newer from its
+  [installation page](https://github.com/cli/cli#installation). Some
+  distribution packages, such as Ubuntu 24.04's, are older. Site Ops uses it
+  without a login to verify published content.
+- `curl`, on Linux.
 
-In the engine release's `Install Site Ops` section, use the
-`Already have uv` command when uv is available, or the bootstrap command for
-your platform. Each command selects that exact engine release and installs the
-Site Ops engine only. To check the bootstrap script's GitHub
-attestation before it runs, expand `Verify the script before it runs` below
-the bootstrap commands.
-[Choose an installation route](docs/install-siteops.md#choose-an-installation-route)
-compares the routes.
+### 1. Install Site Ops
 
-The bootstrap needs `curl` and GitHub CLI 2.95 or newer, which Site Ops also
-uses without a login to verify published content. Install GitHub CLI from
-its [installation page](https://github.com/cli/cli#installation), because
-some distribution packages, such as Ubuntu 24.04's, are older than 2.95.
-The bootstrap reports when Azure CLI is missing.
-Installing the CLI alone does not acquire workspace content or enroll a
-source.
+Open the release you want on the
+[releases page](https://github.com/Azure/digital-ops-scale-kit/releases) and
+copy one command from its **Install Site Ops** section. Each command is
+generated for that exact release, so there is nothing to fill in.
 
-### Enroll the official content source
+| Your machine | Command in the release notes |
+|---|---|
+| Linux x64, including Ubuntu, Azure Cloud Shell and GitHub Codespaces | **Bootstrap without uv**, Linux. It checks the script against the notes, installs uv and Python for your user when needed, and authenticates the engine bundle before installing it. |
+| Windows x64 | **Bootstrap without uv**, PowerShell. The same steps, without administrator rights. |
+| uv already installed | **Already have uv**. uv installs the release wheel over HTTPS and its dependencies from your configured package index. |
 
-Enroll the official publisher once, under a name you choose. This example
-uses `official`:
+A release that contains only content links to the engine release it uses.
+The [installation guide](docs/install-siteops.md#choose-an-installation-route)
+covers verifying the script before it runs, offline installation and
+troubleshooting.
+
+### 2. Approve the official content source
 
 ```text
 siteops source enroll official
 ```
 
-The enrollment accepts releases that the official publisher builds from
-its main branch, for 30 days. Run the same command again to renew. The bootstrap
-does the same when you add `--enroll-source official` or
-`-EnrollSource official`. See [approved sources](docs/projects.md#use-an-approved-source)
-for other publishers and custom policies.
+This approves releases that the official publisher builds from its main
+branch, for 30 days. Site Ops deploys published content only from a source
+you approve this way. Run it again to renew. See
+[approved sources](docs/projects.md#use-an-approved-source) for other
+publishers and custom policies.
 
-### Deploy AIO
+### 3. Deploy AIO
 
-Use an authorized Azure CLI identity and the release named by your release
-instructions. `official` is the approved source you enrolled independently
-above, not authority supplied by downloaded content. Replace the cluster
-placeholder with its full ARM resource ID:
+Copy the deploy command from the release notes' **Workspace content**
+section, which names the exact release, and replace the cluster placeholder:
 
 ```text
 siteops deploy aio-install --source "official@<release>" --input "cluster=<Arc-cluster-resource-ID>"
 ```
 
-The command reads the cluster to fill in its subscription, resource group
-and region. In a private terminal, it shows the Sites and operations of
-one prepared plan and asks for confirmation before executing that plan. For
-CI, JSON output or any other unattended run, pass `--yes` to confirm
-execution. Validation and approved source checks still apply. The command
-does not sign you in, and deployment can incur charges. Follow the
-[outcome check](docs/guided-inputs.md#check-the-result) after deployment.
+Site Ops reads the cluster to fill in its subscription, resource group and
+region. It uses your Azure CLI login and does not sign you in. It shows the
+plan and asks before it changes anything. Pass `--yes` for unattended runs
+such as CI. Deployment can incur charges. When it finishes,
+[check the result](docs/guided-inputs.md#check-the-result).
 
-To install AIO and enable Secret Sync together, add
-`--input enableSecretSync=true` after confirming the cluster prerequisites.
-To enable Secret Sync on an existing AIO 2607 or 2608 instance without
-reinstalling, use the instance ID with the
+To install Secret Sync as well, add `--input enableSecretSync=true`. To add
+it to an instance that already runs AIO, use the
 [standalone Secret Sync route](docs/guided-inputs.md#enable-secret-sync-on-an-existing-instance).
-[Guided inputs](docs/guided-inputs.md) covers optional names and labels,
-answer files, manually described Sites and all three routes. `plan` is available
-when you want a separate preview. It is not a prerequisite for deployment.
+[Guided inputs](docs/guided-inputs.md) covers optional names, answer files
+and separate plans.
 
-### Scale out on the same model
+### 4. Scale out on the same model
 
-[Save Sites](docs/guided-inputs.md#keep-a-site-for-later) for repeatable
-fleet selection and optionally pin a release in an operator project. Review
-only the new Sites before deploying them:
+[Save Sites](docs/guided-inputs.md#keep-a-site-for-later) and pin a release
+in an operator project, then plan and deploy to a selected group of Sites:
 
 ```text
 siteops --approved-source official project pin ./factory --release <release>
 siteops --approved-source official --project ./factory plan aio-install -l name=plant-two,name=plant-three
 ```
 
-Deploy the same selector only after confirming it excludes already installed
-clusters. Reapplying `aio-install` can overwrite their settings. A project
-pin is an optional route for repeatability and `--offline-content`, not a
-prerequisite for the command that deploys one cluster. Local workspaces and
-content beyond AIO also use the same planner and executor.
-See [project Sites](docs/projects.md),
-[fleet targeting](docs/targeting.md) and the
-[local checkout guide](docs/getting-started.md) for experienced workflows.
+Confirm that the selector excludes clusters that already run AIO, because
+reapplying `aio-install` can overwrite their settings. See
+[project Sites](docs/projects.md), [fleet targeting](docs/targeting.md) and
+the [local checkout guide](docs/getting-started.md) for fleet workflows and
+content beyond AIO.
 
 ## Browse deployment choices
 

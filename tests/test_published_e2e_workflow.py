@@ -1469,6 +1469,51 @@ def test_guided_published_deploy_uses_answers_and_read_gate():
     assert 'trust_args=(--approved-source guided)' in step
 
 
+def test_published_deploy_failure_reports_only_codes_and_counts(tmp_path):
+    failed = {
+        "apiVersion": "siteops/v1alpha1", "kind": DEPLOYMENT_KIND, "projection": "publishable", "status": "failed",
+        "exitCode": 1, "engine": {"name": "siteops", "version": "1.0.0b7"},
+        "summary": {"sites": {"total": 1, "counts": {"failed": 1}},
+                    "operations": {"total": 3, "counts": {"failed": 1, "skipped": 2, "succeeded": 0}}},
+        "diagnostics": [{"code": "run.diagnostic", "severity": "error", "summary": "private-marker summary"},
+                        {"code": "has spaces private-marker", "severity": "error", "summary": "x"}],
+    }
+    history = [
+        {"timestamp": "2026-10-10T20:02:14.1234567+00:00", "state": "Failed", "code": "InvalidTemplateDeployment",
+         "details": ["StorageAccountNameInvalid", "private-marker detail with spaces"]},
+        {"timestamp": "2026-10-10T19:00:00+00:00", "state": "Failed", "code": "OlderAttempt", "details": []},
+        {"timestamp": "2026-10-10T20:03:00Z", "state": "Succeeded", "code": None, "details": None},
+    ]
+    install_doubles(tmp_path, {
+        "siteops": [{"match": ["deploy", "aio-install"], "code": 1, "stdout": json.dumps(failed),
+                     "stderr": "provider message rg-private-marker\n"}],
+        "fleet-python": [{"match": ["scripts/coordinate-release-fleet.py", "policy"], "stdout": "policy\n"}],
+        "az": [{"match": ["deployment", "group", "list"], "stdout": json.dumps(history)}],
+    })
+    (tmp_path / "bin" / "python").write_text(
+        f"#!/usr/bin/env bash\nexec {shlex.quote(Path(sys.executable).as_posix())} \"$@\"\n", encoding="utf-8",
+        newline="\n",
+    )
+    result = run_script(_step_run("Deploy AIO through the published engine and package"), tmp_path, {
+        **double_environment(tmp_path), "RUNNER_TEMP": tmp_path.as_posix(), "PUBLISHED_JOURNEY": "guided",
+        "SITEOPS_E2E_PROJECT": (tmp_path / "project").as_posix(), "SITEOPS_E2E_ENGINE_VERSION": "1.0.0b7",
+        "RELEASE": "", "SOURCE_SHA": "a" * 40, "SITE_NAME": "site-private-marker",
+        "SITEOPS_E2E_TRUST": "policy", "SITEOPS_E2E_STATE": (tmp_path / "state").as_posix(),
+        "FLEET_PYTHON": "fleet-python", "E2E_RESOURCE_GROUP": "rg-private-marker",
+        # 2026-10-10T20:00:00Z
+        "JOB_START_EPOCH": "1791662400",
+    })
+    output = result.stdout + result.stderr
+    assert result.returncode == 1
+    assert "::error::The published Site Ops deployment failed." in result.stdout
+    assert "Deployment result: status failed, operations failed 1, skipped 2." in result.stdout
+    assert "Deployment diagnostics: run.diagnostic, unrecognized." in result.stdout
+    assert ("Azure deployment: Failed, error InvalidTemplateDeployment, details StorageAccountNameInvalid, "
+            "unrecognized.") in result.stdout
+    assert "OlderAttempt" not in output
+    assert "private-marker" not in output
+
+
 @pytest.mark.parametrize(("mode", "journey", "expected"), [
     pytest.param("candidate", "guided", ["--trust-policy", "{policy}/policy.json", "--trusted-root", "{policy}/root.json"],
                  id="candidate-policy-without-published-trust"),

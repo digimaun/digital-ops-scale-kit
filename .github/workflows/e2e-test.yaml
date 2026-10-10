@@ -1755,6 +1755,8 @@ jobs:
           SOURCE_SHA: ${{ env.CANDIDATE_MODE == 'true' && github.sha || needs.prep.outputs.published-source-sha }}
           SITE_NAME: ${{ steps.names.outputs.site_name }}
           E2E_JOURNEY: ${{ needs.prep.outputs.published-journey }}
+          E2E_RESOURCE_GROUP: ${{ steps.names.outputs.rg }}
+          JOB_START_EPOCH: ${{ steps.names.outputs.job_start_epoch }}
         run: |
           set -euo pipefail
           target_args=(-l "name=$SITE_NAME")
@@ -1785,6 +1787,52 @@ jobs:
             > "$RUNNER_TEMP/published-deploy-output.txt" \
             2> "$RUNNER_TEMP/published-deploy-output.err"; then
             echo "::error::The published Site Ops deployment failed."
+            # Only enumerated statuses, counts and error codes leave the runner. Messages stay private.
+            deployments="$RUNNER_TEMP/published-deploy-arm.json"
+            az deployment group list -g "$E2E_RESOURCE_GROUP" \
+              --query '[].{timestamp:properties.timestamp,state:properties.provisioningState,code:properties.error.code,details:properties.error.details[].code}' \
+              -o json > "$deployments" 2>/dev/null || echo '[]' > "$deployments"
+            python - "$RUNNER_TEMP/published-deploy-output.txt" "$deployments" "$JOB_START_EPOCH" <<'PY' || true
+          import json
+          import re
+          import sys
+          from datetime import datetime
+
+          token = re.compile(r"[A-Za-z0-9._-]{1,80}")
+
+          def safe(value):
+              return value if isinstance(value, str) and token.fullmatch(value) else "unrecognized"
+
+          try:
+              result = json.loads(open(sys.argv[1], encoding="utf-8").read())
+              operations = result["summary"]["operations"]["counts"]
+              print("Deployment result: status " + safe(result.get("status")) + ", operations " + ", ".join(
+                  safe(key) + " " + str(value) for key, value in sorted(operations.items())
+                  if type(value) is int and value) + ".")
+              codes = sorted({safe(item.get("code")) for item in result.get("diagnostics") or []
+                              if isinstance(item, dict)})
+              print("Deployment diagnostics: " + (", ".join(codes) or "none") + ".")
+          except (OSError, ValueError, KeyError, TypeError, AttributeError):
+              print("Deployment result: unreadable.")
+          try:
+              start = int(sys.argv[3])
+              rows = json.loads(open(sys.argv[2], encoding="utf-8").read())
+          except (OSError, ValueError):
+              start, rows = 0, None
+          if not isinstance(rows, list):
+              print("Azure deployment history: unreadable.")
+              rows = []
+          for row in rows:
+              try:
+                  stamp = datetime.fromisoformat(str(row.get("timestamp")).replace("Z", "+00:00"))
+                  if stamp.tzinfo is None or stamp.timestamp() < start or row.get("state") == "Succeeded":
+                      continue
+              except (ValueError, TypeError, AttributeError):
+                  continue
+              details = [safe(code) for code in row.get("details") or []][:5]
+              print("Azure deployment: " + safe(row.get("state")) + ", error " + safe(row.get("code"))
+                    + (", details " + ", ".join(details) if details else "") + ".")
+          PY
             exit 1
           fi
           python - "$RUNNER_TEMP/published-deploy-output.txt" \

@@ -24,8 +24,8 @@ each commit. E2E runs only when you dispatch it (`workflow_dispatch`).
 
 ### Accept one release candidate
 
-Choose `scenario=release-acceptance` with the exact **Fleet qualification
-selection** JSON as `candidate`. The release workflow starts this run on
+Choose `scenario=release-acceptance` with the JSON from the producer's
+**Exact candidate selection** summary as `candidate`. The release workflow starts this run on
 `main` after it admits a candidate, with `environment=dev` and
 `location=eastus2`. The run is named **Release acceptance** and runs at the
 candidate's source commit. Leave the options for one Site at their defaults,
@@ -80,13 +80,18 @@ duplicated, ambiguous or failed evidence fails the run, and the result is
 uploaded either way. Publication requires the newest acceptance run for the
 candidate to pass.
 
+Site job names match the receipt scenarios: `Site case (site-aio)`,
+`Site case (site-combined)` and `Site case (site-existing-secretsync)`.
+Reconciliation jobs use `Reconcile original Site case (<scenario>)`.
+
 - Retry a failed Site case with **Re-run failed jobs**. Each attempt uses new
   names and its own snapshot, and the newest attempt of each case governs.
 - The fleet must pass within one attempt. Rerunning only its failed jobs stops
   before any Azure work and asks for **Re-run all jobs**.
 - Reconcile an attempt whose cleanup did not complete with
-  `scenario=site-cleanup` or `scenario=fleet-cleanup`, the original run and
-  attempt, the same `candidate` and the same environment secrets.
+  `scenario=site-cleanup` or `scenario=fleet-cleanup`,
+  `original-run` and `original-attempt` from that run, the same `candidate`
+  and the same environment secrets.
   Reconciliation starts only after every attempt of the original run has
   completed. In a persistent group it removes only resources outside the
   original snapshot that Azure reports as created before that attempt
@@ -108,8 +113,8 @@ in its own owned resource group. One installed Site Ops controller selects
 both Sites and makes one deployment with `--parallel 2`. It also checks that
 an unselected sentinel Site is excluded.
 
-Use the exact **Fleet qualification selection** JSON from the selected
-release producer's admission summary as `candidate`. Run the workflow
+Use the JSON from the selected release producer's **Exact candidate selection**
+summary as `candidate`. Run the workflow
 at that same source commit, using a branch or retained tag pointing there.
 The selection binds the producer run/attempt, artifact IDs and frozen
 digests. Preview candidates remain previews and cannot authorize publication.
@@ -196,8 +201,8 @@ cannot substitute for that evidence.
 
 Hard workflow cancellation can prevent automatic cleanup. For a separately
 approved recovery, choose `scenario=fleet-cleanup` with the same
-`candidate`, original `fleet-original-run` and `fleet-original-attempt`,
-and the original subscription/environment. Use the original controller
+`candidate`, `original-run` and `original-attempt`.
+Reuse the original subscription and environment. Use the original controller
 commit, preserving a branch or tag if necessary. Reconciliation recovers
 and verifies the original ownership artifact by ID and digest, then checks
 resource ownership again. It needs no copy of the private allocation file
@@ -361,8 +366,8 @@ From the **Actions** tab, dispatch **E2E Tests** with the defaults to run one AI
 | `published-release` | empty or an exact tag | Empty keeps the integration suite that runs from the checkout source. A tag selects the bounded, verified published package mode below. |
 | `published-source-sha` | empty or a full commit | Required with `published-release`. Must be the exact commit targeted by the published tag. |
 | `published-journey` | `configured` | Applies only with `published-release`. `configured` deploys a configured Site, and `guided` deploys one guided Site. See below. |
-| `candidate` | empty | Candidate scenarios only. The exact **Fleet qualification selection** JSON from the release producer's admission summary. With `aio`, it runs only the three Site cases. |
-| `fleet-original-run`, `fleet-original-attempt` | empty | `fleet-cleanup` and `site-cleanup` only. The original acceptance workflow run ID and attempt. |
+| `candidate` | empty | Candidate scenarios use the JSON from the release producer's **Exact candidate selection** summary. With `aio`, it runs the Site cases without the fleet. |
+| `original-run`, `original-attempt` | empty | The `fleet-cleanup` and `site-cleanup` scenarios use the original acceptance workflow run ID and attempt. |
 
 Qualify both AIO upgrade optionality paths in one dispatch:
 

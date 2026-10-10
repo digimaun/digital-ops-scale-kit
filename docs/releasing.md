@@ -295,9 +295,10 @@ ownership checks. Never substitute a search across the subscription or general
 resource janitor. Keep provider diagnostics and allocation state private.
 These helpers do not install Site Ops, deploy AIO or establish workload health.
 
-The producer's **Fleet qualification selection** summary identifies the
-exact admitted plan, engine, workspaces and inventory for the manual
-`scenario=fleet` E2E path. See [fleet acceptance and its runtime budget](e2e-testing.md#qualify-one-exact-candidate-across-two-sites).
+The producer's **Exact candidate selection** summary identifies the
+exact admitted plan, engine, workspaces and inventory for Site and fleet acceptance.
+The manual `scenario=fleet` E2E path uses the same selection.
+See [fleet acceptance and its runtime budget](e2e-testing.md#qualify-one-exact-candidate-across-two-sites).
 That path installs the selected engine outside checkout, seeds the normal
 operator project, coordinates two live hosts, and requires bound deployment,
 readiness and cleanup receipts. It does not rebuild candidate assets.
@@ -739,7 +740,8 @@ Open the link in the **Start candidate acceptance** summary, or open
 Reruns keep the candidate and write a new receipt for each attempt. The
 latest attempt decides. Resources left by an earlier attempt are removed by
 its own cleanup, or by a separately approved `scenario=site-cleanup` or
-`scenario=fleet-cleanup` run with the original candidate, run and attempt.
+`scenario=fleet-cleanup` run with the same `candidate`.
+Set `original-run` and `original-attempt` to the run and attempt that need reconciliation.
 In persistent groups, that run removes only what the original attempt
 created, as described in [Read the result and retry](e2e-testing.md#read-the-result-and-retry).
 

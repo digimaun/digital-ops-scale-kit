@@ -14,10 +14,13 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+from fleet_workflow import named_job  # noqa: E402
 from release_acceptance import (  # noqa: E402
     ASSERTIONS,
     INSTALLER_CELLS,
     SCENARIOS,
+    SITE_JOB,
+    SLOT_SCENARIOS,
     aggregate,
     installer_cells,
     installer_row,
@@ -125,7 +128,7 @@ def test_each_scenario_records_the_group_mode_its_own_configuration_selected(sel
 
 
 def test_older_passing_attempt_cannot_hide_a_later_failing_attempt(selection):
-    jobs = Jobs().acceptance().add("Site case (existing)", 2, "failure")
+    jobs = Jobs().acceptance().add("Site case (site-existing-secretsync)", 2, "failure")
     evidence = documents(selection)
     evidence["existing"] = site_receipt(selection, "existing", 2, status="failed", assertions=[],
                                         cleanup="confirmed-absent")
@@ -138,7 +141,7 @@ def test_older_passing_attempt_cannot_hide_a_later_failing_attempt(selection):
 
 
 def test_a_case_rerun_alone_is_governed_by_its_latest_passing_attempt(selection):
-    jobs = Jobs().acceptance(enabled="failure").add("Site case (enabled)", 2)
+    jobs = Jobs().acceptance(enabled="failure").add("Site case (site-combined)", 2)
     artifacts = evidence_artifacts({"enabled": 2})
     evidence = documents(selection, {"enabled": 2})
     document = run_aggregate(selection, jobs=jobs, artifacts=artifacts, evidence=evidence)
@@ -164,7 +167,7 @@ def test_site_rows_fail_closed(selection, fault, expected):
     if fault == "receipt-missing":
         evidence["enabled"] = None
     elif fault == "duplicate-job":
-        jobs.add("Site case (enabled)", 1)
+        jobs.add("Site case (site-combined)", 1)
     elif fault == "duplicate-artifact":
         artifacts.append(artifact(f"site-outcome-{RUN}-1-enabled", 701))
     elif fault == "expired-artifact":
@@ -478,6 +481,43 @@ def test_acceptance_run_is_bound_named_and_always_aggregated():
         assert "pattern" not in download["with"] and "merge-multiple" not in download["with"]
         assert aggregate_step["env"][f"DOWNLOAD_{key.upper()}"] == f"${{{{ steps.download-{key}.outcome }}}}"
         assert names.index(f"download-{key}") < names.index("Require every scenario for this candidate")
+
+
+@pytest.mark.parametrize("slot", SLOT_SCENARIOS)
+def test_workflow_site_names_match_receipt_and_ownership_matchers(slot):
+    caller = yaml.safe_load((WORKFLOWS / "e2e-test.yaml").read_text(encoding="utf-8"))
+    reconcile = yaml.safe_load((WORKFLOWS / "_fleet-reconcile.yaml").read_text(encoding="utf-8"))
+    name = evaluate(caller["jobs"]["e2e"]["name"], {
+        "needs": {"prep": {"outputs": {"candidate-mode": "true"}}},
+        "matrix": {"secret-sync-mode": slot},
+    })
+    assert name == SITE_JOB[slot]
+    values = Jobs().add(name, attempt=2, prefix="Acceptance / ").values
+    assert named_job(values, SITE_JOB[slot]) is values[0]
+    outcome = artifact(f"site-outcome-{RUN}-2-{slot}", 500)
+    assert select_evidence(values, [outcome], run=RUN, commit=SOURCE["commit"])[slot] == {
+        "attempt": 2, "status": "passed", "artifact": outcome,
+    }
+    assert evaluate(reconcile["jobs"]["reconcile"]["name"], {
+        "inputs": {"kind": "site"}, "matrix": {"slot": slot},
+    }) == f"Reconcile original {SITE_JOB[slot]}"
+
+
+@pytest.mark.parametrize("slot", SLOT_SCENARIOS)
+@pytest.mark.parametrize("release", ["2607", "2608"])
+def test_ordinary_e2e_job_names_keep_the_release_and_internal_mode(slot, release):
+    job = yaml.safe_load((WORKFLOWS / "e2e-test.yaml").read_text(encoding="utf-8"))["jobs"]["e2e"]
+    assert evaluate(job["name"], {
+        "needs": {"prep": {"outputs": {"candidate-mode": "false"}}},
+        "matrix": {"secret-sync-mode": slot, "aio-release": release},
+    }) == f"e2e ({release}, {slot})"
+
+
+def test_fleet_reconciliation_job_name_is_unchanged():
+    job = yaml.safe_load((WORKFLOWS / "_fleet-reconcile.yaml").read_text(encoding="utf-8"))["jobs"]["reconcile"]
+    assert evaluate(job["name"], {
+        "inputs": {"kind": "fleet"}, "matrix": {"slot": "fleet"},
+    }) == "Reconcile original fleet"
 
 
 def test_site_cases_do_not_cancel_each_other_and_always_clean_up_before_the_receipt():

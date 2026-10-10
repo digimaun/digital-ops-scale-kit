@@ -289,7 +289,7 @@ def main() -> int:
                 prepare = named_job(values, "Fleet prepare")
                 names, artifact = ("Preflight resource ownership", "Retain resource ownership"), "fleet-ownership"
             else:
-                prepare = named_job(values, SITE_JOB.format(site_slot))
+                prepare = named_job(values, SITE_JOB[site_slot])
                 names, artifact = ("Retain Site ownership",), "site-ownership"
                 retained = [step for step in (prepare or {}).get("steps") or ()
                             if isinstance(step, dict) and step.get("name") == names[0]]

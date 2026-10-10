@@ -40,7 +40,7 @@ permissions:
   id-token: write
 jobs:
   reconcile:
-    name: ${{ inputs.kind == 'site' && format('Reconcile original Site case ({0})', matrix.slot) || 'Reconcile original fleet' }}
+    name: ${{ inputs.kind == 'site' && format('Reconcile original Site case ({0})', fromJSON('{"disabled":"site-aio","enabled":"site-combined","existing":"site-existing-secretsync"}')[matrix.slot]) || 'Reconcile original fleet' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     environment: ${{ inputs.environment }}

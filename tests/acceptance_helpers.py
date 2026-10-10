@@ -17,6 +17,7 @@ from release_acceptance import (  # noqa: E402
     INSTALLER_CELLS,
     INSTALLER_JOBS,
     SITE_JOB,
+    SLOT_SCENARIOS,
 )
 
 SOURCE = {"repository": "example/content", "commit": "a" * 40, "ref": "refs/heads/main"}
@@ -72,7 +73,7 @@ def context(selection: dict, attempt: int, *, run: int = RUN) -> dict:
 
 
 def site_receipt(selection: dict, slot: str, attempt: int, groups="ephemeral", **changes) -> dict:
-    scenario = {"disabled": "site-aio", "enabled": "site-combined", "existing": "site-existing-secretsync"}[slot]
+    scenario = SLOT_SCENARIOS[slot]
     return {
         "apiVersion": "siteops.release.acceptance/v1", "kind": "SiteScenarioOutcome",
         "context": context(selection, attempt), "scopeKey": "d" * 64, "slot": slot, "scenario": scenario,
@@ -107,7 +108,7 @@ class Jobs:
     def acceptance(self, attempts=None, fleet_attempt=1, **conclusions):
         attempts = attempts or {}
         for slot in ("disabled", "enabled", "existing"):
-            self.add(SITE_JOB.format(slot), attempts.get(slot, 1), conclusions.get(slot, "success"))
+            self.add(SITE_JOB[slot], attempts.get(slot, 1), conclusions.get(slot, "success"))
         for name in FLEET_JOBS:
             self.add(name, fleet_attempt, conclusions.get(name, "success"), prefix="Fleet / ")
         return self

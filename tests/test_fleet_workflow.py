@@ -156,7 +156,9 @@ def test_producer_emits_the_exact_selection_without_inventing_missing_artifact_i
         assert not output.exists() and not summary.exists()
     else:
         assert json.loads(output.read_text().split("=", 1)[1]) == selected
-        assert "does not authorize Azure use or publication" in summary.read_text()
+        rendered = summary.read_text()
+        assert rendered.splitlines()[1] == "### Exact candidate selection"
+        assert "does not authorize Azure use or publication" in rendered
 
 
 @pytest.mark.parametrize("fault", ["id", "attempt", "source", "expired"])
@@ -920,7 +922,7 @@ def test_site_reconciliation_reports_nothing_only_when_creation_could_not_start(
                                          "conclusion": retained}]
     jobs_page = [{"total_count": 1 if job else 1, "jobs": [{
         "id": 1, "run_id": 50, "run_attempt": 2, "head_sha": SOURCE["commit"],
-        "name": "Site case (existing)" if job else "Site case (enabled)", "steps": steps,
+        "name": "Site case (site-existing-secretsync)" if job else "Site case (site-combined)", "steps": steps,
     }]}]
     artifacts = [{"artifacts": [{
         "id": 700, "name": "site-ownership-50-2-existing", "expired": False, "size_in_bytes": 10,
@@ -952,7 +954,8 @@ def test_evidence_selection_publishes_only_ids_of_the_latest_attempts(inputs, mo
     root, value, _ = inputs
     script = load_script("coordinate-release-fleet")
     site_environment(monkeypatch, root, value, GITHUB_RUN_ID="60", GITHUB_RUN_ATTEMPT="2")
-    names = ["Site case (disabled)", "Site case (enabled)", "Site case (existing)", "Site case (existing)",
+    names = ["Site case (site-aio)", "Site case (site-combined)",
+             "Site case (site-existing-secretsync)", "Site case (site-existing-secretsync)",
              *(f"Fleet / {name}" for name in ("Select fleet candidate", "Fleet prepare", "Fleet host (one)",
                                               "Fleet host (two)", "Fleet controller", "Fleet cleanup",
                                               "Require complete fleet acceptance"))]

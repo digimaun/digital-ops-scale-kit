@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Render one exact, non-secret selection for a later fleet qualification invocation."""
+"""Render the exact candidate selection for Site and fleet acceptance without secrets."""
 
 import json
 import os
@@ -40,11 +40,11 @@ def main() -> int:
         with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
             stream.write("candidate=" + raw + "\n")
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as stream:
-            stream.write("\n### Fleet qualification selection\n\n")
+            stream.write("\n### Exact candidate selection\n\n")
             stream.write("This identifies the frozen candidate. It does not authorize Azure use or publication.\n\n")
             stream.write("```json\n" + json.dumps(value, indent=2, sort_keys=True) + "\n```\n")
     except (ValueError, OSError, KeyError, TypeError):
-        print("The exact fleet candidate selection could not be rendered.", file=sys.stderr)
+        print("The exact candidate selection could not be rendered.", file=sys.stderr)
         return 1
     return 0
 

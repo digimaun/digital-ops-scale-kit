@@ -94,15 +94,15 @@ on:
         options: [configured, guided]
         default: configured
       candidate:
-        description: "Candidate scenarios only: exact FleetCandidate JSON from the producer's admission summary."
+        description: "Candidate scenarios use the FleetCandidate JSON from the producer's Exact candidate selection summary."
         type: string
         default: ""
-      fleet-original-run:
-        description: "Cleanup scenarios only: original acceptance workflow run ID."
+      original-run:
+        description: "Cleanup scenarios use the original acceptance workflow run ID."
         type: string
         default: ""
-      fleet-original-attempt:
-        description: "Cleanup scenarios only: original acceptance workflow attempt."
+      original-attempt:
+        description: "Cleanup scenarios use the original acceptance workflow attempt."
         type: string
         default: ""
 
@@ -140,7 +140,7 @@ jobs:
                       "tests", "published-release", "published-source-sha",
                   ))):
               raise SystemExit("Candidate scenarios use owned targets and mandatory cleanup, not single-Site overrides.")
-          prior = (request.get("fleet-original-run", ""), request.get("fleet-original-attempt", ""))
+          prior = (request.get("original-run", ""), request.get("original-attempt", ""))
           if request["scenario"] in {"fleet-cleanup", "site-cleanup"}:
               if not all(re.fullmatch("[1-9][0-9]{0,19}", value) for value in prior):
                   raise SystemExit("Reconciliation requires the original run and attempt.")
@@ -181,8 +181,8 @@ jobs:
       id-token: write
     with:
       candidate: ${{ inputs.candidate }}
-      original-run: ${{ inputs.fleet-original-run }}
-      original-attempt: ${{ inputs.fleet-original-attempt }}
+      original-run: ${{ inputs.original-run }}
+      original-attempt: ${{ inputs.original-attempt }}
       environment: ${{ inputs.environment }}
       kind: ${{ inputs.scenario == 'site-cleanup' && 'site' || 'fleet' }}
     secrets:
@@ -622,7 +622,7 @@ jobs:
           print(f"Site cases use {mode} resource groups.")
 
   e2e:
-    name: ${{ needs.prep.outputs.candidate-mode == 'true' && format('Site case ({0})', matrix.secret-sync-mode) || format('e2e ({0}, {1})', matrix.aio-release, matrix.secret-sync-mode) }}
+    name: ${{ needs.prep.outputs.candidate-mode == 'true' && format('Site case ({0})', fromJSON('{"disabled":"site-aio","enabled":"site-combined","existing":"site-existing-secretsync"}')[matrix.secret-sync-mode]) || format('e2e ({0}, {1})', matrix.aio-release, matrix.secret-sync-mode) }}
     needs: [prep, site-groups]
     if: ${{ !cancelled() && needs.prep.result == 'success' && (needs.prep.outputs.candidate-mode != 'true' || needs.site-groups.result == 'success') }}
     runs-on: ubuntu-latest

@@ -49,7 +49,7 @@ STEP_ASSERTIONS = {
     "existing-enable": ("existing-plan-operations", "existing-enable-succeeded"),
     "readiness": ("aio-readiness",),
 }
-SITE_JOB = "Site case ({})"
+SITE_JOB = {slot: f"Site case ({scenario})" for slot, scenario in SLOT_SCENARIOS.items()}
 FLEET_JOBS = (
     "Select fleet candidate", "Fleet prepare", "Fleet host (one)", "Fleet host (two)", "Fleet controller",
     "Fleet cleanup", "Require complete fleet acceptance",
@@ -208,7 +208,7 @@ def select_evidence(run_jobs: list[dict], artifacts: list[dict], *, run: int, co
     """
     evidence = {}
     for slot in SITE_SLOTS:
-        attempt, status = latest_job(run_jobs, SITE_JOB.format(slot))
+        attempt, status = latest_job(run_jobs, SITE_JOB[slot])
         item, unique = _artifact(artifacts, attempt and f"site-outcome-{run}-{attempt}-{slot}", run=run, commit=commit)
         evidence[slot] = {"attempt": attempt, "status": status if unique else "ambiguous", "artifact": item}
     latest = {name: latest_job(run_jobs, name) for name in FLEET_JOBS}

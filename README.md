@@ -51,10 +51,13 @@ clone, saved Site or project pin.
 ### Install Site Ops
 
 Select a release deliberately rather than taking the newest. Open its notes
-from the [releases page](https://github.com/Azure/digital-ops-scale-kit/releases)
-and copy a command from their `Install Site Ops` section. Use the
+from the [releases page](https://github.com/Azure/digital-ops-scale-kit/releases).
+A release that includes an engine provides an `Install Site Ops` section.
+A content only release links to its referenced engine's installation instructions.
+
+In the engine release's `Install Site Ops` section, use the
 `Already have uv` command when uv is available, or the bootstrap command for
-your platform. Each command selects that exact release and installs the
+your platform. Each command selects that exact engine release and installs the
 Site Ops engine only. To check the bootstrap script's GitHub
 attestation before it runs, expand `Verify the script before it runs` below
 the bootstrap commands.

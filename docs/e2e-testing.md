@@ -79,7 +79,8 @@ The final job uploads `release-acceptance-<run>-<attempt>-<admission digest>`
 with one row each for the installer, the three Site cases and the fleet. A row
 records its status, group mode, cleanup and vault purge. Missing, skipped,
 duplicated, ambiguous or failed evidence fails the run, and the result is
-uploaded either way. Publication requires the newest acceptance run for the
+uploaded either way. When aggregation cannot run, the run uploads a failing
+placeholder result for the candidate instead. Publication requires the newest acceptance run for the
 candidate to pass.
 
 Site job names match the receipt scenarios: `Site case (site-aio)`,

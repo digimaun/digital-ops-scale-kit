@@ -2637,21 +2637,36 @@ jobs:
     env:
       FLEET_CANDIDATE: ${{ inputs.candidate }}
     steps:
+      # Binding uses only the runner's Python and reads no network source, so every run whose
+      # candidate names this commit records a result, even when checkout or tool setup fails.
+      - name: Bind the exact candidate
+        id: bind
+        shell: python
+        run: |
+          import json, os, re
+          try:
+              raw = os.environ["FLEET_CANDIDATE"]
+              value = json.loads(raw) if len(raw) <= 16384 else None
+              admission = value["artifacts"]["admission"]["sha256"]
+              bound = (
+                  value["apiVersion"] == "siteops.release.acceptance/v1" and value["kind"] == "FleetCandidate"
+                  and value["source"]["repository"] == os.environ["GITHUB_REPOSITORY"]
+                  and value["source"]["commit"] == os.environ["GITHUB_SHA"]
+                  and isinstance(admission, str) and re.fullmatch("[0-9a-f]{64}", admission) is not None
+              )
+          except (ValueError, TypeError, KeyError):
+              bound = False
+          if not bound:
+              raise SystemExit("The candidate does not name this commit, so this run records no result.")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("admission-sha=" + admission + "\n")
+          print("This run records its result for the selected candidate.")
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/setup-fleet-tools
         id: tools
-      # Binding makes no GitHub reads, so every run of a candidate that parses records a bound result.
-      - name: Bind the exact candidate
-        id: bind
-        shell: bash
-        env:
-          PYTHON: ${{ steps.tools.outputs.python }}
-        run: |
-          set -euo pipefail
-          "$PYTHON" -B scripts/coordinate-release-fleet.py bind --root "$RUNNER_TEMP"
       - name: Select exact candidate inputs
         id: select
         shell: bash
@@ -2752,6 +2767,18 @@ jobs:
           "$PYTHON" -B scripts/aggregate-release-acceptance.py aggregate --root "$RUNNER_TEMP/acceptance" \
             --workflow .github/workflows/_siteops-distribution.yaml \
             --output "$RUNNER_TEMP/acceptance/release-acceptance.json"
+      # Without the aggregator's receipt, a failing placeholder keeps this newer run in charge of publication.
+      - name: Keep a failing result when aggregation wrote none
+        if: always() && steps.bind.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/acceptance"
+          result="$RUNNER_TEMP/acceptance/release-acceptance.json"
+          if [[ ! -s "$result" ]]; then
+            printf '%s\n' '{"kind":"ReleaseAcceptance","status":"failed"}' > "$result"
+            echo "::error::Aggregation wrote no receipt, so this run records a failing result."
+          fi
       # A failing receipt is retained too, so a newer failed run governs publication.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always() && steps.bind.outcome == 'success'

@@ -822,24 +822,6 @@ def test_run_jobs_accept_every_earlier_attempt_of_this_run_only(fault):
             run_jobs(pages, run=50, attempt=3, commit=SOURCE["commit"])
 
 
-def test_bind_names_the_admission_without_any_github_read(tmp_path, monkeypatch):
-    script = load_script("coordinate-release-fleet")
-    value = selection()
-    site_environment(monkeypatch, tmp_path, value)
-
-    def refuse(*args, **kwargs):
-        raise AssertionError("Binding must not read GitHub.")
-
-    monkeypatch.setattr(script, "run_private", refuse)
-    monkeypatch.setattr(sys, "argv", ["coordinate-release-fleet.py", "bind", "--root", str(tmp_path)])
-    assert script.main() == 0
-    assert (tmp_path / "outputs").read_text() == f"admission-sha={value['artifacts']['admission']['sha256']}\n"
-    monkeypatch.setenv("FLEET_CANDIDATE", "{}")
-    (tmp_path / "outputs").unlink()
-    assert script.main() == 1
-    assert not (tmp_path / "outputs").exists()
-
-
 def site_environment(monkeypatch, root, value, **extra):
     for name, content in {
         "FLEET_CANDIDATE": json.dumps(value), "GITHUB_REPOSITORY": SOURCE["repository"],

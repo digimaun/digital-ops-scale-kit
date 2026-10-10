@@ -44,7 +44,7 @@ from tests.acceptance_helpers import (  # noqa: E402
     write_candidate,
 )
 from tests.actions_expressions import evaluate, truthy  # noqa: E402
-from tests.shell_helpers import run_script  # noqa: E402
+from tests.shell_helpers import bash_path, run_script  # noqa: E402
 
 WORKFLOWS = ROOT / ".github" / "workflows"
 NEEDS = {key: {"result": "success"} for key in ("fleet-request", "fleet", "prep", "site-groups", "e2e")}
@@ -456,13 +456,16 @@ def test_acceptance_run_is_bound_named_and_always_aggregated():
     assert "environment" not in job
     steps = job["steps"]
     names = [step.get("name") or step.get("id") or step.get("uses") for step in steps]
-    bind = next(step for step in steps if step.get("id") == "bind")
-    assert names.index("Bind the exact candidate") < names.index("Select exact candidate inputs")
-    assert "if" not in bind and "GH_TOKEN" not in bind["env"]
-    assert " bind --root " in bind["run"]
+    bind = steps[0]
+    # Binding comes before checkout and tool setup, so neither can stop a run from recording its result.
+    assert bind["id"] == "bind" and bind["shell"] == "python"
+    assert "if" not in bind and "env" not in bind and "uses" not in bind
+    assert "scripts/" not in bind["run"] and "import json, os, re" in bind["run"]
     aggregate_step = next(step for step in steps if step.get("name") == "Require every scenario for this candidate")
     assert aggregate_step["env"]["ACCEPTANCE_NEEDS"] == "${{ toJSON(needs) }}"
+    fallback = next(step for step in steps if step.get("name") == "Keep a failing result when aggregation wrote none")
     upload = steps[-1]
+    assert names.index("Require every scenario for this candidate") < steps.index(fallback) < len(steps) - 1
     assert upload["with"]["name"] == (
         "release-acceptance-${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.bind.outputs.admission-sha }}"
     )
@@ -528,12 +531,81 @@ def test_acceptance_downloads_only_the_selected_scenario_artifact(slot, artifact
 def test_acceptance_aggregates_and_retains_every_bound_candidate(bound, selected, cancelled, expected):
     job = yaml.safe_load((WORKFLOWS / "e2e-test.yaml").read_text())["jobs"]["acceptance"]
     aggregate_step = next(step for step in job["steps"] if step.get("name") == "Require every scenario for this candidate")
+    fallback = next(step for step in job["steps"] if step.get("name") == "Keep a failing result when aggregation wrote none")
     contexts = {
         "steps": {"bind": {"outcome": bound}, "select": {"outcome": selected}},
         "needs": {"previous": {"result": "failure"}},
     }
-    for step in (aggregate_step, job["steps"][-1]):
+    for step in (aggregate_step, fallback, job["steps"][-1]):
         assert truthy(evaluate(step["if"], contexts, cancelled=cancelled)) is expected
+
+
+def _bind(tmp_path, candidate, **environment):
+    step = yaml.safe_load((WORKFLOWS / "e2e-test.yaml").read_text())["jobs"]["acceptance"]["steps"][0]
+    output = tmp_path / "outputs"
+    result = subprocess.run(
+        [sys.executable, "-c", step["run"]], cwd=tmp_path, capture_output=True, text=True, timeout=60, check=False,
+        env={**os.environ, "FLEET_CANDIDATE": candidate, "GITHUB_OUTPUT": str(output),
+             "GITHUB_REPOSITORY": SOURCE["repository"], "GITHUB_SHA": SOURCE["commit"], **environment},
+    )
+    return result, output.read_text() if output.exists() else None
+
+
+def test_acceptance_binds_a_candidate_for_this_commit_with_only_the_standard_library(tmp_path, selection):
+    result, output = _bind(tmp_path, json.dumps(selection))
+    assert result.returncode == 0, result.stderr
+    assert output == f"admission-sha={selection['artifacts']['admission']['sha256']}\n"
+
+
+@pytest.mark.parametrize("fault", [
+    "other-commit", "other-repository", "other-kind", "short-admission", "upper-admission", "list",
+    "not-json", "oversized", "empty",
+])
+def test_acceptance_records_no_result_for_a_candidate_that_names_another_source(tmp_path, selection, fault):
+    value = copy.deepcopy(selection)
+    raw = None
+    if fault == "other-commit":
+        value["source"]["commit"] = "c" * 40
+    elif fault == "other-repository":
+        value["source"]["repository"] = "fork/content"
+    elif fault == "other-kind":
+        value["kind"] = "ReleaseCandidate"
+    elif fault == "short-admission":
+        value["artifacts"]["admission"]["sha256"] = "a" * 63
+    elif fault == "upper-admission":
+        value["artifacts"]["admission"]["sha256"] = "A" * 64
+    elif fault == "list":
+        raw = json.dumps([value])
+    elif fault == "not-json":
+        raw = "{"
+    elif fault == "oversized":
+        raw = json.dumps({**value, "padding": "x" * 16384})
+    elif fault == "empty":
+        raw = ""
+    result, output = _bind(tmp_path, raw if raw is not None else json.dumps(value))
+    assert result.returncode != 0
+    assert output is None
+    assert "records no result" in result.stderr
+
+
+@pytest.mark.parametrize("written", [None, "", '{"kind": "ReleaseAcceptance", "status": "passed"}'])
+def test_acceptance_keeps_a_failing_result_only_when_aggregation_wrote_none(tmp_path, written):
+    step = next(step for step in yaml.safe_load((WORKFLOWS / "e2e-test.yaml").read_text())["jobs"]["acceptance"]["steps"]
+                if step.get("name") == "Keep a failing result when aggregation wrote none")
+    runner = tmp_path / "runner"
+    receipt = runner / "acceptance" / "release-acceptance.json"
+    if written is not None:
+        receipt.parent.mkdir(parents=True)
+        receipt.write_text(written)
+    result = run_script(step["run"], tmp_path, {"RUNNER_TEMP": bash_path(runner)})
+    assert result.returncode == 0, result.stderr
+    document = json.loads(receipt.read_text())
+    if written:
+        assert document["status"] == "passed"
+        assert "::error::" not in result.stdout
+    else:
+        assert document == {"kind": "ReleaseAcceptance", "status": "failed"}
+        assert "::error::Aggregation wrote no receipt" in result.stdout
 
 
 @pytest.mark.parametrize("slot", SLOT_SCENARIOS)

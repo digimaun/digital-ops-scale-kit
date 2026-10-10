@@ -92,8 +92,8 @@ def write_private(path: Path, value) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("operation", choices=(
-        "bind", "select", "check-inputs", "scope", "check-ownership", "wait-participants", "wait-ready",
-        "wait-deployed", "wait-observed", "wait-cleanup", "ownership", "policy", "evidence",
+        "select", "check-inputs", "scope", "check-ownership", "wait-participants", "wait-ready", "wait-deployed",
+        "wait-observed", "wait-cleanup", "ownership", "policy", "evidence",
     ))
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--kind", choices=("fleet", "site"), default="fleet")
@@ -116,10 +116,7 @@ def main() -> int:
             site_slot = args.slot
         elif args.slot in SITE_SLOTS:
             raise CoordinationError("A Site case slot requires the site kind.")
-        if args.operation == "bind":
-            # Parsing makes no GitHub reads, so a run can always name the candidate its result binds.
-            output({"admission-sha": selected.artifacts["admission"]["sha256"]})
-        elif args.operation == "select":
+        if args.operation == "select":
             reader = GitHubReads(args.root / "selection-metadata")
             producer = selected.producer
             run = reader.read(f"{prefix}/runs/{producer['run']}/attempts/{producer['attempt']}")

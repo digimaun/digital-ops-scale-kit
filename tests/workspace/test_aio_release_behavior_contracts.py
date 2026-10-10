@@ -1,5 +1,6 @@
 """Release behavior that differs across AIO versions and API generations."""
 
+import re
 from pathlib import Path
 
 import yaml
@@ -12,6 +13,24 @@ def _read(workspace: Path, relative_path: str) -> str:
 def _release(workspace: Path, release: str) -> dict:
     path = workspace / "parameters" / "aio-releases" / f"{release}.yaml"
     return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def test_schema_registry_namespace_fits_the_service_limit_for_every_guided_site_name(workspace):
+    # DeviceRegistry rejects a schema registry namespace longer than 32 characters at preflight.
+    template = _read(workspace, "templates/deps/schema-registry.bicep")
+    contract = yaml.safe_load(_read(workspace, "manifests/aio-install/inputs.yaml"))
+    site = next(item for item in contract["inputs"] if item["name"] == "siteName")
+    common = yaml.safe_load(_read(workspace, "parameters/common/common.yaml"))
+    suffix = common["schemaRegistryName"].removeprefix("{{ site.name }}")
+    # The longest guided Site name produces a registry name over the limit, so the long form is reachable.
+    assert site["maxLength"] + len(suffix) > 32
+    assert re.search(r"(?m)^\s*namespace: schemaRegistryNamespace$", template)
+    assert not re.search(r"(?m)^\s*namespace: schemaRegistryName$", template)
+    # A name that fits stays unchanged, so existing registries keep their namespace.
+    assert "length(schemaRegistryName) <= 32\n  ? schemaRegistryName" in template
+    long_form = "'${toLower(take(schemaRegistryName, 26))}${take(uniqueString(resourceGroup().id, schemaRegistryName), 6)}'"
+    assert long_form in template
+    assert 26 + 6 == 32
 
 
 def test_security_pki_defaults_follow_released_aio_behavior(workspace):

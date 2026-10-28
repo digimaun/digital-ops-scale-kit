@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -78,7 +80,25 @@ def native_inputs() -> dict[str, Path]:
     for tool in ("openssl", "python3", "tar"):
         if shutil.which(tool) is None:
             _unavailable(f"The Linux bootstrap harness needs {tool}.")
+    # uv verifies a downloaded runtime against the digest built into the pinned uv.
+    embedded = _embedded_python_digest(selected["SITEOPS_TEST_UV_ARCHIVE"])
+    if embedded != LINUX_PYTHON_SHA256:
+        pytest.fail(
+            f"The pinned uv expects CPython {MANAGED_PYTHON} digest {embedded}, not the fixture "
+            "digest. Update the runtime fixture pins with the uv pin.",
+        )
     return selected
+
+
+def _embedded_python_digest(uv_archive: Path) -> str | None:
+    """Read the pinned runtime's entry from the download list built into uv."""
+    with tarfile.open(uv_archive, "r:gz") as archive:
+        executable = archive.extractfile("uv-x86_64-unknown-linux-gnu/uv").read()
+    key = f'"cpython-{MANAGED_PYTHON}-linux-x86_64-gnu":'.encode("ascii")
+    if executable.count(key) != 1:
+        return None
+    entry = re.compile(rb"\{(?:[^{}]|\{[^{}]*\})*\}").match(executable, executable.index(key) + len(key))
+    return json.loads(entry.group()).get("sha256") if entry else None
 
 
 @pytest.fixture
@@ -165,6 +185,15 @@ def test_linux_existing_installation_keeps_its_runtime_beside_the_pinned_one(
         tmp_path, "previous", SCRIPT, published, native_inputs,
         TEST_PREVIOUS_PYTHON_ARCHIVE=str(previous_archive),
     )
+
+
+@linux_only
+def test_linux_bootstrap_refuses_a_mirrored_runtime_with_another_digest(
+    tmp_path,
+    published,
+    native_inputs,
+):
+    _harness(tmp_path, "digest", SCRIPT, published, native_inputs)
 
 
 def _fake_runtime(parent: Path, version: str, root: Path) -> None:

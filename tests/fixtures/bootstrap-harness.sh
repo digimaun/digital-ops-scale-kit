@@ -659,6 +659,54 @@ scenario_previous() {
   [[ "$(count "$logs/mirror")" == 2 ]] && binding "$python_version" ||
     die "A new installation beside the previous runtime did not use the pinned one."
 }
+# The pinned uv carries the runtime's digest, so a mirror cannot substitute other bytes.
+scenario_digest() {
+  local archive="$root/mirror/20260924/cpython-$python_version+20260924-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+  fresh_home digest
+  "$real_python" -I - "$TEST_PYTHON_ARCHIVE" "$archive" "python/bin/python$python_minor" \
+    "$root/tampered-ran" "$python_version" <<'PY' || die "The tampered runtime archive could not be prepared."
+import io
+import shlex
+import sys
+import tarfile
+
+source, target, interpreter, marker, version = sys.argv[1:]
+identity = " ".join(version.split("."))
+# Keep the layout and name, and swap in an interpreter that records any execution.
+trap = f"#!/bin/sh\n: > {shlex.quote(marker)}\nprintf 'cpython {identity} True %s\\n' \"$0\"\n".encode()
+replaced = 0
+with tarfile.open(source, "r:gz") as original, tarfile.open(target, "w:gz", compresslevel=1) as tampered:
+    for member in original:
+        if member.name == interpreter and member.isfile():
+            member.size = len(trap)
+            tampered.addfile(member, io.BytesIO(trap))
+            replaced += 1
+        else:
+            tampered.addfile(member, original.extractfile(member) if member.isfile() else None)
+if replaced != 1:
+    raise SystemExit(1)
+PY
+  # Neither an older managed runtime nor Python on PATH may replace the refused download.
+  planted "$pydir/cpython-$previous_version-linux-x86_64-gnu/bin/python${previous_version%.*}" "$root/fallback-ran"
+  refuses tampered-runtime "The uv-managed Python could not be provisioned. Check the approved runtime source." \
+    "${first[@]}"
+  [[ "$(count "$logs/mirror")" == 1 ]] || die "The mirror did not serve the tampered runtime once."
+  [[ ! -e "$root/tampered-ran" && ! -e "$root/fallback-ran" && ! -s "$logs/rejected" ]] ||
+    die "A refused runtime or a fallback Python was executed."
+  [[ ! -e "$pydir/cpython-$python_version-linux-x86_64-gnu" &&
+     -z "$(find "$pydir" -name "python$python_minor" -print -quit)" ]] ||
+    die "The tampered runtime was kept."
+  [[ ! -e "$tools/siteops" && ! -e "$bin/siteops" && ! -L "$bin/siteops" && ! -s "$logs/siteops" &&
+     -z "$(find "$data/bundles" -mindepth 1 -print -quit 2>/dev/null)" ]] ||
+    die "A tampered runtime installed or ran Site Ops."
+  cp -- "$TEST_PYTHON_ARCHIVE" "$archive"
+  succeeds pinned-runtime "${first[@]}"
+  [[ "$(count "$logs/mirror")" == 2 ]] && binding "$python_version" &&
+    [[ "$(installed_version "$bin")" == "siteops $first_version" ]] ||
+    die "The pinned runtime archive did not install Site Ops after the tampered one."
+  [[ ! -e "$root/tampered-ran" && ! -e "$root/fallback-ran" ]] ||
+    die "The valid installation executed a refused or fallback runtime."
+}
 scenario_prerequisites() {
   local runs
   fresh_home prerequisites
@@ -749,7 +797,7 @@ PY
 }
 
 case "$scenario" in
-  journey|root|storage|policy|tools|runtime|prerequisites|content|previous) "scenario_$scenario" ;;
+  journey|root|storage|policy|tools|runtime|prerequisites|content|previous|digest) "scenario_$scenario" ;;
   *) die "Unknown scenario $scenario." ;;
 esac
 [[ ! -s "$logs/rejected" ]] || { cat "$logs/rejected" >&2; die "An unexpected tool call was made."; }

@@ -22,6 +22,8 @@ UV_DIGESTS = {
 # The managed CPython the bootstrap scripts pin, and its minor version.
 MANAGED_PYTHON = "3.14.7"
 MANAGED_PYTHON_MINOR = MANAGED_PYTHON.rpartition(".")[0]
+# The runtime that v1.0.0b7 bootstraps provisioned, which existing installations keep.
+PREVIOUS_PYTHON = "3.11.16"
 LINUX_PYTHON_SHA256 = "bd0d0568ccded07bbf1c87727230dc5dd0187e706a87da23c4de78388a229b78"
 LINUX_PYTHON_SIZE = 36237838
 LINUX_UV_ARCHIVE_SHA256 = "6590717592ace991ff83a63fef799e3ad9d33ecc8f96c5d6bdd732496e79337f"

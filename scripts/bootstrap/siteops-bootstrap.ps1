@@ -807,7 +807,8 @@ function Get-ManagedPythonCandidates([string]$Directory) {
     }
 }
 function Select-ManagedPython([string]$Uv, [string]$Directory, [string]$Tools) {
-    # Prefer this runtime when uv manages it, and provision it when uv manages no supported runtime.
+    # An existing Site Ops tool keeps its bound runtime. A new installation uses the pinned
+    # runtime, and uv provisions it when it is absent.
     $pinned = '3.14.7'
     $siteopsHome = Join-Path $Tools 'siteops'
     $existingVersion = ''
@@ -839,11 +840,8 @@ function Select-ManagedPython([string]$Uv, [string]$Directory, [string]$Tools) {
             Fail 'The existing Site Ops runtime is not an available uv-managed Python. Inspect it or run uv tool uninstall siteops after review, then retry.'
         } else { $selected = $selected[0] }
     }
-    if (-not $selected -and $records.Count) {
-        $selected = $records | Sort-Object `
-            @{ Expression = { if ($_.Version -ceq $pinned) { 0 } else { 1 } } }, `
-            @{ Expression = { [version]$_.Version }; Descending = $true } |
-            Select-Object -First 1
+    if (-not $selected) {
+        $selected = $records | Where-Object { $_.Version -ceq $pinned } | Select-Object -First 1
     }
     if (-not $selected) {
         $concrete = Join-Path $Directory "cpython-$pinned-windows-x86_64-none"
@@ -1103,6 +1101,7 @@ if ($SourceCommit) {
     Stage "Release: $Release from $Repository. The source commit will be discovered."
 }
 Stage 'Uses the installed GitHub CLI, checksum-pinned uv 0.12.20, and uv-managed Python.'
+Stage 'A new installation uses CPython 3.14.7. An existing Site Ops installation keeps its runtime.'
 Stage 'Existing uv and Python installations are not upgraded. No account is signed in.'
 if (Get-Command 'uv.exe' -CommandType Application -ErrorAction SilentlyContinue) {
     Stage 'Check: the existing uv executable. Preserve it if another version is installed.'

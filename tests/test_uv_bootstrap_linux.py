@@ -15,7 +15,13 @@ import pytest
 from tests import native_bundle
 from tests.native_bundle import bundle_factory as bundle_factory
 from tests.native_bundle import publish_assets
-from tests.native_uv_consumers import LINUX_PYTHON_SHA256, LINUX_UV_ARCHIVE_SHA256, _unavailable
+from tests.native_uv_consumers import (
+    LINUX_PYTHON_SHA256,
+    LINUX_UV_ARCHIVE_SHA256,
+    MANAGED_PYTHON,
+    PREVIOUS_PYTHON,
+    _unavailable,
+)
 from tests.shell_helpers import bash_path, required_bash
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -133,6 +139,90 @@ def test_linux_bootstrap_installs_through_native_uv_and_the_shipped_helper(
     scenario,
 ):
     _harness(tmp_path, scenario, SCRIPT, published, native_inputs)
+
+
+def _fake_runtime(parent: Path, version: str, root: Path) -> None:
+    """Write a concrete runtime whose interpreter records its use and reports its identity."""
+    minor = version.rpartition(".")[0]
+    concrete = parent / f"cpython-{version}-linux-x86_64-gnu"
+    (concrete / "bin").mkdir(parents=True)
+    for directory in (parent, concrete, concrete / "bin"):
+        directory.chmod(0o755)
+    executable = concrete / "bin" / f"python{minor}"
+    executable.write_text(
+        "#!/usr/bin/env bash\n"
+        f': > "{root}/ran-{version}"\n'
+        f"printf 'cpython {version.replace('.', ' ')} True %s\\n' \"$0\"\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+
+
+@linux_only
+@pytest.mark.parametrize(("present", "bound", "expected"), [
+    pytest.param(("3.10.20", PREVIOUS_PYTHON), None, MANAGED_PYTHON, id="new-beside-older"),
+    pytest.param((PREVIOUS_PYTHON, MANAGED_PYTHON), None, MANAGED_PYTHON, id="new-beside-pinned"),
+    pytest.param((PREVIOUS_PYTHON, MANAGED_PYTHON), PREVIOUS_PYTHON, PREVIOUS_PYTHON, id="bound-previous"),
+    pytest.param(("3.10.20",), "3.10.20", "3.10.20", id="bound-end-of-life"),
+])
+def test_linux_new_installation_uses_only_the_pinned_runtime(tmp_path, present, bound, expected):
+    tmp_path.chmod(0o700)
+    pydir = tmp_path / "python"
+    tools = tmp_path / "tools"
+    source = tmp_path / "source"
+    for version in present:
+        _fake_runtime(pydir, version, tmp_path)
+    _fake_runtime(source, MANAGED_PYTHON, tmp_path)
+    tools.mkdir(mode=0o700)
+    if bound:
+        tool = tools / "siteops"
+        tool.mkdir(mode=0o700)
+        configuration = tool / "pyvenv.cfg"
+        configuration.write_text(
+            f"home = {pydir}/cpython-{bound}-linux-x86_64-gnu/bin\nversion_info = {bound}\n",
+            encoding="utf-8",
+        )
+        configuration.chmod(0o600)
+    text = SCRIPT.read_text(encoding="utf-8")
+    functions = []
+    for name in ("writers_trusted", "trusted_parent", "admit_directory", "admit_file",
+                 "admit_runtime_tree", "select_runtime"):
+        found = re.search(rf"(?ms)^{name}\(\) \{{.*?^\}}", text)
+        assert found, f"The production {name} function is missing."
+        functions.append(found.group(0))
+    script = tmp_path / "select.sh"
+    script.write_text(
+        'set -euo pipefail\numask 077\nuid="$(id -u)"\nprivate_gid=""\n'
+        + "\n".join(functions)
+        + r"""
+fail() { printf 'FAIL: %s\n' "$1"; exit 1; }
+stage() { printf 'STAGE: %s\n' "$1"; }
+# The download source holds only the pinned runtime.
+run_uv() {
+  printf '%s\n' "$*" >> "$TEST_ROOT/uv.log"
+  cp -R -- "$TEST_ROOT/source/cpython-$3-linux-x86_64-gnu" "$pydir/"
+}
+tools="$TEST_ROOT/tools"
+pydir="$TEST_ROOT/python"
+mkdir -p "$pydir"
+select_runtime
+printf 'SELECTED %s\n' "$python"
+""",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["bash", str(script)], cwd=tmp_path, env={**os.environ, "TEST_ROOT": str(tmp_path)},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    minor = expected.rpartition(".")[0]
+    assert f"SELECTED {pydir}/cpython-{expected}-linux-x86_64-gnu/bin/python{minor}" in result.stdout
+    provisioned = MANAGED_PYTHON not in present and not bound
+    log = tmp_path / "uv.log"
+    assert log.exists() is provisioned
+    if provisioned:
+        assert log.read_text(encoding="utf-8") == f"python install {MANAGED_PYTHON} --no-bin --no-registry\n"
+    assert {path.name for path in tmp_path.glob("ran-*")} == {f"ran-{expected}"}
 
 
 def _guard(tmp_path: Path, body: str, *, private_group: bool) -> subprocess.CompletedProcess[str]:

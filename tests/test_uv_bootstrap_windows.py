@@ -14,14 +14,12 @@ import pytest
 
 from tests.native_bundle import bundle_factory as bundle_factory
 from tests.native_bundle import publish_assets
-from tests.native_uv_consumers import MANAGED_PYTHON, MANAGED_PYTHON_MINOR
+from tests.native_uv_consumers import MANAGED_PYTHON, MANAGED_PYTHON_MINOR, PREVIOUS_PYTHON
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "bootstrap" / "siteops-bootstrap.ps1"
 MANAGED_KEY = f"cpython-{MANAGED_PYTHON}-windows-x86_64-none"
-# The runtime that v1.0.0b7 bootstraps provisioned for new installations.
-PREVIOUS_PYTHON = "3.11.16"
-# A later patch of the pinned minor, which only the pin's own preference outranks.
+# A later patch of the pinned minor, which a new installation still does not select.
 NEWER_PYTHON = f"{MANAGED_PYTHON_MINOR}.{int(MANAGED_PYTHON.rpartition('.')[2]) + 2}"
 LIBRARY = f"python{MANAGED_PYTHON_MINOR.replace('.', '')}.dll"
 RUNTIME_RECORD = {
@@ -875,11 +873,18 @@ Select-ManagedPython 'unused' $env:TEST_PYTHON_DIR $env:TEST_TOOLS
     assert "EXISTING_RUNTIME_REUSED" in result.stdout
 
 
-def test_absent_managed_python_is_provisioned_without_aliases_or_registry(tmp_path):
+@pytest.mark.parametrize("older", [(), ("3.10.20", PREVIOUS_PYTHON)], ids=["none", "older-runtimes"])
+def test_absent_managed_python_is_provisioned_without_aliases_or_registry(tmp_path, older):
     source = SCRIPT.read_text(encoding="utf-8")
     selection = source.split("function Select-ManagedPython(", 1)[1].split(
         "    $python = $selected.Python", 1
     )[0]
+    # A new installation never reuses another runtime that uv already manages.
+    for version in older:
+        concrete = tmp_path / "python" / f"cpython-{version}-windows-x86_64-none"
+        concrete.mkdir(parents=True)
+        shutil.copy2(shutil.which("where.exe"), concrete / "python.exe")
+        (concrete / "operator-file").write_text("unchanged", encoding="ascii")
     wrapper = tmp_path / "provision.ps1"
     wrapper.write_text(
         _runtime_functions("Require-PrivateDataRoot", "Require-PrivateExecutablePath")
@@ -925,6 +930,9 @@ Select-ManagedPython 'unused' $env:TEST_PYTHON_DIR $env:TEST_TOOLS
     assert result.returncode == 0, result.stdout + result.stderr
     assert "PROVISION_ACCEPTED" in result.stdout
     assert marker.read_text(encoding="ascii") == "provisioned"
+    for version in older:
+        concrete = tmp_path / "python" / f"cpython-{version}-windows-x86_64-none"
+        assert (concrete / "operator-file").read_text(encoding="ascii") == "unchanged"
 
 
 def test_native_unsafe_explicit_tool_storage_refuses_before_uv(tmp_path):

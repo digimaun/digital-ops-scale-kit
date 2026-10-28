@@ -553,7 +553,7 @@ scenario_tools() {
     die "An unrelated maintenance uv was executed or replaced."
 }
 scenario_runtime() {
-  local concrete mirrored
+  local concrete mirrored mislabeled
   fresh_home runtime-existing
   seed_runtime "$pydir"
   mirrored="$(count "$logs/mirror")"
@@ -595,11 +595,17 @@ scenario_runtime() {
   refuses incomplete-runtime "The uv-managed Python installation is incomplete." "${first[@]}"
   rm -rf -- "$concrete"
   [[ ! -e "$root/runtime-ran" ]] || die "An unadmitted managed runtime was executed."
-  mirrored="$(count "$logs/mirror")"
+  # An existing binding to a concrete key that misstates its runtime is refused.
   seed_runtime "$root/mislabeled"
-  mv -- "$root/mislabeled/cpython-$python_version-linux-x86_64-gnu" "$pydir/cpython-$python_minor.$(( ${python_version##*.} - 1 ))-linux-x86_64-gnu"
+  mislabeled="$python_minor.$(( ${python_version##*.} - 1 ))"
+  mv -- "$root/mislabeled/cpython-$python_version-linux-x86_64-gnu" "$pydir/cpython-$mislabeled-linux-x86_64-gnu"
+  mkdir -p -m 0700 "$tools/siteops"
+  printf 'home = %s\nversion_info = %s\n' "$pydir/cpython-$mislabeled-linux-x86_64-gnu/bin" "$mislabeled" \
+    > "$tools/siteops/pyvenv.cfg"
+  mirrored="$(count "$logs/mirror")"
   refuses mislabeled-runtime "differs from the installed runtime." "${first[@]}"
-  [[ ! -e "$tools/siteops" ]] || die "A mislabeled runtime installed Site Ops."
+  [[ ! -e "$tools/siteops/uv-receipt.toml" && ! -e "$bin/siteops" && "$(count "$logs/mirror")" == "$mirrored" ]] ||
+    die "A mislabeled runtime installed Site Ops."
 }
 scenario_prerequisites() {
   local runs

@@ -513,9 +513,10 @@ def test_each_qualification_cell_runs_only_its_installation_path(cell):
     ]
     runner = ["Install the external qualification tooling"]
     after = ["Install Site Ops from the verified lock", "Install Site Ops from the standalone wheel"]
+    bootstrap = cell["python"] == MANAGED_PYTHON_MINOR
     expected = {
-        "ubuntu": shared + runner + ["Install with the signed Bash bootstrap"] + after,
-        "windows": shared + runner + ["Install with the signed PowerShell bootstrap"] + after,
+        "ubuntu": shared + runner + ["Install with the signed Bash bootstrap"] * bootstrap + after,
+        "windows": shared + runner + ["Install with the signed PowerShell bootstrap"] * bootstrap + after,
         "standard": shared + [STANDARD_USER_STEP],
     }
     kind = "standard" if cell.get("account") == "standard" else cell["os"].split("-")[0]
@@ -527,16 +528,24 @@ def test_each_qualification_cell_runs_only_its_installation_path(cell):
     assert steps == expected[kind]
 
 
-@pytest.mark.parametrize(("runner", "account", "expected"), [
-    pytest.param("Linux", "runner", {"bash", "tooling", "lock", "wheel"}, id="linux-runner"),
-    pytest.param("Windows", "runner", {"powershell", "tooling", "lock", "wheel"}, id="windows-runner"),
-    pytest.param("Windows", "standard", {"standard"}, id="windows-standard-user"),
-    pytest.param("Linux", None, {"bash", "tooling", "lock", "wheel"}, id="linux-missing-account"),
-    pytest.param("Windows", None, {"powershell", "tooling", "lock", "wheel"}, id="windows-missing-account"),
-    pytest.param("macOS", "runner", {"tooling", "lock", "wheel"}, id="other-runner-has-no-bootstrap"),
-    pytest.param("macOS", "standard", set(), id="standard-user-requires-windows"),
+@pytest.mark.parametrize(("runner", "account", "python", "expected"), [
+    pytest.param("Linux", "runner", MANAGED_PYTHON_MINOR, {"bash", "tooling", "lock", "wheel"}, id="linux-runner"),
+    pytest.param("Linux", "runner", "3.13", {"tooling", "lock", "wheel"}, id="linux-other-python"),
+    pytest.param(
+        "Windows", "runner", MANAGED_PYTHON_MINOR, {"powershell", "tooling", "lock", "wheel"}, id="windows-runner",
+    ),
+    pytest.param("Windows", "runner", "3.10", {"tooling", "lock", "wheel"}, id="windows-other-python"),
+    pytest.param("Windows", "standard", MANAGED_PYTHON_MINOR, {"standard"}, id="windows-standard-user"),
+    pytest.param("Linux", None, MANAGED_PYTHON_MINOR, {"bash", "tooling", "lock", "wheel"}, id="linux-missing-account"),
+    pytest.param(
+        "Windows", None, MANAGED_PYTHON_MINOR, {"powershell", "tooling", "lock", "wheel"},
+        id="windows-missing-account",
+    ),
+    pytest.param("Linux", "runner", None, {"tooling", "lock", "wheel"}, id="linux-missing-python"),
+    pytest.param("macOS", "runner", MANAGED_PYTHON_MINOR, {"tooling", "lock", "wheel"}, id="other-runner-has-no-bootstrap"),
+    pytest.param("macOS", "standard", MANAGED_PYTHON_MINOR, set(), id="standard-user-requires-windows"),
 ])
-def test_qualification_installation_guards_use_runner_os_and_account(runner, account, expected):
+def test_qualification_installation_guards_use_runner_os_account_and_python(runner, account, python, expected):
     names = {
         "bash": "Install with the signed Bash bootstrap",
         "powershell": "Install with the signed PowerShell bootstrap",
@@ -545,7 +554,8 @@ def test_qualification_installation_guards_use_runner_os_and_account(runner, acc
         "lock": "Install Site Ops from the verified lock",
         "wheel": "Install Site Ops from the standalone wheel",
     }
-    contexts = {"runner": {"os": runner}, "matrix": {} if account is None else {"account": account}}
+    matrix = {key: value for key, value in (("account", account), ("python", python)) if value is not None}
+    contexts = {"runner": {"os": runner}, "matrix": matrix}
     for key, name in names.items():
         assert truthy(evaluate(_step(REUSABLE["jobs"]["qualify"], name)["if"], contexts)) is (key in expected), name
 
@@ -726,9 +736,8 @@ fi
     return result, log, download
 
 
-@pytest.mark.parametrize("python", QUALIFIED_PYTHONS)
-def test_linux_runner_cells_select_discovery_only_for_the_bootstrap_python(tmp_path, python):
-    result, log, download = _run_linux_bootstrap_cell(tmp_path, python)
+def test_linux_bootstrap_cell_previews_then_installs_the_pinned_source(tmp_path):
+    result, log, download = _run_linux_bootstrap_cell(tmp_path, MANAGED_PYTHON_MINOR)
     assert result.returncode == 0, result.stdout + result.stderr
     pinned = ["--release", "siteops/v0.0.0-ci", "--source-commit", "c" * 40,
         "--repository", "example/publisher", "--source-ref", "refs/heads/feature",
@@ -737,11 +746,9 @@ def test_linux_runner_cells_select_discovery_only_for_the_bootstrap_python(tmp_p
         "--release", "siteops/v0.0.0-ci", "--repository", "example/publisher",
         "--source-ref", "refs/heads/feature", "--caller", "ci.yaml", "--dry-run",
     ]
-    assert _invocations(log) == ([preview, pinned] if python == MANAGED_PYTHON_MINOR else [pinned])
-    assert (tmp_path / "bootstrap-source" / BOOTSTRAP_SH).exists() is (python == MANAGED_PYTHON_MINOR)
-    if python == MANAGED_PYTHON_MINOR:
-        for name in (BOOTSTRAP_SH, ARCHIVE_NAME, ARCHIVE_NAME + ATTESTATION_SUFFIX):
-            assert (tmp_path / "bootstrap-source" / name).read_bytes() == (download / name).read_bytes()
+    assert _invocations(log) == [preview, pinned]
+    for name in (BOOTSTRAP_SH, ARCHIVE_NAME, ARCHIVE_NAME + ATTESTATION_SUFFIX):
+        assert (tmp_path / "bootstrap-source" / name).read_bytes() == (download / name).read_bytes()
 
 
 @pytest.mark.parametrize("fault", ["fail", "missing", "wrong", "write", "duplicate"])
@@ -756,8 +763,7 @@ def test_linux_preview_must_pin_the_source_without_creating_data(tmp_path, fault
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Runner invocation uses native PowerShell 5.1.")
-@pytest.mark.parametrize("python", QUALIFIED_PYTHONS)
-def test_windows_runner_cells_select_discovery_only_for_the_bootstrap_python(tmp_path, python):
+def test_windows_bootstrap_cell_previews_then_installs_the_pinned_source(tmp_path):
     child = (
         '[IO.File]::AppendAllText($env:TEST_ARGUMENTS, '
         '((ConvertTo-Json -InputObject $PSBoundParameters -Compress) + "`n"))\n'
@@ -768,13 +774,13 @@ def test_windows_runner_cells_select_discovery_only_for_the_bootstrap_python(tmp
         (tmp_path / name).write_bytes(b"staged signed asset")
     result = _run_windows_bootstrap_qualifier(
         tmp_path, child,
-        {"MATRIX_PYTHON": python, "TEST_ARGUMENTS": str(log),
+        {"MATRIX_PYTHON": MANAGED_PYTHON_MINOR, "TEST_ARGUMENTS": str(log),
          "ARCHIVE_NAME": ARCHIVE_NAME, "ATTESTATION_SUFFIX": ATTESTATION_SUFFIX},
         success_marker=True, stage_source=True,
     )
     assert result.returncode == 0, result.stdout + result.stderr
     calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
-    assert len(calls) == (2 if python == MANAGED_PYTHON_MINOR else 1)
+    assert len(calls) == 2
     arguments = calls[-1]
     assert arguments["SourceCommit"] == "c" * 40
     assert arguments["Release"] == "siteops/v0.0.0-ci"
@@ -783,18 +789,15 @@ def test_windows_runner_cells_select_discovery_only_for_the_bootstrap_python(tmp
     assert arguments["Caller"] == "ci.yaml"
     assert arguments["Yes"]["IsPresent"]
     assert "DryRun" not in arguments
-    if python == MANAGED_PYTHON_MINOR:
-        preview = calls[0]
-        assert preview["DryRun"]["IsPresent"]
-        assert "SourceCommit" not in preview and "Yes" not in preview
-        assert {key: value for key, value in preview.items() if key != "DryRun"} == {
-            key: value for key, value in arguments.items() if key not in {"SourceCommit", "Yes"}
-        }
-    assert (tmp_path / "bootstrap-source").exists() is (python == MANAGED_PYTHON_MINOR)
-    if python == MANAGED_PYTHON_MINOR:
-        assert (tmp_path / "bootstrap-source" / "bootstrap.ps1").read_bytes() == (tmp_path / "bootstrap.ps1").read_bytes()
-        for name in (ARCHIVE_NAME, ARCHIVE_NAME + ATTESTATION_SUFFIX):
-            assert (tmp_path / "bootstrap-source" / name).read_bytes() == (tmp_path / name).read_bytes()
+    preview = calls[0]
+    assert preview["DryRun"]["IsPresent"]
+    assert "SourceCommit" not in preview and "Yes" not in preview
+    assert {key: value for key, value in preview.items() if key != "DryRun"} == {
+        key: value for key, value in arguments.items() if key not in {"SourceCommit", "Yes"}
+    }
+    assert (tmp_path / "bootstrap-source" / "bootstrap.ps1").read_bytes() == (tmp_path / "bootstrap.ps1").read_bytes()
+    for name in (ARCHIVE_NAME, ARCHIVE_NAME + ATTESTATION_SUFFIX):
+        assert (tmp_path / "bootstrap-source" / name).read_bytes() == (tmp_path / name).read_bytes()
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Preview qualification runs native PowerShell 5.1.")

@@ -16,6 +16,7 @@ from tests import native_bundle
 from tests.native_bundle import bundle_factory as bundle_factory
 from tests.native_bundle import publish_assets
 from tests.native_uv_consumers import (
+    LINUX_PREVIOUS_PYTHON_SHA256,
     LINUX_PYTHON_SHA256,
     LINUX_UV_ARCHIVE_SHA256,
     MANAGED_PYTHON,
@@ -101,7 +102,7 @@ def published(bundle_factory, tmp_path, monkeypatch) -> tuple[Path, Path, Path]:
     return archives[0], archives[1], archive
 
 
-def _harness(tmp_path, scenario, script, published, native_inputs):
+def _harness(tmp_path, scenario, script, published, native_inputs, **extra):
     result = subprocess.run(
         [str(required_bash()), bash_path(HARNESS), bash_path(script), bash_path(HELPER)],
         cwd=tmp_path,
@@ -117,6 +118,7 @@ def _harness(tmp_path, scenario, script, published, native_inputs):
             "TEST_REFERENCED_ARCHIVE": str(published[2]),
             "TEST_UV_ARCHIVE": str(native_inputs["SITEOPS_TEST_UV_ARCHIVE"]),
             "TEST_PYTHON_ARCHIVE": str(native_inputs["SITEOPS_TEST_UV_PYTHON_ARCHIVE"]),
+            **extra,
         },
         capture_output=True,
         text=True,
@@ -139,6 +141,30 @@ def test_linux_bootstrap_installs_through_native_uv_and_the_shipped_helper(
     scenario,
 ):
     _harness(tmp_path, scenario, SCRIPT, published, native_inputs)
+
+
+@pytest.fixture(scope="module")
+def previous_archive() -> Path:
+    """Return the CPython archive that v1.0.0b7 bootstraps installed."""
+    value = os.environ.get("SITEOPS_TEST_UV_PREVIOUS_PYTHON_ARCHIVE")
+    path = Path(value) if value else None
+    if (path is None or not path.is_file()
+            or hashlib.sha256(path.read_bytes()).hexdigest() != LINUX_PREVIOUS_PYTHON_SHA256):
+        _unavailable("SITEOPS_TEST_UV_PREVIOUS_PYTHON_ARCHIVE must name the previous pinned Linux archive.")
+    return path
+
+
+@linux_only
+def test_linux_existing_installation_keeps_its_runtime_beside_the_pinned_one(
+    tmp_path,
+    published,
+    native_inputs,
+    previous_archive,
+):
+    _harness(
+        tmp_path, "previous", SCRIPT, published, native_inputs,
+        TEST_PREVIOUS_PYTHON_ARCHIVE=str(previous_archive),
+    )
 
 
 def _fake_runtime(parent: Path, version: str, root: Path) -> None:

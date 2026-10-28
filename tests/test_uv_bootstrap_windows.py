@@ -19,6 +19,7 @@ from tests.native_uv_consumers import MANAGED_PYTHON, MANAGED_PYTHON_MINOR, PREV
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "bootstrap" / "siteops-bootstrap.ps1"
 MANAGED_KEY = f"cpython-{MANAGED_PYTHON}-windows-x86_64-none"
+PREVIOUS_KEY = f"cpython-{PREVIOUS_PYTHON}-windows-x86_64-none"
 # A later patch of the pinned minor, which a new installation still does not select.
 NEWER_PYTHON = f"{MANAGED_PYTHON_MINOR}.{int(MANAGED_PYTHON.rpartition('.')[2]) + 2}"
 LIBRARY = f"python{MANAGED_PYTHON_MINOR.replace('.', '')}.dll"
@@ -99,12 +100,11 @@ def _native_fixture():
     return Path(executable), Path(archive)
 
 
-def _managed_fixture():
+def _managed_fixture(*keys: str):
     selected = os.environ.get("SITEOPS_TEST_UV_PYTHON_DIR")
     directory = Path(selected) if selected else None
-    if (
-        directory is None
-        or not (directory / MANAGED_KEY / "python.exe").is_file()
+    if directory is None or not all(
+        (directory / key / "python.exe").is_file() for key in (MANAGED_KEY, *keys)
     ):
         if os.environ.get("CI") or os.environ.get("SITEOPS_REQUIRE_WINDOWS_UV") == "1":
             pytest.fail("The required managed Python fixture is unavailable.")
@@ -984,14 +984,8 @@ $env:UV_TOOL_DIR = $env:TEST_UNSAFE
         )
 
 
-def test_native_production_install_block_executes_the_actual_verified_helper(
-    bundle_factory,
-    tmp_path,
-):
-    executable, _ = _native_fixture()
-    managed = _managed_fixture()
-    root, manifest = bundle_factory()
-    archive, _ = publish_assets(root, manifest, tmp_path / "assets")
+def _production_install_wrapper(wrapper: Path, *, pinned: str = MANAGED_PYTHON) -> Path:
+    """Write the production install block with fixture inputs and an optional earlier pin."""
     source = SCRIPT.read_text(encoding="utf-8")
     install = source.split("    $installerHelper = Get-InstallerHelper $archive $download $engineVersion\n", 1)[
         1
@@ -999,22 +993,22 @@ def test_native_production_install_block_executes_the_actual_verified_helper(
         '    Stage "Command directory:',
         1,
     )[0]
-    download = tmp_path / "staging"
-    data = tmp_path / "siteops"
-    wrapper = tmp_path / "production-install.ps1"
+    functions = _runtime_functions(
+        "Get-InstallerHelper",
+        "Check-Payload",
+        "Require-PrivateDataRoot",
+        "Ensure-UvStorage",
+        "Invoke-Uv",
+        "Require-PrivateExecutablePath",
+        "Assert-UvArchive",
+        "Assert-PinnedUv",
+        "Select-Uv",
+        "Select-ManagedPython",
+    )
+    current = f"    $pinned = '{MANAGED_PYTHON}'\n"
+    assert functions.count(current) == 1
     wrapper.write_text(
-        _runtime_functions(
-            "Get-InstallerHelper",
-            "Check-Payload",
-            "Require-PrivateDataRoot",
-            "Ensure-UvStorage",
-            "Invoke-Uv",
-            "Require-PrivateExecutablePath",
-            "Assert-UvArchive",
-            "Assert-PinnedUv",
-            "Select-Uv",
-            "Select-ManagedPython",
-        )
+        functions.replace(current, f"    $pinned = '{pinned}'\n")
         + """
 function Native([string]$name) {
     if ($name -ceq 'uv.exe') { return $env:TEST_UV }
@@ -1035,12 +1029,35 @@ $engineCommit = $SourceCommit
 $engineRef = $SourceRef
 $engineVersion = ''
 $Replace = $env:TEST_REPLACE -eq '1'
+$bundleId = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
 """
         + "    $installerHelper = Get-InstallerHelper $archive $download $engineVersion\n"
         + install
         + "\n'PRODUCTION_INSTALL_ACCEPTED'\n",
         encoding="utf-8",
     )
+    return wrapper
+
+
+def _runtime_binding(tool: Path) -> tuple[str, Path]:
+    settings = dict(
+        line.split(" = ", 1) for line in (tool / "pyvenv.cfg").read_text(encoding="utf-8").splitlines()
+        if " = " in line
+    )
+    return settings["version_info"], Path(settings["home"])
+
+
+def test_native_production_install_block_executes_the_actual_verified_helper(
+    bundle_factory,
+    tmp_path,
+):
+    executable, _ = _native_fixture()
+    managed = _managed_fixture()
+    root, manifest = bundle_factory()
+    archive, _ = publish_assets(root, manifest, tmp_path / "assets")
+    download = tmp_path / "staging"
+    data = tmp_path / "siteops"
+    wrapper = _production_install_wrapper(tmp_path / "production-install.ps1")
     env = dict(
         TEST_UV=executable,
         TEST_ARCHIVE=archive,
@@ -1085,6 +1102,48 @@ $Replace = $env:TEST_REPLACE -eq '1'
     assert replacement.returncode == 0, replacement.stdout + replacement.stderr
     assert "PRODUCTION_INSTALL_ACCEPTED" in replacement.stdout
     assert package.read_bytes() != damaged
+
+
+def test_native_previous_runtime_installation_keeps_its_binding_beside_the_pin(
+    bundle_factory,
+    tmp_path,
+):
+    executable, _ = _native_fixture()
+    managed = _managed_fixture(PREVIOUS_KEY)
+    first_root, first_manifest = bundle_factory(1)
+    second_root, second_manifest = bundle_factory(2)
+    first, _ = publish_assets(first_root, first_manifest, tmp_path / "first")
+    second, _ = publish_assets(second_root, second_manifest, tmp_path / "second")
+    # The v1.0.0b7 bootstrap pinned the previous runtime. Its installation is real.
+    previous = _production_install_wrapper(tmp_path / "previous.ps1", pinned=PREVIOUS_PYTHON)
+    current = _production_install_wrapper(tmp_path / "current.ps1")
+    existing = tmp_path / "existing"
+    fresh = tmp_path / "fresh"
+    shared = dict(TEST_UV=executable, TEST_DATA=tmp_path / "siteops", UV_PYTHON_INSTALL_DIR=managed)
+
+    def install(wrapper, storage, archive, label, replace=""):
+        result = _run(
+            wrapper, tmp_path, **shared, TEST_ARCHIVE=archive, TEST_DOWNLOAD=tmp_path / f"download-{label}",
+            UV_TOOL_DIR=storage / "tools", UV_TOOL_BIN_DIR=storage / "bin", TEST_REPLACE=replace,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "PRODUCTION_INSTALL_ACCEPTED" in result.stdout
+        assert "Provisioning uv-managed CPython" not in result.stdout
+        return subprocess.run(
+            [str(storage / "bin" / "siteops.exe"), "--version"],
+            capture_output=True, text=True, timeout=30, check=True,
+        ).stdout.strip()
+
+    assert install(previous, existing, first, "previous") == f"siteops {first_manifest.version}"
+    tool = existing / "tools" / "siteops"
+    assert _runtime_binding(tool) == (PREVIOUS_PYTHON, managed / PREVIOUS_KEY)
+    configuration = (tool / "pyvenv.cfg").read_bytes()
+    assert install(current, existing, first, "repeat") == f"siteops {first_manifest.version}"
+    assert (tool / "pyvenv.cfg").read_bytes() == configuration
+    assert install(current, existing, second, "replace", "1") == f"siteops {second_manifest.version}"
+    assert _runtime_binding(tool) == (PREVIOUS_PYTHON, managed / PREVIOUS_KEY)
+    assert install(current, fresh, first, "fresh") == f"siteops {first_manifest.version}"
+    assert _runtime_binding(fresh / "tools" / "siteops") == (MANAGED_PYTHON, managed / MANAGED_KEY)
 
 
 @pytest.mark.parametrize(

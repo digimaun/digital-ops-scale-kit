@@ -21,7 +21,7 @@ from tests.bootstrap_discovery_helpers import (
     reference,
     run_bootstrap,
 )
-from tests.native_uv_consumers import MANAGED_PYTHON
+from tests.native_uv_consumers import MANAGED_PYTHON, PREVIOUS_PYTHON
 from tests.shell_helpers import bash_path, required_bash
 from tests.verification_helpers import verified_observation
 from tests.yaml_documents import cached_safe_load
@@ -694,24 +694,26 @@ def test_windows_bootstrap_checks_managed_executables_before_running_them():
     )
 
 
-# Each surface that names the managed CPython the bootstraps provision.
-RUNTIME_SURFACES = (
-    "scripts/bootstrap/siteops-bootstrap.sh",
-    "scripts/bootstrap/siteops-bootstrap.ps1",
-    "scripts/render-siteops-release.py",
-    ".github/workflows/ci.yaml",
-    ".github/actions/setup-published-siteops/action.yaml",
-    "docs/install-siteops.md",
-    "docs/e2e-testing.md",
-    "tests/fixtures/prepare-native-uv.sh",
-    "tests/fixtures/bootstrap-harness.sh",
-)
+# Each surface that names the managed CPython the bootstraps provision. Test fixtures
+# also name the runtime that existing v1.0.0b7 installations keep.
+RUNTIME_SURFACES = {
+    "scripts/bootstrap/siteops-bootstrap.sh": set(),
+    "scripts/bootstrap/siteops-bootstrap.ps1": set(),
+    "scripts/render-siteops-release.py": set(),
+    ".github/workflows/ci.yaml": {PREVIOUS_PYTHON},
+    ".github/actions/setup-published-siteops/action.yaml": set(),
+    "docs/install-siteops.md": set(),
+    "docs/e2e-testing.md": set(),
+    "tests/fixtures/prepare-native-uv.sh": {PREVIOUS_PYTHON},
+    "tests/fixtures/bootstrap-harness.sh": {PREVIOUS_PYTHON},
+}
 
 
 @pytest.mark.parametrize("surface", RUNTIME_SURFACES)
 def test_every_runtime_surface_names_the_bootstrap_python(surface):
     text = (ROOT / surface).read_text(encoding="utf-8")
-    assert set(re.findall(r"(?<![0-9.])3\.1[0-9]\.[0-9]+(?![0-9.])", text)) == {MANAGED_PYTHON}
+    found = set(re.findall(r"(?<![0-9.])3\.1[0-9]\.[0-9]+(?![0-9.])", text))
+    assert found == {MANAGED_PYTHON} | RUNTIME_SURFACES[surface]
 
 
 def test_windows_bootstrap_compares_names_ordinally():

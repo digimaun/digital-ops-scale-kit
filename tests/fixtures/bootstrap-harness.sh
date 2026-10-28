@@ -27,6 +27,8 @@ uv_url=https://github.com/astral-sh/uv/releases/download/0.12.20/uv-x86_64-unkno
 uv_sha=b8299463da6fa7da3b94464444d252d0afca8ac6c96cb229f1baf4012f365246
 python_version=3.14.7
 python_minor="${python_version%.*}"
+# The v1.0.0b7 bootstrap pinned this runtime, so its installations are bound to it.
+previous_version=3.11.16
 first=(--release siteops/v1.0.0b1 --source-commit "$(printf 'a%.0s' {1..40})" --yes)
 second=(--release siteops/v1.0.0b2 --source-commit "$(printf 'b%.0s' {1..40})" --yes)
 first_version=1.0.0b1+build.1.1.gaaaaaaaaaaaa
@@ -607,6 +609,56 @@ scenario_runtime() {
   [[ ! -e "$tools/siteops/uv-receipt.toml" && ! -e "$bin/siteops" && "$(count "$logs/mirror")" == "$mirrored" ]] ||
     die "A mislabeled runtime installed Site Ops."
 }
+binding() {
+  grep -qxF "home = $pydir/cpython-$1-linux-x86_64-gnu/bin" "$tools/siteops/pyvenv.cfg" &&
+    grep -qxF "version_info = $1" "$tools/siteops/pyvenv.cfg"
+}
+uninstall() {
+  env -i HOME="$HOME" PATH="$system" "$bin/uv" tool uninstall siteops --no-config \
+    > "$logs/$1.out" 2>&1 || die "Stock uv could not remove Site Ops."
+}
+scenario_previous() {
+  local configuration
+  [[ -f "${TEST_PREVIOUS_PYTHON_ARCHIVE:-}" ]] || die "The previous runtime archive is required."
+  cp -- "$TEST_PREVIOUS_PYTHON_ARCHIVE" \
+    "$root/mirror/20260924/cpython-$previous_version+20260924-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+  # The emulated v1.0.0b7 bootstrap differs only by its pin, as the released one does.
+  sed "s/^  local pinned=$python_version\$/  local pinned=$previous_version/" "$bootstrap" \
+    > "$root/previous-bootstrap.sh"
+  grep -qxF "  local pinned=$previous_version" "$root/previous-bootstrap.sh" ||
+    die "The previous bootstrap could not be emulated."
+  fresh_home previous
+  bootstrap="$root/previous-bootstrap.sh" succeeds previous-install "${first[@]}"
+  [[ "$(count "$logs/mirror")" == 1 ]] && binding "$previous_version" ||
+    die "The previous bootstrap did not install on its own runtime."
+
+  # A new installation provisions the pinned runtime rather than reuse an older one.
+  uninstall previous-uninstall
+  succeeds new-beside-previous "${first[@]}"
+  [[ "$(count "$logs/mirror")" == 2 ]] && binding "$python_version" ||
+    die "A new installation did not provision and select the pinned runtime."
+  [[ -x "$pydir/cpython-$previous_version-linux-x86_64-gnu/bin/python${previous_version%.*}" ]] ||
+    die "A new installation changed the previous runtime."
+
+  # An existing installation keeps its runtime while the pinned one is present.
+  uninstall new-uninstall
+  bootstrap="$root/previous-bootstrap.sh" succeeds previous-again "${first[@]}"
+  binding "$previous_version" || die "The previous bootstrap did not reuse its own runtime."
+  configuration="$(sha256sum < "$tools/siteops/pyvenv.cfg")"
+  succeeds previous-repeat "${first[@]}"
+  [[ "$(sha256sum < "$tools/siteops/pyvenv.cfg")" == "$configuration" ]] ||
+    die "Repeat installation changed the existing runtime binding."
+  succeeds previous-replace "${second[@]}" --replace
+  [[ "$(installed_version "$bin")" == "siteops $second_version" ]] && binding "$previous_version" ||
+    die "Replacement did not keep the existing runtime."
+  [[ "$(count "$logs/mirror")" == 2 ]] || die "An existing installation provisioned another runtime."
+
+  # Once that installation is removed, the next one uses the pinned runtime without a download.
+  uninstall previous-final-uninstall
+  succeeds new-after-previous "${first[@]}"
+  [[ "$(count "$logs/mirror")" == 2 ]] && binding "$python_version" ||
+    die "A new installation beside the previous runtime did not use the pinned one."
+}
 scenario_prerequisites() {
   local runs
   fresh_home prerequisites
@@ -697,7 +749,7 @@ PY
 }
 
 case "$scenario" in
-  journey|root|storage|policy|tools|runtime|prerequisites|content) "scenario_$scenario" ;;
+  journey|root|storage|policy|tools|runtime|prerequisites|content|previous) "scenario_$scenario" ;;
   *) die "Unknown scenario $scenario." ;;
 esac
 [[ ! -s "$logs/rejected" ]] || { cat "$logs/rejected" >&2; die "An unexpected tool call was made."; }

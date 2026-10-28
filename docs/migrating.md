@@ -87,7 +87,8 @@ New installations, and the wheel command in the release notes, use CPython
 
 On a host that cannot download CPython 3.14.7, allow uv's runtime source,
 set an approved HTTPS `UV_PYTHON_INSTALL_MIRROR`, or run
-`uv python install 3.14.7 --no-bin --no-registry` beforehand.
+`uv python install 3.14.7 --no-bin --no-registry` beforehand. Otherwise the
+bootstrap stops with `CPython 3.14.7 could not be downloaded.`
 
 To move a bootstrap installation to CPython 3.14.7, run
 `uv tool uninstall siteops`, then the new release's bootstrap command.

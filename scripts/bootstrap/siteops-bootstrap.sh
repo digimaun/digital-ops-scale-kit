@@ -213,6 +213,26 @@ admit_runtime_tree() {
       fail "The uv-managed Python links outside its concrete installation."
   done < <(find "$concrete" -type l -print0)
 }
+# uv's report can name the runtime source, so it only selects one of these messages.
+provision_runtime() {
+  local version="$1" report="$staging/python-install" line download=false
+  local remedy="Allow uv's runtime source, set an approved HTTPS UV_PYTHON_INSTALL_MIRROR, or prepare the runtime with uv python install $version --no-bin --no-registry, then retry."
+  run_uv python install "$version" --no-bin --no-registry 2>&1 > /dev/null |
+    { head -c 65536 > "$report"; cat > /dev/null; } && return 0
+  if [[ -f "$report" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      case "$line" in
+        *"Hash mismatch for \`cpython-$version-linux-x86_64-gnu\`"*)
+          fail "The downloaded CPython $version archive did not match its expected digest and was not used. Check the runtime source, mirror or proxy that served it, including UV_PYTHON_INSTALL_MIRROR if it is set." ;;
+        *"Failed to download "*) download=true ;;
+      esac
+    done < "$report"
+  fi
+  if $download; then
+    fail "CPython $version could not be downloaded. Its runtime source, mirror or proxy could not be reached or refused the request. $remedy"
+  fi
+  fail "CPython $version could not be provisioned through uv. $remedy"
+}
 # Select a concrete key without uv discovery, which runs every listed interpreter.
 # An existing Site Ops tool keeps its bound runtime. A new installation uses the
 # pinned runtime, and uv provisions it when it is absent.
@@ -241,8 +261,7 @@ select_runtime() {
     selected="$pinned"
     if [[ ! -e "$pydir/cpython-$pinned-linux-x86_64-gnu" && ! -L "$pydir/cpython-$pinned-linux-x86_64-gnu" ]]; then
       stage "Provisioning uv-managed CPython $pinned without command aliases."
-      run_uv python install "$pinned" --no-bin --no-registry > /dev/null 2>&1 ||
-        fail "The uv-managed Python could not be provisioned. Check the approved runtime source."
+      provision_runtime "$pinned"
     fi
   fi
   minor="${selected%.*}"

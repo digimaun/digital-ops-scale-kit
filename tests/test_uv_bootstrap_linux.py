@@ -188,7 +188,7 @@ def test_linux_existing_installation_keeps_its_runtime_beside_the_pinned_one(
 
 
 @linux_only
-def test_linux_bootstrap_refuses_a_mirrored_runtime_with_another_digest(
+def test_linux_bootstrap_names_why_a_mirrored_runtime_was_refused(
     tmp_path,
     published,
     native_inputs,
@@ -211,6 +211,41 @@ def _fake_runtime(parent: Path, version: str, root: Path) -> None:
         encoding="utf-8",
     )
     executable.chmod(0o755)
+
+
+def _select_runtime(tmp_path: Path, run_uv: str) -> subprocess.CompletedProcess[str]:
+    """Run the production runtime selection with a uv double and the fixture storage."""
+    text = SCRIPT.read_text(encoding="utf-8")
+    functions = []
+    for name in ("writers_trusted", "trusted_parent", "admit_directory", "admit_file",
+                 "admit_runtime_tree", "provision_runtime", "select_runtime"):
+        found = re.search(rf"(?ms)^{name}\(\) \{{.*?^\}}", text)
+        assert found, f"The production {name} function is missing."
+        functions.append(found.group(0))
+    script = tmp_path / "select.sh"
+    script.write_text(
+        'set -euo pipefail\numask 077\nuid="$(id -u)"\nprivate_gid=""\n'
+        + "\n".join(functions)
+        + r"""
+fail() { printf 'FAIL: %s\n' "$1"; exit 1; }
+stage() { printf 'STAGE: %s\n' "$1"; }
+"""
+        + run_uv
+        + r"""
+tools="$TEST_ROOT/tools"
+pydir="$TEST_ROOT/python"
+staging="$TEST_ROOT/staging"
+mkdir -p "$pydir"
+mkdir -m 0700 "$staging"
+select_runtime
+printf 'SELECTED %s\n' "$python"
+""",
+        encoding="utf-8",
+    )
+    return subprocess.run(
+        ["bash", str(script)], cwd=tmp_path, env={**os.environ, "TEST_ROOT": str(tmp_path)},
+        capture_output=True, text=True, timeout=30,
+    )
 
 
 @linux_only
@@ -238,37 +273,13 @@ def test_linux_new_installation_uses_only_the_pinned_runtime(tmp_path, present, 
             encoding="utf-8",
         )
         configuration.chmod(0o600)
-    text = SCRIPT.read_text(encoding="utf-8")
-    functions = []
-    for name in ("writers_trusted", "trusted_parent", "admit_directory", "admit_file",
-                 "admit_runtime_tree", "select_runtime"):
-        found = re.search(rf"(?ms)^{name}\(\) \{{.*?^\}}", text)
-        assert found, f"The production {name} function is missing."
-        functions.append(found.group(0))
-    script = tmp_path / "select.sh"
-    script.write_text(
-        'set -euo pipefail\numask 077\nuid="$(id -u)"\nprivate_gid=""\n'
-        + "\n".join(functions)
-        + r"""
-fail() { printf 'FAIL: %s\n' "$1"; exit 1; }
-stage() { printf 'STAGE: %s\n' "$1"; }
-# The download source holds only the pinned runtime.
+    # The download source holds only the pinned runtime.
+    result = _select_runtime(tmp_path, r"""
 run_uv() {
   printf '%s\n' "$*" >> "$TEST_ROOT/uv.log"
   cp -R -- "$TEST_ROOT/source/cpython-$3-linux-x86_64-gnu" "$pydir/"
 }
-tools="$TEST_ROOT/tools"
-pydir="$TEST_ROOT/python"
-mkdir -p "$pydir"
-select_runtime
-printf 'SELECTED %s\n' "$python"
-""",
-        encoding="utf-8",
-    )
-    result = subprocess.run(
-        ["bash", str(script)], cwd=tmp_path, env={**os.environ, "TEST_ROOT": str(tmp_path)},
-        capture_output=True, text=True, timeout=30,
-    )
+""")
     assert result.returncode == 0, result.stdout + result.stderr
     minor = expected.rpartition(".")[0]
     assert f"SELECTED {pydir}/cpython-{expected}-linux-x86_64-gnu/bin/python{minor}" in result.stdout
@@ -278,6 +289,42 @@ printf 'SELECTED %s\n' "$python"
     if provisioned:
         assert log.read_text(encoding="utf-8") == f"python install {MANAGED_PYTHON} --no-bin --no-registry\n"
     assert {path.name for path in tmp_path.glob("ran-*")} == {f"ran-{expected}"}
+
+
+@linux_only
+@pytest.mark.parametrize(("report", "code"), [
+    pytest.param(
+        f"Downloading cpython-{MANAGED_PYTHON}-linux-x86_64-gnu (download) (24.1MiB)\n"
+        f"error: Failed to install cpython-{MANAGED_PYTHON}-linux-x86_64-gnu\n"
+        "  cause: Failed to extract archive: private-source-detail.tar.gz\n"
+        "  cause: No space left on device (os error 28)",
+        2,
+        id="extraction",
+    ),
+    pytest.param("", 124, id="silent-timeout"),
+    # Only a bounded part of uv's report is read.
+    pytest.param(
+        "x" * 70000 + "\n  cause: Failed to download https://private-source-detail.invalid/cpython.tar.gz\n",
+        1,
+        id="beyond-bound",
+    ),
+])
+def test_linux_other_runtime_provisioning_failures_keep_the_runtime_remedies(tmp_path, report, code):
+    tmp_path.chmod(0o700)
+    (tmp_path / "tools").mkdir(mode=0o700)
+    # An older managed runtime must not replace the refused download.
+    _fake_runtime(tmp_path / "python", PREVIOUS_PYTHON, tmp_path)
+    (tmp_path / "report").write_text(report, encoding="utf-8")
+    result = _select_runtime(tmp_path, f'run_uv() {{ cat -- "$TEST_ROOT/report" >&2; return {code}; }}\n')
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert result.stdout.splitlines()[-1] == (
+        f"FAIL: CPython {MANAGED_PYTHON} could not be provisioned through uv. Allow uv's runtime source, "
+        "set an approved HTTPS UV_PYTHON_INSTALL_MIRROR, or prepare the runtime with "
+        f"uv python install {MANAGED_PYTHON} --no-bin --no-registry, then retry."
+    )
+    assert "private-source-detail" not in result.stdout + result.stderr
+    assert "SELECTED" not in result.stdout
+    assert not list(tmp_path.glob("ran-*"))
 
 
 def _guard(tmp_path: Path, body: str, *, private_group: bool) -> subprocess.CompletedProcess[str]:

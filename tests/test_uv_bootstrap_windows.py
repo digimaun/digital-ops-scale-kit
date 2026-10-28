@@ -55,7 +55,7 @@ def _runtime_functions(*names):
     source = SCRIPT.read_text(encoding="utf-8")
     helpers = tuple(
         name
-        for name in ("Get-ManagedPythonCandidates", "Require-PrivateRuntimeTree")
+        for name in ("Get-ManagedPythonCandidates", "Require-PrivateRuntimeTree", "Get-RuntimeFailure")
         if f"function {name}(" in source
     )
     return _functions(*names, *helpers)
@@ -243,7 +243,10 @@ def test_windows_install_admits_storage_and_runtime_before_execution():
     assert source.index(
         "Require-PrivateRuntimeTree $toolHome $toolDirectory"
     ) < source.index("$installed = Check-Payload")
-    assert "uv python install" not in source
+    # The command is spelled only in the remedy that a provisioning failure names.
+    assert source.count("uv python install") == source.count(
+        "prepare the runtime with uv python install $Version --no-bin --no-registry"
+    ) == 1
     assert "'--no-bin', '--no-registry'" in source
     assert f"$pinned = '{MANAGED_PYTHON}'" in runtime_selection
     assert '"cpython-$pinned-windows-x86_64-none"' in runtime_selection
@@ -933,6 +936,100 @@ Select-ManagedPython 'unused' $env:TEST_PYTHON_DIR $env:TEST_TOOLS
     for version in older:
         concrete = tmp_path / "python" / f"cpython-{version}-windows-x86_64-none"
         assert (concrete / "operator-file").read_text(encoding="ascii") == "unchanged"
+
+
+_RUNTIME_REMEDY = (
+    "Allow uv's runtime source, set an approved HTTPS UV_PYTHON_INSTALL_MIRROR, or prepare the runtime "
+    f"with uv python install {MANAGED_PYTHON} --no-bin --no-registry, then retry."
+)
+_RUNTIME_GENERIC = f"CPython {MANAGED_PYTHON} could not be provisioned through uv. {_RUNTIME_REMEDY}"
+_UV_INSTALL_FAILED = f"error: Failed to install {MANAGED_KEY}\n"
+
+
+@pytest.mark.parametrize("shell", ["powershell.exe", "pwsh"])
+@pytest.mark.parametrize(
+    ("report", "code", "expected"),
+    [
+        pytest.param(
+            f"Downloading {MANAGED_KEY} (download) (21.3MiB)\n Downloaded {MANAGED_KEY} (download)\n"
+            f"{_UV_INSTALL_FAILED}  cause: Hash mismatch for `{MANAGED_KEY}`\n\n"
+            f"         Expected:\n         {'b' * 64}\n\n         Computed:\n         {'c' * 64}\n",
+            1,
+            f"The downloaded CPython {MANAGED_PYTHON} archive did not match its expected digest and was "
+            "not used. Check the runtime source, mirror or proxy that served it, including "
+            "UV_PYTHON_INSTALL_MIRROR if it is set.",
+            id="digest",
+        ),
+        pytest.param(
+            f"{_UV_INSTALL_FAILED}  cause: Request failed after 3 retries in 10.8s\n"
+            "  cause: Failed to download https://private.example.invalid/python/cpython.tar.gz\n"
+            "  cause: error sending request for url (https://private.example.invalid/python/cpython.tar.gz)\n"
+            "  cause: client error (Connect)\n  cause: tcp connect error\n"
+            "  cause: No connection could be made because the target machine actively refused it. "
+            "(os error 10061)\n",
+            1,
+            f"CPython {MANAGED_PYTHON} could not be downloaded. Its runtime source, mirror or proxy "
+            f"could not be reached or refused the request. {_RUNTIME_REMEDY}",
+            id="unreachable",
+        ),
+        pytest.param(
+            f"Downloading {MANAGED_KEY} (download) (21.3MiB)\n{_UV_INSTALL_FAILED}"
+            "  cause: Failed to extract archive: private.example.invalid.tar.gz\n"
+            "  cause: There is not enough space on the disk. (os error 112)\n",
+            2,
+            _RUNTIME_GENERIC,
+            id="extraction",
+        ),
+        pytest.param("", 1, _RUNTIME_GENERIC, id="silent"),
+        # Only a bounded part of uv's report is read.
+        pytest.param(
+            "x" * 70000 + "\n  cause: Failed to download https://private.example.invalid/python/cpython.tar.gz\n",
+            1,
+            _RUNTIME_GENERIC,
+            id="beyond-bound",
+        ),
+    ],
+)
+def test_native_runtime_provisioning_failure_names_its_cause(tmp_path, shell, report, code, expected):
+    program = _shell(shell)
+    directory = tmp_path / "python"
+    # An older managed runtime must not replace the refused download.
+    previous = directory / PREVIOUS_KEY
+    previous.mkdir(parents=True)
+    shutil.copy2(shutil.which("where.exe"), previous / "python.exe")
+    (tmp_path / "report.txt").write_text(report, encoding="utf-8")
+    # A uv double that reports like uv on stderr and fails the runtime download.
+    uv = tmp_path / "uv.cmd"
+    uv.write_text(f'@echo off\r\ntype "%TEST_REPORT%" 1>&2\r\nexit /b {code}\r\n', encoding="ascii")
+    wrapper = tmp_path / "provision.ps1"
+    wrapper.write_text(
+        _runtime_functions(
+            "Require-PrivateDataRoot", "Require-PrivateExecutablePath", "Invoke-Uv", "Select-ManagedPython",
+        )
+        + "\n"
+        + _REPORTED_FAIL
+        + "function Stage([string]$message) { }\n"
+        + "Select-ManagedPython $env:TEST_UV $env:TEST_PYTHON_DIR $env:TEST_TOOLS\n'PROVISIONED'\n",
+        encoding="utf-8",
+    )
+    result = _run(
+        wrapper,
+        tmp_path,
+        program=program,
+        TEST_UV=uv,
+        TEST_REPORT=tmp_path / "report.txt",
+        TEST_PYTHON_DIR=directory,
+        TEST_TOOLS=tmp_path / "tools",
+        UV_PYTHON_INSTALL_MIRROR="https://private.example.invalid/python",
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == 1, output
+    assert f"FAIL: {expected}" in " ".join(result.stdout.split())
+    # uv's report selects the message and is never shown.
+    for detail in ("private.example.invalid", "b" * 64, "cause:", "os error"):
+        assert detail not in output
+    assert "PROVISIONED" not in result.stdout
+    assert not (directory / MANAGED_KEY).exists()
 
 
 def test_native_unsafe_explicit_tool_storage_refuses_before_uv(tmp_path):

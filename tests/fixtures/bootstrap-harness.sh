@@ -659,7 +659,8 @@ scenario_previous() {
   [[ "$(count "$logs/mirror")" == 2 ]] && binding "$python_version" ||
     die "A new installation beside the previous runtime did not use the pinned one."
 }
-# The pinned uv carries the runtime's digest, so a mirror cannot substitute other bytes.
+# A refused runtime download names its cause. The pinned uv carries the runtime's digest, so
+# a mirror cannot substitute other bytes.
 scenario_digest() {
   local archive="$root/mirror/20260924/cpython-$python_version+20260924-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
   fresh_home digest
@@ -688,8 +689,17 @@ if replaced != 1:
 PY
   # Neither an older managed runtime nor Python on PATH may replace the refused download.
   planted "$pydir/cpython-$previous_version-linux-x86_64-gnu/bin/python${previous_version%.*}" "$root/fallback-ran"
-  refuses tampered-runtime "The uv-managed Python could not be provisioned. Check the approved runtime source." \
+  # A mirror that refuses connections stops installation with the download remedies.
+  extra=(UV_PYTHON_INSTALL_MIRROR=https://127.0.0.1:9)
+  refuses unreachable-runtime "Site Ops installation failed: CPython $python_version could not be downloaded. Its runtime source, mirror or proxy could not be reached or refused the request. Allow uv's runtime source, set an approved HTTPS UV_PYTHON_INSTALL_MIRROR, or prepare the runtime with uv python install $python_version --no-bin --no-registry, then retry." \
     "${first[@]}"
+  extra=()
+  [[ ! -s "$logs/mirror" ]] || die "The unreachable mirror case reached the local mirror."
+  refuses tampered-runtime "Site Ops installation failed: The downloaded CPython $python_version archive did not match its expected digest and was not used. Check the runtime source, mirror or proxy that served it, including UV_PYTHON_INSTALL_MIRROR if it is set." \
+    "${first[@]}"
+  # uv's report is classified, never printed, because it can name the source and its digests.
+  ! grep -qE '127\.0\.0\.1|[0-9a-f]{64}|cause:|error:' "$logs/unreachable-runtime.out" "$logs/tampered-runtime.out" ||
+    die "Runtime source details were printed."
   [[ "$(count "$logs/mirror")" == 1 ]] || die "The mirror did not serve the tampered runtime once."
   [[ ! -e "$root/tampered-ran" && ! -e "$root/fallback-ran" && ! -s "$logs/rejected" ]] ||
     die "A refused runtime or a fallback Python was executed."

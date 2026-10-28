@@ -492,7 +492,7 @@ centrally managed.
 |---|---|---|
 | Platform | Windows x64, or x64 Linux based on glibc such as Ubuntu 24.04, Ubuntu 26.04 or Azure Cloud Shell | Bootstrap |
 | Native manager | uv 0.12.20 from an approved channel. The bootstrap acquires a copy pinned by checksum when no qualified uv is on `PATH`. | Release wheel |
-| Python | CPython managed by uv. uv provisions 3.11.16 when needed, without a system Python installation. | Both routes, with no separate installation |
+| Python | CPython managed by uv. uv provisions 3.14.7 when needed, without a system Python installation. The bootstrap keeps the runtime of an existing Site Ops installation. | Both routes, with no separate installation |
 | Package feed | An approved index that serves the required runtime wheels. Configure it in uv. | Online release wheel |
 | GitHub CLI | Version 2.95.0 or newer in the 2.x release line | Bootstrap, and Site Ops verification of published workspace content. No login. |
 
@@ -544,12 +544,12 @@ private feed. uv does not read pip's index configuration.
 
 ```powershell
 uv tool install "https://github.com/Azure/digital-ops-scale-kit/releases/download/<tag>/siteops-<version>-py3-none-any.whl" `
-  --python 3.11.16 --managed-python --no-build --system-certs
+  --python 3.14.7 --managed-python --no-build --system-certs
 ```
 
 ```bash
 uv tool install "https://github.com/Azure/digital-ops-scale-kit/releases/download/<tag>/siteops-<version>-py3-none-any.whl" \
-  --python 3.11.16 --managed-python --no-build --system-certs
+  --python 3.14.7 --managed-python --no-build --system-certs
 ```
 
 Use the exact command printed in the release notes to avoid assembling the
@@ -750,7 +750,7 @@ environment detail. Keep them private and review them before sharing.
 
 Each Site Ops release qualifies both installation paths on Windows Server 2025
 and Ubuntu 24.04 across CPython 3.10 through 3.14 before publication. It also
-runs them on Ubuntu 26.04 with CPython 3.11, and runs the PowerShell bootstrap
+runs them on Ubuntu 26.04 with CPython 3.14, and runs the PowerShell bootstrap
 as a standard Windows user, which acquires its own uv and Python without
 administrator rights. These checks use hosted runners, so they do not cover
 interactive UAC prompts on a Windows desktop. PyPy, Python builds with free

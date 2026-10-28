@@ -15,15 +15,13 @@ import pytest
 from tests import native_bundle
 from tests.native_bundle import bundle_factory as bundle_factory
 from tests.native_bundle import publish_assets
-from tests.native_uv_consumers import _unavailable
+from tests.native_uv_consumers import LINUX_PYTHON_SHA256, LINUX_UV_ARCHIVE_SHA256, _unavailable
 from tests.shell_helpers import bash_path, required_bash
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "bootstrap" / "siteops-bootstrap.sh"
 HARNESS = ROOT / "tests" / "fixtures" / "bootstrap-harness.sh"
 HELPER = ROOT / "scripts" / "siteops_distribution.py"
-UV_ARCHIVE_SHA256 = "6590717592ace991ff83a63fef799e3ad9d33ecc8f96c5d6bdd732496e79337f"
-PYTHON_ARCHIVE_SHA256 = "68c6739376b65258dee5058ccf6777232fe38d31a578965ae8bda327ec7da3a8"
 linux_only = pytest.mark.skipif(
     sys.platform != "linux",
     reason="Requires native Linux ownership and executables.",
@@ -60,8 +58,8 @@ def native_inputs() -> dict[str, Path]:
     """Return the pinned uv archive and the exact managed CPython archive."""
     selected = {}
     for name, digest in (
-        ("SITEOPS_TEST_UV_ARCHIVE", UV_ARCHIVE_SHA256),
-        ("SITEOPS_TEST_UV_PYTHON_ARCHIVE", PYTHON_ARCHIVE_SHA256),
+        ("SITEOPS_TEST_UV_ARCHIVE", LINUX_UV_ARCHIVE_SHA256),
+        ("SITEOPS_TEST_UV_PYTHON_ARCHIVE", LINUX_PYTHON_SHA256),
     ):
         value = os.environ.get(name)
         path = Path(value) if value else None

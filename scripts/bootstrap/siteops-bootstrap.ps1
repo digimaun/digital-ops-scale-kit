@@ -807,6 +807,8 @@ function Get-ManagedPythonCandidates([string]$Directory) {
     }
 }
 function Select-ManagedPython([string]$Uv, [string]$Directory, [string]$Tools) {
+    # Prefer this runtime when uv manages it, and provision it when uv manages no supported runtime.
+    $pinned = '3.14.7'
     $siteopsHome = Join-Path $Tools 'siteops'
     $existingVersion = ''
     $existingHome = ''
@@ -839,19 +841,19 @@ function Select-ManagedPython([string]$Uv, [string]$Directory, [string]$Tools) {
     }
     if (-not $selected -and $records.Count) {
         $selected = $records | Sort-Object `
-            @{ Expression = { if ($_.Version -ceq '3.11.16') { 0 } else { 1 } } }, `
+            @{ Expression = { if ($_.Version -ceq $pinned) { 0 } else { 1 } } }, `
             @{ Expression = { [version]$_.Version }; Descending = $true } |
             Select-Object -First 1
     }
     if (-not $selected) {
-        $concrete = Join-Path $Directory 'cpython-3.11.16-windows-x86_64-none'
+        $concrete = Join-Path $Directory "cpython-$pinned-windows-x86_64-none"
         if (Test-Path -LiteralPath $concrete) {
             Fail 'The uv-managed Python installation is incomplete. Inspect it before repair.'
         }
-        Stage 'Provisioning uv-managed CPython 3.11.16 without command aliases or registry changes.'
-        $null = Invoke-Uv $Uv @('python', 'install', '3.11.16', '--no-bin', '--no-registry')
+        Stage "Provisioning uv-managed CPython $pinned without command aliases or registry changes."
+        $null = Invoke-Uv $Uv @('python', 'install', $pinned, '--no-bin', '--no-registry')
         $matches = @(Get-ManagedPythonCandidates $Directory | Where-Object {
-            $_.Version -ceq '3.11.16' -and
+            $_.Version -ceq $pinned -and
             [string]::Equals($_.Python, (Join-Path $concrete 'python.exe'), [StringComparison]::OrdinalIgnoreCase)
         })
         if ($matches.Count -ne 1) { Fail 'The selected uv-managed Python is unavailable.' }

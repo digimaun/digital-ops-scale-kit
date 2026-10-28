@@ -390,12 +390,12 @@ jobs:
           $previousPreference = $ErrorActionPreference
           try {
               $ErrorActionPreference = 'Continue'
-              & $uv python install 3.11.16 --no-bin --no-registry --no-config --system-certs --no-progress `
+              & $uv python install 3.14.7 --no-bin --no-registry --no-config --system-certs --no-progress `
                   > (Join-Path $fixtures 'runtime.log') 2>&1
               $runtimeExit = $LASTEXITCODE
           } finally { $ErrorActionPreference = $previousPreference }
           if ($runtimeExit -ne 0 -or -not (Test-Path -LiteralPath (
-              Join-Path $env:UV_PYTHON_INSTALL_DIR 'cpython-3.11.16-windows-x86_64-none\python.exe'
+              Join-Path $env:UV_PYTHON_INSTALL_DIR 'cpython-3.14.7-windows-x86_64-none\python.exe'
           ) -PathType Leaf)) { throw 'The qualified uv-managed runtime fixture is unavailable.' }
           $settings = @(
               "SITEOPS_TEST_UV=$uv",

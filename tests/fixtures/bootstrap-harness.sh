@@ -25,6 +25,8 @@ die() { printf 'Bootstrap harness: %s\n' "$1" >&2; exit 1; }
 real_python="$(command -v python3)"
 uv_url=https://github.com/astral-sh/uv/releases/download/0.12.20/uv-x86_64-unknown-linux-gnu.tar.gz
 uv_sha=b8299463da6fa7da3b94464444d252d0afca8ac6c96cb229f1baf4012f365246
+python_version=3.14.7
+python_minor="${python_version%.*}"
 first=(--release siteops/v1.0.0b1 --source-commit "$(printf 'a%.0s' {1..40})" --yes)
 second=(--release siteops/v1.0.0b2 --source-commit "$(printf 'b%.0s' {1..40})" --yes)
 first_version=1.0.0b1+build.1.1.gaaaaaaaaaaaa
@@ -143,7 +145,7 @@ printf 'subjectAltName=IP:127.0.0.1\nbasicConstraints=CA:FALSE\nextendedKeyUsage
 openssl x509 -req -in "$tls/server.csr" -CA "$tls/ca.pem" -CAkey "$tls/ca.key" \
   -CAcreateserial -days 1 -extfile "$tls/extensions" -out "$tls/server.pem" > /dev/null 2>&1
 cp -- "$TEST_PYTHON_ARCHIVE" \
-  "$root/mirror/20260924/cpython-3.11.16+20260924-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+  "$root/mirror/20260924/cpython-$python_version+20260924-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
 "$real_python" -I - "$tls" "$root/mirror" "$logs/mirror" <<'PY' &
 import functools
 import http.server
@@ -263,7 +265,7 @@ installed_version() {
 seed_runtime() {
   env -i HOME="$HOME" PATH="$system" SSL_CERT_FILE="$tls/ca.pem" \
     UV_PYTHON_INSTALL_MIRROR="$mirror_url" UV_PYTHON_INSTALL_DIR="$1" \
-    UV_CACHE_DIR="$root/seed-cache" "$root/seed/uv" python install 3.11.16 --no-bin \
+    UV_CACHE_DIR="$root/seed-cache" "$root/seed/uv" python install "$python_version" --no-bin \
     --no-registry --no-config --no-progress > "$logs/seed.out" 2>&1 ||
     { cat "$logs/seed.out" >&2; die "The existing runtime fixture could not be prepared."; }
 }
@@ -300,9 +302,9 @@ scenario_journey() {
     die "Native uv did not expose siteops."
   [[ "$(sha256sum < "$bin/uv" | cut -d ' ' -f 1)" == "$uv_sha" ]] ||
     die "The pinned uv was not exposed for maintenance."
-  [[ ! -e "$bin/python3.11" && ! -e "$bin/python3" && ! -e "$bin/python" ]] ||
+  [[ ! -e "$bin/python$python_minor" && ! -e "$bin/python3" && ! -e "$bin/python" ]] ||
     die "Managed Python command aliases were exposed."
-  grep -qxF "home = $pydir/cpython-3.11.16-linux-x86_64-gnu/bin" "$tools/siteops/pyvenv.cfg" ||
+  grep -qxF "home = $pydir/cpython-$python_version-linux-x86_64-gnu/bin" "$tools/siteops/pyvenv.cfg" ||
     die "Site Ops is not bound to the concrete managed runtime."
   [[ "$(installed_version "$bin")" == "siteops $first_version" ]] ||
     die "The installed command reports another build."
@@ -356,9 +358,9 @@ PY
   [[ "$(sha256sum < "$tools/siteops/uv-receipt.toml")" == "$receipt" ]] ||
     die "An altered retained payload changed the native tool."
   cp -- "$root/license" "$second_bundle/LICENSE"
-  printf 'import os\n' > "$tools/siteops/lib/python3.11/site-packages/extra.pth"
+  printf 'import os\n' > "$tools/siteops/lib/python$python_minor/site-packages/extra.pth"
   refuses startup "unrecognized Python startup files" "${second[@]}" --replace
-  rm -- "$tools/siteops/lib/python3.11/site-packages/extra.pth"
+  rm -- "$tools/siteops/lib/python$python_minor/site-packages/extra.pth"
   succeeds repaired "${second[@]}"
 
   env -i HOME="$HOME" PATH="$system" "$bin/uv" tool uninstall siteops --no-config \
@@ -435,7 +437,7 @@ scenario_storage() {
   extra=(UV_TOOL_BIN_DIR=relative/bin)
   refuses relative-bin "Select uv tool, command, and Python directories" "${first[@]}"
   no_uv_download "Rejected uv storage"
-  [[ ! -e "$data/tools" && ! -s "$logs/mirror" && ! -e "$root/real-python/cpython-3.11.16-linux-x86_64-gnu" ]] ||
+  [[ ! -e "$data/tools" && ! -s "$logs/mirror" && ! -e "$root/real-python/cpython-$python_version-linux-x86_64-gnu" ]] ||
     die "Rejected uv storage ran or provisioned tools."
 
   base="$root/uv-state"
@@ -446,7 +448,7 @@ scenario_storage() {
   succeeds explicit "${first[@]}"
   [[ -L "$base/bin/siteops" && "$(readlink "$base/bin/siteops")" == "$base/tools/siteops/bin/siteops" ]] ||
     die "Explicit uv tool storage was not used."
-  grep -qxF "home = $base/python/cpython-3.11.16-linux-x86_64-gnu/bin" "$base/tools/siteops/pyvenv.cfg" ||
+  grep -qxF "home = $base/python/cpython-$python_version-linux-x86_64-gnu/bin" "$base/tools/siteops/pyvenv.cfg" ||
     die "The explicit managed runtime directory was not used."
   [[ ! -e "$tools" && ! -e "$pydir" && -x "$base/bin/uv" ]] ||
     die "Explicit uv storage leaked into default locations."
@@ -564,28 +566,28 @@ scenario_runtime() {
     die "A rejected runtime changed the tool configuration."
   cp "$logs/original-pyvenv.cfg" "$tools/siteops/pyvenv.cfg"
   mkdir -p "$root/open-runtime"
-  planted "$root/open-runtime/bin/python3.11" "$root/bound-ran"
+  planted "$root/open-runtime/bin/python$python_minor" "$root/bound-ran"
   chmod 0777 "$root/open-runtime"
-  ln -sfn "$root/open-runtime/bin/python3.11" "$tools/siteops/bin/python"
+  ln -sfn "$root/open-runtime/bin/python$python_minor" "$tools/siteops/bin/python"
   sed -i "s#^home = .*#home = $root/open-runtime/bin#" "$tools/siteops/pyvenv.cfg"
   refuses bound-replace "The current Site Ops tool uses an unsafe runtime." "${first[@]}" --replace
   refuses bound-install "Inspect it or run uv tool uninstall siteops after review" "${first[@]}"
   [[ ! -e "$root/bound-ran" ]] || die "An unadmitted tool runtime was executed."
 
   fresh_home runtime-unsafe
-  concrete="$pydir/cpython-3.11.16-linux-x86_64-gnu"
-  planted "$concrete/bin/python3.11" "$root/runtime-ran"
+  concrete="$pydir/cpython-$python_version-linux-x86_64-gnu"
+  planted "$concrete/bin/python$python_minor" "$root/runtime-ran"
   mkdir -p "$concrete/lib"
   chmod 0777 "$concrete/lib"
   refuses unsafe-runtime "The uv-managed Python has files other users can change." "${first[@]}"
   rm -rf -- "$concrete"
-  planted "$concrete/bin/python3.11" "$root/runtime-ran"
+  planted "$concrete/bin/python$python_minor" "$root/runtime-ran"
   mkdir -m 0777 "$root/open-libraries"
   ln -s "$root/open-libraries" "$concrete/lib"
   refuses linked-library "The uv-managed Python links outside its concrete installation." "${first[@]}"
   [[ ! -e "$root/runtime-ran" ]] || die "A runtime with unadmitted library links was executed."
   rm -rf -- "$concrete"
-  planted "$root/elsewhere/bin/python3.11" "$root/runtime-ran"
+  planted "$root/elsewhere/bin/python$python_minor" "$root/runtime-ran"
   ln -s "$root/elsewhere" "$concrete"
   refuses linked-runtime "The uv-managed Python must use trusted, non-symlinked directories." "${first[@]}"
   rm -- "$concrete"
@@ -595,7 +597,7 @@ scenario_runtime() {
   [[ ! -e "$root/runtime-ran" ]] || die "An unadmitted managed runtime was executed."
   mirrored="$(count "$logs/mirror")"
   seed_runtime "$root/mislabeled"
-  mv -- "$root/mislabeled/cpython-3.11.16-linux-x86_64-gnu" "$pydir/cpython-3.11.15-linux-x86_64-gnu"
+  mv -- "$root/mislabeled/cpython-$python_version-linux-x86_64-gnu" "$pydir/cpython-$python_minor.$(( ${python_version##*.} - 1 ))-linux-x86_64-gnu"
   refuses mislabeled-runtime "differs from the installed runtime." "${first[@]}"
   [[ ! -e "$tools/siteops" ]] || die "A mislabeled runtime installed Site Ops."
 }

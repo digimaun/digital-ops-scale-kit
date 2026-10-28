@@ -217,6 +217,8 @@ admit_runtime_tree() {
 select_runtime() {
   local selected="" existing="" home="" line candidate minor patch identity
   local best_minor=-1 best_patch=-1
+  # Prefer this runtime when uv manages it, and provision it when uv manages no supported runtime.
+  local pinned=3.14.7
   local key='^cpython-(3\.(1[0-4])\.(0|[1-9][0-9]{0,2}))-linux-x86_64-gnu$'
   if [[ -e "$tools/siteops" || -L "$tools/siteops" ]]; then
     admit_file "$tools/siteops/pyvenv.cfg" && (( $(stat -c %s -- "$admitted") <= 65536 )) ||
@@ -238,8 +240,8 @@ select_runtime() {
   if [[ -z "$selected" ]]; then
     for candidate in "$pydir"/cpython-3.*-linux-x86_64-gnu; do
       [[ "${candidate##*/}" =~ $key ]] || continue
-      if [[ "${BASH_REMATCH[1]}" == 3.11.16 ]]; then
-        selected=3.11.16
+      if [[ "${BASH_REMATCH[1]}" == "$pinned" ]]; then
+        selected="$pinned"
         break
       fi
       minor="${BASH_REMATCH[2]}"
@@ -252,10 +254,10 @@ select_runtime() {
     done
   fi
   if [[ -z "$selected" ]]; then
-    stage "Provisioning uv-managed CPython 3.11.16 without command aliases."
-    run_uv python install 3.11.16 --no-bin --no-registry > /dev/null 2>&1 ||
+    stage "Provisioning uv-managed CPython $pinned without command aliases."
+    run_uv python install "$pinned" --no-bin --no-registry > /dev/null 2>&1 ||
       fail "The uv-managed Python could not be provisioned. Check the approved runtime source."
-    selected=3.11.16
+    selected="$pinned"
   fi
   minor="${selected%.*}"
   admit_runtime_tree "$pydir/cpython-$selected-linux-x86_64-gnu" "$minor"

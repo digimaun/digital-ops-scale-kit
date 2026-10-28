@@ -14,9 +14,26 @@ import pytest
 
 from tests.native_bundle import bundle_factory as bundle_factory
 from tests.native_bundle import publish_assets
+from tests.native_uv_consumers import MANAGED_PYTHON, MANAGED_PYTHON_MINOR
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "bootstrap" / "siteops-bootstrap.ps1"
+MANAGED_KEY = f"cpython-{MANAGED_PYTHON}-windows-x86_64-none"
+# The runtime that v1.0.0b7 bootstraps provisioned for new installations.
+PREVIOUS_PYTHON = "3.11.16"
+# A later patch of the pinned minor, which only the pin's own preference outranks.
+NEWER_PYTHON = f"{MANAGED_PYTHON_MINOR}.{int(MANAGED_PYTHON.rpartition('.')[2]) + 2}"
+LIBRARY = f"python{MANAGED_PYTHON_MINOR.replace('.', '')}.dll"
+RUNTIME_RECORD = {
+    "key": MANAGED_KEY,
+    "version": MANAGED_PYTHON,
+    "version_parts": dict(zip(("major", "minor", "patch"), map(int, MANAGED_PYTHON.split(".")))),
+    "implementation": "cpython",
+    "arch": "x86_64",
+    "os": "windows",
+    "variant": "default",
+    "libc": "none",
+}
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Requires native Windows ACLs.")
 
 
@@ -89,7 +106,7 @@ def _managed_fixture():
     directory = Path(selected) if selected else None
     if (
         directory is None
-        or not (directory / "cpython-3.11.16-windows-x86_64-none" / "python.exe").is_file()
+        or not (directory / MANAGED_KEY / "python.exe").is_file()
     ):
         if os.environ.get("CI") or os.environ.get("SITEOPS_REQUIRE_WINDOWS_UV") == "1":
             pytest.fail("The required managed Python fixture is unavailable.")
@@ -230,7 +247,8 @@ def test_windows_install_admits_storage_and_runtime_before_execution():
     ) < source.index("$installed = Check-Payload")
     assert "uv python install" not in source
     assert "'--no-bin', '--no-registry'" in source
-    assert "cpython-3.11.16-windows-x86_64-none" in source
+    assert f"$pinned = '{MANAGED_PYTHON}'" in runtime_selection
+    assert '"cpython-$pinned-windows-x86_64-none"' in runtime_selection
 
 
 def test_windows_retained_proof_and_archive_paths_are_admitted_before_verification():
@@ -441,11 +459,11 @@ if ($selected -cne (Join-Path $cache 'uv.exe')) { throw 'Wrong uv selected.' }
 @pytest.mark.parametrize("existing", [False, True])
 @pytest.mark.parametrize("other_state", ["incomplete", "writable"])
 def test_native_runtime_selection_ignores_unrelated_candidate(tmp_path, existing, other_state):
-    source = _managed_fixture() / "cpython-3.11.16-windows-x86_64-none"
+    source = _managed_fixture() / MANAGED_KEY
     managed = tmp_path / "managed"
     selected = managed / source.name
     shutil.copytree(source, selected)
-    other = managed / "cpython-3.12.7-windows-x86_64-none"
+    other = managed / f"cpython-{NEWER_PYTHON}-windows-x86_64-none"
     other.mkdir()
     marker = other / "operator-file"
     marker.write_bytes(b"unrelated runtime")
@@ -463,7 +481,7 @@ def test_native_runtime_selection_ignores_unrelated_candidate(tmp_path, existing
         current = tools / "siteops"
         current.mkdir()
         (current / "pyvenv.cfg").write_text(
-            f"version_info = 3.11.16\nhome = {selected}\n", encoding="utf-8",
+            f"version_info = {MANAGED_PYTHON}\nhome = {selected}\n", encoding="utf-8",
         )
     wrapper = tmp_path / "select-python.ps1"
     wrapper.write_text(
@@ -496,7 +514,7 @@ if ($python -cne $env:TEST_SELECTED) { throw 'Wrong runtime selected.' }
 
 
 def test_native_runtime_selection_refuses_unsafe_selected_candidate(tmp_path):
-    source = _managed_fixture() / "cpython-3.11.16-windows-x86_64-none"
+    source = _managed_fixture() / MANAGED_KEY
     managed = tmp_path / "managed"
     selected = managed / source.name
     shutil.copytree(source, selected)
@@ -534,7 +552,7 @@ Select-ManagedPython 'unused' $env:TEST_MANAGED $env:TEST_TOOLS
 def test_native_managed_runtime_uses_concrete_patch_path_and_existing_binding(tmp_path, existing):
     executable, _ = _native_fixture()
     managed = _managed_fixture()
-    concrete = managed / "cpython-3.11.16-windows-x86_64-none" / "python.exe"
+    concrete = managed / MANAGED_KEY / "python.exe"
     tools = tmp_path / "tools"
     tools.mkdir()
     wrapper = tmp_path / "python.ps1"
@@ -558,7 +576,7 @@ if ($python -cne $env:TEST_CONCRETE) { throw 'The minor alias was selected.' }
         current = tools / "siteops"
         current.mkdir()
         (current / "pyvenv.cfg").write_text(
-            f"version_info = 3.11.16\nhome = {concrete.parent}\n",
+            f"version_info = {MANAGED_PYTHON}\nhome = {concrete.parent}\n",
             encoding="utf-8",
         )
     result = _run(
@@ -587,7 +605,7 @@ def test_native_fresh_archive_helper_runs_with_isolated_python_and_maps_exit(
     exit_code,
     expected,
 ):
-    python = _managed_fixture() / "cpython-3.11.16-windows-x86_64-none" / "python.exe"
+    python = _managed_fixture() / MANAGED_KEY / "python.exe"
     archive = tmp_path / "bundle.zip"
     helper = (
         "import json, os, sys\n"
@@ -760,7 +778,7 @@ Assert-PinnedUv $uv (Split-Path -Parent $uv)
 
 def test_native_incomplete_managed_python_refuses_before_install(tmp_path):
     directory = tmp_path / "python"
-    concrete = directory / "cpython-3.11.16-windows-x86_64-none"
+    concrete = directory / MANAGED_KEY
     concrete.mkdir(parents=True)
     marker = concrete / "operator-file"
     marker.write_text("unchanged", encoding="ascii")
@@ -796,8 +814,8 @@ def test_existing_siteops_runtime_wins_over_the_default_managed_patch(tmp_path, 
     tools = tmp_path / "tools"
     tools.mkdir()
     python_directory = tmp_path / "managed"
-    previous = python_directory / "cpython-3.12.7-windows-x86_64-none"
-    for version in ("3.11.16", "3.12.7"):
+    previous = python_directory / f"cpython-{PREVIOUS_PYTHON}-windows-x86_64-none"
+    for version in (MANAGED_PYTHON, PREVIOUS_PYTHON, NEWER_PYTHON):
         concrete = python_directory / f"cpython-{version}-windows-x86_64-none"
         concrete.mkdir(parents=True)
         shutil.copy2(shutil.which("where.exe"), concrete / "python.exe")
@@ -811,7 +829,7 @@ def test_existing_siteops_runtime_wins_over_the_default_managed_patch(tmp_path, 
         current = tools / "siteops"
         current.mkdir()
         (current / "pyvenv.cfg").write_text(
-            f"version_info = 3.12.7\nhome = {home}\n",
+            f"version_info = {PREVIOUS_PYTHON}\nhome = {home}\n",
             encoding="utf-8",
         )
     source = SCRIPT.read_text(encoding="utf-8")
@@ -844,7 +862,7 @@ Select-ManagedPython 'unused' $env:TEST_PYTHON_DIR $env:TEST_TOOLS
         tmp_path,
         TEST_PYTHON_DIR=python_directory,
         TEST_TOOLS=tools,
-        TEST_EXPECTED="3.12.7" if existing else "3.11.16",
+        TEST_EXPECTED=PREVIOUS_PYTHON if existing else MANAGED_PYTHON,
     )
     if existing == "soft-hyphen":
         assert result.returncode == 1, result.stdout + result.stderr
@@ -869,10 +887,10 @@ def test_absent_managed_python_is_provisioned_without_aliases_or_registry(tmp_pa
 function Stage([string]$message) { }
 function Invoke-Uv([string]$tool, [string[]]$arguments) {
     if ($arguments -contains 'install') {
-        if ($arguments -cnotcontains '3.11.16' -or
+        if ($arguments -cnotcontains $env:TEST_PINNED -or
             $arguments -cnotcontains '--no-bin' -or
             $arguments -cnotcontains '--no-registry') { throw 'Unsafe runtime provisioning.' }
-        $concrete = Join-Path $env:TEST_PYTHON_DIR 'cpython-3.11.16-windows-x86_64-none'
+        $concrete = Join-Path $env:TEST_PYTHON_DIR ('cpython-' + $env:TEST_PINNED + '-windows-x86_64-none')
         New-Item -ItemType Directory -Path $concrete -ErrorAction Stop | Out-Null
         Copy-Item -LiteralPath $env:TEST_DUMMY_PYTHON -Destination (Join-Path $concrete 'python.exe')
         [IO.File]::WriteAllText($env:TEST_MARKER, 'provisioned')
@@ -884,8 +902,8 @@ function Invoke-Uv([string]$tool, [string[]]$arguments) {
         + "function Select-ManagedPython("
         + selection
         + """
-if ($selected.Version -cne '3.11.16' -or
-    $selected.Python -cne (Join-Path $Directory 'cpython-3.11.16-windows-x86_64-none\\python.exe')) {
+if ($selected.Version -cne $env:TEST_PINNED -or
+    $selected.Python -cne (Join-Path $Directory ('cpython-' + $env:TEST_PINNED + '-windows-x86_64-none\\python.exe'))) {
     throw 'The concrete runtime was not selected.'
 }
 }
@@ -902,6 +920,7 @@ Select-ManagedPython 'unused' $env:TEST_PYTHON_DIR $env:TEST_TOOLS
         TEST_TOOLS=tmp_path / "tools",
         TEST_DUMMY_PYTHON=shutil.which("where.exe"),
         TEST_MARKER=marker,
+        TEST_PINNED=MANAGED_PYTHON,
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "PROVISION_ACCEPTED" in result.stdout
@@ -1068,12 +1087,12 @@ def test_native_python_inventory_does_not_execute_before_runtime_admission(
     tmp_path, fault, expected
 ):
     managed = tmp_path / "managed"
-    concrete = managed / "cpython-3.11.16-windows-x86_64-none"
+    concrete = managed / MANAGED_KEY
     concrete.mkdir(parents=True)
     shutil.copy2(shutil.which("where.exe"), concrete / "python.exe")
     library_directory = concrete / "DLLs"
     library_directory.mkdir()
-    library = library_directory / "python311.dll"
+    library = library_directory / LIBRARY
     library.write_bytes(b"synthetic library")
     unsafe = library if fault == "library" else library_directory
     if fault == "junction":
@@ -1121,16 +1140,7 @@ Select-ManagedPython 'unused' $env:TEST_MANAGED $env:TEST_TOOLS
 """,
         encoding="utf-8",
     )
-    record = {
-        "key": "cpython-3.11.16-windows-x86_64-none",
-        "version": "3.11.16",
-        "version_parts": {"major": 3, "minor": 11, "patch": 16},
-        "implementation": "cpython",
-        "arch": "x86_64",
-        "os": "windows",
-        "variant": "default",
-        "libc": "none",
-    }
+    record = RUNTIME_RECORD
     marker = tmp_path / "unadmitted-inventory"
     try:
         result = _run(
@@ -1161,18 +1171,18 @@ Select-ManagedPython 'unused' $env:TEST_MANAGED $env:TEST_TOOLS
 @pytest.mark.parametrize("previous", ["external", "writable-interpreter", "writable-library", "safe"])
 def test_native_replacement_admits_previous_tool_before_uv(tmp_path, previous):
     managed = _managed_fixture()
-    concrete = managed / "cpython-3.11.16-windows-x86_64-none"
+    concrete = managed / MANAGED_KEY
     tool_directory = tmp_path / "tools"
     tool = tool_directory / "siteops"
     scripts = tool / "Scripts"
     scripts.mkdir(parents=True)
     interpreter = scripts / "python.exe"
     shutil.copy2(shutil.which("where.exe"), interpreter)
-    library = scripts / "python311.dll"
+    library = scripts / LIBRARY
     library.write_bytes(b"synthetic library")
     home = concrete if previous != "external" else tmp_path / "external"
     (tool / "pyvenv.cfg").write_text(
-        f"version_info = 3.11.16\nhome = {home}\n", encoding="utf-8"
+        f"version_info = {MANAGED_PYTHON}\nhome = {home}\n", encoding="utf-8"
     )
     unsafe = {
         "writable-interpreter": interpreter,
@@ -1221,16 +1231,7 @@ $SourceRef = 'refs/heads/main'
         + "\n'REPLACEMENT_ACCEPTED'\n",
         encoding="utf-8",
     )
-    record = {
-        "key": "cpython-3.11.16-windows-x86_64-none",
-        "version": "3.11.16",
-        "version_parts": {"major": 3, "minor": 11, "patch": 16},
-        "implementation": "cpython",
-        "arch": "x86_64",
-        "os": "windows",
-        "variant": "default",
-        "libc": "none",
-    }
+    record = RUNTIME_RECORD
     marker = tmp_path / "native-install"
     try:
         result = _run(

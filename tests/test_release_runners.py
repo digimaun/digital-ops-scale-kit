@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.native_uv_consumers import LINUX_PYTHON_SHA256, MANAGED_PYTHON
 from tests.shell_helpers import run_script
 from tests.yaml_documents import cached_safe_load
 
@@ -31,7 +32,8 @@ def test_windows_uv_gate_requires_qualified_native_fixtures_before_tests():
     run = next(step["run"] for step in steps if step.get("name") == "Windows bootstrap tests")
     assert setup.index("Get-FileHash") < setup.index("Expand-Archive") < setup.index("python install")
     assert "95f9bc30fbb3574d276e28ac4a6de932d25153645853d13da8c21eec3bc88d06" in setup
-    assert "3.11.16" in setup and "--no-bin --no-registry" in setup
+    assert f"python install {MANAGED_PYTHON} --no-bin --no-registry" in setup
+    assert f"cpython-{MANAGED_PYTHON}-windows-x86_64-none" in setup
     for variable in (
         "SITEOPS_TEST_UV", "SITEOPS_TEST_UV_ARCHIVE", "SITEOPS_TEST_UV_PYTHON_DIR",
         "SITEOPS_REQUIRE_WINDOWS_UV",
@@ -58,7 +60,7 @@ def test_linux_unit_gate_requires_native_archives_on_the_supported_host():
     assert 'bash tests/fixtures/prepare-native-uv.sh "$fixtures"' in setup
     fixture = (ROOT / "tests" / "fixtures" / "prepare-native-uv.sh").read_text()
     assert "6590717592ace991ff83a63fef799e3ad9d33ecc8f96c5d6bdd732496e79337f" in fixture
-    assert "68c6739376b65258dee5058ccf6777232fe38d31a578965ae8bda327ec7da3a8" in fixture
+    assert LINUX_PYTHON_SHA256 in fixture
     assert fixture.index("sha256sum --check") < fixture.index("tar -xzf")
     assert "command -v openssl" in fixture
 

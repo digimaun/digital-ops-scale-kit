@@ -21,6 +21,7 @@ from tests.bootstrap_discovery_helpers import (
     reference,
     run_bootstrap,
 )
+from tests.native_uv_consumers import MANAGED_PYTHON
 from tests.shell_helpers import bash_path, required_bash
 from tests.verification_helpers import verified_observation
 from tests.yaml_documents import cached_safe_load
@@ -693,6 +694,26 @@ def test_windows_bootstrap_checks_managed_executables_before_running_them():
     )
 
 
+# Each surface that names the managed CPython the bootstraps provision.
+RUNTIME_SURFACES = (
+    "scripts/bootstrap/siteops-bootstrap.sh",
+    "scripts/bootstrap/siteops-bootstrap.ps1",
+    "scripts/render-siteops-release.py",
+    ".github/workflows/ci.yaml",
+    ".github/actions/setup-published-siteops/action.yaml",
+    "docs/install-siteops.md",
+    "docs/e2e-testing.md",
+    "tests/fixtures/prepare-native-uv.sh",
+    "tests/fixtures/bootstrap-harness.sh",
+)
+
+
+@pytest.mark.parametrize("surface", RUNTIME_SURFACES)
+def test_every_runtime_surface_names_the_bootstrap_python(surface):
+    text = (ROOT / surface).read_text(encoding="utf-8")
+    assert set(re.findall(r"(?<![0-9.])3\.1[0-9]\.[0-9]+(?![0-9.])", text)) == {MANAGED_PYTHON}
+
+
 def test_windows_bootstrap_compares_names_ordinally():
     powershell = (SCRIPTS / "siteops-bootstrap.ps1").read_text(encoding="utf-8")
     # Culture comparisons ignore characters such as U+00AD, which still name another file.
@@ -858,7 +879,7 @@ def test_windows_bootstrap_rejects_untrusted_selected_executable_path(tmp_path, 
         rights = "(OI)(CI)M"
     else:
         shared = local_appdata
-        executable = shared / "uv" / "python" / "cpython-3.11.16-windows-x86_64-none" / "python.exe"
+        executable = shared / "uv" / "python" / f"cpython-{MANAGED_PYTHON}-windows-x86_64-none" / "python.exe"
         rights = "(OI)(CI)(WD,AD)"
     grant = subprocess.run(
         ["icacls.exe", str(shared), "/grant", f"*S-1-5-32-545:{rights}"],
@@ -896,7 +917,7 @@ def test_windows_bootstrap_accepts_private_selected_executable_path(tmp_path, ki
         private_root = root
     else:
         private_root = local_appdata / "uv" / "python"
-        executable = private_root / "cpython-3.11.16-windows-x86_64-none" / "python.exe"
+        executable = private_root / f"cpython-{MANAGED_PYTHON}-windows-x86_64-none" / "python.exe"
     executable.parent.mkdir(parents=True)
     shutil.copy2(shutil.which("where.exe"), executable)
     selected = _windows_tool_probe(

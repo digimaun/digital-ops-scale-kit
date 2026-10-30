@@ -14,6 +14,7 @@ from tests.integration.helpers.assertions import (
     site_names,
     site_results,
 )
+from tests.integration.helpers.azure import run_az
 from tests.integration.helpers.kube import (
     KubectlError,
     apply_manifest,
@@ -53,6 +54,9 @@ EXPECTED_OVEN_DATA_KEYS = {"Temperature", "EnergyUse", "Weight"}
 # connector statically, which is the path the telemetry assertion covers.
 TEMPLATE_MANAGED_API_VERSION = "2026-07-01"
 
+# The schema registry API version that templates/deps/schema-registry.bicep deploys.
+SCHEMA_REGISTRY_API_VERSION = "2025-10-01"
+
 
 def _release_config(orchestrator, site_name: str) -> dict:
     """The release configuration the deployment reads for one site."""
@@ -86,6 +90,37 @@ def _opcua_connector_version(orchestrator, site_name: str) -> str:
         .get("opcUaConnector", {})
     )
     return str(connector_configuration.get("version") or "")
+
+
+def _schema_count(registry_id: str) -> int:
+    """The number of schemas on the first page of one registry's listing.
+
+    Reads with core Azure CLI, so the runner needs no CLI extension. The
+    registry ID is redacted from any error, and the raw response is never
+    reported.
+    """
+    proc = run_az(
+        [
+            "az",
+            "rest",
+            "--method",
+            "get",
+            "--url",
+            f"{registry_id}/schemas?api-version={SCHEMA_REGISTRY_API_VERSION}",
+            "-o",
+            "json",
+        ],
+        timeout=120,
+        redact=(registry_id,),
+    )
+    try:
+        listing = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        raise AssertionError("The schema registry listing was not valid JSON.") from None
+    schemas = listing.get("value") if isinstance(listing, dict) else None
+    if not isinstance(schemas, list):
+        raise AssertionError("The schema registry listing has no `value` list.")
+    return len(schemas)
 
 
 class TestOpcUaSolutionDeployment:
@@ -394,7 +429,8 @@ class TestOpcUaSolutionDataFlowing:
     asserts at least one message arrives with the expected oven schema.
     Proves the full upstream half of the data path: simulator → OPC UA
     connector → broker. The dataflow → Event Hub egress is not asserted
-    here. That is the cloud-side scope deferred to a follow-up.
+    here. That is the cloud-side scope deferred to a follow-up. The
+    connector's schema is also checked in the Site's schema registry.
 
     Earlier releases deploy the connector statically. Template-managed
     releases run when their release configuration declares the connector
@@ -414,6 +450,10 @@ class TestOpcUaSolutionDataFlowing:
     # room for apk install plus pod scheduling.
     SUBSCRIBE_WAIT_SECONDS = 360
     POD_TIMEOUT_SECONDS = 600
+    # The connector writes its schema asynchronously. The telemetry test runs
+    # first, so the connector is already sampling when the schema read starts.
+    SCHEMA_WAIT_SECONDS = 180
+    SCHEMA_POLL_SECONDS = 10
 
     def test_oven_telemetry_observed_on_mqtt(
         self, opc_ua_solution_result, aio_namespace, kubectl_available, orchestrator
@@ -497,4 +537,62 @@ class TestOpcUaSolutionDataFlowing:
                 "Every site under test uses the template-managed connector "
                 "without a release-provided ConnectorTemplate. Release 2607 "
                 "has this documented limitation, so no telemetry is expected."
+            )
+
+    def test_connector_schema_is_in_the_schema_registry(
+        self, aio_install_result, opc_ua_solution_result, orchestrator
+    ):
+        """The connector's schema reaches the Site's schema registry.
+
+        The connector for OPC UA creates a schema for each asset source, and
+        AIO stores it in the schema registry through the AIO extension's
+        identity. Each run creates a new registry, so a listed schema shows
+        that the role the installation assigns lets the extension write to
+        it. No schema name is asserted, since connector naming can differ by
+        release. Sites without a running connector are skipped, as above.
+        """
+        checked = 0
+        for name in site_names(opc_ua_solution_result):
+            api_version = _aio_api_version(orchestrator, name)
+            connector_version = _opcua_connector_version(orchestrator, name)
+            if api_version >= TEMPLATE_MANAGED_API_VERSION and not connector_version:
+                continue
+            install_step = find_step(aio_install_result, name, "schema-registry")
+            registry = assert_output_exists(install_step, "schemaRegistry")
+            registry_id = registry.get("id") if isinstance(registry, dict) else None
+            assert registry_id, (
+                f"Site '{name}': aio-install schema-registry.schemaRegistry has "
+                "no `id` field."
+            )
+
+            deadline = time.monotonic() + self.SCHEMA_WAIT_SECONDS
+            count: int | None = None
+            last_error: str | None = None
+            while True:
+                try:
+                    count = _schema_count(registry_id)
+                    last_error = None
+                except RuntimeError as e:
+                    last_error = str(e)
+                remaining = deadline - time.monotonic()
+                if count or remaining <= 0:
+                    break
+                time.sleep(min(self.SCHEMA_POLL_SECONDS, remaining))
+
+            if not count:
+                observation = (
+                    "could not be read" if count is None else f"listed {count} schemas"
+                )
+                detail = f" Last read error: {last_error.rstrip('.')}." if last_error else ""
+                pytest.fail(
+                    f"Site '{name}': after {self.SCHEMA_WAIT_SECONDS}s the schema "
+                    f"registry {observation}.{detail} Check the AIO extension's "
+                    "role on the registry and the connector's status."
+                )
+            checked += 1
+
+        if checked == 0:
+            pytest.skip(
+                "No site under test runs the OPC UA connector, so no connector "
+                "schema is expected."
             )

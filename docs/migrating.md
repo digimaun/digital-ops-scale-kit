@@ -50,6 +50,8 @@ These changes affect how you install or run Site Ops after v1.0.0b7.
 | Want Arc extension settings without a saved Site | Nothing changes for existing use. Review [typed extension settings](#typed-extension-settings). |
 | Upgrade an existing AIO instance that has no configured Site | Nothing changes for existing use. Review the [typed AIO upgrade](#typed-aio-upgrade). |
 | Run v1.0.0b8 content with an earlier Site Ops engine, or produce your own packages | Install the matching engine. Review the [typed map feature](#typed-map-feature). |
+| Use a condition that limits the roles your deployment identity can assign | Allow Azure Device Registry Administrator. Review the [schema registry role](#schema-registry-role). |
+| Installed AIO with an earlier release | Nothing changes for existing use. Review the [schema registry role](#schema-registry-role) to remove the earlier Contributor assignment. |
 | Write the YAML key `=` twice in one mapping, quoted or bare | Keep one. Review [repeated equals keys](#repeated-equals-keys). |
 | Match the text of a missing typed input error | Review [missing input messages](#missing-input-messages). |
 | Match the text of a template error from `plan` or `deploy` | Review [template error messages](#template-error-messages). |
@@ -155,6 +157,41 @@ If you produce your own packages, add `typed-input-maps/v1` to
 workspace whose input contract declares a `stringMap` input. The producer
 rejects such a workspace without it. See
 [workspace packages](workspace-packages.md#build-workspaces-declared-by-a-release).
+
+### Schema registry role
+
+Allow Azure Device Registry Administrator
+(`12675fd7-7f59-493f-9201-f7944860a2f1`) in any condition that limits the
+roles your deployment identity can assign. `aio-install` and the samples that
+install AIO now give the AIO extension's identity this role on the schema
+registry instead of Contributor. It is the role that `az iot ops create`
+assigns, and it grants `Microsoft.DeviceRegistry/*` only. If the condition
+leaves it out, the `schema-registry-role` step fails with an authorization
+error for `Microsoft.Authorization/roleAssignments/write`. The condition in
+[Assign Azure roles](ci-cd-setup.md#3-assign-azure-roles) already allows it.
+
+An instance installed with an earlier release keeps its Contributor
+assignment, and `aio-upgrade` leaves role assignments unchanged. The next run
+of `aio-install`, or of the sample that installed AIO, adds Azure Device
+Registry Administrator beside Contributor. Site Ops never removes a role
+assignment. After that run, you can remove Contributor. `<schema-registry>`
+is `<site>-sr` by default.
+
+```bash
+PRINCIPAL_ID=$(az k8s-extension list --cluster-name <cluster> \
+  --resource-group <resource-group> --cluster-type connectedClusters \
+  --query "[?extensionType=='microsoft.iotoperations'].identity.principalId" \
+  --output tsv)
+REGISTRY_ID=$(az resource show --resource-group <resource-group> \
+  --name <schema-registry> \
+  --resource-type Microsoft.DeviceRegistry/schemaRegistries --query id --output tsv)
+
+az role assignment list --assignee-object-id "$PRINCIPAL_ID" --scope "$REGISTRY_ID" --output table
+az role assignment delete --assignee-object-id "$PRINCIPAL_ID" --role Contributor --scope "$REGISTRY_ID"
+```
+
+Run the delete only when the list shows Azure Device Registry Administrator.
+The extension needs one of the two roles to use the schema registry.
 
 ### Repeated equals keys
 

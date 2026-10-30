@@ -95,7 +95,7 @@ az role assignment create \
   --scope /subscriptions/<subscription-id>
 ```
 
-**For AIO deployments:** The full installation includes RBAC operations (e.g., granting the AIO extension access to the schema registry). Contributor cannot create role assignments. Use Owner with a condition that prevents privilege escalation:
+**For AIO deployments:** The full installation includes RBAC operations (for example, granting the AIO extension Azure Device Registry Administrator on the schema registry). Contributor cannot create role assignments. Use Owner with a condition that prevents privilege escalation:
 
 ```bash
 az role assignment create \

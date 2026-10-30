@@ -1,13 +1,15 @@
 // schema-registry-role.bicep
 // -------------------------------------------------------------------------------------
-// Grants the AIO extension's system-assigned MI Contributor on an existing
-// Schema Registry. Run after both schema-registry and the AIO instance exist.
+// Grants the AIO extension's system assigned MI Azure Device Registry Administrator
+// on an existing Schema Registry, the role `az iot ops create` assigns. The role
+// grants Microsoft.DeviceRegistry/* only. Run after both schema-registry and the AIO
+// instance exist.
 //
 // Inputs:  schemaRegistryName, aioExtensionPrincipalId.
 // Outputs: none (role assignment is idempotent on the same triple of scope/principal/role).
 // -------------------------------------------------------------------------------------
 
-metadata description = 'Assigns Contributor role to AIO extension on Schema Registry.'
+metadata description = 'Assigns Azure Device Registry Administrator role to AIO extension on Schema Registry.'
 
 /*****************************************************************************/
 /*                          Deployment Parameters                            */
@@ -31,13 +33,15 @@ resource schemaRegistry 'Microsoft.DeviceRegistry/schemaRegistries@2025-10-01' e
 /*                          Role Assignment                                  */
 /*****************************************************************************/
 
-// Contributor role for AIO Extension MI on Schema Registry
-// Role ID: b24988ac-6180-42a0-ab88-20f7382dd24c
+// Azure Device Registry Administrator role for AIO Extension MI on Schema Registry
+// Role ID: 12675fd7-7f59-493f-9201-f7944860a2f1
+// The name includes the role ID, so changing the role creates a new assignment and
+// leaves the earlier one in place.
 resource aioExtensionSchemaRegistryRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(schemaRegistry.id, aioExtensionPrincipalId, 'b24988ac-6180-42a0-ab88-20f7382dd24c')
+  name: guid(schemaRegistry.id, aioExtensionPrincipalId, '12675fd7-7f59-493f-9201-f7944860a2f1')
   scope: schemaRegistry
   properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'b24988ac-6180-42a0-ab88-20f7382dd24c')
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '12675fd7-7f59-493f-9201-f7944860a2f1')
     principalId: aioExtensionPrincipalId
     principalType: 'ServicePrincipal'
   }

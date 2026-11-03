@@ -27,7 +27,7 @@
     "templates/host-bootstrap/aksee/_partial.yaml",
     "templates/host-ops/aksee-upgrade/_partial.yaml"
   ],
-  "indexDigest": "7aff412a9b74b83276ae8de8b896b6d91f64bb6b78f34291f405e1c16cf1405f",
+  "indexDigest": "9e0aacb94a6fe54826fc7971e50e56cbeb0a73ee6aebc0cfbeb511f8d2c90ffa",
   "inputs": [
     {
       "digests": {
@@ -127,17 +127,17 @@
     },
     {
       "digests": {
-        "git-blob-sha1": "fe58c3055382aa3107c281d5b0851bf68d49ac1b",
-        "git-blob-sha1-crlf": "e02fe08767e4b2bdc67e97554521c11afa713e64",
-        "sha256": "e19b0a0abb4a47fb646367a4419053cea068e7feeec1c6c343e127340d56b3e9"
+        "git-blob-sha1": "bb64b65ed1658236e65c057f09291e1bdca0ee39",
+        "git-blob-sha1-crlf": "2e082bfba9b28f218acc6ae15dba42fcc4041719",
+        "sha256": "53678219d86d694292325faba04d6bf3c0135d2016ca9aa15d2ea76f0036f53c"
       },
       "path": "manifests/_partials/_secretsync.yaml"
     },
     {
       "digests": {
-        "git-blob-sha1": "673cd5f71d882e95f863560e2ed95da4ee285ed8",
-        "git-blob-sha1-crlf": "b5bc334d2e7eec73d2f7949c53441062d1a006a7",
-        "sha256": "e268d9255999b70eef87670408032d9ceaef55e4be6f53ffe18a5ffd63a55d62"
+        "git-blob-sha1": "254b544b626425632b821b6cdd6704fb8dd8e49a",
+        "git-blob-sha1-crlf": "2d417b36c7092faf6879efc8db8ff370b8ef9f4d",
+        "sha256": "aab675e010d6c5a90c301dc52ffb93a82d0653640220b637f3c8203369fe9333"
       },
       "path": "manifests/aio-install/entry.yaml"
     },
@@ -167,17 +167,17 @@
     },
     {
       "digests": {
-        "git-blob-sha1": "048eaa02d12ba75cb59185995bd66fc6d4a4680c",
-        "git-blob-sha1-crlf": "97e696360f3c2507716ca1b909bd7d5fa44f2cc0",
-        "sha256": "8ea5c879b6f4acf2067b8a6b8fd86a86db01dbced45292e1583a416d9d86b7f5"
+        "git-blob-sha1": "43ba9001f686456f40368355ecfc9d3a67d1d154",
+        "git-blob-sha1-crlf": "58f3ac6b67c1d612a3a05be9cc2f429b36c28fed",
+        "sha256": "eff1df297d6ec5a9e26b48b4281ef73e979046592a2b66ff27639c6a0c5dce4f"
       },
       "path": "manifests/aio-upgrade/entry.yaml"
     },
     {
       "digests": {
-        "git-blob-sha1": "427d2c16831db624e87d0a04f3dfe2fa038d499b",
-        "git-blob-sha1-crlf": "e8b139c0fb1a188c2b30a088aa79a650e0917607",
-        "sha256": "70e2af45cc5aa55bc63d6fd020fd9eef4119e9d9a2691d427bc0e2067d434bf1"
+        "git-blob-sha1": "d3ec661c322bbb3cac83471b655ceb8cf3633b3f",
+        "git-blob-sha1-crlf": "2900e20abd8e0313b79e2591a23ebfd1f6537ddb",
+        "sha256": "459aa3d978934cc1d85eaeed491ae18d5bc807325d5a7a3849f777366debaec4"
       },
       "path": "manifests/aio-upgrade/manifest.yaml"
     },
@@ -255,9 +255,9 @@
     },
     {
       "digests": {
-        "git-blob-sha1": "700e5d8d292467d8039fd6c8125ebb68d51c8727",
-        "git-blob-sha1-crlf": "ebea7502db152f6aac346e1aac67f24dfbda754a",
-        "sha256": "ec833b362825ebd3b9aa2379d23ce7f5edc5b90c3be1d0d00f47350b25435d1e"
+        "git-blob-sha1": "70a9df053cef5dc43ddab732239b194370e5dde5",
+        "git-blob-sha1-crlf": "727ec0d4d3cf5d77d4ddbc085ba33751ce78e2db",
+        "sha256": "3e3279af1f82e9242dbd9ccbc19c1bfbcf77d785ec89d281b1795270d5c2e1a2"
       },
       "path": "samples/aio-with-opc-ua/manifest.yaml"
     },

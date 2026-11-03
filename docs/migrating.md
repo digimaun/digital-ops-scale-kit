@@ -51,6 +51,9 @@ These changes affect how you install or run Site Ops after v1.0.0b7.
 | Want Arc extension settings without a saved Site | Nothing changes for existing use. Review [typed extension settings](#typed-extension-settings). |
 | Upgrade an existing AIO instance that has no configured Site | Nothing changes for existing use. Review the [typed AIO upgrade](#typed-aio-upgrade). |
 | Run v1.0.0b8 content with an earlier Site Ops engine, or produce your own packages | Install the matching engine. Review the [typed map feature](#typed-map-feature). |
+| Use a condition that limits the roles your deployment identity can assign | Allow Azure Device Registry Administrator. Review the [schema registry role](#schema-registry-role). |
+| Set `brokerConfig.backendRedundancyFactor` to 1 | Set it to 2 or more. Review [broker redundancy](#broker-redundancy). |
+| Upgrade AIO with `aio-upgrade` | Nothing changes for a supported upgrade. Review the [upgrade path check](#upgrade-path-check). |
 | Write the YAML key `=` twice in one mapping, quoted or bare | Keep one. Review [repeated equals keys](#repeated-equals-keys). |
 | Match the text of a missing typed input error | Review [missing input messages](#missing-input-messages). |
 | Match the text of a template error from `plan` or `deploy` | Review [template error messages](#template-error-messages). |
@@ -167,12 +170,46 @@ earlier engine refuses a package that declares it, on every route, with
 engine that the content release names. With a local checkout, typed routes on
 an earlier engine fail with `type must be string, boolean or azureResourceId`,
 while configured Sites and `--site-file` runs read no input contract.
+`aio-upgrade` also needs the feature `step-reports/v1`, and an earlier engine
+rejects the `requiredFeatures` key of its Manifest.
 
 If you produce your own packages, add `typed-input-maps/v1` to
 `requiredFeatures`, or `--require-feature typed-input-maps/v1`, for a
 workspace whose input contract declares a `stringMap` input. The producer
-rejects such a workspace without it. See
+rejects such a workspace without it. Add `step-reports/v1` the same way for
+a workspace that contains `aio-upgrade`. See
 [workspace packages](workspace-packages.md#build-workspaces-declared-by-a-release).
+
+### Schema registry role
+
+`aio-install` now gives the AIO extension Azure Device Registry Administrator
+on the schema registry instead of Contributor. If a condition limits
+which roles your deployment identity can assign, allow this role
+(`12675fd7-7f59-493f-9201-f7944860a2f1`).
+
+An existing instance keeps its Contributor assignment. Your next
+`aio-install` run adds the new role, after which you can remove Contributor
+with `az role assignment delete`.
+
+### Broker redundancy
+
+A Site that sets `parameters.brokerConfig.backendRedundancyFactor` to 1 now
+fails at the `aio-instance` step, because broker upgrades need 2 or more.
+Set it to 2 or more, or remove it to use the default of 2.
+
+### Upgrade path check
+
+`aio-upgrade` checks the installed AIO version first. It stops before any
+change when the target AIO release's supported upgrade list does not include
+that version, or when the move is a downgrade or between preview and GA, for
+example:
+
+```text
+Microsoft's supported upgrade list for AIO release 2609 (1.4.112) does not include AIO 1.1.69. Upgrade to AIO release 2606 first.
+```
+
+Upgrade to the AIO release that the message names, then to your target.
+Supported upgrades and reruns at the same AIO release are unchanged.
 
 ### Repeated equals keys
 

@@ -99,6 +99,9 @@ settings of an existing installation, run
 [aio-upgrade](../aio-upgrade/README.md#change-extension-settings) at its
 current AIO release, which keeps the existing settings and removes no key.
 
+To run an extension version or release train other than the AIO release's,
+see [Pin an extension version or train](../../../../docs/aio-releases.md#pin-an-extension-version-or-train).
+
 ### Settings Scale Kit derives
 
 This installation derives some AIO extension settings from other Site
@@ -181,8 +184,9 @@ Installation can create or update Arc extensions, the AIO instance and
 children, a custom location, an ADR namespace, Schema Registry storage and
 role assignments. Optional capabilities add their own resources.
 Deployment can incur Azure charges and needs permission to create role assignments at
-the applicable scope, commonly Owner or User Access Administrator plus
-Contributor.
+the applicable scope, commonly Contributor plus Role Based Access Control
+Administrator with a condition that allows only the roles the content assigns.
+See [Assign Azure roles](../../../../docs/ci-cd-setup.md#3-assign-azure-roles).
 
 An executable plan establishes local preparation, not Azure authorization
 or cluster readiness. Deployment success reports provider operations.

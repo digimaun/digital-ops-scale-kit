@@ -348,10 +348,10 @@ No Site file specific to Azure is committed. The E2E Site is rendered at run tim
 
 | Mode | Resource group | SP scope | When to use |
 |------|---------------|----------|-------------|
-| ephemeral (default) | Workflow creates and deletes it for each run. | `Owner` at subscription level. | Routine CI validation, fully automated. |
-| persistent | Operator supplies an existing RG. Only resources created during the run are deleted (snapshot delta). The cluster itself is always a fresh k3s on the runner. | `Owner` at RG level. | Restricted subscriptions where `Owner` at subscription level is not acceptable. Matrices with several AIO releases are serialized in the shared RG. |
+| ephemeral (default) | Workflow creates and deletes it for each run. | `Owner`, or `Contributor` plus constrained Role Based Access Control Administrator, at subscription level. | Routine CI validation, fully automated. |
+| persistent | Operator supplies an existing RG. Only resources created during the run are deleted (snapshot delta). The cluster itself is always a fresh k3s on the runner. | The same roles on the RG. | Restricted subscriptions where roles at subscription level are not acceptable. Matrices with several AIO releases are serialized in the shared RG. |
 
-`Owner` is required (not `Contributor`) because AIO deployments make role assignments (for example, schema registry and Key Vault). `Contributor` cannot grant roles.
+AIO deployments assign roles, for example on the schema registry and Key Vault, so the SP needs role assignment rights as well as `Contributor`. [Assign Azure roles](ci-cd-setup.md#3-assign-azure-roles) shows the condition that limits Role Based Access Control Administrator to those roles. The OPC UA solution phase also assigns Azure Event Hubs Data Sender.
 
 ## Prerequisites
 
@@ -359,8 +359,8 @@ No Site file specific to Azure is committed. The E2E Site is rendered at run tim
 
 Follow [CI/CD setup - Azure OIDC Configuration](ci-cd-setup.md#azure-oidc-configuration) to create the service principal and federated credential. The SP needs:
 
-- **ephemeral mode:** `Owner` on the subscription.
-- **persistent mode:** `Owner` on the selected resource group.
+- **ephemeral mode:** `Owner`, or `Contributor` plus constrained Role Based Access Control Administrator, on the subscription.
+- **persistent mode:** the same roles on the selected resource group.
 
 ### 2. Custom Locations RP object ID
 
@@ -415,7 +415,8 @@ From the **Actions** tab, dispatch **E2E Tests** with the defaults to run one AI
 | `skip-teardown` | false | Preserve the deployment for inspection. Scope depends on mode (see below). |
 | `keep-cluster-alive-minutes` | `0` | Hold the runner for N min before teardown for debugging. Clamped to what is left of the job budget so teardown still runs. Nothing should be added to the persistent RG during the hold (it'll be deleted by teardown). |
 | `tests` | empty (run all) or `aio-install,enable-secretsync` | Allowlist of test phases to deploy and run, separated by commas. Valid values: `aio-install`, `enable-secretsync`, `sync-secrets`, `opc-ua-solution`, `dataflow-sample`, `aio-resources`, `resource-set-samples`, `aio-upgrade`. Useful for demos and focused debugging when paired with `keep-cluster-alive-minutes`. |
-| `upgrade-to` | empty or `2609` | Optional AIO release to upgrade to after the install phase tests pass. Empty skips the upgrade phase. Each cell skips it when it equals the cell's `aio-releases` value. Requires `aio-upgrade` to be in the `tests` allowlist (or `tests` empty). |
+| `upgrade-to` | empty or `2609` | Optional AIO release to upgrade to after the install phase tests pass. Empty skips the upgrade phase. Each cell skips it when it equals the cell's `aio-releases` value. Requires `aio-upgrade` to be in the `tests` allowlist (or `tests` empty). With `published-release`, see [upgrade from a published release](#upgrade-from-a-published-release). |
+| `upgrade-first-hop` | empty | Set it when `aio-upgrade` should refuse `upgrade-to`. It names the AIO release that the refusal must name to upgrade to first. The upgrade phase then checks only that refusal. |
 | `secret-sync-modes` | `enabled` or `enabled,disabled` | Matrix modes for Secret Sync and workload identity. Use `enabled,disabled` with `tests=aio-upgrade` to qualify upgrade behavior with and without the OIDC profile. |
 | `opcua-modes` | `Stable` or `Stable,Disabled` | Source AIO runs only. `Disabled` requires explicit tests limited to `aio-install`, `enable-secretsync`, `sync-secrets` and `aio-upgrade`. Published and candidate acceptance runs require `Stable`. |
 | `published-release` | empty or an exact tag | Empty keeps the integration suite that runs from the checkout source. A tag selects the bounded, verified published package mode below. |
@@ -510,12 +511,12 @@ Published qualification is deliberately bounded:
 | `published-release` | Exact approved published tag |
 | `published-source-sha` | Exact full source commit |
 | `aio-releases` | One AIO release. Guided mode uses `2609`. |
-| `tests` | `aio-install` |
+| `tests` | `aio-install`, or `aio-install,aio-upgrade` with `upgrade-to` |
 | `published-journey` | `configured` or `guided` |
 | `secret-sync-modes` | `disabled` for configured Sites. Guided supports `disabled`, `enabled` or both. |
 | `resource-group` | Existing dedicated RG |
 | `cluster-name` | Empty, so the workflow creates a unique Arc registration. |
-| `upgrade-to` | empty |
+| `upgrade-to` | Empty, or an AIO release in this checkout for a configured Site |
 | `skip-teardown` | `false` |
 | `keep-cluster-alive-minutes` | `0` |
 
@@ -525,7 +526,7 @@ until cleanup of the snapshot delta completes. The RG itself is preserved. Anyth
 another actor adds after the snapshot can enter the deletion delta, so use a
 dedicated RG and do not make concurrent changes during the run. The mode
 establishes the published engine/package deployment route and bounded AIO
-readiness observations. They do not establish upgrade behavior, workload
+readiness observations. Without `upgrade-to`, they do not establish upgrade behavior, workload
 data movement or general production health. A configured disabled cell
 does not establish Secret Sync. A guided enabled cell additionally
 observes the Secret Provider Class, managed identity, vault, federated
@@ -559,6 +560,34 @@ gh workflow run e2e-test.yaml \
   -f tests=aio-install \
   -f secret-sync-modes=disabled,enabled
 ```
+
+### Upgrade from a published release
+
+A configured published cell with `upgrade-to` installs AIO with the published
+release's verified engine and content, at the `aio-releases` value that
+release ships. Then it installs this checkout's engine and runs the upgrade
+phase with this checkout's content, as a source run does. The published
+engine keeps its own verified environment, and the upgrade tests must import
+the checkout engine. For example, from AIO release 2602 in v1.0.0b7:
+
+```bash
+gh workflow run e2e-test.yaml \
+  --ref <branch> \
+  -f published-release=v1.0.0b7 \
+  -f published-source-sha=<full-main-commit-of-v1.0.0b7> \
+  -f aio-releases=2602 \
+  -f upgrade-to=2609 \
+  -f resource-group=<dedicated-existing-rg> \
+  -f tests=aio-install,aio-upgrade \
+  -f secret-sync-modes=disabled
+```
+
+The cell expects the upgrade to succeed and runs the upgrade tests. The upgrade
+results artifact is uploaded as for a source run. Set `upgrade-first-hop` when
+the installed AIO version is outside the target's list, so the path check
+should refuse the target and name that release first. Every AIO release in
+this workspace lists the versions of the earlier ones, so such a run needs a
+source that the workspace does not ship.
 
 ### What `skip-teardown` leaves behind
 
@@ -671,6 +700,8 @@ pytest tests/integration/ -v -m integration
 - **Narrows test collection** to `_UPGRADE_PHASE_ALLOWED_CLASSES` in `tests/integration/conftest.py`. Classes whose assertions require outputs from the install phase are listed in `_UPGRADE_PHASE_INSTALL_ONLY_CLASSES` instead. A workspace test requires every class in the upgrade module to appear in exactly one collection.
 - **Bypasses the `aio_install_result` fixture** so `aio-install` is not deployed again at the new AIO release on top of the existing instance.
 
+When `AIO_RELEASE_FROM` and `AIO_RELEASE_TO` differ, as the workflow sets them, and this checkout still ships the source release, the upgrade tests also select the source release again after the upgrade. They require the `check-upgrade-path` step to refuse that downgrade before any later step runs, then rerun `aio-upgrade` at the target and require the path check to find the installed AIO version unchanged. An upgrade from a release this checkout does not ship skips that pair.
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
@@ -678,7 +709,7 @@ pytest tests/integration/ -v -m integration
 | `azure/login` fails with `AADSTS70021` | Federated credential `sub` claim mismatch. | Confirm the credential matches `repo:<org>/<repo>:environment:<env>` (or branch ref) exactly. See [CI/CD setup](ci-cd-setup.md#azure-oidc-configuration). |
 | Pytest collects 0 integration tests | Selector does not match the rendered Site, or `SITEOPS_EXTRA_SITES_DIRS` is unset. | Check `INTEGRATION_SELECTOR` equals the rendered Site's `name:` field. |
 | Rendered output still contains `${...}` | Template references a variable not in `ALL_VARS`. | Add it to `REQUIRED_VARS` or `OPTIONAL_VARS` in `scripts/render-e2e-site.py`. |
-| AIO deploy fails with `AuthorizationFailed` on role assignment | SP is `Contributor`, not `Owner`. | Escalate to `Owner` on sub (ephemeral) or RG (persistent). |
+| AIO deploy fails with `AuthorizationFailed` on role assignment | The SP cannot assign the role, or the condition does not list it. | Grant Role Based Access Control Administrator with the condition in [Assign Azure roles](ci-cd-setup.md#3-assign-azure-roles), and add any role your phases assign, such as Azure Event Hubs Data Sender, to both role lists. |
 | Teardown in persistent mode leaves resources | The snapshot step failed or was skipped. | Inspect the step summary warning and the `Snapshot RG resources (persistent mode)` step log. Clean up residual resources manually. |
 | Step summary shows `Persistent-mode teardown incomplete (N residual resource(s))` | One or more delta deletes did not converge in 5 retry passes. | Inspect the `[delete-failed pass=*]` warnings in the teardown step log. Clean up the named resources manually. For a connectedCluster, use `az connectedk8s delete -n <name> -g <rg> --yes --force`. |
 | connect-arc times out waiting for `Connected` | Arc registration or heartbeat did not reach `Connected`. Authentication, cluster reachability, or custom locations configuration may be involved. | Verify prerequisite 2. Rerun with `skip-teardown: true` and inspect `az connectedk8s show` from an authorized local session. |

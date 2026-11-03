@@ -36,6 +36,7 @@ python scripts\build-workspace-package.py `
   --require-feature composition/v1 `
   --require-feature manifest-selection/v1 `
   --require-feature typed-input-maps/v1 `
+  --require-feature step-reports/v1 `
   --include docs `
   --include README.md `
   --license LICENSE `
@@ -122,7 +123,7 @@ its own package, compatibility range and licensing files:
       "package": "iot-operations.zip",
       "compatibility": {
         "siteops": ">=1.0.0b1,<2",
-        "requiredFeatures": ["manifest/v1", "composition/v1", "manifest-selection/v1", "typed-input-maps/v1"]
+        "requiredFeatures": ["manifest/v1", "composition/v1", "manifest-selection/v1", "typed-input-maps/v1", "step-reports/v1"]
       },
       "include": ["docs", "README.md"],
       "licenses": ["LICENSE", "ThirdPartyNotices.txt"]
@@ -184,7 +185,9 @@ in the selected commit. License paths must identify regular files. `include`
 is optional, and omitted `requiredFeatures` defaults to `manifest/v1`.
 The producer also records `compiled-templates/v1`. It rejects a workspace
 whose input contract declares a `stringMap` input unless `requiredFeatures`
-includes `typed-input-maps/v1`.
+includes `typed-input-maps/v1`. It also rejects a workspace whose Manifest
+lists a feature in its own `requiredFeatures` that the package does not
+declare.
 
 If a workspace contains either generated index file, both must be present and
 current for that exact source. Production preserves the existing generic or
@@ -299,9 +302,10 @@ workspace affect the archive identity, not the workspace tree identity.
 The metadata file is excluded from its own payload inventory.
 
 Supported required features are `manifest/v1`, `composition/v1`,
-`manifest-selection/v1` and `typed-input-maps/v1`. Package production also
-requires `compiled-templates/v1`, and `typed-input-maps/v1` when an input
-contract declares a `stringMap` input. Unsupported required features and
+`manifest-selection/v1`, `typed-input-maps/v1` and `step-reports/v1`. Package
+production also requires `compiled-templates/v1`, `typed-input-maps/v1` when
+an input contract declares a `stringMap` input, and each feature that a
+Manifest lists in `requiredFeatures`. Unsupported required features and
 incompatible engine versions are rejected. Compatibility describes the declared engine
 contract, not deployment or workload qualification.
 

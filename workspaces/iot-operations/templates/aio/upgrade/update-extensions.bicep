@@ -34,7 +34,15 @@
 //     equivalent for scalekit-managed installs and avoids a snapshot field for a
 //     value scalekit owns. If Microsoft ever changes the default cert-manager
 //     namespace, both install and this template must be updated together.
+//
+// Upgrade path: before any write, the effective AIO target passes the same
+// decision as the check-upgrade-path step (upgrade-path.bicep). A refused move
+// fails this deployment, and every extension PUT below reads a guarded value,
+// so none of them runs. A Site or step parameter that changes the target after
+// the early check is covered too.
 // -------------------------------------------------------------------------------------
+
+import { preserved, targetDecision, upgradePaths } from 'upgrade-path.bicep'
 
 // =====================================================================================
 // Parameters: connected cluster + resolved snapshots (from resolve-extensions chaining)
@@ -108,8 +116,8 @@ param certManagerConfigurationOverrides object = {}
 // Effective values: empty target preserves the resolved current value.
 // =====================================================================================
 
-var effectiveAioVersion = !empty(aioVersion) ? aioVersion : aio.version
-var effectiveAioTrain = !empty(aioTrain) ? aioTrain : aio.releaseTrain
+var effectiveAioVersion = preserved(aioVersion, aio.version)
+var effectiveAioTrain = preserved(aioTrain, aio.releaseTrain)
 var releaseExtensionConfiguration = aioReleaseConfiguration.?extension ?? {}
 var releaseAioConfigurationOverrides = releaseExtensionConfiguration.?configurationOverrides ?? {}
 var configureSecurityPkiSubjectName = aioApiVersion == '2026-07-01' || bool(releaseExtensionConfiguration.?securityPkiSubjectName ?? false)
@@ -169,6 +177,16 @@ var effectiveCertManagerVersion = !empty(certManagerVersion) ? certManagerVersio
 var effectiveCertManagerTrain = !empty(certManagerTrain) ? certManagerTrain : certManager.releaseTrain
 
 // =====================================================================================
+// Upgrade path guard: each PUT reads its version through the decision.
+// =====================================================================================
+
+var upgradePath = targetDecision(aio.version, aio.releaseTrain, aioVersion, aioTrain, upgradePaths)
+var upgradeRefused = upgradePath.status == 'refused'
+var guardedAioVersion = upgradeRefused ? fail(upgradePath.message) : effectiveAioVersion
+var guardedSecretStoreVersion = upgradeRefused ? fail(upgradePath.message) : effectiveSecretStoreVersion
+var guardedCertManagerVersion = upgradeRefused ? fail(upgradePath.message) : effectiveCertManagerVersion
+
+// =====================================================================================
 // Cluster reference (extensions are scoped to the connected cluster).
 // =====================================================================================
 
@@ -186,7 +204,7 @@ resource aioExtensionUpdate 'Microsoft.KubernetesConfiguration/extensions@2023-0
   identity: aio.identity
   properties: {
     extensionType: aio.extensionType
-    version: effectiveAioVersion
+    version: guardedAioVersion
     releaseTrain: effectiveAioTrain
     autoUpgradeMinorVersion: false
     scope: {
@@ -218,7 +236,7 @@ resource secretStoreExtensionUpdate 'Microsoft.KubernetesConfiguration/extension
   identity: secretStore.identity
   properties: {
     extensionType: secretStore.extensionType
-    version: effectiveSecretStoreVersion
+    version: guardedSecretStoreVersion
     releaseTrain: effectiveSecretStoreTrain
     autoUpgradeMinorVersion: false
     // union() preserves existing keys and overlays overrides. Keys removed in
@@ -240,7 +258,7 @@ resource certManagerExtensionUpdate 'Microsoft.KubernetesConfiguration/extension
   identity: certManager.identity
   properties: {
     extensionType: certManager.extensionType
-    version: effectiveCertManagerVersion
+    version: guardedCertManagerVersion
     releaseTrain: effectiveCertManagerTrain
     autoUpgradeMinorVersion: false
     scope: {
